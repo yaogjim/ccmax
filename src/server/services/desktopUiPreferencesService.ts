@@ -6,7 +6,7 @@ import { ApiError } from '../middleware/errorHandler.js'
 import { readRecoverableJsonFile } from './recoverableJsonFile.js'
 import { ensurePersistentStorageUpgraded } from './persistentStorageMigrations.js'
 
-const CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION = 5
+const CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION = 6
 const MAX_PROJECT_PREFERENCE_ENTRIES = 2_000
 const MAX_PROJECT_DISPLAY_NAME_ENTRIES = 2_000
 const MAX_PROJECT_DISPLAY_NAME_KEY_LENGTH = 4_096
@@ -19,6 +19,7 @@ const MIN_PET_SIZE = 96
 const MAX_PET_SIZE = 192
 const DEFAULT_PET_SIZE = 144
 const MAX_PET_SESSION_ID_LENGTH = 200
+const MAX_SKILL_MARKET_URL_LENGTH = 2_048
 const DEFAULT_PROFILE_SUBTITLE = 'github.com/NanmiCoder/cc-haha'
 const DEFAULT_PET_ID = 'dada-code'
 
@@ -62,6 +63,12 @@ export type DesktopSettingsNavigationPreferences = {
   trace: boolean
   diagnostics: boolean
   about: boolean
+  h5Access: boolean
+}
+
+export type DesktopSkillMarketPreferences = {
+  visible: boolean
+  url: string
 }
 
 export type DesktopUiPreferences = {
@@ -71,6 +78,7 @@ export type DesktopUiPreferences = {
   pet: DesktopPetPreferences
   projectDisplayNames: ProjectDisplayNames
   settingsNavigation: DesktopSettingsNavigationPreferences
+  skillMarket: DesktopSkillMarketPreferences
   [key: string]: unknown
 }
 
@@ -115,6 +123,12 @@ const DEFAULT_SETTINGS_NAVIGATION_PREFERENCES: DesktopSettingsNavigationPreferen
   trace: false,
   diagnostics: false,
   about: false,
+  h5Access: false,
+}
+
+const DEFAULT_SKILL_MARKET_PREFERENCES: DesktopSkillMarketPreferences = {
+  visible: false,
+  url: '',
 }
 
 function defaultPreferences(): DesktopUiPreferences {
@@ -125,6 +139,7 @@ function defaultPreferences(): DesktopUiPreferences {
     pet: { ...DEFAULT_PET_PREFERENCES },
     projectDisplayNames: createProjectDisplayNames(),
     settingsNavigation: { ...DEFAULT_SETTINGS_NAVIGATION_PREFERENCES },
+    skillMarket: { ...DEFAULT_SKILL_MARKET_PREFERENCES },
   }
 }
 
@@ -360,7 +375,54 @@ export function normalizeDesktopSettingsNavigationPreferences(
       DEFAULT_SETTINGS_NAVIGATION_PREFERENCES.diagnostics,
     ),
     about: normalizeBooleanPreference(record.about, DEFAULT_SETTINGS_NAVIGATION_PREFERENCES.about),
+    h5Access: normalizeBooleanPreference(record.h5Access, DEFAULT_SETTINGS_NAVIGATION_PREFERENCES.h5Access),
   }
+}
+
+export function parseSkillMarketUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return ''
+  if (trimmed.length > MAX_SKILL_MARKET_URL_LENGTH) return null
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.toString()
+  } catch {
+    return null
+  }
+}
+
+export function normalizeDesktopSkillMarketPreferences(value: unknown): DesktopSkillMarketPreferences {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { ...DEFAULT_SKILL_MARKET_PREFERENCES }
+  }
+
+  const record = value as Record<string, unknown>
+  return {
+    ...record,
+    visible: normalizeBooleanPreference(record.visible, DEFAULT_SKILL_MARKET_PREFERENCES.visible),
+    url: parseSkillMarketUrl(record.url) ?? DEFAULT_SKILL_MARKET_PREFERENCES.url,
+  }
+}
+
+function validateSkillMarketPreferencesPatch(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw ApiError.badRequest('Skill market preferences must be an object')
+  }
+  const patch = value as Record<string, unknown>
+  if (Object.prototype.hasOwnProperty.call(patch, 'visible') && typeof patch.visible !== 'boolean') {
+    throw ApiError.badRequest('visible must be a boolean')
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'url')) {
+    if (typeof patch.url !== 'string') {
+      throw ApiError.badRequest('url must be a string')
+    }
+    if (parseSkillMarketUrl(patch.url) === null) {
+      throw ApiError.badRequest('url must be an http or https URL')
+    }
+  }
+  return patch
 }
 
 function normalizeProjectOrganization(value: unknown): SidebarProjectPreferences['projectOrganization'] {
@@ -390,6 +452,7 @@ function normalizeDesktopUiPreferences(value: unknown): DesktopUiPreferences | n
     pet: normalizeDesktopPetPreferences(record.pet),
     projectDisplayNames: normalizeProjectDisplayNames(record.projectDisplayNames),
     settingsNavigation: normalizeDesktopSettingsNavigationPreferences(record.settingsNavigation),
+    skillMarket: normalizeDesktopSkillMarketPreferences(record.skillMarket),
   }
 }
 
@@ -504,6 +567,7 @@ export class DesktopUiPreferencesService {
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
+        skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
       }
 
       await this.writePreferences(nextPreferences)
@@ -538,6 +602,7 @@ export class DesktopUiPreferencesService {
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
+        skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
       }
 
       await this.writePreferences(nextPreferences)
@@ -576,6 +641,7 @@ export class DesktopUiPreferencesService {
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames,
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
+        skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
       }
 
       await this.writePreferences(nextPreferences)
@@ -602,6 +668,7 @@ export class DesktopUiPreferencesService {
         }),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
+        skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
       }
 
       await this.writePreferences(nextPreferences)
@@ -626,6 +693,32 @@ export class DesktopUiPreferencesService {
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences({
           ...currentNavigation,
+          ...patch,
+        }),
+        skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
+      }
+
+      await this.writePreferences(nextPreferences)
+      return nextPreferences
+    })
+  }
+
+  async updateSkillMarketPreferences(skillMarket: unknown): Promise<DesktopUiPreferences> {
+    const filePath = this.getPreferencesPath()
+    return this.withWriteLock(filePath, async () => {
+      const { preferences } = await this.readPreferences()
+      const currentMarket = normalizeDesktopSkillMarketPreferences(preferences.skillMarket)
+      const patch = validateSkillMarketPreferencesPatch(skillMarket)
+      const nextPreferences: DesktopUiPreferences = {
+        ...preferences,
+        schemaVersion: preferences.schemaVersion,
+        sidebar: normalizeSidebarProjectPreferences(preferences.sidebar),
+        profile: normalizeProfilePreferences(preferences.profile),
+        pet: normalizeDesktopPetPreferences(preferences.pet),
+        projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
+        settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
+        skillMarket: normalizeDesktopSkillMarketPreferences({
+          ...currentMarket,
           ...patch,
         }),
       }
@@ -680,6 +773,7 @@ export class DesktopUiPreferencesService {
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
+        skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
       }
 
       await this.writePreferences(nextPreferences)
@@ -708,6 +802,7 @@ export class DesktopUiPreferencesService {
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
+        skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
       }
 
       await this.writePreferences(nextPreferences)

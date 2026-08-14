@@ -32,6 +32,12 @@ export type DesktopSettingsNavigationPreferences = {
   trace: boolean
   diagnostics: boolean
   about: boolean
+  h5Access: boolean
+}
+
+export type DesktopSkillMarketPreferences = {
+  visible: boolean
+  url: string
 }
 
 export type DesktopUiPreferences = {
@@ -41,6 +47,7 @@ export type DesktopUiPreferences = {
   pet: DesktopPetPreferences
   projectDisplayNames: Record<string, string>
   settingsNavigation: DesktopSettingsNavigationPreferences
+  skillMarket: DesktopSkillMarketPreferences
 }
 
 export type DesktopUiPreferencesResponse = {
@@ -104,6 +111,13 @@ export const desktopUiPreferencesApi = {
     return api.put<{ ok: true; preferences: DesktopUiPreferences }>(
       '/api/desktop-ui/preferences/settings-navigation',
       settingsNavigation,
+    )
+  },
+
+  updateSkillMarketPreferences(skillMarket: Partial<DesktopSkillMarketPreferences>) {
+    return api.put<{ ok: true; preferences: DesktopUiPreferences }>(
+      '/api/desktop-ui/preferences/skill-market',
+      skillMarket,
     )
   },
 

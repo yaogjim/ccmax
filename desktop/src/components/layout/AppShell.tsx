@@ -6,7 +6,7 @@ import { UpdateChecker } from '@/components/layout/UpdateChecker'
 import { StatusDot } from '@/components/ui/Badge'
 import { IconButton } from '@/components/ui/IconButton'
 import { useSettingsStore } from '../../stores/settingsStore'
-import { useSettingsNavigationStore } from '../../stores/settingsNavigationStore'
+import { enforceHiddenSkillMarketTab, useSettingsNavigationStore } from '../../stores/settingsNavigationStore'
 import { useUIStore, type SettingsTab } from '../../stores/uiStore'
 import { useKeyboardShortcuts } from '../../hooks/useKeyboardShortcuts'
 import { useElectronWindowDragRegions } from '../../hooks/useElectronWindowDragRegions'
@@ -137,7 +137,10 @@ export function AppShell() {
           void preferencesRequest
             .then(({ preferences }) => {
               if (cancelled) return
-              useSettingsNavigationStore.getState().applyLoadedPreferences(preferences.settingsNavigation)
+              useSettingsNavigationStore.getState().applyLoadedPreferences(
+                preferences.settingsNavigation,
+                preferences.skillMarket,
+              )
               hydrateProjectDisplayNames(
                 preferences.projectDisplayNames ?? {},
                 displayNameHydrationRevision,
@@ -147,7 +150,7 @@ export function AppShell() {
               }
             })
             .catch(() => {
-              useSettingsNavigationStore.getState().applyLoadedPreferences(null)
+              useSettingsNavigationStore.getState().applyLoadedPreferences(null, null)
             })
         }
 
@@ -158,6 +161,7 @@ export function AppShell() {
 
           await useTabStore.getState().restoreTabs()
           if (cancelled) return
+          enforceHiddenSkillMarketTab()
           if (traceLaunch.sessionId) {
             // A deep link arrives before the session list is in the store often
             // enough that the id prefix is the only title we can guarantee.

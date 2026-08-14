@@ -2004,11 +2004,18 @@ Row 9, all 8 cells: continuing from straight down, turning left through lower-le
 
   // Settings > System
   'settings.system.title': 'System',
-  'settings.system.description': 'Choose which extra Settings menus stay visible.',
+  'settings.system.description': 'Choose which extra menus stay visible, and configure the Skills Market.',
   'settings.system.menusTitle': 'Settings menus',
   'settings.system.menusDescription': 'Hidden menus stay available here so you can turn them back on.',
   'settings.system.menuToggleDescription': 'Show {menu} in Settings.',
-  'settings.system.saveError': 'Could not save the Settings menu visibility.',
+  'settings.system.marketTitle': 'Skills Market',
+  'settings.system.marketDescription': 'Control whether the main-menu Skills Market entry is shown, and set its URL.',
+  'settings.system.marketToggleDescription': 'Show Skills Market in the main menu.',
+  'settings.system.marketUrl': 'Skills Market URL',
+  'settings.system.marketUrlHint': 'Leave empty to use the built-in market. Only http and https URLs are allowed.',
+  'settings.system.marketUrlPlaceholder': 'https://example.com/skills',
+  'settings.system.marketUrlInvalid': 'Enter a valid http or https URL.',
+  'settings.system.saveError': 'Could not save these System settings.',
 
   // Settings > Computer Use
   'settings.tab.computerUse': 'Computer Use',

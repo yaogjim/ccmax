@@ -70,12 +70,14 @@ vi.mock('../../stores/tabStore', () => {
     openTab: mocks.openTab,
     openTraceTab: mocks.openTraceTab,
     setActiveTab: mocks.setActiveTab,
+    closeTab: vi.fn(),
   })
   useTabStore.setState = (next: { activeTabId?: string | null }) => {
     if ('activeTabId' in next) mocks.tabState.activeTabId = next.activeTabId ?? null
   }
   return {
     SETTINGS_TAB_ID: '__settings__',
+    MARKET_TAB_ID: '__market__',
     useTabStore,
   }
 })

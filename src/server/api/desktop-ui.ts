@@ -5,6 +5,7 @@
  * PUT  /api/desktop-ui/preferences/sidebar  — persist sidebar project preferences
  * PUT  /api/desktop-ui/preferences/project-display-name — set or reset one project display name
  * PUT  /api/desktop-ui/preferences/settings-navigation — persist settings menu visibility
+ * PUT  /api/desktop-ui/preferences/skill-market — persist sidebar Skills Market visibility and URL
  * PUT  /api/desktop-ui/preferences/profile  — persist local profile preferences
  * GET  /api/desktop-ui/preferences/pet      — read only desktop pet preferences
  * PUT  /api/desktop-ui/preferences/pet      — patch desktop pet preferences
@@ -61,6 +62,15 @@ export async function handleDesktopUiApi(
       return Response.json({
         ok: true,
         preferences: await desktopUiPreferencesService.updateSettingsNavigationPreferences(body),
+      })
+    }
+
+    if (detail === 'skill-market') {
+      if (req.method !== 'PUT') throw methodNotAllowed(req.method)
+      const body = await parseJsonBody(req)
+      return Response.json({
+        ok: true,
+        preferences: await desktopUiPreferencesService.updateSkillMarketPreferences(body),
       })
     }
 

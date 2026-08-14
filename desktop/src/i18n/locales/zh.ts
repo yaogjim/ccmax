@@ -2004,11 +2004,18 @@ export const zh: Record<TranslationKey, string> = {
 
   // Settings > System
   'settings.system.title': '系统',
-  'settings.system.description': '选择哪些额外的设置菜单保持显示。',
+  'settings.system.description': '选择哪些额外菜单保持显示，并配置技能市场。',
   'settings.system.menusTitle': '设置菜单',
   'settings.system.menusDescription': '隐藏的菜单仍可在这里重新打开。',
   'settings.system.menuToggleDescription': '在设置中显示{menu}。',
-  'settings.system.saveError': '无法保存设置菜单的显示状态。',
+  'settings.system.marketTitle': '技能市场',
+  'settings.system.marketDescription': '控制是否在主菜单显示技能市场，并设置其地址。',
+  'settings.system.marketToggleDescription': '在主菜单中显示技能市场。',
+  'settings.system.marketUrl': '技能市场地址',
+  'settings.system.marketUrlHint': '留空则使用内置技能市场。仅支持 http 和 https 地址。',
+  'settings.system.marketUrlPlaceholder': 'https://example.com/skills',
+  'settings.system.marketUrlInvalid': '请输入有效的 http 或 https 地址。',
+  'settings.system.saveError': '无法保存这些系统设置。',
 
   // Settings > Computer Use
   'settings.tab.computerUse': 'Computer Use',

@@ -116,6 +116,7 @@ describe('Settings section navigation', () => {
     expect(screen.queryByRole('button', { name: 'Trace' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Diagnostics' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'About' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'H5 Access' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'System' })).toBeInTheDocument()
   })
 

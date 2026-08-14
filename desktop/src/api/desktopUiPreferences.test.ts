@@ -3,7 +3,7 @@ import { getDefaultBaseUrl, setAuthToken, setBaseUrl } from './client'
 import { desktopUiPreferencesApi, getProfileAvatarUrl } from './desktopUiPreferences'
 
 const preferences = {
-  schemaVersion: 5,
+  schemaVersion: 6,
   projectDisplayNames: {},
   profile: {
     displayName: 'cc-haha',
@@ -27,6 +27,11 @@ const preferences = {
     trace: false,
     diagnostics: false,
     about: false,
+    h5Access: false,
+  },
+  skillMarket: {
+    visible: false,
+    url: '',
   },
   sidebar: {
     projectOrder: [],
@@ -142,6 +147,29 @@ describe('desktopUiPreferencesApi', () => {
       expect.objectContaining({
         method: 'PUT',
         body: JSON.stringify(settingsNavigation),
+      }),
+    )
+  })
+
+  it('sends skill market patches through the dedicated endpoint', async () => {
+    setBaseUrl('http://127.0.0.1:49237')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, preferences }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const skillMarket = { visible: true, url: 'https://market.example/skills' }
+
+    await expect(desktopUiPreferencesApi.updateSkillMarketPreferences(skillMarket)).resolves.toEqual({
+      ok: true,
+      preferences,
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:49237/api/desktop-ui/preferences/skill-market',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify(skillMarket),
       }),
     )
   })

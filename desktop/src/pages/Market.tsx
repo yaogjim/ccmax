@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import { useTranslation } from '../i18n'
 import { useMarketStore } from '../stores/marketStore'
+import { useSettingsNavigationStore } from '../stores/settingsNavigationStore'
 import { useSkillStore } from '../stores/skillStore'
 import { useUIStore } from '../stores/uiStore'
 import { InstallConfirmDialog } from '../components/market/InstallConfirmDialog'
@@ -11,10 +12,24 @@ import type { NormalizedSkill } from '../types/market'
 
 export function Market({ featured }: { featured?: ReactNode } = {}) {
   const t = useTranslation()
+  const marketUrl = useSettingsNavigationStore((s) => s.skillMarket.url)
   const selectedId = useMarketStore((s) => s.selectedId)
   const installingIds = useMarketStore((s) => s.installingIds)
   const [confirmInstall, setConfirmInstall] = useState<NormalizedSkill | null>(null)
   const [confirmUninstall, setConfirmUninstall] = useState<NormalizedSkill | null>(null)
+
+  if (marketUrl) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col bg-[var(--color-surface)]">
+        <iframe
+          title={t('sidebar.market')}
+          src={marketUrl}
+          className="h-full w-full border-0"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
+        />
+      </div>
+    )
+  }
 
   const findSkill = (id: string): NormalizedSkill | null => {
     const state = useMarketStore.getState()

@@ -36,6 +36,7 @@ import {
   setProjectDisplayName,
   useProjectDisplayNameRevision,
 } from '../../stores/projectDisplayNameStore'
+import { useSettingsNavigationStore } from '../../stores/settingsNavigationStore'
 import {
   desktopUiPreferencesApi,
   type DesktopUiPreferencesResponse,
@@ -138,6 +139,7 @@ export function Sidebar({
   const openModal = useUIStore((s) => s.openModal)
   const closeModal = useUIStore((s) => s.closeModal)
   const activeTabId = useTabStore((s) => s.activeTabId)
+  const skillMarketVisible = useSettingsNavigationStore((s) => s.skillMarket.visible)
   const tabs = useTabStore((s) => s.tabs)
   const chatSessions = useChatStore((s) => s.sessions)
   const closeTab = useTabStore((s) => s.closeTab)
@@ -1043,7 +1045,7 @@ export function Sidebar({
             {t('sidebar.scheduled')}
           </NavItem>
         )}
-        {!isMobile && (
+        {!isMobile && skillMarketVisible && (
           <NavItem
             active={activeTabId === MARKET_TAB_ID || activeTabId === CONNECTORS_TAB_ID}
             collapsed={!expanded}

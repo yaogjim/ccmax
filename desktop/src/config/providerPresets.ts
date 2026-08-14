@@ -24,6 +24,11 @@ export function selectableProviderPresets(presets: ProviderPreset[]): ProviderPr
   return presets.filter((preset) => !preset.deprecated)
 }
 
+export function defaultAddProviderPreset(presets: ProviderPreset[]): ProviderPreset | undefined {
+  const selectable = selectableProviderPresets(presets)
+  return selectable.find((preset) => preset.id === 'custom') ?? selectable[0]
+}
+
 export function normalizeProviderBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, '').toLowerCase()
 }

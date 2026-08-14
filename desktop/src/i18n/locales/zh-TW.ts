@@ -2005,11 +2005,18 @@ export const zh: Record<TranslationKey, string> = {
 
   // Settings > System
   'settings.system.title': '系統',
-  'settings.system.description': '選擇哪些額外的設定選單保持顯示。',
+  'settings.system.description': '選擇哪些額外選單保持顯示，並設定技能市集。',
   'settings.system.menusTitle': '設定選單',
   'settings.system.menusDescription': '隱藏的選單仍可在這裡重新開啟。',
   'settings.system.menuToggleDescription': '在設定中顯示{menu}。',
-  'settings.system.saveError': '無法儲存設定選單的顯示狀態。',
+  'settings.system.marketTitle': '技能市集',
+  'settings.system.marketDescription': '控制是否在主選單顯示技能市集，並設定其網址。',
+  'settings.system.marketToggleDescription': '在主選單中顯示技能市集。',
+  'settings.system.marketUrl': '技能市集網址',
+  'settings.system.marketUrlHint': '留空則使用內建技能市集。僅支援 http 與 https 網址。',
+  'settings.system.marketUrlPlaceholder': 'https://example.com/skills',
+  'settings.system.marketUrlInvalid': '請輸入有效的 http 或 https 網址。',
+  'settings.system.saveError': '無法儲存這些系統設定。',
 
   // Settings > Computer Use
   'settings.tab.computerUse': 'Computer Use',

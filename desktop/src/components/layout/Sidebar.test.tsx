@@ -240,6 +240,7 @@ import {
   captureProjectDisplayNameHydrationRevision,
   hydrateProjectDisplayNames,
 } from '../../stores/projectDisplayNameStore'
+import { resetSettingsNavigationStore, showSkillMarket } from '../../stores/settingsNavigationTestUtils'
 import type { SessionListItem } from '../../types/session'
 import type { PerSessionState } from '../../stores/chatStore'
 
@@ -325,7 +326,7 @@ function makeDesktopUiPreferencesResponse({
   return {
     exists,
     preferences: {
-      schemaVersion: 5,
+      schemaVersion: 6,
       sidebar,
       projectDisplayNames,
       settingsNavigation: {
@@ -335,6 +336,11 @@ function makeDesktopUiPreferencesResponse({
         trace: false,
         diagnostics: false,
         about: false,
+        h5Access: false,
+      },
+      skillMarket: {
+        visible: false,
+        url: '',
       },
       profile: {
         displayName: 'cc-haha',
@@ -494,6 +500,7 @@ describe('Sidebar', () => {
       sidebarOpen: true,
       addToast,
     } as Partial<ReturnType<typeof useUIStore.getState>>)
+    resetSettingsNavigationStore({ hydrated: true })
   })
 
   afterEach(() => {
@@ -2175,7 +2182,14 @@ describe('Sidebar', () => {
     expect(onRequestClose).toHaveBeenCalledTimes(2)
   })
 
+  it('hides the market entry from desktop navigation by default', () => {
+    render(<Sidebar />)
+
+    expect(screen.queryByRole('button', { name: 'Extension Market' })).not.toBeInTheDocument()
+  })
+
   it('keeps one unified extension market entry in desktop navigation', () => {
+    showSkillMarket()
     render(<Sidebar />)
 
     expect(screen.queryByRole('button', { name: 'sidebar.connectors' })).not.toBeInTheDocument()

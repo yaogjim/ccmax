@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { BUNDLED_PROVIDER_PRESETS, presetMatchesBaseUrl, selectableProviderPresets } from './providerPresets'
+import { BUNDLED_PROVIDER_PRESETS, defaultAddProviderPreset, presetMatchesBaseUrl, selectableProviderPresets } from './providerPresets'
 import type { ProviderPreset } from '../types/providerPreset'
 
 function makePreset(overrides: Partial<ProviderPreset> & { id: string }): ProviderPreset {
@@ -37,6 +37,13 @@ describe('selectableProviderPresets', () => {
 })
 
 describe('bundled provider presets', () => {
+  // The add-provider picker opens on the blank custom entry instead of the first
+  // featured sponsor. Retired gateways stay resolvable in the bundle; the it.each
+  // below owns those assertions.
+  it('defaults add-provider selection to the custom preset', () => {
+    expect(defaultAddProviderPreset(BUNDLED_PROVIDER_PRESETS)?.id).toBe('custom')
+  })
+
   it('defaults MiniMax to the China endpoint while retaining the global endpoint', () => {
     const minimax = BUNDLED_PROVIDER_PRESETS.find((preset) => preset.id === 'minimax')
 
@@ -112,6 +119,9 @@ describe('bundled provider presets', () => {
     expect(qiniuai && presetMatchesBaseUrl(qiniuai, ' HTTPS://API.QNAIGC.COM/ ')).toBe(true)
   })
 
+  // The picker groups featured presets into their own row; losing the flag would
+  // silently demote the sponsors into the generic list. Pinning the whole row also
+  // proves the retired gateways are not featured any more.
   it.each(['xuanshuapi', 'fennoai', 'qiniuai'])('retires %s without removing saved-provider metadata', (id) => {
     const preset = BUNDLED_PROVIDER_PRESETS.find((candidate) => candidate.id === id)
 

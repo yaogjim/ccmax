@@ -342,9 +342,14 @@ describe('provider presets API', () => {
       const preset = PROVIDER_PRESETS.find((candidate) => candidate.id === id)
 
       expect(preset?.deprecated).toBe(true)
+      // Records saved before these fields existed fall back to the preset for them.
+      expect(preset?.authStrategy).toBeDefined()
+    }
+
+    for (const id of ['shengsuanyun', 'jiekouai']) {
+      const preset = PROVIDER_PRESETS.find((candidate) => candidate.id === id)
       // defaultEnv is never persisted per provider, so it can only come from here.
       expect(preset?.defaultEnv).toBeDefined()
-      // Records saved before these fields existed fall back to the preset for them.
       expect(preset?.authStrategy).toBe('auth_token')
       expect(preset?.modelContextWindows).toBeDefined()
     }

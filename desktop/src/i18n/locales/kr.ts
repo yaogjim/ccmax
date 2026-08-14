@@ -2006,11 +2006,18 @@ export const kr: Record<TranslationKey, string> = {
 
   // Settings > System
   'settings.system.title': '시스템',
-  'settings.system.description': '추가로 표시할 설정 메뉴를 선택합니다.',
+  'settings.system.description': '추가로 표시할 메뉴를 선택하고 스킬 마켓을 구성합니다.',
   'settings.system.menusTitle': '설정 메뉴',
   'settings.system.menusDescription': '숨긴 메뉴는 여기에서 다시 켤 수 있습니다.',
   'settings.system.menuToggleDescription': '설정에 {menu}을(를) 표시합니다.',
-  'settings.system.saveError': '설정 메뉴 표시 상태를 저장하지 못했습니다.',
+  'settings.system.marketTitle': '스킬 마켓',
+  'settings.system.marketDescription': '메인 메뉴에 스킬 마켓을 표시할지와 주소를 설정합니다.',
+  'settings.system.marketToggleDescription': '메인 메뉴에 스킬 마켓을 표시합니다.',
+  'settings.system.marketUrl': '스킬 마켓 URL',
+  'settings.system.marketUrlHint': '비워 두면 내장 마켓을 사용합니다. http 및 https URL만 사용할 수 있습니다.',
+  'settings.system.marketUrlPlaceholder': 'https://example.com/skills',
+  'settings.system.marketUrlInvalid': '유효한 http 또는 https URL을 입력하세요.',
+  'settings.system.saveError': '이 시스템 설정을 저장하지 못했습니다.',
 
   // Settings > Computer Use
   'settings.tab.computerUse': '컴퓨터 사용',

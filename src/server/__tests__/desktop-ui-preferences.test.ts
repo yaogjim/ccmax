@@ -25,6 +25,12 @@ const DEFAULT_SETTINGS_NAVIGATION_PREFERENCES = {
   trace: false,
   diagnostics: false,
   about: false,
+  h5Access: false,
+}
+
+const DEFAULT_SKILL_MARKET_PREFERENCES = {
+  visible: false,
+  url: '',
 }
 
 async function setup() {
@@ -75,7 +81,7 @@ describe('DesktopUiPreferencesService', () => {
 
     expect(result.exists).toBe(false)
     expect(result.preferences).toEqual({
-      schemaVersion: 5,
+      schemaVersion: 6,
       profile: {
         displayName: 'cc-haha',
         subtitle: 'github.com/NanmiCoder/cc-haha',
@@ -85,6 +91,7 @@ describe('DesktopUiPreferencesService', () => {
       pet: DEFAULT_PET_PREFERENCES,
       projectDisplayNames: {},
       settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
+      skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
       sidebar: {
         projectOrder: [],
         pinnedProjects: [],
@@ -130,7 +137,7 @@ describe('DesktopUiPreferencesService', () => {
 
     expect(before.exists).toBe(true)
     expect(before.preferences).toEqual({
-      schemaVersion: 5,
+      schemaVersion: 6,
       futureField: { keep: true },
       profile: {
         displayName: 'cc-haha',
@@ -143,6 +150,7 @@ describe('DesktopUiPreferencesService', () => {
         '/workspace/alpha': 'Alpha project',
       },
       settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
+      skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
       sidebar: {
         projectOrder: ['/workspace/alpha', '/workspace/beta'],
         pinnedProjects: ['/workspace/beta'],
@@ -152,7 +160,7 @@ describe('DesktopUiPreferencesService', () => {
       },
     })
     expect(after).toEqual({
-      schemaVersion: 5,
+      schemaVersion: 6,
       futureField: { keep: true },
       profile: {
         displayName: 'cc-haha',
@@ -165,6 +173,7 @@ describe('DesktopUiPreferencesService', () => {
         '/workspace/alpha': 'Alpha project',
       },
       settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
+      skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
       sidebar: {
         projectOrder: ['/workspace/gamma'],
         pinnedProjects: [],
@@ -198,7 +207,7 @@ describe('DesktopUiPreferencesService', () => {
     await fs.writeFile(
       path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
       JSON.stringify({
-        schemaVersion: 5,
+        schemaVersion: 6,
         profile: {
           displayName: 'cc-haha',
           subtitle: 'github.com/NanmiCoder/cc-haha',
@@ -222,7 +231,7 @@ describe('DesktopUiPreferencesService', () => {
     await fs.writeFile(
       path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
       JSON.stringify({
-        schemaVersion: 5,
+        schemaVersion: 6,
         profile: {
           displayName: 'Custom Operator',
           subtitle: 'custom.example/profile',
@@ -370,7 +379,7 @@ describe('DesktopUiPreferencesService', () => {
     })
 
     expect(after).toMatchObject({
-      schemaVersion: 5,
+      schemaVersion: 6,
       futureField: { keep: true },
       profile: {
         displayName: 'Local Operator',
@@ -449,7 +458,7 @@ describe('DesktopUiPreferencesService', () => {
     const after = await new DesktopUiPreferencesService().updatePetPreferences({ enabled: true })
 
     expect(after).toMatchObject({
-      schemaVersion: 5,
+      schemaVersion: 6,
       futureField: { keep: true },
       pet: {
         futurePetField: { keep: 'pet-too' },
@@ -556,7 +565,43 @@ describe('DesktopUiPreferencesService', () => {
     const before = await new DesktopUiPreferencesService().readPreferences()
 
     expect(before.preferences.settingsNavigation).toEqual(DEFAULT_SETTINGS_NAVIGATION_PREFERENCES)
-    expect(before.preferences.schemaVersion).toBe(5)
+    expect(before.preferences.skillMarket).toEqual(DEFAULT_SKILL_MARKET_PREFERENCES)
+    expect(before.preferences.schemaVersion).toBe(6)
+    expect(before.preferences.futureField).toEqual({ keep: true })
+  })
+
+  test('hides H5 access and the sidebar skill market when migrating schema 5 files', async () => {
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
+      JSON.stringify({
+        schemaVersion: 5,
+        futureField: { keep: true },
+        settingsNavigation: {
+          terminal: true,
+          adapters: false,
+          pets: false,
+          trace: false,
+          diagnostics: false,
+          about: true,
+        },
+      }),
+      'utf-8',
+    )
+
+    const before = await new DesktopUiPreferencesService().readPreferences()
+
+    expect(before.preferences.schemaVersion).toBe(6)
+    expect(before.preferences.settingsNavigation).toEqual({
+      terminal: true,
+      adapters: false,
+      pets: false,
+      trace: false,
+      diagnostics: false,
+      about: true,
+      h5Access: false,
+    })
+    expect(before.preferences.skillMarket).toEqual(DEFAULT_SKILL_MARKET_PREFERENCES)
     expect(before.preferences.futureField).toEqual({ keep: true })
   })
 
@@ -583,7 +628,7 @@ describe('DesktopUiPreferencesService', () => {
     })
 
     expect(after).toMatchObject({
-      schemaVersion: 5,
+      schemaVersion: 6,
       futureField: { keep: true },
       settingsNavigation: {
         futureNav: { keep: 'nav' },
@@ -593,6 +638,7 @@ describe('DesktopUiPreferencesService', () => {
         trace: false,
         diagnostics: true,
         about: false,
+        h5Access: false,
       },
     })
     expect(await readDesktopUiFile()).toEqual(after)
@@ -615,7 +661,44 @@ describe('DesktopUiPreferencesService', () => {
       trace: false,
       diagnostics: true,
       about: true,
+      h5Access: false,
     })
+  })
+
+  test('normalizes and persists skill market preferences without touching sibling fields', async () => {
+    const service = new DesktopUiPreferencesService()
+    await service.updateSettingsNavigationPreferences({ terminal: true })
+    const after = await service.updateSkillMarketPreferences({
+      visible: true,
+      url: ' HTTPS://Skills.Example/market ',
+    })
+
+    expect(after.skillMarket).toEqual({
+      visible: true,
+      url: 'https://skills.example/market',
+    })
+    expect(after.settingsNavigation.terminal).toBe(true)
+    expect(await readDesktopUiFile()).toEqual(after)
+  })
+
+  test('rejects invalid skill market URLs without overwriting stored values', async () => {
+    const service = new DesktopUiPreferencesService()
+    const before = await service.updateSkillMarketPreferences({
+      visible: true,
+      url: 'https://market.example/skills',
+    })
+
+    await expect(service.updateSkillMarketPreferences({
+      url: 'javascript:alert(1)',
+    })).rejects.toThrow('url must be an http or https URL')
+    await expect(service.updateSkillMarketPreferences({
+      visible: 'yes',
+    })).rejects.toThrow('visible must be a boolean')
+    await expect(service.updateSkillMarketPreferences([])).rejects.toThrow(
+      'Skill market preferences must be an object',
+    )
+
+    expect(await readDesktopUiFile()).toEqual(before)
   })
 
   test('normalizes and persists profile preferences without touching sidebar preferences', async () => {
@@ -628,7 +711,7 @@ describe('DesktopUiPreferencesService', () => {
     })
 
     expect(after).toEqual({
-      schemaVersion: 5,
+      schemaVersion: 6,
       profile: {
         displayName: 'Claude Captain',
         subtitle: 'local.example/profile',
@@ -638,6 +721,7 @@ describe('DesktopUiPreferencesService', () => {
       pet: DEFAULT_PET_PREFERENCES,
       projectDisplayNames: {},
       settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
+      skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
       sidebar: {
         projectOrder: [],
         pinnedProjects: [],
@@ -722,7 +806,7 @@ describe('desktop UI preferences API', () => {
     expect(putBody).toEqual({
       ok: true,
       preferences: {
-        schemaVersion: 5,
+        schemaVersion: 6,
         profile: {
           displayName: 'cc-haha',
           subtitle: 'github.com/NanmiCoder/cc-haha',
@@ -732,6 +816,7 @@ describe('desktop UI preferences API', () => {
         pet: DEFAULT_PET_PREFERENCES,
         projectDisplayNames: {},
         settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
+        skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
         sidebar: {
           projectOrder: ['/workspace/beta', '/workspace/alpha'],
           pinnedProjects: ['/workspace/beta'],
@@ -750,7 +835,7 @@ describe('desktop UI preferences API', () => {
     expect(getBody).toEqual({
       exists: true,
       preferences: {
-        schemaVersion: 5,
+        schemaVersion: 6,
         profile: {
           displayName: 'cc-haha',
           subtitle: 'github.com/NanmiCoder/cc-haha',
@@ -760,6 +845,7 @@ describe('desktop UI preferences API', () => {
         pet: DEFAULT_PET_PREFERENCES,
         projectDisplayNames: {},
         settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
+        skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
         sidebar: {
           projectOrder: ['/workspace/beta', '/workspace/alpha'],
           pinnedProjects: ['/workspace/beta'],
@@ -849,7 +935,7 @@ describe('desktop UI preferences API', () => {
     await expect(putRes.json()).resolves.toMatchObject({
       ok: true,
       preferences: {
-        schemaVersion: 5,
+        schemaVersion: 6,
         pet: {
           enabled: true,
           selectedPetId: 'seedy',
@@ -1100,7 +1186,7 @@ describe('desktop UI preferences API', () => {
     expect(putBody).toMatchObject({
       ok: true,
       preferences: {
-        schemaVersion: 5,
+        schemaVersion: 6,
         settingsNavigation: {
           terminal: true,
           adapters: false,
@@ -1108,6 +1194,28 @@ describe('desktop UI preferences API', () => {
           trace: false,
           diagnostics: true,
           about: false,
+          h5Access: false,
+        },
+      },
+    })
+  })
+
+  test('persists skill market patches through the API', async () => {
+    const putReq = makeRequest('PUT', '/api/desktop-ui/preferences/skill-market', {
+      visible: true,
+      url: 'https://market.example/skills',
+    })
+    const putRes = await handleDesktopUiApi(putReq.req, putReq.url, putReq.segments)
+    const putBody = await putRes.json() as Record<string, unknown>
+
+    expect(putRes.status).toBe(200)
+    expect(putBody).toMatchObject({
+      ok: true,
+      preferences: {
+        schemaVersion: 6,
+        skillMarket: {
+          visible: true,
+          url: 'https://market.example/skills',
         },
       },
     })

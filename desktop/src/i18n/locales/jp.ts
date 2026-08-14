@@ -2006,11 +2006,18 @@ export const jp: Record<TranslationKey, string> = {
 
   // Settings > System
   'settings.system.title': 'システム',
-  'settings.system.description': '追加の設定メニューを表示するかどうかを選びます。',
+  'settings.system.description': '追加のメニューを表示するかどうかを選び、スキルマーケットを設定します。',
   'settings.system.menusTitle': '設定メニュー',
   'settings.system.menusDescription': '非表示のメニューは、ここから再び表示できます。',
   'settings.system.menuToggleDescription': '設定に {menu} を表示します。',
-  'settings.system.saveError': '設定メニューの表示状態を保存できませんでした。',
+  'settings.system.marketTitle': 'スキルマーケット',
+  'settings.system.marketDescription': 'メインメニューにスキルマーケットを表示するかどうかと、その URL を設定します。',
+  'settings.system.marketToggleDescription': 'メインメニューにスキルマーケットを表示します。',
+  'settings.system.marketUrl': 'スキルマーケット URL',
+  'settings.system.marketUrlHint': '空欄にすると内蔵マーケットを使います。http と https の URL のみ利用できます。',
+  'settings.system.marketUrlPlaceholder': 'https://example.com/skills',
+  'settings.system.marketUrlInvalid': '有効な http または https の URL を入力してください。',
+  'settings.system.saveError': 'これらのシステム設定を保存できませんでした。',
 
   // Settings > Computer Use
   'settings.tab.computerUse': 'コンピューター操作',
