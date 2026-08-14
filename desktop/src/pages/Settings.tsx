@@ -23,7 +23,9 @@ import { AgentManager } from '../components/settings/AgentManager'
 import { H5AccessSettings } from './settings/H5AccessSettings'
 import { GeneralSettings } from './settings/GeneralSettings'
 import { AboutSettings } from './settings/AboutSettings'
+import { SystemSettings } from './settings/SystemSettings'
 import { ProviderSettings } from './settings/ProviderSettings'
+import { useSettingsNavigationStore } from '../stores/settingsNavigationStore'
 
 export function Settings() {
   return getDesktopHost().isDesktop ? <DesktopSettings /> : <H5Settings />
@@ -33,13 +35,20 @@ export function DesktopSettings() {
   const activeTab = useUIStore((s) => s.activeSettingsTab)
   const setActiveTab = useUIStore((s) => s.setActiveSettingsTab)
   const pendingSettingsTab = useUIStore((s) => s.pendingSettingsTab)
+  const isSettingsTabVisible = useSettingsNavigationStore((s) => s.isSettingsTabVisible)
+  const resolveVisibleSettingsTab = useSettingsNavigationStore((s) => s.resolveVisibleSettingsTab)
   const t = useTranslation()
 
   useEffect(() => {
     if (!pendingSettingsTab) return
-    setActiveTab(pendingSettingsTab)
+    setActiveTab(resolveVisibleSettingsTab(pendingSettingsTab))
     useUIStore.getState().setPendingSettingsTab(null)
-  }, [pendingSettingsTab, setActiveTab])
+  }, [pendingSettingsTab, resolveVisibleSettingsTab, setActiveTab])
+
+  useEffect(() => {
+    const visibleTab = resolveVisibleSettingsTab(activeTab)
+    if (visibleTab !== activeTab) setActiveTab(visibleTab)
+  }, [activeTab, resolveVisibleSettingsTab, setActiveTab])
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-[var(--color-surface)]">
@@ -69,22 +78,35 @@ export function DesktopSettings() {
             <TabButton icon="dns" label={t('settings.tab.providers')} active={activeTab === 'providers'} onClick={() => setActiveTab('providers')} />
             <TabButton icon="tune" label={t('settings.tab.general')} active={activeTab === 'general'} onClick={() => setActiveTab('general')} />
             <TabButton icon="qr_code_2" label={t('settings.tab.h5Access')} active={activeTab === 'h5Access'} onClick={() => setActiveTab('h5Access')} />
-            <TabButton icon="chat" label={t('settings.tab.adapters')} active={activeTab === 'adapters'} onClick={() => setActiveTab('adapters')} />
-            <TabButton icon="terminal" label={t('settings.tab.terminal')} active={activeTab === 'terminal'} onClick={() => setActiveTab('terminal')} />
+            {isSettingsTabVisible('adapters') ? (
+              <TabButton icon="chat" label={t('settings.tab.adapters')} active={activeTab === 'adapters'} onClick={() => setActiveTab('adapters')} />
+            ) : null}
+            {isSettingsTabVisible('terminal') ? (
+              <TabButton icon="terminal" label={t('settings.tab.terminal')} active={activeTab === 'terminal'} onClick={() => setActiveTab('terminal')} />
+            ) : null}
             <TabButton icon="dns" label={t('settings.tab.mcp')} active={activeTab === 'mcp'} onClick={() => setActiveTab('mcp')} />
             <TabButton icon="smart_toy" label={t('settings.tab.agents')} active={activeTab === 'agents'} onClick={() => setActiveTab('agents')} />
             <TabButton icon="auto_awesome" label={t('settings.tab.skills')} active={activeTab === 'skills'} onClick={() => setActiveTab('skills')} />
             <TabButton icon="history_edu" label={t('settings.tab.memory')} active={activeTab === 'memory'} onClick={() => setActiveTab('memory')} />
             <TabButton icon="extension" label={t('settings.tab.plugins')} active={activeTab === 'plugins'} onClick={() => setActiveTab('plugins')} />
-            <TabButton icon="pets" label={t('settings.tab.pets')} active={activeTab === 'pets'} onClick={() => setActiveTab('pets')} />
+            {isSettingsTabVisible('pets') ? (
+              <TabButton icon="pets" label={t('settings.tab.pets')} active={activeTab === 'pets'} onClick={() => setActiveTab('pets')} />
+            ) : null}
             <TabButton icon="mouse" label={t('settings.tab.computerUse')} active={activeTab === 'computerUse'} onClick={() => setActiveTab('computerUse')} />
             <TabButton icon="monitoring" label={t('settings.tab.activity')} active={activeTab === 'activity'} onClick={() => setActiveTab('activity')} />
-            <TabButton icon="account_tree" label={t('settings.tab.trace')} active={activeTab === 'trace'} onClick={() => setActiveTab('trace')} />
-            <TabButton icon="monitor_heart" label={t('settings.tab.diagnostics')} active={activeTab === 'diagnostics'} onClick={() => setActiveTab('diagnostics')} />
+            {isSettingsTabVisible('trace') ? (
+              <TabButton icon="account_tree" label={t('settings.tab.trace')} active={activeTab === 'trace'} onClick={() => setActiveTab('trace')} />
+            ) : null}
+            {isSettingsTabVisible('diagnostics') ? (
+              <TabButton icon="monitor_heart" label={t('settings.tab.diagnostics')} active={activeTab === 'diagnostics'} onClick={() => setActiveTab('diagnostics')} />
+            ) : null}
+            <TabButton icon="settings" label={t('settings.tab.system')} active={activeTab === 'system'} onClick={() => setActiveTab('system')} />
           </div>
-          <div className="mt-2 border-t border-[var(--color-border-separator)] pt-2">
-            <TabButton icon="info" label={t('settings.tab.about')} active={activeTab === 'about'} onClick={() => setActiveTab('about')} />
-          </div>
+          {isSettingsTabVisible('about') ? (
+            <div className="mt-2 border-t border-[var(--color-border-separator)] pt-2">
+              <TabButton icon="info" label={t('settings.tab.about')} active={activeTab === 'about'} onClick={() => setActiveTab('about')} />
+            </div>
+          ) : null}
         </div>
 
         {/* Tab content; trace embeds a full-bleed page that manages its own scroll */}
@@ -104,6 +126,7 @@ export function DesktopSettings() {
           {activeTab === 'computerUse' && <ComputerUseSettings />}
           {activeTab === 'trace' && <TraceList />}
           {activeTab === 'diagnostics' && <DiagnosticsSettings />}
+          {activeTab === 'system' && <SystemSettings />}
           {activeTab === 'about' && <AboutSettings />}
         </div>
       </div>

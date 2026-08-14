@@ -7,6 +7,7 @@ import { SAFE_DOCTOR_STORAGE_KEYS } from '../lib/doctorRepair'
 import { useSessionStore } from '../stores/sessionStore'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useUIStore } from '../stores/uiStore'
+import { showOptionalSettingsMenus } from '../stores/settingsNavigationTestUtils'
 
 const diagnosticsApiMock = vi.hoisted(() => ({
   getStatus: vi.fn(),
@@ -240,6 +241,7 @@ describe('Settings > Diagnostics tab', () => {
 
     useSettingsStore.setState({ locale: 'en' })
     useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null, toasts: [] })
+    showOptionalSettingsMenus({ diagnostics: true })
     useSessionStore.setState({
       sessions: [{
         id: 'session-1',

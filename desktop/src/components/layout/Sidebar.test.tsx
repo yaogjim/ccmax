@@ -328,6 +328,14 @@ function makeDesktopUiPreferencesResponse({
       schemaVersion: 5,
       sidebar,
       projectDisplayNames,
+      settingsNavigation: {
+        terminal: false,
+        adapters: false,
+        pets: false,
+        trace: false,
+        diagnostics: false,
+        about: false,
+      },
       profile: {
         displayName: 'cc-haha',
         subtitle: 'github.com/NanmiCoder/cc-haha',
@@ -536,6 +544,7 @@ describe('Sidebar', () => {
 
     expect(region).toHaveTextContent('cc-haha')
     expect(region).not.toHaveTextContent('Claude Code')
+    expect(region.querySelector('a[href="https://github.com/NanmiCoder/cc-haha"]')).toBeNull()
   })
 
   it('groups sessions by project and expands overflow rows', () => {
@@ -2086,8 +2095,8 @@ describe('Sidebar', () => {
   it('shows the brand mark only on the rail, where the wordmark is clamped away', async () => {
     render(<Sidebar />)
 
-    // Scope to the wordmark's own row — the GitHub link in the same header is
-    // also an svg and would answer a looser query.
+    // Scope to the wordmark's own row — the brand mark beside it is also an svg
+    // and would answer a looser query.
     const brandRow = () => screen.getByText('haha').closest('div')
 
     // Expanded, the name carries the brand and the mark beside it is clutter.

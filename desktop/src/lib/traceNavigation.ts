@@ -1,4 +1,5 @@
 import { t } from '../i18n'
+import { useSettingsNavigationStore } from '../stores/settingsNavigationStore'
 import { SETTINGS_TAB_ID, useTabStore } from '../stores/tabStore'
 import { useUIStore } from '../stores/uiStore'
 
@@ -10,7 +11,9 @@ import { useUIStore } from '../stores/uiStore'
  * or a restored tab.
  */
 export function openTraceList(): void {
-  useUIStore.getState().setPendingSettingsTab('trace')
+  useUIStore.getState().setPendingSettingsTab(
+    useSettingsNavigationStore.getState().resolveVisibleSettingsTab('trace'),
+  )
   useTabStore.getState().openTab(SETTINGS_TAB_ID, t('sidebar.settings'), 'settings')
 }
 

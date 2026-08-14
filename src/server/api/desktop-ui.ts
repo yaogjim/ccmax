@@ -4,6 +4,7 @@
  * GET  /api/desktop-ui/preferences          — read cc-haha UI preferences
  * PUT  /api/desktop-ui/preferences/sidebar  — persist sidebar project preferences
  * PUT  /api/desktop-ui/preferences/project-display-name — set or reset one project display name
+ * PUT  /api/desktop-ui/preferences/settings-navigation — persist settings menu visibility
  * PUT  /api/desktop-ui/preferences/profile  — persist local profile preferences
  * GET  /api/desktop-ui/preferences/pet      — read only desktop pet preferences
  * PUT  /api/desktop-ui/preferences/pet      — patch desktop pet preferences
@@ -52,6 +53,15 @@ export async function handleDesktopUiApi(
       const body = await parseJsonBody(req)
       const update = await desktopUiPreferencesService.updateProjectDisplayName(body)
       return Response.json({ ok: true, ...update })
+    }
+
+    if (detail === 'settings-navigation') {
+      if (req.method !== 'PUT') throw methodNotAllowed(req.method)
+      const body = await parseJsonBody(req)
+      return Response.json({
+        ok: true,
+        preferences: await desktopUiPreferencesService.updateSettingsNavigationPreferences(body),
+      })
     }
 
     if (detail === 'pet') {

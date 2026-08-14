@@ -849,6 +849,7 @@ export const en = {
   'settings.tab.plugins': 'Plugins',
   'settings.tab.pets': 'Pets',
   'settings.tab.diagnostics': 'Diagnostics',
+  'settings.tab.system': 'System',
 
   // Settings > Pets
   'settings.pets.title': 'Desktop Pet',
@@ -1998,14 +1999,16 @@ Row 9, all 8 cells: continuing from straight down, turning left through lower-le
   'settings.tab.about': 'About',
   'settings.about.version': 'Version',
   'settings.about.changelog': 'Release Notes',
-  'settings.about.repo': 'GitHub Repository',
-  'settings.about.starHint': 'If this project helps you, consider giving it a Star',
-  'settings.about.feedback': 'Report an Issue',
-  'settings.about.feedbackDesc': 'Open a GitHub Issue for bugs or usage questions',
-  'settings.about.author': 'Author',
-  'settings.about.socialMedia': 'Social Media',
   'settings.about.updates': 'App Updates',
   'settings.about.updatesDesc': 'Check GitHub Releases, download the installer, and relaunch after install.',
+
+  // Settings > System
+  'settings.system.title': 'System',
+  'settings.system.description': 'Choose which extra Settings menus stay visible.',
+  'settings.system.menusTitle': 'Settings menus',
+  'settings.system.menusDescription': 'Hidden menus stay available here so you can turn them back on.',
+  'settings.system.menuToggleDescription': 'Show {menu} in Settings.',
+  'settings.system.saveError': 'Could not save the Settings menu visibility.',
 
   // Settings > Computer Use
   'settings.tab.computerUse': 'Computer Use',

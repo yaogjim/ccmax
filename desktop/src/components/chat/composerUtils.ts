@@ -1,4 +1,5 @@
 import type { SettingsTab } from '../../stores/uiStore'
+import { useSettingsNavigationStore } from '../../stores/settingsNavigationStore'
 import type { TranslationKey } from '../../i18n'
 import type { SlashCommandOption } from '../../types/slashCommand'
 
@@ -255,7 +256,10 @@ export function resolveSlashUiAction(value: string): SlashUiAction | null {
 
   const settingsCommand = SETTINGS_SLASH_COMMANDS.find((command) => command.name === normalizedValue)
   if (settingsCommand) {
-    return { type: 'settings', tab: settingsCommand.tab }
+    return {
+      type: 'settings',
+      tab: useSettingsNavigationStore.getState().resolveVisibleSettingsTab(settingsCommand.tab),
+    }
   }
 
   if (normalizedValue === 'model') {

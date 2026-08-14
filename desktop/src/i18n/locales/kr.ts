@@ -851,6 +851,7 @@ export const kr: Record<TranslationKey, string> = {
   'settings.tab.plugins': '플러그인',
   'settings.tab.pets': '펫',
   'settings.tab.diagnostics': '진단',
+  'settings.tab.system': '시스템',
 
   // Settings > Pets
   'settings.pets.title': '데스크톱 펫',
@@ -2000,14 +2001,16 @@ export const kr: Record<TranslationKey, string> = {
   'settings.tab.about': '정보',
   'settings.about.version': '버전',
   'settings.about.changelog': '릴리스 노트',
-  'settings.about.repo': 'GitHub 저장소',
-  'settings.about.starHint': '이 프로젝트가 도움이 되었다면 Star를 눌러 주세요',
-  'settings.about.feedback': '문제 신고',
-  'settings.about.feedbackDesc': '버그나 사용 관련 질문은 GitHub Issue를 작성하세요',
-  'settings.about.author': '작성자',
-  'settings.about.socialMedia': '소셜 미디어',
   'settings.about.updates': '앱 업데이트',
   'settings.about.updatesDesc': 'GitHub Releases를 확인하고 설치 관리자를 다운로드한 후 설치 후 다시 시작합니다.',
+
+  // Settings > System
+  'settings.system.title': '시스템',
+  'settings.system.description': '추가로 표시할 설정 메뉴를 선택합니다.',
+  'settings.system.menusTitle': '설정 메뉴',
+  'settings.system.menusDescription': '숨긴 메뉴는 여기에서 다시 켤 수 있습니다.',
+  'settings.system.menuToggleDescription': '설정에 {menu}을(를) 표시합니다.',
+  'settings.system.saveError': '설정 메뉴 표시 상태를 저장하지 못했습니다.',
 
   // Settings > Computer Use
   'settings.tab.computerUse': '컴퓨터 사용',

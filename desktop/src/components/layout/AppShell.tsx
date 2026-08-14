@@ -6,6 +6,7 @@ import { UpdateChecker } from '@/components/layout/UpdateChecker'
 import { StatusDot } from '@/components/ui/Badge'
 import { IconButton } from '@/components/ui/IconButton'
 import { useSettingsStore } from '../../stores/settingsStore'
+import { useSettingsNavigationStore } from '../../stores/settingsNavigationStore'
 import { useUIStore, type SettingsTab } from '../../stores/uiStore'
 import { useKeyboardShortcuts } from '../../hooks/useKeyboardShortcuts'
 import { useElectronWindowDragRegions } from '../../hooks/useElectronWindowDragRegions'
@@ -136,6 +137,7 @@ export function AppShell() {
           void preferencesRequest
             .then(({ preferences }) => {
               if (cancelled) return
+              useSettingsNavigationStore.getState().applyLoadedPreferences(preferences.settingsNavigation)
               hydrateProjectDisplayNames(
                 preferences.projectDisplayNames ?? {},
                 displayNameHydrationRevision,
@@ -144,7 +146,9 @@ export function AppShell() {
                 return getDesktopHost().pets.show()
               }
             })
-            .catch(() => undefined)
+            .catch(() => {
+              useSettingsNavigationStore.getState().applyLoadedPreferences(null)
+            })
         }
 
         setReady(true)
@@ -200,7 +204,9 @@ export function AppShell() {
     host.window.onNativeMenuNavigate((target) => {
       const destination = target as SettingsTab | 'settings'
       if (destination === 'about') {
-        useUIStore.getState().setPendingSettingsTab('about')
+        useUIStore.getState().setPendingSettingsTab(
+          useSettingsNavigationStore.getState().resolveVisibleSettingsTab('about'),
+        )
       }
       useTabStore.getState().openTab(SETTINGS_TAB_ID, 'Settings', 'settings')
     })

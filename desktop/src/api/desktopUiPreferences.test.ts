@@ -3,7 +3,7 @@ import { getDefaultBaseUrl, setAuthToken, setBaseUrl } from './client'
 import { desktopUiPreferencesApi, getProfileAvatarUrl } from './desktopUiPreferences'
 
 const preferences = {
-  schemaVersion: 3,
+  schemaVersion: 5,
   projectDisplayNames: {},
   profile: {
     displayName: 'cc-haha',
@@ -19,6 +19,14 @@ const preferences = {
     collapsed: false,
     motionEnabled: true,
     lastSessionId: null,
+  },
+  settingsNavigation: {
+    terminal: false,
+    adapters: false,
+    pets: false,
+    trace: false,
+    diagnostics: false,
+    about: false,
   },
   sidebar: {
     projectOrder: [],
@@ -111,6 +119,29 @@ describe('desktopUiPreferencesApi', () => {
       expect.objectContaining({
         method: 'PUT',
         body: JSON.stringify({ projectKey: '/workspace/apps/../project', displayName: null }),
+      }),
+    )
+  })
+
+  it('sends settings navigation patches through the dedicated endpoint', async () => {
+    setBaseUrl('http://127.0.0.1:49237')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, preferences }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const settingsNavigation = { terminal: true, diagnostics: true }
+
+    await expect(desktopUiPreferencesApi.updateSettingsNavigationPreferences(settingsNavigation)).resolves.toEqual({
+      ok: true,
+      preferences,
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:49237/api/desktop-ui/preferences/settings-navigation',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify(settingsNavigation),
       }),
     )
   })

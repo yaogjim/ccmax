@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import {
   FALLBACK_SLASH_COMMANDS,
   appendAgentSlashCommands,
@@ -13,8 +13,12 @@ import {
   replaceSlashCommand,
   resolveSlashUiAction,
 } from './composerUtils'
+import { resetSettingsNavigationStore, showOptionalSettingsMenus } from '../../stores/settingsNavigationTestUtils'
 
 describe('composerUtils', () => {
+  beforeEach(() => {
+    resetSettingsNavigationStore()
+  })
   it('finds slash token without trailing space', () => {
     expect(findSlashToken('/rev', 4)).toEqual({ start: 0, filter: 'rev' })
     expect(findSlashToken('hello /rev', 10)).toEqual({ start: 6, filter: 'rev' })
@@ -275,6 +279,18 @@ describe('composerUtils', () => {
     expect(mergeSlashCommands([]).map((command) => command.name)).toContain('config')
     expect(mergeSlashCommands([]).map((command) => command.name)).not.toContain('plugins')
     expect(mergeSlashCommands([]).map((command) => command.name)).not.toContain('settings')
+  })
+
+  it('falls back /doctor to System when Diagnostics is hidden', () => {
+    resetSettingsNavigationStore({ hydrated: true })
+
+    expect(resolveSlashUiAction('doctor')).toEqual({ type: 'settings', tab: 'system' })
+  })
+
+  it('keeps /doctor on Diagnostics when that Settings menu is visible', () => {
+    showOptionalSettingsMenus({ diagnostics: true })
+
+    expect(resolveSlashUiAction('doctor')).toEqual({ type: 'settings', tab: 'diagnostics' })
   })
 
   it('routes session inspection commands to the desktop panel', () => {

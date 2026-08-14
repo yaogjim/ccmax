@@ -8,6 +8,7 @@ import {
 import { SETTINGS_TAB_ID, useTabStore } from '../stores/tabStore'
 import { useUIStore } from '../stores/uiStore'
 import { useSettingsStore } from '../stores/settingsStore'
+import { resetSettingsNavigationStore, showOptionalSettingsMenus } from '../stores/settingsNavigationTestUtils'
 
 vi.mock('../api/sessions', () => ({
   sessionsApi: { list: vi.fn() },
@@ -18,11 +19,13 @@ describe('traceNavigation', () => {
     useSettingsStore.setState({ locale: 'en' })
     useTabStore.setState({ tabs: [], activeTabId: null })
     useUIStore.setState({ pendingSettingsTab: null })
+    resetSettingsNavigationStore()
   })
 
   afterEach(() => {
     useTabStore.setState({ tabs: [], activeTabId: null })
     useUIStore.setState({ pendingSettingsTab: null })
+    resetSettingsNavigationStore()
   })
 
   it('opens the trace list by focusing the Settings tab on its Trace section', () => {
@@ -30,6 +33,22 @@ describe('traceNavigation', () => {
 
     expect(useTabStore.getState().activeTabId).toBe(SETTINGS_TAB_ID)
     expect(useTabStore.getState().tabs.find((tab) => tab.sessionId === SETTINGS_TAB_ID)?.type).toBe('settings')
+    expect(useUIStore.getState().pendingSettingsTab).toBe('trace')
+  })
+
+  it('falls back the hidden Trace list to System after preferences hydrate', () => {
+    resetSettingsNavigationStore({ hydrated: true })
+
+    openTraceList()
+
+    expect(useUIStore.getState().pendingSettingsTab).toBe('system')
+  })
+
+  it('still opens Trace when that Settings menu is visible', () => {
+    showOptionalSettingsMenus({ trace: true })
+
+    openTraceList()
+
     expect(useUIStore.getState().pendingSettingsTab).toBe('trace')
   })
 

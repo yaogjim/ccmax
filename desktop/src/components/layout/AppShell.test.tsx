@@ -8,6 +8,8 @@ import {
   hydrateProjectDisplayNames,
   resolveProjectDisplayName,
 } from '../../stores/projectDisplayNameStore'
+import { useSettingsNavigationStore } from '../../stores/settingsNavigationStore'
+import { resetSettingsNavigationStore } from '../../stores/settingsNavigationTestUtils'
 
 const mocks = vi.hoisted(() => ({
   initializeDesktopServerUrl: vi.fn(),
@@ -207,7 +209,8 @@ describe('AppShell boot flow', () => {
     mocks.tabState.activeTabId = null
     mocks.tabState.tabs = []
     useSessionStore.setState({ sessions: [], activeSessionId: null, isLoading: false, error: null })
-    useUIStore.setState({ sidebarOpen: true })
+    useUIStore.setState({ sidebarOpen: true, activeSettingsTab: 'providers', pendingSettingsTab: null })
+    resetSettingsNavigationStore()
     Reflect.deleteProperty(window, 'desktopHost')
     window.history.pushState({}, '', '/')
   })
@@ -445,13 +448,73 @@ describe('AppShell boot flow', () => {
 
     await screen.findByText('sidebar loaded')
     await waitFor(() => expect(onNativeMenuNavigate).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(useSettingsNavigationStore.getState().hydrated).toBe(true))
+
+    act(() => {
+      navigate?.('about')
+    })
+
+    expect(useUIStore.getState().pendingSettingsTab).toBe('system')
+    expect(mocks.openTab).toHaveBeenCalledWith('__settings__', 'Settings', 'settings')
+  })
+
+  it('keeps native About navigation when the About menu is enabled', async () => {
+    mocks.getDesktopUiPreferences.mockResolvedValueOnce({
+      exists: true,
+      preferences: {
+        schemaVersion: 5,
+        sidebar: {},
+        profile: {},
+        pet: {
+          enabled: false,
+          selectedPetId: 'dada-code',
+          size: 144,
+          collapsed: false,
+          motionEnabled: true,
+          lastSessionId: null,
+        },
+        settingsNavigation: {
+          terminal: false,
+          adapters: false,
+          pets: false,
+          trace: false,
+          diagnostics: false,
+          about: true,
+        },
+      },
+    })
+    let navigate: ((target: string) => void) | undefined
+    window.desktopHost = {
+      isDesktop: true,
+      window: {
+        onNativeMenuNavigate: vi.fn((handler: (target: string) => void) => {
+          navigate = handler
+          return Promise.resolve(vi.fn())
+        }),
+      },
+    } as any
+
+    render(<AppShell />)
+
+    await screen.findByText('sidebar loaded')
+    await waitFor(() => expect(useSettingsNavigationStore.getState().hydrated).toBe(true))
+    expect(useSettingsNavigationStore.getState().preferences.about).toBe(true)
 
     act(() => {
       navigate?.('about')
     })
 
     expect(useUIStore.getState().pendingSettingsTab).toBe('about')
-    expect(mocks.openTab).toHaveBeenCalledWith('__settings__', 'Settings', 'settings')
+  })
+
+  it('falls back a restored hidden Settings tab to System after preferences load', async () => {
+    useUIStore.setState({ activeSettingsTab: 'diagnostics' })
+
+    render(<AppShell />)
+
+    await screen.findByText('sidebar loaded')
+    await waitFor(() => expect(useSettingsNavigationStore.getState().hydrated).toBe(true))
+    expect(useUIStore.getState().activeSettingsTab).toBe('system')
   })
 
   it('restores an enabled pet window and routes pet session navigation', async () => {

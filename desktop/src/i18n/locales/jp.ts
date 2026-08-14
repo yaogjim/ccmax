@@ -851,6 +851,7 @@ export const jp: Record<TranslationKey, string> = {
   'settings.tab.plugins': 'プラグイン',
   'settings.tab.pets': 'ペット',
   'settings.tab.diagnostics': '診断',
+  'settings.tab.system': 'システム',
 
   // Settings > Pets
   'settings.pets.title': 'デスクトップペット',
@@ -2000,14 +2001,16 @@ export const jp: Record<TranslationKey, string> = {
   'settings.tab.about': '情報',
   'settings.about.version': 'バージョン',
   'settings.about.changelog': 'リリースノート',
-  'settings.about.repo': 'GitHub リポジトリ',
-  'settings.about.starHint': 'このプロジェクトが役立った場合は、Star を付けることをご検討ください',
-  'settings.about.feedback': '問題を報告',
-  'settings.about.feedbackDesc': 'バグや使い方の質問について GitHub Issue を作成します',
-  'settings.about.author': '作者',
-  'settings.about.socialMedia': 'ソーシャルメディア',
   'settings.about.updates': 'アプリの更新',
   'settings.about.updatesDesc': 'GitHub Releases を確認し、インストーラーをダウンロードして、インストール後に再起動します。',
+
+  // Settings > System
+  'settings.system.title': 'システム',
+  'settings.system.description': '追加の設定メニューを表示するかどうかを選びます。',
+  'settings.system.menusTitle': '設定メニュー',
+  'settings.system.menusDescription': '非表示のメニューは、ここから再び表示できます。',
+  'settings.system.menuToggleDescription': '設定に {menu} を表示します。',
+  'settings.system.saveError': '設定メニューの表示状態を保存できませんでした。',
 
   // Settings > Computer Use
   'settings.tab.computerUse': 'コンピューター操作',

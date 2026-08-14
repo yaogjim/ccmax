@@ -22,7 +22,7 @@ describe('locale detection', () => {
     expect(resolveSupportedLocale(['zh-Hans-HK'])).toBe('zh')
   })
 
-  it('uses Electron preferred system languages before the renderer fallback', async () => {
+  it('defaults new users to Simplified Chinese instead of the system language', async () => {
     mockBrowserLanguages(['en-US'])
     const host = {
       getLocalePreference: vi.fn().mockResolvedValue(null),
@@ -31,12 +31,13 @@ describe('locale detection', () => {
       onLocaleChanged: vi.fn().mockResolvedValue(() => {}),
     }
 
-    await expect(initializeLocale(host)).resolves.toBe('kr')
+    await expect(initializeLocale(host)).resolves.toBe('zh')
 
-    expect(document.documentElement.lang).toBe('ko')
+    expect(host.getPreferredSystemLanguages).not.toHaveBeenCalled()
+    expect(document.documentElement.lang).toBe('zh-CN')
   })
 
-  it('falls back to renderer languages when the native lookup fails', async () => {
+  it('defaults to Simplified Chinese when the native lookup fails', async () => {
     mockBrowserLanguages(['ja-JP'])
 
     await expect(initializeLocale({
@@ -44,9 +45,9 @@ describe('locale detection', () => {
       getPreferredSystemLanguages: () => Promise.reject(new Error('IPC unavailable')),
       setLocalePreference: vi.fn().mockResolvedValue(undefined),
       onLocaleChanged: vi.fn().mockResolvedValue(() => {}),
-    })).resolves.toBe('jp')
+    })).resolves.toBe('zh')
 
-    expect(document.documentElement.lang).toBe('ja')
+    expect(document.documentElement.lang).toBe('zh-CN')
   })
 
   it('migrates a stored main-window choice without consulting the system again', async () => {
@@ -64,6 +65,24 @@ describe('locale detection', () => {
     expect(host.getLocalePreference).not.toHaveBeenCalled()
     expect(host.getPreferredSystemLanguages).not.toHaveBeenCalled()
     expect(document.documentElement.lang).toBe('zh-TW')
+  })
+
+  it('keeps a stored English preference instead of defaulting back to Chinese', async () => {
+    // The merged tree stores the display locale under main's LOCALE_STORAGE_KEY
+    // ('cc-haha-locale'); the picked commit's test used the ccmax canonical key,
+    // which nothing in this tree reads any more.
+    window.localStorage.setItem('cc-haha-locale', 'en')
+    const host = {
+      getLocalePreference: vi.fn().mockResolvedValue(null),
+      getPreferredSystemLanguages: vi.fn().mockResolvedValue(['zh-CN']),
+      setLocalePreference: vi.fn().mockResolvedValue(undefined),
+      onLocaleChanged: vi.fn().mockResolvedValue(() => {}),
+    }
+
+    await expect(initializeLocale(host)).resolves.toBe('en')
+
+    expect(host.setLocalePreference).toHaveBeenCalledWith('en')
+    expect(document.documentElement.lang).toBe('en')
   })
 
   it('uses the app-level manual preference in an isolated companion partition', async () => {
@@ -101,7 +120,7 @@ describe('locale detection', () => {
     unsubscribe()
   })
 
-  it('uses navigator.language when navigator.languages is unavailable', async () => {
+  it('defaults to Simplified Chinese when browser language lookup is unavailable', async () => {
     vi.spyOn(window.navigator, 'languages', 'get').mockImplementation(() => {
       throw new Error('languages unavailable')
     })
@@ -112,6 +131,6 @@ describe('locale detection', () => {
       getPreferredSystemLanguages: vi.fn().mockRejectedValue(new Error('IPC unavailable')),
       setLocalePreference: vi.fn().mockResolvedValue(undefined),
       onLocaleChanged: vi.fn().mockResolvedValue(() => {}),
-    })).resolves.toBe('jp')
+    })).resolves.toBe('zh')
   })
 })

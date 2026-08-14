@@ -18,6 +18,15 @@ const DEFAULT_PET_PREFERENCES = {
   lastSessionId: null,
 }
 
+const DEFAULT_SETTINGS_NAVIGATION_PREFERENCES = {
+  terminal: false,
+  adapters: false,
+  pets: false,
+  trace: false,
+  diagnostics: false,
+  about: false,
+}
+
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'desktop-ui-preferences-'))
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
@@ -75,6 +84,7 @@ describe('DesktopUiPreferencesService', () => {
       },
       pet: DEFAULT_PET_PREFERENCES,
       projectDisplayNames: {},
+      settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
       sidebar: {
         projectOrder: [],
         pinnedProjects: [],
@@ -132,6 +142,7 @@ describe('DesktopUiPreferencesService', () => {
       projectDisplayNames: {
         '/workspace/alpha': 'Alpha project',
       },
+      settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
       sidebar: {
         projectOrder: ['/workspace/alpha', '/workspace/beta'],
         pinnedProjects: ['/workspace/beta'],
@@ -153,6 +164,7 @@ describe('DesktopUiPreferencesService', () => {
       projectDisplayNames: {
         '/workspace/alpha': 'Alpha project',
       },
+      settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
       sidebar: {
         projectOrder: ['/workspace/gamma'],
         pinnedProjects: [],
@@ -178,6 +190,57 @@ describe('DesktopUiPreferencesService', () => {
     expect(result.preferences.pet).toEqual(DEFAULT_PET_PREFERENCES)
     expect(result.preferences.projectDisplayNames).toEqual({})
     expect(files.some((name) => name.startsWith('desktop-ui.json.invalid-'))).toBe(true)
+  })
+
+  test('preserves explicitly stored legacy and custom profile values', async () => {
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
+      JSON.stringify({
+        schemaVersion: 5,
+        profile: {
+          displayName: 'cc-haha',
+          subtitle: 'github.com/NanmiCoder/cc-haha',
+          avatarFile: null,
+          avatarUpdatedAt: null,
+        },
+      }),
+      'utf-8',
+    )
+
+    const service = new DesktopUiPreferencesService()
+    const legacy = await service.readPreferences()
+
+    expect(legacy.preferences.profile).toEqual({
+      displayName: 'cc-haha',
+      subtitle: 'github.com/NanmiCoder/cc-haha',
+      avatarFile: null,
+      avatarUpdatedAt: null,
+    })
+
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
+      JSON.stringify({
+        schemaVersion: 5,
+        profile: {
+          displayName: 'Custom Operator',
+          subtitle: 'custom.example/profile',
+          avatarFile: null,
+          avatarUpdatedAt: null,
+        },
+      }),
+      'utf-8',
+    )
+
+    const custom = await service.readPreferences()
+
+    expect(custom.preferences.profile).toEqual({
+      displayName: 'Custom Operator',
+      subtitle: 'custom.example/profile',
+      avatarFile: null,
+      avatarUpdatedAt: null,
+    })
   })
 
   test('sets and resets exact project display name keys without prototype pollution', async () => {
@@ -472,6 +535,89 @@ describe('DesktopUiPreferencesService', () => {
     })
   })
 
+  test('hides optional settings menus by default and migrates old schema files', async () => {
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
+      JSON.stringify({
+        schemaVersion: 4,
+        futureField: { keep: true },
+        sidebar: {
+          projectOrder: ['/workspace/alpha'],
+          pinnedProjects: [],
+          hiddenProjects: [],
+          projectOrganization: 'recentProject',
+          projectSortBy: 'updatedAt',
+        },
+      }),
+      'utf-8',
+    )
+
+    const before = await new DesktopUiPreferencesService().readPreferences()
+
+    expect(before.preferences.settingsNavigation).toEqual(DEFAULT_SETTINGS_NAVIGATION_PREFERENCES)
+    expect(before.preferences.schemaVersion).toBe(5)
+    expect(before.preferences.futureField).toEqual({ keep: true })
+  })
+
+  test('normalizes invalid settings navigation values and preserves unknown fields', async () => {
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
+      JSON.stringify({
+        schemaVersion: 4,
+        futureField: { keep: true },
+        settingsNavigation: {
+          futureNav: { keep: 'nav' },
+          terminal: 'yes',
+          adapters: 1,
+          pets: true,
+          about: false,
+        },
+      }),
+      'utf-8',
+    )
+
+    const after = await new DesktopUiPreferencesService().updateSettingsNavigationPreferences({
+      diagnostics: true,
+    })
+
+    expect(after).toMatchObject({
+      schemaVersion: 5,
+      futureField: { keep: true },
+      settingsNavigation: {
+        futureNav: { keep: 'nav' },
+        terminal: false,
+        adapters: false,
+        pets: true,
+        trace: false,
+        diagnostics: true,
+        about: false,
+      },
+    })
+    expect(await readDesktopUiFile()).toEqual(after)
+  })
+
+  test('merges concurrent settings navigation patches without reverting either update', async () => {
+    const first = new DesktopUiPreferencesService()
+    const second = new DesktopUiPreferencesService()
+
+    await Promise.all([
+      first.updateSettingsNavigationPreferences({ terminal: true, pets: true }),
+      second.updateSettingsNavigationPreferences({ diagnostics: true, about: true }),
+    ])
+
+    const { preferences } = await first.readPreferences()
+    expect(preferences.settingsNavigation).toEqual({
+      terminal: true,
+      adapters: false,
+      pets: true,
+      trace: false,
+      diagnostics: true,
+      about: true,
+    })
+  })
+
   test('normalizes and persists profile preferences without touching sidebar preferences', async () => {
     const service = new DesktopUiPreferencesService()
     const after = await service.updateProfilePreferences({
@@ -491,6 +637,7 @@ describe('DesktopUiPreferencesService', () => {
       },
       pet: DEFAULT_PET_PREFERENCES,
       projectDisplayNames: {},
+      settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
       sidebar: {
         projectOrder: [],
         pinnedProjects: [],
@@ -584,6 +731,7 @@ describe('desktop UI preferences API', () => {
         },
         pet: DEFAULT_PET_PREFERENCES,
         projectDisplayNames: {},
+        settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
         sidebar: {
           projectOrder: ['/workspace/beta', '/workspace/alpha'],
           pinnedProjects: ['/workspace/beta'],
@@ -611,6 +759,7 @@ describe('desktop UI preferences API', () => {
         },
         pet: DEFAULT_PET_PREFERENCES,
         projectDisplayNames: {},
+        settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
         sidebar: {
           projectOrder: ['/workspace/beta', '/workspace/alpha'],
           pinnedProjects: ['/workspace/beta'],
@@ -936,6 +1085,31 @@ describe('desktop UI preferences API', () => {
     await expect(patchRes.json()).resolves.toMatchObject({
       error: 'METHOD_NOT_ALLOWED',
       message: 'Method PATCH not allowed',
+    })
+  })
+
+  test('persists settings navigation patches through the API', async () => {
+    const putReq = makeRequest('PUT', '/api/desktop-ui/preferences/settings-navigation', {
+      terminal: true,
+      diagnostics: true,
+    })
+    const putRes = await handleDesktopUiApi(putReq.req, putReq.url, putReq.segments)
+    const putBody = await putRes.json() as Record<string, unknown>
+
+    expect(putRes.status).toBe(200)
+    expect(putBody).toMatchObject({
+      ok: true,
+      preferences: {
+        schemaVersion: 5,
+        settingsNavigation: {
+          terminal: true,
+          adapters: false,
+          pets: false,
+          trace: false,
+          diagnostics: true,
+          about: false,
+        },
+      },
     })
   })
 })

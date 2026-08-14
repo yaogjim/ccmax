@@ -11,6 +11,7 @@ import type { ProviderPreset } from '../types/providerPreset'
 import type { AppMode, ChatSendBehavior, PermissionMode, ThemeMode, UpdateProxySettings } from '../types/settings'
 import { browserHost } from '../lib/desktopHost/browserHost'
 import { settingsApi } from '../api/settings'
+import { showOptionalSettingsMenus } from '../stores/settingsNavigationTestUtils'
 
 const MOCK_DELETE_PROVIDER = vi.fn()
 const MOCK_GET_SETTINGS = vi.fn()
@@ -193,6 +194,7 @@ function installElectronDesktopHost() {
 describe('Settings > General tab', () => {
   beforeEach(() => {
     vi.useRealTimers()
+    showOptionalSettingsMenus()
     MOCK_DELETE_PROVIDER.mockReset()
     desktopNotificationsMock.getDesktopNotificationPermission.mockReset()
     desktopNotificationsMock.getDesktopNotificationPlatform.mockReset()
@@ -3427,6 +3429,7 @@ describe('Settings > Providers tab', () => {
 
 describe('Settings > About tab', () => {
   beforeEach(() => {
+    showOptionalSettingsMenus({ about: true })
     useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: 'about' })
     useSettingsStore.setState({
       locale: 'en',

@@ -850,6 +850,7 @@ export const zh: Record<TranslationKey, string> = {
   'settings.tab.plugins': '插件',
   'settings.tab.pets': '宠物',
   'settings.tab.diagnostics': '诊断',
+  'settings.tab.system': '系统',
 
   // Settings > Pets
   'settings.pets.title': '桌面宠物',
@@ -1998,14 +1999,16 @@ export const zh: Record<TranslationKey, string> = {
   'settings.tab.about': '关于',
   'settings.about.version': '版本',
   'settings.about.changelog': '更新日志',
-  'settings.about.repo': 'GitHub 仓库',
-  'settings.about.starHint': '如果这个项目对你有帮助，欢迎给个 Star',
-  'settings.about.feedback': '反馈问题',
-  'settings.about.feedbackDesc': '遇到 Bug 或使用问题，前往 GitHub Issue 提交反馈',
-  'settings.about.author': '作者',
-  'settings.about.socialMedia': '社交媒体',
   'settings.about.updates': '应用更新',
   'settings.about.updatesDesc': '检查 GitHub Releases，下载安装包，并在安装后自动重启。',
+
+  // Settings > System
+  'settings.system.title': '系统',
+  'settings.system.description': '选择哪些额外的设置菜单保持显示。',
+  'settings.system.menusTitle': '设置菜单',
+  'settings.system.menusDescription': '隐藏的菜单仍可在这里重新打开。',
+  'settings.system.menuToggleDescription': '在设置中显示{menu}。',
+  'settings.system.saveError': '无法保存设置菜单的显示状态。',
 
   // Settings > Computer Use
   'settings.tab.computerUse': 'Computer Use',

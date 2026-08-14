@@ -4,6 +4,7 @@ import '@testing-library/jest-dom'
 import { DesktopSettings as Settings } from '../pages/Settings'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useUIStore } from '../stores/uiStore'
+import { showOptionalSettingsMenus } from '../stores/settingsNavigationTestUtils'
 
 vi.mock('../features/pets/PetSettings', () => ({
   PetSettings: () => <div>Pet settings content</div>,
@@ -13,6 +14,7 @@ describe('Settings pet navigation', () => {
   beforeEach(() => {
     useSettingsStore.setState({ locale: 'en' })
     useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null })
+    showOptionalSettingsMenus({ pets: true })
   })
 
   it('opens the dedicated pet settings tab and persists it as active', () => {

@@ -12,11 +12,11 @@ describe('desktop index startup diagnostics', () => {
     expect(watchdogIndex).toBeGreaterThan(0)
     expect(moduleIndex).toBeGreaterThan(watchdogIndex)
     expect(html).toContain('__CC_HAHA_BOOTSTRAPPED__')
-    expect(html).toContain('Desktop startup failed')
+    expect(html).toContain('桌面端启动失败')
   })
 
   it('diagnoses module resource failures and boot timeouts outside React', () => {
-    expect(html).toContain('Startup resource failed to load:')
-    expect(html).toContain('Desktop app did not finish bootstrapping within')
+    expect(html).toContain('启动资源加载失败：')
+    expect(html).toContain('桌面端未能在 ')
   })
 })

@@ -25,12 +25,22 @@ export type DesktopPetPreferences = {
   lastSessionId: string | null
 }
 
+export type DesktopSettingsNavigationPreferences = {
+  terminal: boolean
+  adapters: boolean
+  pets: boolean
+  trace: boolean
+  diagnostics: boolean
+  about: boolean
+}
+
 export type DesktopUiPreferences = {
   schemaVersion: number
   sidebar: SidebarProjectPreferences
   profile: DesktopProfilePreferences
   pet: DesktopPetPreferences
   projectDisplayNames: Record<string, string>
+  settingsNavigation: DesktopSettingsNavigationPreferences
 }
 
 export type DesktopUiPreferencesResponse = {
@@ -87,6 +97,13 @@ export const desktopUiPreferencesApi = {
     return api.put<DesktopPetPreferencesUpdateResponse>(
       '/api/desktop-ui/preferences/pet',
       pet,
+    )
+  },
+
+  updateSettingsNavigationPreferences(settingsNavigation: Partial<DesktopSettingsNavigationPreferences>) {
+    return api.put<{ ok: true; preferences: DesktopUiPreferences }>(
+      '/api/desktop-ui/preferences/settings-navigation',
+      settingsNavigation,
     )
   },
 

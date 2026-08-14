@@ -17,6 +17,10 @@ vi.mock('../api/traces', () => ({
 import { DesktopSettings as Settings } from './Settings'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useUIStore } from '../stores/uiStore'
+import {
+  resetSettingsNavigationStore,
+  showOptionalSettingsMenus,
+} from '../stores/settingsNavigationTestUtils'
 
 /**
  * The rail is a scroll container taller than its viewport, and Settings
@@ -35,12 +39,14 @@ describe('Settings section navigation', () => {
     })
     useSettingsStore.setState({ locale: 'en' })
     useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null })
+    showOptionalSettingsMenus()
   })
 
   afterEach(() => {
     cleanup()
     scrollIntoView.mockClear()
     useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null })
+    resetSettingsNavigationStore()
   })
 
   it('opens the section a pending request asked for and clears the request', async () => {
@@ -97,5 +103,30 @@ describe('Settings section navigation', () => {
     // Page chrome stays left-pinned. Chasing the settings tab's strip offset used
     // to shove this rail mid-panel whenever the tab was not leading.
     expect((rail as HTMLElement).style.marginLeft).toBe('')
+  })
+
+  it('hides optional rail entries until they are enabled', () => {
+    resetSettingsNavigationStore({ hydrated: true })
+
+    render(<Settings />)
+
+    expect(screen.queryByRole('button', { name: 'Terminal' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'IM Adapters' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Pets' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Trace' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Diagnostics' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'About' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'System' })).toBeInTheDocument()
+  })
+
+  it('falls back a pending hidden section to System', async () => {
+    resetSettingsNavigationStore({ hydrated: true })
+    useUIStore.setState({ pendingSettingsTab: 'trace' })
+
+    render(<Settings />)
+
+    expect(await screen.findByRole('heading', { name: 'System' })).toBeInTheDocument()
+    expect(useUIStore.getState().activeSettingsTab).toBe('system')
+    expect(useUIStore.getState().pendingSettingsTab).toBeNull()
   })
 })

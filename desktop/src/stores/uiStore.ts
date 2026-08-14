@@ -59,6 +59,7 @@ const SETTINGS_TABS = [
   'computerUse',
   'trace',
   'diagnostics',
+  'system',
   'about',
 ] as const
 
@@ -246,6 +247,7 @@ export type SettingsTab =
   | 'computerUse'
   | 'trace'
   | 'diagnostics'
+  | 'system'
   | 'about'
 
 type ActiveView = 'code' | 'scheduled' | 'terminal' | 'history' | 'settings'

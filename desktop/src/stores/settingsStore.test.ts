@@ -30,35 +30,18 @@ describe('settingsStore locale defaults', () => {
   })
 
   it.each([
-    ['en-GB', 'en'],
-    ['zh-CN', 'zh'],
-    ['zh-SG', 'zh'],
-    ['zh-Hant', 'zh-TW'],
-    ['zh-HK', 'zh-TW'],
-    ['ja-JP', 'jp'],
-    ['ko-KR', 'kr'],
-  ] as const)('maps the system language %s to %s', async (systemLanguage, expectedLocale) => {
+    ['en-GB'],
+    ['zh-CN'],
+    ['zh-Hant'],
+    ['ja-JP'],
+    ['ko-KR'],
+    ['fr-FR'],
+  ] as const)('defaults new users to Simplified Chinese even when the system language is %s', async (systemLanguage) => {
     mockSystemLanguages([systemLanguage])
 
     const { useSettingsStore } = await import('./settingsStore')
 
-    expect(useSettingsStore.getState().locale).toBe(expectedLocale)
-  })
-
-  it('uses the first supported language in the system preference list', async () => {
-    mockSystemLanguages(['fr-FR', 'ja-JP', 'en-US'])
-
-    const { useSettingsStore } = await import('./settingsStore')
-
-    expect(useSettingsStore.getState().locale).toBe('jp')
-  })
-
-  it('defaults to English when no system language is supported', async () => {
-    mockSystemLanguages(['fr-FR', 'de-DE'])
-
-    const { useSettingsStore } = await import('./settingsStore')
-
-    expect(useSettingsStore.getState().locale).toBe('en')
+    expect(useSettingsStore.getState().locale).toBe('zh')
   })
 
   it('keeps a stored locale override', async () => {

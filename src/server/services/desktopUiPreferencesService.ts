@@ -55,12 +55,22 @@ export type DesktopPetPreferences = {
 
 export type ProjectDisplayNames = Record<string, string>
 
+export type DesktopSettingsNavigationPreferences = {
+  terminal: boolean
+  adapters: boolean
+  pets: boolean
+  trace: boolean
+  diagnostics: boolean
+  about: boolean
+}
+
 export type DesktopUiPreferences = {
   schemaVersion: number
   sidebar: SidebarProjectPreferences
   profile: DesktopProfilePreferences
   pet: DesktopPetPreferences
   projectDisplayNames: ProjectDisplayNames
+  settingsNavigation: DesktopSettingsNavigationPreferences
   [key: string]: unknown
 }
 
@@ -98,6 +108,15 @@ function createProjectDisplayNames(): ProjectDisplayNames {
   return Object.fromEntries([]) as ProjectDisplayNames
 }
 
+const DEFAULT_SETTINGS_NAVIGATION_PREFERENCES: DesktopSettingsNavigationPreferences = {
+  terminal: false,
+  adapters: false,
+  pets: false,
+  trace: false,
+  diagnostics: false,
+  about: false,
+}
+
 function defaultPreferences(): DesktopUiPreferences {
   return {
     schemaVersion: CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION,
@@ -105,6 +124,7 @@ function defaultPreferences(): DesktopUiPreferences {
     profile: { ...DEFAULT_PROFILE_PREFERENCES },
     pet: { ...DEFAULT_PET_PREFERENCES },
     projectDisplayNames: createProjectDisplayNames(),
+    settingsNavigation: { ...DEFAULT_SETTINGS_NAVIGATION_PREFERENCES },
   }
 }
 
@@ -317,6 +337,32 @@ export function normalizeDesktopPetPreferences(value: unknown): DesktopPetPrefer
   }
 }
 
+function normalizeBooleanPreference(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback
+}
+
+export function normalizeDesktopSettingsNavigationPreferences(
+  value: unknown,
+): DesktopSettingsNavigationPreferences {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { ...DEFAULT_SETTINGS_NAVIGATION_PREFERENCES }
+  }
+
+  const record = value as Record<string, unknown>
+  return {
+    ...record,
+    terminal: normalizeBooleanPreference(record.terminal, DEFAULT_SETTINGS_NAVIGATION_PREFERENCES.terminal),
+    adapters: normalizeBooleanPreference(record.adapters, DEFAULT_SETTINGS_NAVIGATION_PREFERENCES.adapters),
+    pets: normalizeBooleanPreference(record.pets, DEFAULT_SETTINGS_NAVIGATION_PREFERENCES.pets),
+    trace: normalizeBooleanPreference(record.trace, DEFAULT_SETTINGS_NAVIGATION_PREFERENCES.trace),
+    diagnostics: normalizeBooleanPreference(
+      record.diagnostics,
+      DEFAULT_SETTINGS_NAVIGATION_PREFERENCES.diagnostics,
+    ),
+    about: normalizeBooleanPreference(record.about, DEFAULT_SETTINGS_NAVIGATION_PREFERENCES.about),
+  }
+}
+
 function normalizeProjectOrganization(value: unknown): SidebarProjectPreferences['projectOrganization'] {
   return value === 'project' || value === 'recentProject' || value === 'time' ? value : 'recentProject'
 }
@@ -343,6 +389,7 @@ function normalizeDesktopUiPreferences(value: unknown): DesktopUiPreferences | n
     profile: normalizeProfilePreferences(record.profile),
     pet: normalizeDesktopPetPreferences(record.pet),
     projectDisplayNames: normalizeProjectDisplayNames(record.projectDisplayNames),
+    settingsNavigation: normalizeDesktopSettingsNavigationPreferences(record.settingsNavigation),
   }
 }
 
@@ -456,6 +503,7 @@ export class DesktopUiPreferencesService {
         profile: normalizeProfilePreferences(preferences.profile),
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
+        settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
       }
 
       await this.writePreferences(nextPreferences)
@@ -489,6 +537,7 @@ export class DesktopUiPreferencesService {
         },
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
+        settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
       }
 
       await this.writePreferences(nextPreferences)
@@ -526,6 +575,7 @@ export class DesktopUiPreferencesService {
         profile: normalizeProfilePreferences(preferences.profile),
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames,
+        settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
       }
 
       await this.writePreferences(nextPreferences)
@@ -551,6 +601,33 @@ export class DesktopUiPreferencesService {
           ...patch,
         }),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
+        settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
+      }
+
+      await this.writePreferences(nextPreferences)
+      return nextPreferences
+    })
+  }
+
+  async updateSettingsNavigationPreferences(settingsNavigation: unknown): Promise<DesktopUiPreferences> {
+    const filePath = this.getPreferencesPath()
+    return this.withWriteLock(filePath, async () => {
+      const { preferences } = await this.readPreferences()
+      const currentNavigation = normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation)
+      const patch = settingsNavigation && typeof settingsNavigation === 'object' && !Array.isArray(settingsNavigation)
+        ? settingsNavigation as Record<string, unknown>
+        : {}
+      const nextPreferences: DesktopUiPreferences = {
+        ...preferences,
+        schemaVersion: preferences.schemaVersion,
+        sidebar: normalizeSidebarProjectPreferences(preferences.sidebar),
+        profile: normalizeProfilePreferences(preferences.profile),
+        pet: normalizeDesktopPetPreferences(preferences.pet),
+        projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
+        settingsNavigation: normalizeDesktopSettingsNavigationPreferences({
+          ...currentNavigation,
+          ...patch,
+        }),
       }
 
       await this.writePreferences(nextPreferences)
@@ -602,6 +679,7 @@ export class DesktopUiPreferencesService {
         },
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
+        settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
       }
 
       await this.writePreferences(nextPreferences)
@@ -629,6 +707,7 @@ export class DesktopUiPreferencesService {
         },
         pet: normalizeDesktopPetPreferences(preferences.pet),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
+        settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
       }
 
       await this.writePreferences(nextPreferences)

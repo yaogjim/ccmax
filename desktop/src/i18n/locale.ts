@@ -62,7 +62,7 @@ export function resolveSupportedLocale(languageTags: readonly string[]): Locale 
     const locale = mapLanguageTag(languageTag)
     if (locale) return locale
   }
-  return 'en'
+  return 'zh'
 }
 
 export function readStoredLocale(): Locale | null {
@@ -78,7 +78,7 @@ export function readStoredLocale(): Locale | null {
 export function getInitialLocale(): Locale {
   return readStoredLocale()
     ?? initializedLocale
-    ?? resolveSupportedLocale(readBrowserLanguages())
+    ?? 'zh'
 }
 
 export function applyDocumentLocale(locale: Locale): void {
@@ -127,20 +127,10 @@ export async function initializeLocale(
       return appPreference
     }
   } catch {
-    // Fall through to system language detection.
+    // Fall through to the Simplified Chinese default.
   }
 
-  let languageTags: string[] = []
-  try {
-    const preferredSystemLanguages = await runtime.getPreferredSystemLanguages()
-    languageTags = preferredSystemLanguages.length > 0
-      ? preferredSystemLanguages
-      : readBrowserLanguages()
-  } catch {
-    languageTags = readBrowserLanguages()
-  }
-
-  const locale = resolveSupportedLocale(languageTags)
+  const locale: Locale = 'zh'
   applyResolvedLocale(locale)
   return locale
 }
