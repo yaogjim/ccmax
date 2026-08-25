@@ -1,25 +1,28 @@
-# Claude Code Haha
+# ccmax
 
 <p align="center">
-  <img src="docs/images/readme-cover-zh.jpg" alt="cc-haha — Claude Code 开源桌面端" width="960">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-horizontal-dark.png">
+    <img src="docs/images/logo-horizontal.png" alt="ccmax" width="480">
+  </picture>
 </p>
 
 <div align="center">
 
-[![GitHub Stars](https://img.shields.io/github/stars/NanmiCoder/cc-haha?style=social)](https://github.com/NanmiCoder/cc-haha/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/NanmiCoder/cc-haha?style=social)](https://github.com/NanmiCoder/cc-haha/network/members)
-[![GitHub Issues](https://img.shields.io/github/issues/NanmiCoder/cc-haha)](https://github.com/NanmiCoder/cc-haha/issues)
-[![GitHub Pull Requests](https://img.shields.io/github/issues-pr/NanmiCoder/cc-haha)](https://github.com/NanmiCoder/cc-haha/pulls)
-[![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/NanmiCoder/cc-haha/blob/main/LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/yaogjim/ccmax?style=social)](https://github.com/yaogjim/ccmax/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/yaogjim/ccmax?style=social)](https://github.com/yaogjim/ccmax/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/yaogjim/ccmax)](https://github.com/yaogjim/ccmax/issues)
+[![GitHub Pull Requests](https://img.shields.io/github/issues-pr/yaogjim/ccmax)](https://github.com/yaogjim/ccmax/pulls)
+[![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/yaogjim/ccmax/blob/main/LICENSE)
 [![中文](https://img.shields.io/badge/🇨🇳_简体中文-当前-blue)](README.zh-CN.md)
 [![English](https://img.shields.io/badge/🇺🇸_English-Available-green)](README.md)
-[![Docs](https://img.shields.io/badge/📖_文档站点-Visit-FF7A00)](https://cchaha.ai)
+[![Docs](https://img.shields.io/badge/📖_文档站点-Visit-FF7A00)](https://yaogjim.github.io/ccmax)
 
 **简体中文** · [English](README.md)
 
 </div>
 
-Claude Code Haha 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索、分支 / Worktree 启动、Diff 审阅、内置浏览器预览、图形化权限审批、模型自选（Claude / ChatGPT / Grok / 预设 / 本地端点）、图片生成、MCP 与 SubAgent 可视化管理、Agent Teams 协作工作台、动态 Workflow 编排、模型请求追踪、Computer Use、技能市场、多主题、桌面宠物、H5 远程访问、IM 接入和定时任务，集中在一个 macOS / Windows / Linux APP 里。
+ccmax 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索、分支 / Worktree 启动、Diff 审阅、内置浏览器预览、图形化权限审批、模型自选（Claude / ChatGPT / Grok / 预设 / 本地端点）、图片生成、MCP 与 SubAgent 可视化管理、Agent Teams 协作工作台、动态 Workflow 编排、模型请求追踪、Computer Use、技能市场、多主题、桌面宠物、H5 远程访问、IM 接入和定时任务，集中在一个 macOS / Windows / Linux APP 里。
 
 <p align="center">
   <a href="#桌面端预览">桌面端预览</a> · <a href="#安装桌面端">安装桌面端</a> · <a href="#桌面端亮点">桌面端亮点</a> · <a href="#更多文档">更多文档</a> · <a href="#赞助与合作">赞助与合作</a> · <a href="#用户交流群">用户交流群</a>
@@ -30,7 +33,7 @@ Claude Code Haha 是一个**桌面端 Claude Code 工作台**：多会话与全�
 ## 桌面端预览
 
 <p align="center">
-  <a href="https://github.com/NanmiCoder/cc-haha/releases"><img src="https://img.shields.io/badge/⬇_下载桌面端-macOS_%7C_Windows_%7C_Linux-FF7A00?style=for-the-badge" alt="下载桌面端"></a>
+  <a href="https://github.com/yaogjim/ccmax/releases"><img src="https://img.shields.io/badge/⬇_下载桌面端-macOS_%7C_Windows_%7C_Linux-FF7A00?style=for-the-badge" alt="下载桌面端"></a>
 </p>
 
 <table>
@@ -72,13 +75,13 @@ Claude Code Haha 是一个**桌面端 Claude Code 工作台**：多会话与全�
     </tr>
     <tr>
       <td align="center" valign="middle">
-        <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=cc-haha">
+        <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=ccmax">
           <img src="docs/images/sponsors/atlascloud-logo-black.png#gh-light-mode-only" width="180" alt="Atlas Cloud">
           <img src="docs/images/sponsors/atlascloud-logo-white.png#gh-dark-mode-only" width="180" alt="Atlas Cloud">
         </a>
       </td>
       <td valign="middle">
-        感谢 <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=cc-haha">Atlas Cloud</a> 赞助本项目！Atlas Cloud 是一个全模态 AI 推理平台，让开发者通过统一的 AI API 访问视频生成、图像生成和 LLM API，无需分别维护多个厂商集成，即可调用 300+ 精选模型。cc-haha 已内置 Atlas Cloud 供应商预设，在设置里选择后填入 API Key 即可直接使用。Atlas Cloud 最新推出 <a href="https://www.atlascloud.ai/console/coding-plan">coding plan 优惠</a>，为开发者提供更具性价比的 API 访问预算。
+        感谢 <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=ccmax">Atlas Cloud</a> 赞助本项目！Atlas Cloud 是一个全模态 AI 推理平台，让开发者通过统一的 AI API 访问视频生成、图像生成和 LLM API，无需分别维护多个厂商集成，即可调用 300+ 精选模型。ccmax 已内置 Atlas Cloud 供应商预设，在设置里选择后填入 API Key 即可直接使用。Atlas Cloud 最新推出 <a href="https://www.atlascloud.ai/console/coding-plan">coding plan 优惠</a>，为开发者提供更具性价比的 API 访问预算。
       </td>
     </tr>
     <tr>
@@ -100,7 +103,7 @@ Claude Code Haha 是一个**桌面端 Claude Code 工作台**：多会话与全�
 
 ## 安装桌面端
 
-1. 前往 [Releases](https://github.com/NanmiCoder/cc-haha/releases) 下载 macOS / Windows / Linux 桌面端安装包。
+1. 前往 [Releases](https://github.com/yaogjim/ccmax/releases) 下载 macOS / Windows / Linux 桌面端安装包。
 2. 首次启动后，在桌面端设置里配置模型提供商、API Key 和默认模型。
 3. 正式 macOS Release 需要经过签名和公证；如果安装的是 draft/unsigned 临时包，首次打开可能仍需手动放行。Windows 未签名安装包可能出现 SmartScreen 提示，点「更多信息」→「仍要运行」即可。详见 [桌面端安装指南](docs/start/install.md)。
 
@@ -113,7 +116,7 @@ Claude Code Haha 是一个**桌面端 Claude Code 工作台**：多会话与全�
 ```bash
 bun install
 cp .env.example .env
-./bin/claude-haha
+./bin/ccmax
 ```
 
 更多配置见 [环境变量](docs/cli/env.md) 和 [命令行安装与启动](docs/cli/index.md)。
@@ -122,10 +125,10 @@ cp .env.example .env
 
 ## 用户交流群
 
-使用过程中有问题、想反馈 Bug，或者想看看别人怎么用，欢迎扫码加入 cc-haha 企业微信用户群。也可以直接来 [Issues](https://github.com/NanmiCoder/cc-haha/issues) 提问。企业定制 / 私有化部署 / Agent 定制需求，请联系作者 [NanmiCoder](https://github.com/NanmiCoder)。
+使用过程中有问题、想反馈 Bug，或者想看看别人怎么用，欢迎扫码加入 ccmax 企业微信用户群。也可以直接来 [Issues](https://github.com/yaogjim/ccmax/issues) 提问。企业定制 / 私有化部署 / Agent 定制需求，请联系作者 [yaogjim](https://github.com/yaogjim)。
 
 <p align="center">
-  <img src="docs/images/community/wechat-group-qr.png" width="300" alt="cc-haha 企业微信用户群二维码">
+  <img src="docs/images/community/wechat-group-qr.png" width="300" alt="ccmax 企业微信用户群二维码">
 </p>
 
 ---
@@ -183,7 +186,7 @@ cp .env.example .env
 
 ## 更多文档
 
-完整文档站：<https://cchaha.ai>
+完整文档站：<https://yaogjim.github.io/ccmax>
 
 | 分区 | 文档 |
 |------|------|
@@ -221,8 +224,8 @@ cp .env.example .env
 
 ## ⭐ Star History
 
-如果这个项目对你有帮助，欢迎点一个 ⭐ Star，让更多人发现 Claude Code Haha。
+如果这个项目对你有帮助，欢迎点一个 ⭐ Star，让更多人发现 ccmax。
 
-<a href="https://www.repostars.dev/?repos=NanmiCoder%2Fcc-haha&theme=ocean">
-  <img alt="Star History Chart" src="https://www.repostars.dev/api/embed?repo=NanmiCoder%2Fcc-haha&theme=ocean" />
+<a href="https://www.repostars.dev/?repos=yaogjim%2Fccmax&theme=ocean">
+  <img alt="Star History Chart" src="https://www.repostars.dev/api/embed?repo=yaogjim%2Fccmax&theme=ocean" />
 </a>

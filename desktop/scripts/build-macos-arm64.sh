@@ -14,7 +14,7 @@ ELECTRON_BUILDER_CLI="${DESKTOP_DIR}/node_modules/electron-builder/out/cli/cli.j
 
 usage() {
   cat <<'EOF'
-Build Claude Code Haha desktop for macOS Apple Silicon with Electron Builder.
+Build ccmax desktop for macOS Apple Silicon with Electron Builder.
 
 Usage:
   ./desktop/scripts/build-macos-arm64.sh [extra electron-builder args...]

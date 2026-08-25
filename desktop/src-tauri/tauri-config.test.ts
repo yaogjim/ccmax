@@ -30,4 +30,24 @@ describe('tauri security config', () => {
     expect(cargoToml).toContain('reqwest = { version = "0.13"')
     expect(cargoToml).toContain('features = ["system-proxy"]')
   })
+
+  it('brands the native menu copy with the ccmax product name', () => {
+    const libRs = readFileSync(join(currentDir, 'src/lib.rs'), 'utf8')
+
+    expect(libRs).toContain('MenuItemBuilder::with_id("nav_about", "关于 ccmax")')
+    expect(libRs).toContain('SubmenuBuilder::new(app, "ccmax")')
+    expect(libRs).not.toContain('关于 Claude Code Haha')
+    expect(libRs).not.toContain('SubmenuBuilder::new(app, "Claude Code Haha")')
+  })
+
+  it('keeps local update-install teardown commands after disabling the unpublished updater', () => {
+    const libRs = readFileSync(join(currentDir, 'src/lib.rs'), 'utf8')
+
+    expect(libRs).toContain('fn prepare_for_update_install')
+    expect(libRs).toContain('fn cancel_update_install')
+    expect(libRs).toContain('prepare_for_update_install,')
+    expect(libRs).toContain('cancel_update_install,')
+    expect(libRs).toContain('stop_server_sidecar')
+    expect(libRs).toContain('stop_adapters_sidecar')
+  })
 })

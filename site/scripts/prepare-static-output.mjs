@@ -4,7 +4,16 @@ import path from 'node:path'
 import { generateDocsManifest, paths } from './generate-docs-manifest.mjs'
 
 const distDir = path.join(paths.siteDir, 'dist')
-const expectedCustomDomain = 'cchaha.ai'
+
+// GitHub Pages 项目站：上传的产物根会被映射到 /ccmax/，所以公开地址都挂在
+// https://yaogjim.github.io/ccmax/ 下，而物理产物仍然直接落在 dist/（不嵌套 ccmax）。
+const siteOrigin = 'https://yaogjim.github.io'
+const siteBasePath = '/ccmax/'
+
+/** 把站点内的逻辑 route（`/`、`/en`、`/start/install`）拼成公开绝对地址。 */
+function toAbsoluteUrl(route) {
+  return `${siteOrigin}${siteBasePath}${String(route).replace(/^\/+/, '')}`
+}
 
 async function pathExists(targetPath) {
   return fs.access(targetPath).then(() => true, () => false)
@@ -131,10 +140,9 @@ function escapeHtml(value) {
 function shellForRoute(shell, meta) {
   if (!meta) return shell
 
-  const origin = `https://${expectedCustomDomain}`
   const isEnglish = meta.path === '/en' || meta.path.startsWith('/en/')
-  const canonical = `${origin}${meta.path}`
-  const alternate = meta.alternate ? `${origin}${meta.alternate}` : null
+  const canonical = toAbsoluteUrl(meta.path)
+  const alternate = meta.alternate ? toAbsoluteUrl(meta.alternate) : null
 
   const head = [
     `<link rel="canonical" href="${escapeHtml(canonical)}">`,
@@ -181,10 +189,9 @@ function alternateFor(record, records) {
 }
 
 async function writeSitemap(records) {
-  const origin = `https://${expectedCustomDomain}`
   const urls = ['/', '/en', ...records.map((record) => record.path)]
   const body = urls
-    .map((url) => `  <url><loc>${origin}${url}</loc><changefreq>weekly</changefreq></url>`)
+    .map((url) => `  <url><loc>${toAbsoluteUrl(url)}</loc><changefreq>weekly</changefreq></url>`)
     .join('\n')
 
   await fs.writeFile(
@@ -194,7 +201,7 @@ async function writeSitemap(records) {
 
   await fs.writeFile(
     path.join(distDir, 'robots.txt'),
-    `User-agent: *\nAllow: /\n\nSitemap: ${origin}/sitemap.xml\n`
+    `User-agent: *\nAllow: ${siteBasePath}\n\nSitemap: ${toAbsoluteUrl('/sitemap.xml')}\n`
   )
 }
 
@@ -223,17 +230,23 @@ async function main() {
   await copyReferencedDocImages(records)
   await copySiteReferencedImages()
 
-  const customDomain = (await fs.readFile(path.join(distDir, 'CNAME'), 'utf8')).trim()
-  if (customDomain !== expectedCustomDomain) {
-    throw new Error(`Expected CNAME to contain ${expectedCustomDomain}, received ${customDomain || 'an empty value'}.`)
+  if (await pathExists(path.join(distDir, 'CNAME'))) {
+    throw new Error('dist/CNAME must not exist for the GitHub Pages project site.')
   }
+
+  await fs.writeFile(path.join(distDir, 'index.html'), shellForRoute(shell, {
+    alternate: '/en',
+    description: 'ccmax — Claude Code 的本地优先桌面客户端。会话、改动、Agent、定时任务都摆在明处，接哪个模型你说了算。',
+    path: '/',
+    title: 'ccmax — Claude Code 的本地优先桌面客户端'
+  }))
 
   for (const record of records) {
     await createRouteEntry(record.path, shell, {
       alternate: alternateFor(record, records),
       description: record.description,
       path: record.path,
-      title: `${record.title} · Claude Code Haha`
+      title: `${record.title} · ccmax`
     })
   }
 
@@ -241,7 +254,7 @@ async function main() {
     alternate: '/',
     description: 'A local-first desktop client for Claude Code. Sessions, diffs, agents and scheduled runs all sit in the open.',
     path: '/en',
-    title: 'Claude Code Haha — a local-first desktop client for Claude Code'
+    title: 'ccmax — a local-first desktop client for Claude Code'
   })
 
   for (const legacy of legacyRoutes) {

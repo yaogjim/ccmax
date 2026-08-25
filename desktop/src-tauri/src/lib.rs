@@ -2642,12 +2642,12 @@ pub fn run() {
     let builder = builder
         .menu(|app| {
             let about_item =
-                MenuItemBuilder::with_id("nav_about", "关于 Claude Code Haha").build(app)?;
+                MenuItemBuilder::with_id("nav_about", "关于 ccmax").build(app)?;
             let settings_item = MenuItemBuilder::with_id("nav_settings", "设置...")
                 .accelerator("CmdOrCtrl+,")
                 .build(app)?;
 
-            let app_submenu = SubmenuBuilder::new(app, "Claude Code Haha")
+            let app_submenu = SubmenuBuilder::new(app, "ccmax")
                 .item(&about_item)
                 .separator()
                 .item(&settings_item)

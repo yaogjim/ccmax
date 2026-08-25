@@ -11,9 +11,9 @@ assignees: ''
 ## 提交前确认
 <!-- 请在提交 issue 前确认以下事项 -->
 
-- [ ] 我已经阅读了 [README 常见问题](https://github.com/NanmiCoder/cc-haha#常见问题)
+- [ ] 我已经阅读了 [README 常见问题](https://github.com/yaogjim/ccmax#常见问题)
 - [ ] 我已经升级到最新版本后复现过这个问题
-- [ ] 我已经搜索过[现有 issues](https://github.com/NanmiCoder/cc-haha/issues)，确认没有重复问题
+- [ ] 我已经搜索过[现有 issues](https://github.com/yaogjim/ccmax/issues)，确认没有重复问题
 - [ ] 我已经隐藏截图和日志中的 API Key、Token、Cookie 等敏感信息
 - [ ] 我已在分享前检查自动生成的诊断报告或诊断包，确认其中没有不应公开的私密元数据
 
