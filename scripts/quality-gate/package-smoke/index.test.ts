@@ -146,13 +146,13 @@ describe('final macOS helper cursor resource verification', () => {
   function fixture(arch: 'arm64' | 'x64' = 'arm64') {
     const rootDir = createRepoRoot()
     tempDirs.push(rootDir)
-    const app = 'desktop/build-artifacts/electron/mac/Claude Code Haha.app'
+    const app = 'desktop/build-artifacts/electron/mac/ccmax.app'
     const resources = `${app}/Contents/Resources`
     const binaries = `${resources}/app.asar.unpacked/src-tauri/binaries`
     const triple = arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin'
     const pty = `${resources}/app.asar.unpacked/node_modules/node-pty`
     writeFile(rootDir, `${app}/Contents/Info.plist`)
-    writeFile(rootDir, `${app}/Contents/MacOS/Claude Code Haha`, thinMachO(arch))
+    writeFile(rootDir, `${app}/Contents/MacOS/ccmax`, thinMachO(arch))
     writeFile(rootDir, `${resources}/app.asar`)
     writeFile(rootDir, `${resources}/app.asar.unpacked/dist/index.html`)
     writeFile(rootDir, `${binaries}/claude-sidecar-${triple}`, thinMachO(arch))
@@ -320,13 +320,13 @@ describe('packaged artifact inspection', () => {
   test('fails closed when an arm64 package contains an x64 cu-helper', async () => {
     const rootDir = createRepoRoot()
     tempDirs.push(rootDir)
-    const appRoot = 'desktop/build-artifacts/electron/mac-arm64/Claude Code Haha.app'
+    const appRoot = 'desktop/build-artifacts/electron/mac-arm64/ccmax.app'
     const resources = `${appRoot}/Contents/Resources`
     const sidecarRoot = `${resources}/app.asar.unpacked/src-tauri/binaries`
     const nodePtyRoot = `${resources}/app.asar.unpacked/node_modules/node-pty`
 
     writeFile(rootDir, `${appRoot}/Contents/Info.plist`)
-    writeFile(rootDir, `${appRoot}/Contents/MacOS/Claude Code Haha`, thinMachO('arm64'))
+    writeFile(rootDir, `${appRoot}/Contents/MacOS/ccmax`, thinMachO('arm64'))
     writeFile(rootDir, `${resources}/app.asar`)
     writeFile(rootDir, `${resources}/app.asar.unpacked/dist/index.html`)
     writeFile(rootDir, `${sidecarRoot}/claude-sidecar-aarch64-apple-darwin`, thinMachO('arm64'))
@@ -363,13 +363,13 @@ describe('packaged artifact inspection', () => {
   test('fails closed when the helper Mach-O deployment target drifts below 14.4', async () => {
     const rootDir = createRepoRoot()
     tempDirs.push(rootDir)
-    const appRoot = 'desktop/build-artifacts/electron/mac-arm64/Claude Code Haha.app'
+    const appRoot = 'desktop/build-artifacts/electron/mac-arm64/ccmax.app'
     const resources = `${appRoot}/Contents/Resources`
     const sidecarRoot = `${resources}/app.asar.unpacked/src-tauri/binaries`
     const nodePtyRoot = `${resources}/app.asar.unpacked/node_modules/node-pty`
 
     writeFile(rootDir, `${appRoot}/Contents/Info.plist`)
-    writeFile(rootDir, `${appRoot}/Contents/MacOS/Claude Code Haha`, thinMachO('arm64'))
+    writeFile(rootDir, `${appRoot}/Contents/MacOS/ccmax`, thinMachO('arm64'))
     writeFile(rootDir, `${resources}/app.asar`)
     writeFile(rootDir, `${resources}/app.asar.unpacked/dist/index.html`)
     writeFile(rootDir, `${sidecarRoot}/claude-sidecar-aarch64-apple-darwin`, thinMachO('arm64'))
@@ -523,12 +523,12 @@ describe('packaged artifact inspection', () => {
   test('requires one Developer ID signer across host, sidecar, and helper', async () => {
     const rootDir = createRepoRoot()
     tempDirs.push(rootDir)
-    const appRoot = 'desktop/build-artifacts/electron/mac-arm64/Claude Code Haha.app'
+    const appRoot = 'desktop/build-artifacts/electron/mac-arm64/ccmax.app'
     const resources = `${appRoot}/Contents/Resources`
     const sidecarRoot = `${resources}/app.asar.unpacked/src-tauri/binaries`
     const nodePtyRoot = `${resources}/app.asar.unpacked/node_modules/node-pty`
     writeFile(rootDir, `${appRoot}/Contents/Info.plist`)
-    writeFile(rootDir, `${appRoot}/Contents/MacOS/Claude Code Haha`, thinMachO('arm64'))
+    writeFile(rootDir, `${appRoot}/Contents/MacOS/ccmax`, thinMachO('arm64'))
     writeFile(rootDir, `${resources}/app.asar`)
     writeFile(rootDir, `${resources}/app.asar.unpacked/dist/index.html`)
     writeFile(rootDir, `${sidecarRoot}/claude-sidecar-aarch64-apple-darwin`, thinMachO('arm64'))

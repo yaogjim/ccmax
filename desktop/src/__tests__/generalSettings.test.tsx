@@ -2339,7 +2339,7 @@ describe('Settings > Providers tab', () => {
     ]
 
     render(<Settings />)
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model/i }))
 
     const dialog = screen.getByRole('dialog')
     expect(within(dialog).getByRole('button', { name: 'Custom' })).toHaveAttribute('aria-pressed', 'true')

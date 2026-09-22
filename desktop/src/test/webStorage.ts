@@ -55,3 +55,8 @@ function installStorage(name: 'localStorage' | 'sessionStorage'): void {
 
 installStorage('localStorage')
 installStorage('sessionStorage')
+
+// Product defaults new installs to Simplified Chinese, while the shared test
+// suite asserts English labels unless a test explicitly selects another locale.
+// Seed the canonical preference before application modules initialize.
+globalThis.localStorage.setItem('ccmax-locale', 'en')

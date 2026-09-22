@@ -31,12 +31,12 @@ export function getForkOwnedDir(): string {
  * prefer an existing `ccmax` dir, else fall back to legacy `cc-haha`, else
  * return the primary write target `ccmax`.
  */
-export function resolveForkOwnedDir(): string {
-  const primary = getForkOwnedDir()
+export function resolveForkOwnedDir(configDir = getClaudeConfigHomeDir()): string {
+  const primary = join(configDir, 'ccmax')
   if (existsSync(primary)) {
     return primary
   }
-  const legacy = getCcHahaDir()
+  const legacy = join(configDir, 'cc-haha')
   if (existsSync(legacy)) {
     return legacy
   }

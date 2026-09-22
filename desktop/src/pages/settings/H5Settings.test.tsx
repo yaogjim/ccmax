@@ -64,6 +64,8 @@ it('creates a provider using the existing form and reports save errors without l
   render(<ProviderSettings browserMode />)
   fireEvent.click(screen.getByRole('button', { name: /Add Model/ }))
   const dialog = within(screen.getByRole('dialog'))
+  fireEvent.change(dialog.getByRole('textbox', { name: /Base URL/ }), { target: { value: 'https://provider.example.test' } })
+  fireEvent.change(dialog.getByRole('textbox', { name: /Main Model/ }), { target: { value: 'fixture-model' } })
   fireEvent.change(dialog.getByPlaceholderText('sk-...'), { target: { value: 'fake-test-key' } })
   fireEvent.click(dialog.getByRole('button', { name: 'Add' }))
   await waitFor(() => expect(create).toHaveBeenCalled())

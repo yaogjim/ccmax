@@ -29,7 +29,7 @@ describe('sessionRuntimeStore runtime cleanup', () => {
     }, oldSession]) {
       store.syncFromSessions([metadata], startedWith)
       expect(useSessionRuntimeStore.getState().selections[oldSession.id]).toEqual(next)
-      expect(JSON.parse(localStorage.getItem('cc-haha-session-runtime')!)[oldSession.id]).toEqual(next)
+      expect(JSON.parse(localStorage.getItem('ccmax-session-runtime')!)[oldSession.id]).toEqual(next)
     }
   })
 
@@ -184,7 +184,7 @@ describe('sessionRuntimeStore runtime cleanup', () => {
       modelId: 'MiniMax-M3[1m]',
       effortLevel: 'max',
     })
-    expect(JSON.parse(localStorage.getItem('cc-haha-session-runtime')!)).toEqual({
+    expect(JSON.parse(localStorage.getItem('ccmax-session-runtime')!)).toEqual({
       'session-loaded-minimax': {
         providerId: 'provider-minimax',
         modelId: 'MiniMax-M3[1m]',
