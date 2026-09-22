@@ -19,6 +19,7 @@
  */
 
 import { parseLauncherArgs, resolveSidecarInvocation } from './launcherRouting'
+import { runCli } from './sidecarEntrypoints'
 
 // The compiled Computer Use runtime relaunches this executable directly. Its
 // isolated worker has no app-root and must not load preload, CLI configuration,
@@ -140,7 +141,7 @@ if (mode === 'adapters') {
     const { startServer } = await import('../../src/server/index.ts')
     startServer()
   } else if (mode === 'cli') {
-    await import('../../src/entrypoints/cli.tsx')
+    await runCli()
   } else {
     console.error(`claude-sidecar: unknown mode "${mode}" (expected "server", "cli" or "adapters")`)
     process.exit(2)
