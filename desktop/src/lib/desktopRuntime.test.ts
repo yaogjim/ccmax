@@ -22,10 +22,14 @@ import {
   H5ConnectionRequiredError,
   H5_SERVER_URL_STORAGE_KEY,
   H5_TOKEN_STORAGE_KEY,
+  LEGACY_H5_SERVER_URL_STORAGE_KEY,
+  LEGACY_H5_TOKEN_STORAGE_KEY,
+  clearStoredH5Connection,
   initializeDesktopServerUrl,
   isBrowserH5Runtime,
   isDesktopRuntime,
   isLoopbackHostname,
+  readStoredH5Connection,
   requiresH5AuthForServerUrl,
   saveAndVerifyH5Connection,
 } from './desktopRuntime'
@@ -45,6 +49,7 @@ describe('desktopRuntime browser H5 bootstrap', () => {
     clientMocks.explicitDefaultBaseUrl = false
     vi.useRealTimers()
     window.localStorage.clear()
+    clearStoredH5Connection()
     window.history.pushState({}, '', '/')
     Reflect.deleteProperty(window, 'desktopHost')
     Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
@@ -544,5 +549,82 @@ describe('desktopRuntime browser H5 bootstrap', () => {
       serverUrl: 'http://192.168.0.102:28670',
       reason: 'missing-token',
     } satisfies Partial<H5ConnectionRequiredError>)
+  })
+
+  it('reads legacy H5 pairing and prefers canonical on conflict', () => {
+    window.localStorage.setItem(LEGACY_H5_SERVER_URL_STORAGE_KEY, 'https://legacy.example/app')
+    window.localStorage.setItem(LEGACY_H5_TOKEN_STORAGE_KEY, 'legacy-token')
+    expect(readStoredH5Connection()).toEqual({
+      serverUrl: 'https://legacy.example/app',
+      token: 'legacy-token',
+    })
+
+    window.localStorage.setItem(H5_SERVER_URL_STORAGE_KEY, 'https://canonical.example/app')
+    window.localStorage.setItem(H5_TOKEN_STORAGE_KEY, 'canonical-token')
+    expect(readStoredH5Connection()).toEqual({
+      serverUrl: 'https://canonical.example/app',
+      token: 'canonical-token',
+    })
+  })
+
+  it('saves H5 pairing only to canonical keys', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(healthOkResponse()) as typeof fetch
+    clientMocks.postVerify.mockResolvedValueOnce({ ok: true })
+    window.localStorage.setItem(LEGACY_H5_SERVER_URL_STORAGE_KEY, 'https://legacy.example/app')
+    window.localStorage.setItem(LEGACY_H5_TOKEN_STORAGE_KEY, 'legacy-token')
+
+    await expect(saveAndVerifyH5Connection('https://public.example.com/app', 'fresh-token')).resolves.toBe(
+      'https://public.example.com/app',
+    )
+
+    expect(window.localStorage.getItem(H5_SERVER_URL_STORAGE_KEY)).toBe('https://public.example.com/app')
+    expect(window.localStorage.getItem(H5_TOKEN_STORAGE_KEY)).toBe('fresh-token')
+    expect(window.localStorage.getItem(LEGACY_H5_SERVER_URL_STORAGE_KEY)).toBe('https://legacy.example/app')
+    expect(window.localStorage.getItem(LEGACY_H5_TOKEN_STORAGE_KEY)).toBe('legacy-token')
+  })
+
+  it('clears only the canonical token on invalid verify and does not revive legacy token in the same run', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(healthOkResponse()) as typeof fetch
+    clientMocks.postVerify.mockRejectedValueOnce(
+      Object.assign(new Error('Invalid or missing H5 access token'), { status: 401 }),
+    )
+    window.localStorage.setItem(LEGACY_H5_TOKEN_STORAGE_KEY, 'legacy-still-present')
+    window.localStorage.setItem(H5_TOKEN_STORAGE_KEY, 'stale-canonical')
+
+    await expect(saveAndVerifyH5Connection('https://public.example.com/app', 'stale-token')).rejects.toMatchObject({
+      reason: 'invalid-token',
+    })
+
+    expect(window.localStorage.getItem(H5_TOKEN_STORAGE_KEY)).toBeNull()
+    expect(window.localStorage.getItem(LEGACY_H5_TOKEN_STORAGE_KEY)).toBe('legacy-still-present')
+    expect(readStoredH5Connection().token).toBeNull()
+  })
+
+  it('explicit clear removes both canonical and legacy H5 pairing keys', () => {
+    window.localStorage.setItem(H5_SERVER_URL_STORAGE_KEY, 'https://canonical.example/app')
+    window.localStorage.setItem(H5_TOKEN_STORAGE_KEY, 'canonical-token')
+    window.localStorage.setItem(LEGACY_H5_SERVER_URL_STORAGE_KEY, 'https://legacy.example/app')
+    window.localStorage.setItem(LEGACY_H5_TOKEN_STORAGE_KEY, 'legacy-token')
+
+    clearStoredH5Connection()
+
+    expect(window.localStorage.getItem(H5_SERVER_URL_STORAGE_KEY)).toBeNull()
+    expect(window.localStorage.getItem(H5_TOKEN_STORAGE_KEY)).toBeNull()
+    expect(window.localStorage.getItem(LEGACY_H5_SERVER_URL_STORAGE_KEY)).toBeNull()
+    expect(window.localStorage.getItem(LEGACY_H5_TOKEN_STORAGE_KEY)).toBeNull()
+    expect(readStoredH5Connection()).toEqual({ serverUrl: null, token: null })
+  })
+
+  it('reuses a legacy-paired H5 token only for its normalized server URL', async () => {
+    window.localStorage.setItem(LEGACY_H5_SERVER_URL_STORAGE_KEY, 'https://paired.example/app/')
+    window.localStorage.setItem(LEGACY_H5_TOKEN_STORAGE_KEY, 'paired-server-token')
+    window.history.pushState({}, '', '/?serverUrl=https%3A%2F%2Fpaired.example%2Fapp')
+    globalThis.fetch = vi.fn().mockResolvedValue(healthOkResponse()) as typeof fetch
+    clientMocks.postVerify.mockResolvedValueOnce({ ok: true })
+
+    await expect(initializeDesktopServerUrl()).resolves.toBe('https://paired.example/app')
+
+    expect(clientMocks.setAuthToken).toHaveBeenLastCalledWith('paired-server-token')
+    expect(clientMocks.postVerify).toHaveBeenCalledWith('/api/h5-access/verify')
   })
 })

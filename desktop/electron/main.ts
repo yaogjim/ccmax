@@ -22,6 +22,8 @@ import { saveWorkspaceBrowserPdf } from './services/workspaceBrowserPdf'
 import { workspaceBrowserMenuPosition } from './services/workspaceBrowserMenu'
 import type { WorkspaceBrowserMenuOptions } from '../src/lib/desktopHost/types'
 import { acquireSingleInstanceLock } from './services/singleInstance'
+import { runProfileStartup } from './services/profileStartup'
+import { prepareUserDataProfile } from './services/userDataProfileMigration'
 import { installTray, shouldInstallTray, type TrayController } from './services/tray'
 import { ElectronUpdaterService, updaterSessionProxyConfig } from './services/updater'
 import { createUpdateSmokeUpdaterFromEnv } from './services/updateSmoke'
@@ -962,13 +964,35 @@ async function createMainWindow() {
   writeWindowSmokeSnapshot(mainWindow, 'after-final-show')
 }
 
-if (!acquireSingleInstanceLock(app, () => mainWindow)) {
-  process.exit(0)
-}
+// Lifecycle handlers are registered synchronously so async bootstrap cannot
+// drop or double-register them if preparation fails mid-flight.
+app.on('window-all-closed', () => {
+  if (isQuitting && process.platform !== 'darwin') app.quit()
+})
 
-registerIpcHandlers()
+async function bootstrap() {
+  // prepare → setPath(userData) → single-instance lock. setPath uses the
+  // fallback path even when migration itself failed (legacy profile).
+  const startup = await runProfileStartup({
+    prepareProfile: () => prepareUserDataProfile(app),
+    setUserDataPath: activePath => {
+      app.setPath('userData', activePath)
+    },
+    acquireSingleInstanceLock: () => {
+      // Historical guard form kept for security/static contract slices.
+      if (!acquireSingleInstanceLock(app, () => mainWindow)) {
+        return false
+      }
+      return true
+    },
+  })
+  if (!startup.hasLock) {
+    process.exit(0)
+  }
 
-app.whenReady().then(async () => {
+  registerIpcHandlers()
+
+  await app.whenReady()
   applyWindowsAppUserModelId(app)
   applyStartupPortableMode(app)
   installSystemAppearanceWatch()
@@ -1011,10 +1035,12 @@ app.whenReady().then(async () => {
     }
     void createMainWindow()
   })
-})
+}
 
-app.on('window-all-closed', () => {
-  if (isQuitting && process.platform !== 'darwin') app.quit()
+void bootstrap().catch(error => {
+  const detail = sanitizeHostDiagnostic(error instanceof Error ? error.message : String(error))
+  console.error(`[desktop] bootstrap failed: ${detail}`)
+  app.exit(1)
 })
 
 app.on('before-quit', event => {

@@ -4,28 +4,31 @@ import {
   WORKSPACE_STORAGE_VERSION,
 } from './workspace/storageKey'
 import {
-  APP_ZOOM_STORAGE_KEY,
-  LEGACY_UI_ZOOM_STORAGE_KEY,
   isValidStoredAppZoomLevel,
   normalizeAppZoomLevel,
 } from './appZoom'
+import {
+  APP_ZOOM_STORAGE_KEY,
+  DESKTOP_PERSISTENCE_KEYS,
+  DESKTOP_PERSISTENCE_VERSION_KEY,
+  LOCALE_STORAGE_KEY,
+  DARK_THEME_STORAGE_KEY,
+  FOLLOW_SYSTEM_THEME_STORAGE_KEY,
+  LIGHT_THEME_STORAGE_KEY,
+  SESSION_RUNTIME_STORAGE_KEY,
+  TAB_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+  copyStage18LegacyKeysIfMissing,
+  type StorageLike,
+} from './persistenceKeys'
 
 export const CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION = 4
-export const DESKTOP_PERSISTENCE_VERSION_KEY = 'cc-haha.persistence.schemaVersion'
+export { DESKTOP_PERSISTENCE_VERSION_KEY }
 
 type DesktopMigrationReport = {
   migratedKeys: string[]
 }
 
-type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
-
-const TAB_STORAGE_KEY = 'cc-haha-open-tabs'
-const SESSION_RUNTIME_STORAGE_KEY = 'cc-haha-session-runtime'
-const THEME_STORAGE_KEY = 'cc-haha-theme'
-const FOLLOW_SYSTEM_THEME_STORAGE_KEY = 'cc-haha-follow-system-theme'
-const LIGHT_THEME_STORAGE_KEY = 'cc-haha-light-theme'
-const DARK_THEME_STORAGE_KEY = 'cc-haha-dark-theme'
-const LOCALE_STORAGE_KEY = 'cc-haha-locale'
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
 const PERSISTED_SPECIAL_TAB_TYPES = ['settings', 'scheduled', 'market', 'connectors', 'traces'] as const
 const PERSISTED_SPECIAL_TAB_IDS: Record<(typeof PERSISTED_SPECIAL_TAB_TYPES)[number], string> = {
@@ -270,20 +273,18 @@ function normalizeEnumKey(
 
 function normalizeAppZoomKey(storage: StorageLike, report: DesktopMigrationReport): void {
   const value = storage.getItem(APP_ZOOM_STORAGE_KEY)
+  if (value === null) return
+
   if (!isValidStoredAppZoomLevel(value)) {
     storage.removeItem(APP_ZOOM_STORAGE_KEY)
     report.migratedKeys.push(APP_ZOOM_STORAGE_KEY)
+    return
   }
 
-  const currentValue = storage.getItem(APP_ZOOM_STORAGE_KEY)
-  const legacyValue = storage.getItem(LEGACY_UI_ZOOM_STORAGE_KEY)
-  if (currentValue === null && legacyValue !== null && isValidStoredAppZoomLevel(legacyValue)) {
-    storage.setItem(APP_ZOOM_STORAGE_KEY, String(normalizeAppZoomLevel(legacyValue)))
+  const normalized = String(normalizeAppZoomLevel(value))
+  if (normalized !== value) {
+    storage.setItem(APP_ZOOM_STORAGE_KEY, normalized)
     report.migratedKeys.push(APP_ZOOM_STORAGE_KEY)
-  }
-  if (legacyValue !== null) {
-    storage.removeItem(LEGACY_UI_ZOOM_STORAGE_KEY)
-    report.migratedKeys.push(LEGACY_UI_ZOOM_STORAGE_KEY)
   }
 }
 
@@ -311,6 +312,13 @@ export function runDesktopPersistenceMigrations(storage: StorageLike | null = ge
   const report: DesktopMigrationReport = { migratedKeys: [] }
   if (!storage) return report
 
+  // 1) Canonical-first copy: never overwrite existing new keys; keep old keys.
+  // Pure copies are not reported — migratedKeys tracks shape/enum changes only.
+  runMigrationStep(report, DESKTOP_PERSISTENCE_KEYS.openTabs.canonical, () => {
+    copyStage18LegacyKeysIfMissing(storage)
+  })
+
+  // 2) Shape/enum cleaning operates only on canonical keys.
   runMigrationStep(report, TAB_STORAGE_KEY, () => migrateTabs(storage, report))
   runMigrationStep(report, SESSION_RUNTIME_STORAGE_KEY, () => migrateSessionRuntime(storage, report))
   runMigrationStep(report, THEME_STORAGE_KEY, () =>

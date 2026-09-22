@@ -8,6 +8,7 @@ import {
   nextAppZoomLevel,
   normalizeAppZoomLevel,
 } from './appZoom'
+import { LEGACY_APP_ZOOM_STORAGE_KEY } from './persistenceKeys'
 import { browserHost } from './desktopHost/browserHost'
 
 describe('appZoom', () => {
@@ -44,7 +45,16 @@ describe('appZoom', () => {
     expect(window.localStorage.getItem(APP_ZOOM_STORAGE_KEY)).toBe('1.2')
   })
 
-  it('reads the legacy UI zoom key when the app zoom key is absent', async () => {
+  it('reads the legacy app-zoom key when the canonical key is absent', async () => {
+    window.localStorage.setItem(LEGACY_APP_ZOOM_STORAGE_KEY, '1.35')
+
+    await initializeAppZoom()
+
+    expect(document.documentElement.getAttribute('data-app-zoom-percent')).toBe('135')
+    expect(window.localStorage.getItem(APP_ZOOM_STORAGE_KEY)).toBeNull()
+  })
+
+  it('reads the legacy UI zoom key when both newer keys are absent', async () => {
     window.localStorage.setItem(LEGACY_UI_ZOOM_STORAGE_KEY, '1.25')
 
     await initializeAppZoom()
@@ -53,10 +63,25 @@ describe('appZoom', () => {
     expect(window.localStorage.getItem(APP_ZOOM_STORAGE_KEY)).toBeNull()
   })
 
-  it('persists app zoom changes', async () => {
+  it('prefers the canonical key when legacy zoom keys also exist', async () => {
+    window.localStorage.setItem(APP_ZOOM_STORAGE_KEY, '1.1')
+    window.localStorage.setItem(LEGACY_APP_ZOOM_STORAGE_KEY, '1.5')
+    window.localStorage.setItem(LEGACY_UI_ZOOM_STORAGE_KEY, '1.8')
+
+    await initializeAppZoom()
+
+    expect(document.documentElement.getAttribute('data-app-zoom-percent')).toBe('110')
+  })
+
+  it('persists app zoom changes only to the canonical key', async () => {
+    window.localStorage.setItem(LEGACY_APP_ZOOM_STORAGE_KEY, '1.0')
+    window.localStorage.setItem(LEGACY_UI_ZOOM_STORAGE_KEY, '1.0')
+
     await applyAppZoomLevel(1.3)
 
     expect(window.localStorage.getItem(APP_ZOOM_STORAGE_KEY)).toBe('1.3')
+    expect(window.localStorage.getItem(LEGACY_APP_ZOOM_STORAGE_KEY)).toBe('1.0')
+    expect(window.localStorage.getItem(LEGACY_UI_ZOOM_STORAGE_KEY)).toBe('1.0')
     expect(document.documentElement.style.getPropertyValue('--app-zoom')).toBe('1.3')
   })
 

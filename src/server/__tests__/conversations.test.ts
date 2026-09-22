@@ -2495,8 +2495,6 @@ describe('WebSocket Chat Integration', () => {
   })
 
   it('refreshes the first-turn AI title from the completed assistant transcript', async () => {
-    const providerConfigPath = path.join(tmpDir, 'cc-haha', 'providers.json')
-    const originalProviderConfig = await fs.readFile(providerConfigPath, 'utf-8').catch(() => null)
     const upstreamInputs: string[] = []
     const titleModelServer = Bun.serve({
       hostname: '127.0.0.1',
@@ -2515,32 +2513,24 @@ describe('WebSocket Chat Integration', () => {
         })
       },
     })
+    const providerService = new ProviderService()
+    let provider: { id: string } | undefined
 
     try {
-      await fs.mkdir(path.dirname(providerConfigPath), { recursive: true })
-      await fs.writeFile(
-        providerConfigPath,
-        JSON.stringify({
-          activeId: 'title-transcript-provider',
-          providers: [
-            {
-              id: 'title-transcript-provider',
-              presetId: 'minimax',
-              name: 'Title Transcript Provider',
-              apiKey: 'test-key',
-              baseUrl: `http://127.0.0.1:${titleModelServer.port}/anthropic`,
-              apiFormat: 'anthropic',
-              models: {
-                main: 'minimax-main',
-                haiku: 'minimax-haiku',
-                sonnet: 'minimax-main',
-                opus: 'minimax-main',
-              },
-            },
-          ],
-        }, null, 2),
-        'utf-8',
-      )
+      provider = await providerService.addProvider({
+        presetId: 'minimax',
+        name: 'Title Transcript Provider',
+        apiKey: 'test-key',
+        baseUrl: `http://127.0.0.1:${titleModelServer.port}/anthropic`,
+        apiFormat: 'anthropic',
+        models: {
+          main: 'minimax-main',
+          haiku: 'minimax-haiku',
+          sonnet: 'minimax-main',
+          opus: 'minimax-main',
+        },
+      })
+      await providerService.activateProvider(provider.id)
 
       const sessionId = `title-transcript-${crypto.randomUUID()}`
       const messages: any[] = []
@@ -2585,12 +2575,11 @@ describe('WebSocket Chat Integration', () => {
       expect(upstreamInputs.some((input) => input.includes('Echo: 看一下这个搜索结果'))).toBe(true)
       expect(upstreamInputs.some((input) => input.includes('Return the title in Chinese.'))).toBe(true)
     } finally {
-      titleModelServer.stop(true)
-      if (originalProviderConfig === null) {
-        await fs.rm(providerConfigPath, { force: true })
-      } else {
-        await fs.writeFile(providerConfigPath, originalProviderConfig, 'utf-8')
+      await providerService.activateOfficial()
+      if (provider) {
+        await providerService.deleteProvider(provider.id)
       }
+      titleModelServer.stop(true)
     }
   }, 10000)
 

@@ -345,19 +345,31 @@ export function blankingIsSound(source: string): boolean {
   return parses(blankNonCode(source))
 }
 
-/**
- * Imports in `source` that nothing in `source` references.
- *
- * Side-effect imports declare no binding and cannot appear here.
- */
-export function findDeadImports(source: string): Array<{ binding: string; line: number }> {
-  const code = blankNonCode(source)
-  const statements: Array<{ start: number; end: number; clause: string }> = []
+/** One parsed import statement and the local bindings it declares. */
+type ImportStatementAnalysis = {
+  start: number
+  end: number
+  line: number
+  bindings: string[]
+}
+
+type DeadImportAnalysis = {
+  body: string
+  statements: ImportStatementAnalysis[]
+}
+
+function prepareDeadImportAnalysis(code: string): DeadImportAnalysis {
+  const statements: ImportStatementAnalysis[] = []
 
   IMPORT_STATEMENT.lastIndex = 0
   let match: RegExpExecArray | null
   while ((match = IMPORT_STATEMENT.exec(code)) !== null) {
-    statements.push({ start: match.index, end: match.index + match[0].length, clause: match[1]! })
+    statements.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      line: code.slice(0, match.index).split('\n').length,
+      bindings: parseImportClause(match[1]!),
+    })
   }
 
   // Every import statement is blanked before the scan: an import may only be kept
@@ -368,16 +380,54 @@ export function findDeadImports(source: string): Array<{ binding: string; line: 
       if (characters[index] !== '\n') characters[index] = ' '
     }
   }
-  const body = characters.join('')
 
+  return { body: characters.join(''), statements }
+}
+
+function deadImportHitIn(analysis: DeadImportAnalysis, binding: string, line: number): { binding: string; line: number } | null {
+  return referencedIn(analysis.body, binding) ? null : { binding, line }
+}
+
+/**
+ * The targeted imported binding in already-blanked `code`, when nothing in `code`
+ * references it outside import statements.
+ */
+export function findDeadImportedBindingInBlankedCode(
+  code: string,
+  targetBinding: string,
+): { binding: string; line: number } | null {
+  const analysis = prepareDeadImportAnalysis(code)
+  for (const statement of analysis.statements) {
+    if (!statement.bindings.includes(targetBinding)) continue
+    return deadImportHitIn(analysis, targetBinding, statement.line)
+  }
+  return null
+}
+
+/**
+ * Imports in already-blanked `code` that nothing in `code` references.
+ *
+ * Side-effect imports declare no binding and cannot appear here.
+ */
+export function findDeadImportsInBlankedCode(code: string): Array<{ binding: string; line: number }> {
+  const analysis = prepareDeadImportAnalysis(code)
   const dead: Array<{ binding: string; line: number }> = []
-  for (const statement of statements) {
-    const line = code.slice(0, statement.start).split('\n').length
-    for (const binding of parseImportClause(statement.clause)) {
-      if (!referencedIn(body, binding)) dead.push({ binding, line })
+  for (const statement of analysis.statements) {
+    for (const binding of statement.bindings) {
+      const hit = deadImportHitIn(analysis, binding, statement.line)
+      if (hit) dead.push(hit)
     }
   }
   return dead
+}
+
+/**
+ * Imports in `source` that nothing in `source` references.
+ *
+ * Side-effect imports declare no binding and cannot appear here.
+ */
+export function findDeadImports(source: string): Array<{ binding: string; line: number }> {
+  return findDeadImportsInBlankedCode(blankNonCode(source))
 }
 
 const SKIPPED_DIRECTORIES = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', 'artifacts', 'target'])
@@ -413,26 +463,34 @@ function listSourceFiles(absoluteRoot: string, rootDir: string, out: string[] = 
 export function scanDeadImports(
   rootDir: string,
   roots: readonly string[] = DEAD_IMPORT_ROOTS,
-): { dead: DeadImport[]; scannedFiles: string[]; degradedFiles: string[] } {
+): {
+  dead: DeadImport[]
+  scannedFiles: string[]
+  degradedFiles: string[]
+  blankedSources: Map<string, string>
+} {
   const scannedFiles: string[] = []
   const degradedFiles: string[] = []
   const dead: DeadImport[] = []
+  const blankedSources = new Map<string, string>()
 
   for (const root of roots) {
     for (const file of listSourceFiles(join(rootDir, root), rootDir).sort()) {
       scannedFiles.push(file)
       const source = readFileSync(join(rootDir, file), 'utf8')
-      if (!blankingIsSound(source)) {
+      const blanked = blankNonCode(source)
+      if (!parses(blanked)) {
         degradedFiles.push(file)
         continue
       }
-      for (const hit of findDeadImports(source)) {
+      blankedSources.set(file, blanked)
+      for (const hit of findDeadImportsInBlankedCode(blanked)) {
         dead.push({ file, binding: hit.binding, line: hit.line })
       }
     }
   }
 
-  return { dead, scannedFiles, degradedFiles }
+  return { dead, scannedFiles, degradedFiles, blankedSources }
 }
 
 /** Stable `file:line binding` key, used by the report and by the allowlist. */

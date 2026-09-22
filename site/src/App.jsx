@@ -1,15 +1,19 @@
 import { lazy, Suspense, useEffect, useState } from 'react'
 import HomePage from './pages/home/HomePage'
 import { resolveLegacyRoute, toSiteHref } from './content/docs'
+import { isSitePath, withoutSiteBase } from './lib/site.js'
 
 const DocPage = lazy(() => import('./components/DocPage'))
 
 function currentPath() {
-  return window.location.pathname.replace(/\/+$/, '') || '/'
+  const pathname = window.location.pathname
+  if (!isSitePath(pathname)) return null
+  return withoutSiteBase(pathname)
 }
 
 function NotFound({ pathname }) {
-  const isEnglish = pathname.startsWith('/en')
+  const logical = pathname && isSitePath(pathname) ? withoutSiteBase(pathname) : pathname
+  const isEnglish = String(logical || '').startsWith('/en')
   return (
     <main className="not-found">
       <p>404</p>
@@ -55,6 +59,7 @@ export default function App() {
       const target = new URL(anchor.href, window.location.href)
       if (target.origin !== window.location.origin) return
       if (/\.html$/i.test(target.pathname)) return
+      if (!isSitePath(target.pathname)) return
       if (target.pathname === window.location.pathname && target.search === window.location.search) return
 
       event.preventDefault()
@@ -72,11 +77,16 @@ export default function App() {
 
   // 老路由一律换到新地址，别让重组把外部链接打死在 404 上。
   useEffect(() => {
+    if (path == null) return
     const legacy = resolveLegacyRoute(path)
     if (!legacy) return
     window.history.replaceState({}, '', toSiteHref(legacy) + window.location.hash)
     setPath(currentPath())
   }, [path])
+
+  if (path == null) {
+    return <NotFound pathname={window.location.pathname} />
+  }
 
   if (path === '/' || path === '/en') {
     return <HomePage locale={path === '/en' ? 'en' : 'zh'} />

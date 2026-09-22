@@ -203,8 +203,8 @@ describe('uiStore following the system appearance', () => {
 
     useUIStore.getState().setFollowSystemTheme(false)
     expect(useUIStore.getState().theme).toBe('dark')
-    expect(window.localStorage.getItem('cc-haha-theme')).toBe('dark')
-    expect(window.localStorage.getItem('cc-haha-follow-system-theme')).toBe('0')
+    expect(window.localStorage.getItem('ccmax-theme')).toBe('dark')
+    expect(window.localStorage.getItem('ccmax-follow-system-theme')).toBe('0')
     teardownTheme()
   })
 
@@ -220,7 +220,7 @@ describe('uiStore following the system appearance', () => {
     // classic rather than pure white.
     expect(useUIStore.getState().theme).toBe('dark')
     expect(useUIStore.getState().lightTheme).toBe('warm-classic')
-    expect(window.localStorage.getItem('cc-haha-light-theme')).toBe('warm-classic')
+    expect(window.localStorage.getItem('ccmax-light-theme')).toBe('warm-classic')
     teardownTheme()
   })
 
@@ -235,7 +235,7 @@ describe('uiStore following the system appearance', () => {
 
     expect(useUIStore.getState().theme).toBe('white')
     expect(useUIStore.getState().darkTheme).toBe('ink-blue')
-    expect(window.localStorage.getItem('cc-haha-dark-theme')).toBe('ink-blue')
+    expect(window.localStorage.getItem('ccmax-dark-theme')).toBe('ink-blue')
     teardownTheme()
   })
 
@@ -308,11 +308,12 @@ describe('uiStore following the system appearance', () => {
     expect(useUIStore.getState().followSystemTheme).toBe(true)
 
     // Another window opted out; only storage reflects it.
-    window.localStorage.setItem('cc-haha-follow-system-theme', '0')
+    // Post-migration windows write the canonical key.
+    window.localStorage.setItem('ccmax-follow-system-theme', '0')
 
     media.emit(true)
 
-    expect(window.localStorage.getItem('cc-haha-follow-system-theme')).toBe('0')
+    expect(window.localStorage.getItem('ccmax-follow-system-theme')).toBe('0')
     expect(useUIStore.getState().theme).toBe('white')
     teardownTheme()
   })
@@ -324,8 +325,8 @@ describe('uiStore following the system appearance', () => {
     initializeTheme()
     expect(useUIStore.getState().theme).toBe('dark')
 
-    window.localStorage.setItem('cc-haha-light-theme', 'celadon')
-    window.localStorage.setItem('cc-haha-dark-theme', 'ink-blue')
+    window.localStorage.setItem('ccmax-light-theme', 'celadon')
+    window.localStorage.setItem('ccmax-dark-theme', 'ink-blue')
 
     media.emit(false)
     expect(useUIStore.getState().theme).toBe('celadon')
@@ -345,10 +346,10 @@ describe('uiStore following the system appearance', () => {
     expect(useUIStore.getState().theme).toBe('white')
 
     // A storage event is what the browser delivers to the windows that did
-    // not perform the write.
-    window.localStorage.setItem('cc-haha-theme', 'celadon')
-    window.localStorage.setItem('cc-haha-light-theme', 'celadon')
-    window.dispatchEvent(new StorageEvent('storage', { key: 'cc-haha-light-theme' }))
+    // not perform the write. Post-migration windows write canonical keys.
+    window.localStorage.setItem('ccmax-theme', 'celadon')
+    window.localStorage.setItem('ccmax-light-theme', 'celadon')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'ccmax-light-theme' }))
 
     expect(useUIStore.getState().theme).toBe('celadon')
     expect(useUIStore.getState().lightTheme).toBe('celadon')
@@ -365,7 +366,7 @@ describe('uiStore following the system appearance', () => {
     const { initializeTheme, useUIStore, teardownTheme } = await import('./uiStore')
     initializeTheme()
 
-    window.localStorage.setItem('cc-haha-theme', 'celadon')
+    window.localStorage.setItem('ccmax-theme', 'celadon')
     window.dispatchEvent(new StorageEvent('storage', { key: 'cc-haha-open-tabs' }))
 
     expect(useUIStore.getState().theme).toBe('white')
@@ -384,7 +385,7 @@ describe('uiStore settings tab persistence', () => {
 
     first.useUIStore.getState().setActiveSettingsTab('general')
 
-    expect(window.localStorage.getItem('cc-haha-active-settings-tab')).toBe('general')
+    expect(window.localStorage.getItem('ccmax-active-settings-tab')).toBe('general')
 
     vi.resetModules()
     const recreated = await import('./uiStore')
@@ -397,7 +398,7 @@ describe('uiStore settings tab persistence', () => {
 
     first.useUIStore.getState().setActiveSettingsTab('pets')
 
-    expect(window.localStorage.getItem('cc-haha-active-settings-tab')).toBe('pets')
+    expect(window.localStorage.getItem('ccmax-active-settings-tab')).toBe('pets')
 
     vi.resetModules()
     const recreated = await import('./uiStore')

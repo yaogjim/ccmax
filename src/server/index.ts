@@ -123,6 +123,18 @@ export async function startBackgroundIndexesInPriorityOrder(
 }
 
 const publicAccessServers = new Set<PublicAccessServer>()
+/**
+ * Storage upgrade (including SQLite family migration) must finish before any
+ * background index opens a database path. Migration failures do not block
+ * startup: path getters fall back to the legacy main when the primary is absent.
+ */
+export async function startBackgroundIndexesAfterStorageUpgrade(
+  options: BackgroundIndexStartupOptions = {},
+  ensureUpgraded: () => Promise<unknown> = ensurePersistentStorageUpgraded,
+): Promise<void> {
+  await ensureUpgraded()
+  await startBackgroundIndexesInPriorityOrder(options)
+}
 
 let backgroundIndexStartupController: AbortController | undefined
 let backgroundIndexStartup: Promise<void> | undefined
@@ -131,7 +143,7 @@ function beginBackgroundIndexStartup(): void {
   backgroundIndexStartupController?.abort()
   const controller = new AbortController()
   backgroundIndexStartupController = controller
-  const operation = startBackgroundIndexesInPriorityOrder({
+  const operation = startBackgroundIndexesAfterStorageUpgrade({
     signal: controller.signal,
   }).catch(() => undefined)
   backgroundIndexStartup = operation

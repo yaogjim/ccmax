@@ -77,6 +77,7 @@ describe('Electron app mode service', () => {
     expect(applyStartupPortableMode(fakeApp, env)).toBe(customDir)
     expect(env).toMatchObject({
       CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '1',
       CC_HAHA_APP_PORTABLE_DIR: '1',
       WEBVIEW2_USER_DATA_FOLDER: path.join(customDir, 'EBWebView'),
     })
@@ -125,6 +126,7 @@ describe('Electron app mode service', () => {
     const customDir = path.join(tempDir(), 'custom-data')
     const managedEnv: NodeJS.ProcessEnv = {
       CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '1',
       CC_HAHA_APP_PORTABLE_DIR: '1',
       WEBVIEW2_USER_DATA_FOLDER: path.join(customDir, 'EBWebView'),
       APPDATA: 'C:\\Users\\someone\\AppData\\Roaming',
@@ -132,9 +134,101 @@ describe('Electron app mode service', () => {
     clearAppManagedPortableEnv(managedEnv)
     expect(managedEnv).toEqual({ APPDATA: 'C:\\Users\\someone\\AppData\\Roaming' })
 
+    const legacyOnlyEnv: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: customDir,
+      CC_HAHA_APP_PORTABLE_DIR: '1',
+      WEBVIEW2_USER_DATA_FOLDER: path.join(customDir, 'EBWebView'),
+      APPDATA: 'C:\\Users\\someone\\AppData\\Roaming',
+    }
+    clearAppManagedPortableEnv(legacyOnlyEnv)
+    expect(legacyOnlyEnv).toEqual({ APPDATA: 'C:\\Users\\someone\\AppData\\Roaming' })
+
+    const canonicalOnlyEnv: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '1',
+      WEBVIEW2_USER_DATA_FOLDER: path.join(customDir, 'EBWebView'),
+      APPDATA: 'C:\\Users\\someone\\AppData\\Roaming',
+    }
+    clearAppManagedPortableEnv(canonicalOnlyEnv)
+    expect(canonicalOnlyEnv).toEqual({ APPDATA: 'C:\\Users\\someone\\AppData\\Roaming' })
+
     const externalEnv: NodeJS.ProcessEnv = { CLAUDE_CONFIG_DIR: customDir }
     clearAppManagedPortableEnv(externalEnv)
     expect(externalEnv).toEqual({ CLAUDE_CONFIG_DIR: customDir })
+
+    // Canonical present but not '1' suppresses legacy managed marker — treat as external.
+    const suppressedEnv: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '0',
+      CC_HAHA_APP_PORTABLE_DIR: '1',
+      WEBVIEW2_USER_DATA_FOLDER: path.join(customDir, 'EBWebView'),
+    }
+    clearAppManagedPortableEnv(suppressedEnv)
+    expect(suppressedEnv).toEqual({
+      CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '0',
+      CC_HAHA_APP_PORTABLE_DIR: '1',
+      WEBVIEW2_USER_DATA_FOLDER: path.join(customDir, 'EBWebView'),
+    })
+  })
+
+  it('classifies managed markers with canonical-over-legacy priority', () => {
+    const fakeApp = app()
+    const customDir = path.join(fakeApp.root, 'custom-data')
+
+    const canonicalOnly: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '1',
+    }
+    expect(getAppMode(fakeApp, canonicalOnly)).toMatchObject({
+      mode: 'portable',
+      activeConfigDir: customDir,
+      configDirSource: 'portable',
+    })
+    expect(() => setAppMode(fakeApp, { mode: 'default', portableDir: null }, canonicalOnly))
+      .not.toThrow()
+
+    const legacyOnly: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: customDir,
+      CC_HAHA_APP_PORTABLE_DIR: '1',
+    }
+    expect(getAppMode(fakeApp, legacyOnly)).toMatchObject({
+      configDirSource: 'portable',
+    })
+    expect(() => setAppMode(fakeApp, { mode: 'default', portableDir: null }, legacyOnly))
+      .not.toThrow()
+
+    const emptyCanonicalSuppressesLegacy: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '',
+      CC_HAHA_APP_PORTABLE_DIR: '1',
+    }
+    expect(getAppMode(fakeApp, emptyCanonicalSuppressesLegacy)).toMatchObject({
+      configDirSource: 'environment',
+    })
+    expect(() => setAppMode(fakeApp, { mode: 'default', portableDir: null }, emptyCanonicalSuppressesLegacy))
+      .toThrow('CLAUDE_CONFIG_DIR is controlled by the launch environment')
+
+    const zeroCanonicalSuppressesLegacy: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '0',
+      CC_HAHA_APP_PORTABLE_DIR: '1',
+    }
+    expect(getAppMode(fakeApp, zeroCanonicalSuppressesLegacy)).toMatchObject({
+      configDirSource: 'environment',
+    })
+    expect(() => setAppMode(fakeApp, { mode: 'default', portableDir: null }, zeroCanonicalSuppressesLegacy))
+      .toThrow('CLAUDE_CONFIG_DIR is controlled by the launch environment')
+
+    // Conflict: both present; canonical '1' wins (managed), not environment.
+    const bothManaged: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '1',
+      CC_HAHA_APP_PORTABLE_DIR: '0',
+    }
+    expect(getAppMode(fakeApp, bothManaged)).toMatchObject({
+      configDirSource: 'portable',
+    })
   })
 
   it('drops inherited app-managed env so switching back to ~/.claude survives relaunch', () => {
@@ -143,12 +237,14 @@ describe('Electron app mode service', () => {
     const oldCustomDir = path.join(fakeApp.root, 'old-custom')
     const env: NodeJS.ProcessEnv = {
       CLAUDE_CONFIG_DIR: oldCustomDir,
+      CCMAX_APP_PORTABLE_DIR: '1',
       CC_HAHA_APP_PORTABLE_DIR: '1',
       WEBVIEW2_USER_DATA_FOLDER: path.join(oldCustomDir, 'EBWebView'),
     }
 
     expect(applyStartupPortableMode(fakeApp, env)).toBeNull()
     expect(env.CLAUDE_CONFIG_DIR).toBeUndefined()
+    expect(env.CCMAX_APP_PORTABLE_DIR).toBeUndefined()
     expect(env.CC_HAHA_APP_PORTABLE_DIR).toBeUndefined()
     expect(env.WEBVIEW2_USER_DATA_FOLDER).toBeUndefined()
     expect(getAppMode(fakeApp, env)).toMatchObject({
@@ -163,12 +259,32 @@ describe('Electron app mode service', () => {
     writeMode(fakeApp, { mode: 'portable', portable_dir: newCustomDir })
     const env: NodeJS.ProcessEnv = {
       CLAUDE_CONFIG_DIR: path.join(fakeApp.root, 'old-custom'),
+      CCMAX_APP_PORTABLE_DIR: '1',
       CC_HAHA_APP_PORTABLE_DIR: '1',
       WEBVIEW2_USER_DATA_FOLDER: path.join(fakeApp.root, 'old-custom', 'EBWebView'),
     }
 
     expect(applyStartupPortableMode(fakeApp, env)).toBe(newCustomDir)
     expect(env.CLAUDE_CONFIG_DIR).toBe(newCustomDir)
+    expect(env.CCMAX_APP_PORTABLE_DIR).toBe('1')
+    expect(env.CC_HAHA_APP_PORTABLE_DIR).toBe('1')
+    expect(env.WEBVIEW2_USER_DATA_FOLDER).toBe(path.join(newCustomDir, 'EBWebView'))
+  })
+
+  it('replaces a legacy-only inherited managed env with the newly persisted custom directory', () => {
+    const fakeApp = app()
+    const newCustomDir = path.join(fakeApp.root, 'new-custom')
+    writeMode(fakeApp, { mode: 'portable', portable_dir: newCustomDir })
+    const env: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: path.join(fakeApp.root, 'old-custom'),
+      CC_HAHA_APP_PORTABLE_DIR: '1',
+      WEBVIEW2_USER_DATA_FOLDER: path.join(fakeApp.root, 'old-custom', 'EBWebView'),
+    }
+
+    expect(applyStartupPortableMode(fakeApp, env)).toBe(newCustomDir)
+    expect(env.CLAUDE_CONFIG_DIR).toBe(newCustomDir)
+    expect(env.CCMAX_APP_PORTABLE_DIR).toBe('1')
+    expect(env.CC_HAHA_APP_PORTABLE_DIR).toBe('1')
     expect(env.WEBVIEW2_USER_DATA_FOLDER).toBe(path.join(newCustomDir, 'EBWebView'))
   })
 
@@ -197,6 +313,7 @@ describe('Electron app mode service', () => {
 
     setAppMode(fakeApp, { mode: 'portable', portableDir: customDir }, {
       CLAUDE_CONFIG_DIR: previousActive,
+      CCMAX_APP_PORTABLE_DIR: '1',
       CC_HAHA_APP_PORTABLE_DIR: '1',
     })
 
@@ -218,6 +335,7 @@ describe('Electron app mode service', () => {
 
     setAppMode(fakeApp, { mode: 'default', portableDir: null }, {
       CLAUDE_CONFIG_DIR: customDir,
+      CCMAX_APP_PORTABLE_DIR: '1',
       CC_HAHA_APP_PORTABLE_DIR: '1',
     })
 
@@ -266,6 +384,7 @@ describe('Electron app mode service', () => {
 
     expect(() => applyStartupPortableMode(fakeApp, env)).toThrow('mkdir failed')
     expect(env.CLAUDE_CONFIG_DIR).toBeUndefined()
+    expect(env.CCMAX_APP_PORTABLE_DIR).toBeUndefined()
     expect(env.CC_HAHA_APP_PORTABLE_DIR).toBeUndefined()
     expect(env.WEBVIEW2_USER_DATA_FOLDER).toBeUndefined()
   })

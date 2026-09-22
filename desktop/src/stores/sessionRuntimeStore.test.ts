@@ -71,7 +71,7 @@ describe('sessionRuntimeStore runtime cleanup', () => {
     expect(useSessionRuntimeStore.getState().selections['session-grok']).toEqual(
       EXPECTED_GROK_SELECTION,
     )
-    expect(JSON.parse(localStorage.getItem('cc-haha-session-runtime')!)).toEqual({
+    expect(JSON.parse(localStorage.getItem('ccmax-session-runtime')!)).toEqual({
       'session-grok': EXPECTED_GROK_SELECTION,
     })
   })
@@ -104,7 +104,7 @@ describe('sessionRuntimeStore runtime cleanup', () => {
     expect(loadedStore.getState().selections['session-loaded-grok']).toEqual(
       EXPECTED_GROK_SELECTION,
     )
-    expect(JSON.parse(localStorage.getItem('cc-haha-session-runtime')!)).toEqual({
+    expect(JSON.parse(localStorage.getItem('ccmax-session-runtime')!)).toEqual({
       'session-loaded-grok': EXPECTED_GROK_SELECTION,
     })
   })
@@ -129,8 +129,35 @@ describe('sessionRuntimeStore runtime cleanup', () => {
     expect(loadedStore.getState().selections['session-loaded-kimi']).toEqual(
       expectedSelection,
     )
+    // Unchanged load does not rewrite; legacy remains until the next normal write.
+    expect(localStorage.getItem('ccmax-session-runtime')).toBeNull()
     expect(JSON.parse(localStorage.getItem('cc-haha-session-runtime')!)).toEqual({
       'session-loaded-kimi': expectedSelection,
+    })
+
+    loadedStore.getState().setSelection('session-loaded-kimi', {
+      providerId: 'kimi-provider',
+      modelId: 'k3',
+      effortLevel: 'xhigh' as const,
+    })
+    expect(JSON.parse(localStorage.getItem('ccmax-session-runtime')!)).toEqual({
+      'session-loaded-kimi': expectedSelection,
+    })
+    expect(localStorage.getItem('cc-haha-session-runtime')).not.toBeNull()
+  })
+
+  it('prefers the canonical session-runtime key when legacy also exists', async () => {
+    localStorage.setItem('ccmax-session-runtime', JSON.stringify({
+      'session-canonical': { providerId: null, modelId: 'claude-sonnet' },
+    }))
+    localStorage.setItem('cc-haha-session-runtime', JSON.stringify({
+      'session-legacy': { providerId: null, modelId: 'legacy-model' },
+    }))
+    vi.resetModules()
+
+    const { useSessionRuntimeStore: loadedStore } = await import('./sessionRuntimeStore')
+    expect(loadedStore.getState().selections).toEqual({
+      'session-canonical': { providerId: null, modelId: 'claude-sonnet' },
     })
   })
 

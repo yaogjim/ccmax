@@ -6,6 +6,7 @@ import { dirname, join } from 'path'
 import { getClaudeConfigHomeDir, isEnvDefinedFalsy, isEnvTruthy } from '../../utils/envUtils.js'
 import {
   openTraceIndexDatabase,
+  getTraceIndexDatabasePath,
   type TraceIndexDatabase,
 } from '../../server/services/localIndex/traceDatabase.js'
 import {
@@ -340,7 +341,7 @@ function currentTraceScopeContext(): TraceScopeContext {
     scope,
     storageDir: join(scope, 'cc-haha', 'traces'),
     target: {
-      path: join(scope, 'cc-haha', 'db', 'trace-index-v1.sqlite'),
+      path: getTraceIndexDatabasePath(),
       scope,
     },
   }
@@ -2578,7 +2579,7 @@ async function appendTraceEntry(sessionId: string, entry: TraceFileEntry): Promi
   )
   const target: TraceIndexTarget = {
     scope,
-    path: join(scope, 'cc-haha', 'db', 'trace-index-v1.sqlite'),
+    path: getTraceIndexDatabasePath(),
   }
   const queueKey = `${scope}\0${normalizedSessionId}`
   const previous = traceWriteQueues.get(queueKey) ?? Promise.resolve()

@@ -40,29 +40,31 @@ describe('normalizeStoredLocale', () => {
 })
 
 describe('resolveRootRedirect', () => {
-  it('中文浏览器留在中文站', () => {
-    assert.equal(resolveRootRedirect({ languages: ['zh-CN'], pathname: '/' }), null)
+  it('中文浏览器留在 /ccmax 中文站', () => {
+    assert.equal(resolveRootRedirect({ languages: ['zh-CN'], pathname: '/ccmax' }), null)
+    assert.equal(resolveRootRedirect({ languages: ['zh-CN'], pathname: '/ccmax/' }), null)
   })
 
-  it('非中文浏览器跳英文站', () => {
-    assert.equal(resolveRootRedirect({ languages: ['en-US'], pathname: '/' }), '/en')
-    assert.equal(resolveRootRedirect({ languages: ['ja-JP'], pathname: '/' }), '/en')
+  it('非中文浏览器从 /ccmax/ 跳 /ccmax/en', () => {
+    assert.equal(resolveRootRedirect({ languages: ['en-US'], pathname: '/ccmax' }), '/ccmax/en')
+    assert.equal(resolveRootRedirect({ languages: ['en-US'], pathname: '/ccmax/' }), '/ccmax/en')
+    assert.equal(resolveRootRedirect({ languages: ['ja-JP'], pathname: '/ccmax/' }), '/ccmax/en')
   })
 
   it('拿不到浏览器语言时按英文兜底', () => {
-    assert.equal(resolveRootRedirect({ languages: [], pathname: '/' }), '/en')
-    assert.equal(resolveRootRedirect({ pathname: '/' }), '/en')
+    assert.equal(resolveRootRedirect({ languages: [], pathname: '/ccmax' }), '/ccmax/en')
+    assert.equal(resolveRootRedirect({ pathname: '/ccmax/' }), '/ccmax/en')
   })
 
-  it('根路径的尾斜杠和空串都算根', () => {
-    for (const pathname of ['/', '', '//']) {
-      assert.equal(resolveRootRedirect({ languages: ['en'], pathname }), '/en', JSON.stringify(pathname))
+  it('URL 根和其他仓库路径 fail-closed', () => {
+    for (const pathname of ['/', '', '//', '/other-repo', '/other-repo/docs']) {
+      assert.equal(resolveRootRedirect({ languages: ['en'], pathname }), null, JSON.stringify(pathname))
     }
   })
 
-  it('只动根路径，带前缀的地址一概不碰', () => {
+  it('只动站点根，带前缀的地址一概不碰', () => {
     // 这是整个功能的安全边界：英文用户点开中文文档不该被踢走，反之亦然。
-    const cases = ['/en', '/en/', '/start', '/en/start', '/desktop/pets', '/internals']
+    const cases = ['/en', '/en/', '/start', '/en/start', '/desktop/pets', '/internals', '/ccmax/en', '/ccmax/start']
     for (const pathname of cases) {
       assert.equal(resolveRootRedirect({ languages: ['en-US'], pathname }), null, pathname)
       assert.equal(resolveRootRedirect({ languages: ['zh-CN'], pathname }), null, pathname)
@@ -71,12 +73,12 @@ describe('resolveRootRedirect', () => {
 
   it('记住的偏好优先于浏览器语言', () => {
     // 中文浏览器手动切到英文后，回首页不该被弹回中文，否则切换器等于没用。
-    assert.equal(resolveRootRedirect({ languages: ['zh-CN'], pathname: '/', stored: 'en' }), '/en')
-    assert.equal(resolveRootRedirect({ languages: ['en-US'], pathname: '/', stored: 'zh' }), null)
+    assert.equal(resolveRootRedirect({ languages: ['zh-CN'], pathname: '/ccmax/', stored: 'en' }), '/ccmax/en')
+    assert.equal(resolveRootRedirect({ languages: ['en-US'], pathname: '/ccmax/', stored: 'zh' }), null)
   })
 
   it('偏好是脏值时退回浏览器语言', () => {
-    assert.equal(resolveRootRedirect({ languages: ['zh-CN'], pathname: '/', stored: 'garbage' }), null)
-    assert.equal(resolveRootRedirect({ languages: ['en-US'], pathname: '/', stored: '' }), '/en')
+    assert.equal(resolveRootRedirect({ languages: ['zh-CN'], pathname: '/ccmax/', stored: 'garbage' }), null)
+    assert.equal(resolveRootRedirect({ languages: ['en-US'], pathname: '/ccmax/', stored: '' }), '/ccmax/en')
   })
 })

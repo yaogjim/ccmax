@@ -3,11 +3,16 @@ import { sessionsApi } from '../api/sessions'
 import { ApiError } from '../api/client'
 import { dropSession as dropVirtualHeightSession } from '../components/chat/virtualHeightCache'
 import { destroyTerminalRuntime } from '../lib/terminalRuntime'
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  TAB_STORAGE_KEY,
+  readCanonicalFirst,
+  safeRemoveItem,
+  writeCanonical,
+} from '../lib/persistenceKeys'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
 import { teamMemberSessionId } from '../types/team'
 import type { SessionListItem } from '../types/session'
-
-const TAB_STORAGE_KEY = 'cc-haha-open-tabs'
 
 export const SETTINGS_TAB_ID = '__settings__'
 export const SCHEDULED_TAB_ID = '__scheduled__'
@@ -423,7 +428,7 @@ export const useTabStore = create<TabStore>((set, get) => ({
       activeTabId: persistedActiveTabId,
     }
     try {
-      localStorage.setItem(TAB_STORAGE_KEY, JSON.stringify(data))
+      writeCanonical(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.openTabs, JSON.stringify(data))
     } catch { /* noop */ }
   },
 
@@ -436,13 +441,13 @@ export const useTabStore = create<TabStore>((set, get) => ({
         return current.tabs === restoreStartedWith.tabs &&
           current.activeTabId === restoreStartedWith.activeTabId
       }
-      const raw = localStorage.getItem(TAB_STORAGE_KEY)
+      const raw = readCanonicalFirst(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.openTabs)
       if (!raw) return
 
       const data = JSON.parse(raw) as TabPersistence
       if (!data.openTabs || data.openTabs.length === 0) {
         set({ tabs: [], activeTabId: null })
-        localStorage.removeItem(TAB_STORAGE_KEY)
+        safeRemoveItem(globalThis.localStorage, TAB_STORAGE_KEY)
         return
       }
 
@@ -519,7 +524,7 @@ export const useTabStore = create<TabStore>((set, get) => ({
       const uniqueTabs = validTabs.filter((tab, index) => validTabs.findIndex(other => other.sessionId === tab.sessionId) === index)
       if (uniqueTabs.length === 0) {
         set({ tabs: [], activeTabId: null })
-        localStorage.removeItem(TAB_STORAGE_KEY)
+        safeRemoveItem(globalThis.localStorage, TAB_STORAGE_KEY)
         return
       }
 

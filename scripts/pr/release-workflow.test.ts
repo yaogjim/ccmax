@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parse } from 'yaml'
@@ -147,6 +147,10 @@ describe('release desktop workflow', () => {
     expect(collectStep).toContain('install-macos-unsigned.sh')
     expect(collectStep).toContain('[ "${{ matrix.smoke_platform }}" = "macos" ]')
     expect(collectStep).not.toContain('-type d -name "*.app"')
+    expect(collectStep).toContain('ci-ccmax-v${{ steps.version.outputs.version }}-${{ matrix.artifact_name }}')
+    expect(workflow).toContain('name: ccmax-v${{ steps.version.outputs.version }}-${{ matrix.artifact_name }}')
+    expect(workflow).not.toContain('Claude-Code-Haha')
+    expect(workflow).not.toContain('ci-Claude-Code-Haha')
   })
 
   test('desktop package includes Linux deb metadata required by electron-builder', () => {
@@ -165,10 +169,11 @@ describe('release desktop workflow', () => {
     }
 
     expect(desktopPackage.description).toBeTruthy()
-    expect(desktopPackage.homepage).toBe('https://github.com/NanmiCoder/cc-haha')
-    expect(desktopPackage.author?.name).toBe('NanmiCoder')
-    expect(desktopPackage.author?.email).toBe('relakkes@gmail.com')
-    expect(desktopPackage.build?.linux?.maintainer).toBe('NanmiCoder <relakkes@gmail.com>')
+    expect(desktopPackage.homepage).toBe('https://github.com/yaogjim/ccmax')
+    expect(desktopPackage.author?.name).toBe('ccmax contributors')
+    expect(desktopPackage.author).not.toHaveProperty('email')
+    expect(desktopPackage.build?.linux?.maintainer).toBe('ccmax contributors')
+    expect(existsSync('.github/FUNDING.yml')).toBe(false)
   })
 
   test('release workflow requires macOS Gatekeeper launch approval for signed builds', () => {
@@ -230,7 +235,7 @@ describe('release desktop workflow', () => {
     expect(signedBuildStep).toContain('xcrun stapler staple "$app_path"')
     expect(signedBuildStep).toContain('xcrun stapler validate "$app_path"')
     expect(signedBuildStep).toContain('spctl -a -vv -t execute "$app_path"')
-    expect(signedBuildStep).toContain('app_path="build-artifacts/electron/${{ matrix.app_bundle_dir }}/Claude Code Haha.app"')
+    expect(signedBuildStep).toContain('app_path="build-artifacts/electron/${{ matrix.app_bundle_dir }}/ccmax.app"')
     expect(signedBuildStep).toContain('package_args=( ${{ matrix.builder_args }} --prepackaged "$app_path" --publish never -c.mac.notarize=false )')
     expect(signedBuildStep).toContain('find build-artifacts/electron -maxdepth 1 -type f -delete')
     expect(signedBuildStep).toContain('Signed electron-builder timed out')
@@ -420,7 +425,7 @@ describe('release desktop workflow', () => {
     expect(workflow.indexOf('Verify Windows updater config before SignPath')).toBeLessThan(
       workflow.indexOf('Stage project-owned Windows application executables'),
     )
-    expect(stageApplicationStep).toContain('Claude Code Haha.exe')
+    expect(stageApplicationStep).toContain('ccmax.exe')
     expect(stageApplicationStep).toContain('claude-sidecar-${{ matrix.target_triple }}.exe')
     expect(stageApplicationStep).not.toContain('rg.exe')
     expect(stageApplicationStep).not.toContain('node-pty')
@@ -438,10 +443,10 @@ describe('release desktop workflow', () => {
     expect(restoreInstallerStep).toContain('A trusted production signature is required')
     expect(refreshMetadataStep).toContain('scripts/refresh-windows-update-metadata.ts')
     expect(refreshMetadataStep).toContain('desktop/build-artifacts/electron/latest.yml')
-    expect(applicationConfiguration).toContain('<pe-file path="Claude Code Haha.exe">')
+    expect(applicationConfiguration).toContain('<pe-file path="ccmax.exe">')
     expect(applicationConfiguration).toContain('<pe-file path="claude-sidecar-*.exe">')
     expect(applicationConfiguration).not.toContain('rg.exe')
-    expect(installerConfiguration).toContain('<pe-file path="Claude-Code-Haha-*-win-*.exe">')
+    expect(installerConfiguration).toContain('<pe-file path="ccmax-*-win-*.exe">')
     expect(workflow).not.toContain('WINDOWS_CERTIFICATE')
     expect(workflow).not.toContain('WINDOWS_CERTIFICATE_PASSWORD')
     expect(workflow.indexOf('Restore and verify signed Windows application executables')).toBeLessThan(workflow.indexOf('Package NSIS installer from signed Windows application'))
@@ -472,7 +477,7 @@ describe('release desktop workflow', () => {
     expect(buildJob).toContain('builder_args: --win nsis --arm64')
     expect(buildJob).toContain('builder_args: --linux AppImage deb rpm --x64')
     expect(buildJob).toContain('builder_args: --linux AppImage deb rpm --arm64')
-    expect(buildJob).toContain('Claude-Code-Haha-${APP_VERSION}-win-arm64.exe')
+    expect(buildJob).toContain('ccmax-${APP_VERSION}-win-arm64.exe')
     expect(buildJob).toContain('Upload release artifacts for final publish')
     expect(buildJob).toContain('actions/upload-artifact@v4')
     expect(buildJob).toContain('name: desktop-release-artifacts-${{ matrix.label }}')
@@ -549,27 +554,28 @@ describe('release desktop workflow', () => {
       }
     }
     const version = desktopPackage.version
-    expect(desktopPackage.build.artifactName).toBe('Claude-Code-Haha-${version}-${os}-${arch}.${ext}')
+    expect(desktopPackage.build.artifactName).toBe('ccmax-${version}-${os}-${arch}.${ext}')
+    expect(desktopPackage.build.artifactName).not.toContain('Claude-Code-Haha')
 
     const expectedReleaseAssets = [
-      `Claude-Code-Haha-${version}-mac-arm64.dmg`,
-      `Claude-Code-Haha-${version}-mac-arm64.dmg.blockmap`,
-      `Claude-Code-Haha-${version}-mac-arm64.zip`,
-      `Claude-Code-Haha-${version}-mac-arm64.zip.blockmap`,
-      `Claude-Code-Haha-${version}-mac-x64.dmg`,
-      `Claude-Code-Haha-${version}-mac-x64.dmg.blockmap`,
-      `Claude-Code-Haha-${version}-mac-x64.zip`,
-      `Claude-Code-Haha-${version}-mac-x64.zip.blockmap`,
-      `Claude-Code-Haha-${version}-linux-x86_64.AppImage`,
-      `Claude-Code-Haha-${version}-linux-amd64.deb`,
-      `Claude-Code-Haha-${version}-linux-x86_64.rpm`,
-      `Claude-Code-Haha-${version}-linux-arm64.AppImage`,
-      `Claude-Code-Haha-${version}-linux-arm64.deb`,
-      `Claude-Code-Haha-${version}-linux-aarch64.rpm`,
-      `Claude-Code-Haha-${version}-win-x64.exe`,
-      `Claude-Code-Haha-${version}-win-x64.exe.blockmap`,
-      `Claude-Code-Haha-${version}-win-arm64.exe`,
-      `Claude-Code-Haha-${version}-win-arm64.exe.blockmap`,
+      `ccmax-${version}-mac-arm64.dmg`,
+      `ccmax-${version}-mac-arm64.dmg.blockmap`,
+      `ccmax-${version}-mac-arm64.zip`,
+      `ccmax-${version}-mac-arm64.zip.blockmap`,
+      `ccmax-${version}-mac-x64.dmg`,
+      `ccmax-${version}-mac-x64.dmg.blockmap`,
+      `ccmax-${version}-mac-x64.zip`,
+      `ccmax-${version}-mac-x64.zip.blockmap`,
+      `ccmax-${version}-linux-x86_64.AppImage`,
+      `ccmax-${version}-linux-amd64.deb`,
+      `ccmax-${version}-linux-x86_64.rpm`,
+      `ccmax-${version}-linux-arm64.AppImage`,
+      `ccmax-${version}-linux-arm64.deb`,
+      `ccmax-${version}-linux-aarch64.rpm`,
+      `ccmax-${version}-win-x64.exe`,
+      `ccmax-${version}-win-x64.exe.blockmap`,
+      `ccmax-${version}-win-arm64.exe`,
+      `ccmax-${version}-win-arm64.exe.blockmap`,
     ]
     const namespacedMetadata = [
       'latest-mac-macOS-ARM64.yml',
@@ -614,26 +620,30 @@ describe('release desktop workflow', () => {
     const buildJob = extractJob(workflow, 'build')
     const publishJob = extractJob(workflow, 'publish-release')
     const expectedFiles = [
-      'Claude-Code-Haha-${APP_VERSION}-mac-arm64.dmg',
-      'Claude-Code-Haha-${APP_VERSION}-mac-arm64.zip',
-      'Claude-Code-Haha-${APP_VERSION}-mac-x64.dmg',
-      'Claude-Code-Haha-${APP_VERSION}-mac-x64.zip',
-      'Claude-Code-Haha-${APP_VERSION}-linux-x86_64.AppImage',
-      'Claude-Code-Haha-${APP_VERSION}-linux-amd64.deb',
-      'Claude-Code-Haha-${APP_VERSION}-linux-x86_64.rpm',
-      'Claude-Code-Haha-${APP_VERSION}-linux-arm64.AppImage',
-      'Claude-Code-Haha-${APP_VERSION}-linux-arm64.deb',
-      'Claude-Code-Haha-${APP_VERSION}-linux-aarch64.rpm',
-      'Claude-Code-Haha-${APP_VERSION}-win-x64.exe',
-      'Claude-Code-Haha-${APP_VERSION}-win-x64.exe.blockmap',
-      'Claude-Code-Haha-${APP_VERSION}-win-arm64.exe',
-      'Claude-Code-Haha-${APP_VERSION}-win-arm64.exe.blockmap',
+      'ccmax-${APP_VERSION}-mac-arm64.dmg',
+      'ccmax-${APP_VERSION}-mac-arm64.zip',
+      'ccmax-${APP_VERSION}-mac-x64.dmg',
+      'ccmax-${APP_VERSION}-mac-x64.zip',
+      'ccmax-${APP_VERSION}-linux-x86_64.AppImage',
+      'ccmax-${APP_VERSION}-linux-amd64.deb',
+      'ccmax-${APP_VERSION}-linux-x86_64.rpm',
+      'ccmax-${APP_VERSION}-linux-arm64.AppImage',
+      'ccmax-${APP_VERSION}-linux-arm64.deb',
+      'ccmax-${APP_VERSION}-linux-aarch64.rpm',
+      'ccmax-${APP_VERSION}-win-x64.exe',
+      'ccmax-${APP_VERSION}-win-x64.exe.blockmap',
+      'ccmax-${APP_VERSION}-win-arm64.exe',
+      'ccmax-${APP_VERSION}-win-arm64.exe.blockmap',
     ]
 
     for (const file of expectedFiles) {
       expect(buildJob).toContain(file)
       expect(publishJob).toContain(file)
     }
+    expect(buildJob).not.toContain('Claude-Code-Haha-')
+    expect(publishJob).not.toContain('Claude-Code-Haha-')
+    expect(publishJob).toContain('name: ccmax v${{ steps.version.outputs.value }}')
+    expect(publishJob).not.toContain('Claude Code Haha v')
     for (const metadata of ['latest-mac.yml', 'latest-linux.yml', 'latest-linux-arm64.yml', 'latest.yml']) {
       expect(publishJob).toContain(`artifacts/update-metadata-standard/$file`)
       expect(publishJob).toContain(metadata)
@@ -659,8 +669,8 @@ describe('release desktop workflow', () => {
     expect(desktopPackage.build.publish).toEqual([
       {
         provider: 'github',
-        owner: 'NanmiCoder',
-        repo: 'cc-haha',
+        owner: 'yaogjim',
+        repo: 'ccmax',
       },
     ])
     expect(desktopPackage.build.mac?.publish).toBeUndefined()
@@ -815,7 +825,7 @@ describe('release desktop workflow', () => {
     expect(recoveryHelper).toContain('robocopy.exe')
     expect(recoveryHelper).not.toMatch(/\/XC|\/XN|\/XO/)
     expect(recoveryHelper).toContain('Multiple distinct legacy data sources')
-    expect(recoveryHelper).toContain('Active CLAUDE_CONFIG_DIR is managed outside Claude Code Haha')
+    expect(recoveryHelper).toContain('Active CLAUDE_CONFIG_DIR is managed outside ccmax')
     expect(recoveryHelper).toContain('Test-LexicalPathAtOrBelow')
     expect(recoveryHelper).toContain('-SharedInstallDirs @($PerMachineInstallDir)')
     expect(normalizedRecoveryHelper).toContain("function Invoke-LegacyRecovery {\n  param(\n    [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$InstallDirs")
@@ -856,7 +866,7 @@ describe('release desktop workflow', () => {
     expect(installerSmoke).toContain('$Stage completed successfully.')
     expect(installerSmoke).toContain('Fresh install did not create the application executable')
     expect(installerSmoke).toContain('Reinstall removed the application executable')
-    expect(installerSmoke).toContain("'中文 安装目录\\Claude Code Haha'")
+    expect(installerSmoke).toContain("'中文 安装目录\\ccmax'")
     expect(installerSmoke).toContain('Invoke-InstalledApplicationSmoke')
     expect(installerSmoke).toContain('CC_HAHA_ELECTRON_WINDOW_SMOKE_LOG')
     expect(installerSmoke).toContain('desktop-server-state.json')
@@ -872,5 +882,28 @@ describe('release desktop workflow', () => {
     expect(compiledSidecarSmoke).toContain("'中文 安装目录'")
     expect(compiledSidecarSmoke).toContain("'中文 用户目录'")
     expect(compiledSidecarSmoke).toContain('copyFile(builtExecutable, executable)')
+  })
+
+  test('unsigned macOS installer finds current ccmax DMG artifacts while keeping dual quit', () => {
+    const installer = readFileSync('desktop/scripts/install-macos-unsigned.sh', 'utf8')
+
+    expect(installer).toContain('APP_NAME="ccmax.app"')
+    expect(installer).toContain('APP_PATH="/Applications/${APP_NAME}"')
+    expect(installer).toContain('Opening ccmax...')
+    expect(installer).toContain("${HOME}/.Trash/ccmax.$(date +%Y%m%d%H%M%S).app")
+    expect(installer).toContain('osascript -e \'quit app "ccmax"\' >/dev/null 2>&1 || true')
+    expect(installer).toContain('osascript -e \'quit app "Claude Code Haha"\' >/dev/null 2>&1 || true')
+    expect(installer.indexOf('quit app "ccmax"')).toBeLessThan(
+      installer.indexOf('quit app "Claude Code Haha"'),
+    )
+    expect(installer).toContain('ccmax-*-mac-*.dmg')
+    expect(installer).toContain(
+      'bash install-macos-unsigned.sh /path/to/ccmax-0.4.0-mac-arm64.dmg',
+    )
+    expect(installer).toContain('No ccmax macOS DMG found next to this script.')
+    expect(installer).not.toContain('Claude-Code-Haha-*-mac-*.dmg')
+    expect(installer).not.toContain('Claude-Code-Haha-0.4.0-mac-arm64.dmg')
+    expect(installer).not.toContain('No Claude Code Haha macOS DMG found next to this script.')
+    expect(installer).not.toContain('APP_NAME="Claude Code Haha.app"')
   })
 })

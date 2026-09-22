@@ -3,7 +3,12 @@ import path from 'node:path'
 export type SidecarMode = 'server' | 'cli' | 'adapters'
 
 const EXPLICIT_MODES = new Set<SidecarMode>(['server', 'cli', 'adapters'])
-const DESKTOP_CLI_NAMES = new Set(['claude-haha', 'claude-haha.exe'])
+const DESKTOP_CLI_NAMES = new Set([
+  'ccmax',
+  'ccmax.exe',
+  'claude-haha',
+  'claude-haha.exe',
+])
 
 export function resolveSidecarInvocation(
   rawArgs: string[],
@@ -23,7 +28,7 @@ export function resolveSidecarInvocation(
     }
   }
 
-  const execName = path.basename(execPath).toLowerCase()
+  const execName = path.basename(execPath.replace(/\\/g, '/')).toLowerCase()
   if (DESKTOP_CLI_NAMES.has(execName)) {
     return {
       mode: 'cli',

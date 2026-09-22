@@ -2,12 +2,16 @@ import { useState } from 'react'
 import { ShieldAlert, X } from 'lucide-react'
 import { useTranslation } from '../../i18n'
 import { IconButton } from '@/components/ui/IconButton'
-
-const STORAGE_KEY = 'cc-haha-market-disclaimer-dismissed'
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  readCanonicalFirst,
+  writeCanonical,
+} from '../../lib/persistenceKeys'
 
 function readDismissed(): boolean {
   try {
-    return typeof localStorage !== 'undefined' && localStorage.getItem(STORAGE_KEY) === '1'
+    return typeof localStorage !== 'undefined'
+      && readCanonicalFirst(localStorage, DESKTOP_PERSISTENCE_KEYS.marketDisclaimerDismissed) === '1'
   } catch {
     return false
   }
@@ -45,7 +49,7 @@ export function MarketDisclaimer() {
         onClick={() => {
           setDismissed(true)
           try {
-            localStorage.setItem(STORAGE_KEY, '1')
+            writeCanonical(localStorage, DESKTOP_PERSISTENCE_KEYS.marketDisclaimerDismissed, '1')
           } catch {
             // Persisting is best-effort; the banner stays dismissed for this session.
           }

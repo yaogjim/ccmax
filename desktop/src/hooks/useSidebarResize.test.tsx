@@ -101,7 +101,7 @@ describe('useSidebarResize', () => {
 
     expect(shellWidth()).toBe(360)
     expect(useUIStore.getState().sidebarWidth).toBe(360)
-    expect(localStorage.getItem('cc-haha-sidebar-width')).toBe('360')
+    expect(localStorage.getItem('ccmax-sidebar-width')).toBe('360')
   })
 
   it('clamps the width to the safe range instead of following the pointer past it', () => {

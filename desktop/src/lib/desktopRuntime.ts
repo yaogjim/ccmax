@@ -8,9 +8,31 @@ import {
 } from '../api/client'
 import { getDesktopHost } from './desktopHost'
 import { isPublicAccessRuntime } from './publicAccessRuntime'
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  H5_SERVER_URL_STORAGE_KEY,
+  H5_TOKEN_STORAGE_KEY,
+  LEGACY_H5_SERVER_URL_STORAGE_KEY,
+  LEGACY_H5_TOKEN_STORAGE_KEY,
+  readCanonicalFirst,
+  safeGetItem,
+  safeRemoveItem,
+  writeCanonical,
+} from './persistenceKeys'
 
-export const H5_SERVER_URL_STORAGE_KEY = 'cc-haha-h5-server-url'
-export const H5_TOKEN_STORAGE_KEY = 'cc-haha-h5-token'
+export {
+  H5_SERVER_URL_STORAGE_KEY,
+  H5_TOKEN_STORAGE_KEY,
+  LEGACY_H5_SERVER_URL_STORAGE_KEY,
+  LEGACY_H5_TOKEN_STORAGE_KEY,
+}
+
+/**
+ * After an invalid-token clear in this run, do not re-adopt a legacy token via
+ * fallback. Explicit clearStoredH5Connection resets this; a successful token
+ * write also resets it. Legacy keys themselves are left in place.
+ */
+let suppressH5TokenLegacyFallback = false
 
 type H5ConnectionFailureReason =
   | 'missing-token'
@@ -94,9 +116,15 @@ export function readStoredH5Connection(): StoredH5Connection {
   }
 
   try {
+    const serverUrl = normalizeServerUrl(
+      readCanonicalFirst(window.localStorage, DESKTOP_PERSISTENCE_KEYS.h5ServerUrl),
+    )
+    const rawToken = suppressH5TokenLegacyFallback
+      ? safeGetItem(window.localStorage, H5_TOKEN_STORAGE_KEY)
+      : readCanonicalFirst(window.localStorage, DESKTOP_PERSISTENCE_KEYS.h5Token)
     return {
-      serverUrl: normalizeServerUrl(window.localStorage.getItem(H5_SERVER_URL_STORAGE_KEY)),
-      token: normalizeToken(window.localStorage.getItem(H5_TOKEN_STORAGE_KEY)),
+      serverUrl,
+      token: normalizeToken(rawToken),
     }
   } catch {
     return { serverUrl: null, token: null }
@@ -106,13 +134,16 @@ export function readStoredH5Connection(): StoredH5Connection {
 export function clearStoredH5Connection() {
   if (typeof window !== 'undefined') {
     try {
-      window.localStorage.removeItem(H5_SERVER_URL_STORAGE_KEY)
-      window.localStorage.removeItem(H5_TOKEN_STORAGE_KEY)
+      safeRemoveItem(window.localStorage, H5_SERVER_URL_STORAGE_KEY)
+      safeRemoveItem(window.localStorage, LEGACY_H5_SERVER_URL_STORAGE_KEY)
+      safeRemoveItem(window.localStorage, H5_TOKEN_STORAGE_KEY)
+      safeRemoveItem(window.localStorage, LEGACY_H5_TOKEN_STORAGE_KEY)
     } catch {
       // Ignore storage failures
     }
   }
 
+  suppressH5TokenLegacyFallback = false
   setAuthToken(null)
 }
 
@@ -136,8 +167,17 @@ export async function saveAndVerifyH5Connection(serverUrl: string, token: string
     await waitForHealth(normalizedServerUrl)
     await verifyH5Access()
   } catch (error) {
-    forgetRejectedH5Token(error, normalizedServerUrl, normalizedToken)
-    throw normalizeBrowserH5Error(error, normalizedServerUrl)
+    const failure = normalizeBrowserH5Error(error, normalizedServerUrl)
+    // The token the user just supplied for this server was rejected, so the
+    // stale canonical token must not survive. The legacy key stays in place for
+    // compatibility but is not read again in this run. Any other failure (a
+    // dead host, disabled H5, CORS) only drops the in-memory credential.
+    if (failure.reason === 'invalid-token') {
+      clearStoredH5Token()
+    } else {
+      setAuthToken(null)
+    }
+    throw failure
   }
 
   rememberVerifiedH5Connection(normalizedServerUrl, normalizedToken)
@@ -473,7 +513,7 @@ function rememberStoredH5ServerUrl(serverUrl: string) {
   if (typeof window === 'undefined') return
 
   try {
-    window.localStorage.setItem(H5_SERVER_URL_STORAGE_KEY, serverUrl)
+    writeCanonical(window.localStorage, DESKTOP_PERSISTENCE_KEYS.h5ServerUrl, serverUrl)
   } catch {
     // Ignore storage failures.
   }
@@ -482,7 +522,11 @@ function rememberStoredH5ServerUrl(serverUrl: string) {
 function clearStoredH5Token() {
   if (typeof window !== 'undefined') {
     try {
-      window.localStorage.removeItem(H5_TOKEN_STORAGE_KEY)
+      // Invalid-token path: clear only the canonical token. Leave legacy in place
+      // for compatibility, but suppress same-run legacy fallback so an invalid
+      // token cannot be revived via readCanonicalFirst.
+      safeRemoveItem(window.localStorage, H5_TOKEN_STORAGE_KEY)
+      suppressH5TokenLegacyFallback = true
     } catch {
       // Ignore storage failures.
     }
@@ -510,6 +554,8 @@ function rememberVerifiedH5Connection(serverUrl: string, token: string) {
     if (readStoredH5Connection().serverUrl !== serverUrl) window.localStorage.removeItem(H5_TOKEN_STORAGE_KEY)
     window.localStorage.setItem(H5_SERVER_URL_STORAGE_KEY, serverUrl)
     window.localStorage.setItem(H5_TOKEN_STORAGE_KEY, token)
+    // A freshly verified token may be adopted again after an invalid-token clear.
+    suppressH5TokenLegacyFallback = false
   } catch {
     // Storage restrictions do not prevent the current authenticated connection.
   }

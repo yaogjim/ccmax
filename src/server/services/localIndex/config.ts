@@ -1,5 +1,5 @@
-import { join } from 'node:path'
-import { getCcHahaDir } from '../../../utils/envUtils.js'
+import { getClaudeConfigHomeDir } from '../../../utils/envUtils.js'
+import { resolveActiveManagedDatabasePath } from './managedDatabasePath.js'
 import type { LocalIndexMode } from './types.js'
 
 export const LOCAL_INDEX_INVALID_MODE = 'LOCAL_INDEX_INVALID_MODE' as const
@@ -27,5 +27,8 @@ export function resolveLocalIndexMode(
 }
 
 export function getLocalIndexDatabasePath(): string {
-  return join(getCcHahaDir(), 'db', 'index-v1.sqlite')
+  return resolveActiveManagedDatabasePath(
+    getClaudeConfigHomeDir(),
+    'index-v1.sqlite',
+  )
 }

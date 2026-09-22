@@ -8,6 +8,13 @@ vi.mock('../api/doctor', () => ({
   doctorApi: doctorApiMock,
 }))
 
+import {
+  APP_ZOOM_STORAGE_KEY,
+  DESKTOP_PERSISTENCE_VERSION_KEY,
+  LEGACY_APP_ZOOM_STORAGE_KEY,
+  LEGACY_THEME_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+} from './persistenceKeys'
 import { SAFE_DOCTOR_STORAGE_KEYS, runDoctorCheck, runLocalDoctorRepair } from './doctorRepair'
 
 describe('doctorRepair', () => {
@@ -15,7 +22,7 @@ describe('doctorRepair', () => {
     vi.clearAllMocks()
   })
 
-  it('clears only the safe desktop UI storage keys', () => {
+  it('clears only the safe desktop UI storage keys (canonical and legacy)', () => {
     window.localStorage.clear()
     for (const key of SAFE_DOCTOR_STORAGE_KEYS) {
       window.localStorage.setItem(key, `${key}-value`)
@@ -34,14 +41,22 @@ describe('doctorRepair', () => {
     expect(window.localStorage.getItem('cc-haha-provider-config')).toBe('preserve')
   })
 
-  it('resets the appearance completely, not just the applied theme', () => {
-    // The theme is three keys. Clearing only the applied one leaves the
-    // follow-the-system switch behind, so the reset would not restore the
-    // out-of-the-box appearance.
+  it('resets the appearance completely, including dark theme keys', () => {
+    // The theme is four keys. Clearing only the applied one leaves the
+    // follow-the-system switch and ground preferences behind, so the reset
+    // would not restore the out-of-the-box appearance.
     expect(SAFE_DOCTOR_STORAGE_KEYS).toEqual(expect.arrayContaining([
-      'cc-haha-theme',
+      THEME_STORAGE_KEY,
+      LEGACY_THEME_STORAGE_KEY,
+      'ccmax-follow-system-theme',
       'cc-haha-follow-system-theme',
+      'ccmax-light-theme',
       'cc-haha-light-theme',
+      'ccmax-dark-theme',
+      'cc-haha-dark-theme',
+      APP_ZOOM_STORAGE_KEY,
+      LEGACY_APP_ZOOM_STORAGE_KEY,
+      DESKTOP_PERSISTENCE_VERSION_KEY,
     ]))
   })
 
@@ -63,7 +78,8 @@ describe('doctorRepair', () => {
 
   it('checks the server report for the active cwd without clearing desktop state', async () => {
     window.localStorage.clear()
-    window.localStorage.setItem('cc-haha-theme', 'dark')
+    window.localStorage.setItem(THEME_STORAGE_KEY, 'dark')
+    window.localStorage.setItem(LEGACY_THEME_STORAGE_KEY, 'dark')
     doctorApiMock.report.mockResolvedValueOnce({
       report: {
         generatedAt: '2026-07-11T00:00:00.000Z',
@@ -77,6 +93,7 @@ describe('doctorRepair', () => {
 
     expect(doctorApiMock.report).toHaveBeenCalledWith('/workspace/project')
     expect(report.summary.total).toBe(0)
-    expect(window.localStorage.getItem('cc-haha-theme')).toBe('dark')
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe('dark')
+    expect(window.localStorage.getItem(LEGACY_THEME_STORAGE_KEY)).toBe('dark')
   })
 })

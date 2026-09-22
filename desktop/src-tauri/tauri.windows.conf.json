@@ -2,14 +2,15 @@
   "app": {
     "windows": [
       {
-        "title": "Claude Code Haha",
+        "title": "ccmax",
         "width": 1440,
         "height": 960,
         "minWidth": 960,
         "minHeight": 640,
         "decorations": false,
         "transparent": false,
-        "acceptFirstMouse": true
+        "acceptFirstMouse": true,
+        "create": false
       }
     ]
   }

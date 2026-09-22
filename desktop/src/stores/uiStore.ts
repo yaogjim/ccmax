@@ -23,9 +23,11 @@ import {
   subscribeSystemAppearance,
   subscribeThemeStorageChanges,
 } from '../theme/systemAppearance'
-
-const ACTIVE_SETTINGS_TAB_STORAGE_KEY = 'cc-haha-active-settings-tab'
-const SIDEBAR_WIDTH_STORAGE_KEY = 'cc-haha-sidebar-width'
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  readCanonicalFirst,
+  writeCanonical,
+} from '../lib/persistenceKeys'
 
 export const SIDEBAR_MIN_WIDTH = 240
 export const SIDEBAR_MAX_WIDTH = 480
@@ -37,7 +39,7 @@ export function clampSidebarWidth(width: number): number {
 
 function getStoredSidebarWidth(): number {
   try {
-    const stored = Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY))
+    const stored = Number(readCanonicalFirst(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarWidth))
     if (Number.isFinite(stored) && stored > 0) return clampSidebarWidth(stored)
   } catch { /* localStorage unavailable */ }
   return SIDEBAR_DEFAULT_WIDTH
@@ -85,6 +87,7 @@ type ThemePreferences = {
  * time the theme is persisted for any reason.
  */
 function persistThemeState({ theme, lightTheme, darkTheme, followSystem }: ThemePreferences): void {
+  // Normal writes only touch canonical keys — never mirror to legacy theme keys.
   persist(THEME_STORAGE_KEY, theme)
   persist(LIGHT_THEME_STORAGE_KEY, lightTheme)
   persist(DARK_THEME_STORAGE_KEY, darkTheme)
@@ -108,7 +111,7 @@ function isSettingsTab(value: unknown): value is SettingsTab {
 
 function getStoredSettingsTab(): SettingsTab {
   try {
-    const stored = localStorage.getItem(ACTIVE_SETTINGS_TAB_STORAGE_KEY)
+    const stored = readCanonicalFirst(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.activeSettingsTab)
     if (isSettingsTab(stored)) return stored
   } catch { /* localStorage unavailable */ }
   return 'providers'
@@ -363,12 +366,12 @@ export const useUIStore = create<UIStore>((set) => ({
   setSidebarOpen: (open) => set({ sidebarOpen: open }),
   setSidebarWidth: (width) => {
     const clamped = clampSidebarWidth(width)
-    persist(SIDEBAR_WIDTH_STORAGE_KEY, String(clamped))
+    writeCanonical(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarWidth, String(clamped))
     set({ sidebarWidth: clamped })
   },
   setActiveView: (view) => set({ activeView: view }),
   setActiveSettingsTab: (tab) => {
-    try { localStorage.setItem(ACTIVE_SETTINGS_TAB_STORAGE_KEY, tab) } catch { /* noop */ }
+    writeCanonical(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.activeSettingsTab, tab)
     set({ activeSettingsTab: tab })
   },
   setPendingSettingsTab: (tab) => set({ pendingSettingsTab: tab }),

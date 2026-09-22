@@ -45,6 +45,11 @@ import {
 import { getDesktopHost } from '../../lib/desktopHost'
 import { hasRunningBackgroundTasks } from '../../lib/backgroundTasks'
 import { getSessionWorkspaceState, getSessionSeedWorkDir } from '../../lib/sessionWorkspace'
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  readCanonicalFirst,
+  writeCanonical,
+} from '../../lib/persistenceKeys'
 
 const desktopHost = getDesktopHost()
 const isDesktopRuntime = desktopHost.isDesktop
@@ -52,11 +57,6 @@ const isWindows = typeof navigator !== 'undefined' && /Win/.test(navigator.platf
 const SESSION_LIST_AUTO_REFRESH_MS = 30_000
 const SESSION_LIST_BUILDING_REFRESH_MS = 1_500
 const SESSION_LIST_FOCUS_REFRESH_MIN_MS = 5_000
-const PROJECT_ORDER_STORAGE_KEY = 'cc-haha-sidebar-project-order'
-const PROJECT_PINNED_STORAGE_KEY = 'cc-haha-sidebar-pinned-projects'
-const PROJECT_HIDDEN_STORAGE_KEY = 'cc-haha-sidebar-hidden-projects'
-const PROJECT_ORGANIZATION_STORAGE_KEY = 'cc-haha-sidebar-project-organization'
-const PROJECT_SORT_STORAGE_KEY = 'cc-haha-sidebar-project-sort'
 const PROJECT_GROUP_VISIBLE_COUNT = 6
 
 type SidebarProjectOrganization = 'project' | 'recentProject' | 'time'
@@ -954,18 +954,29 @@ export function Sidebar({
               Collapsed, the mark is centered on the rail instead. */}
           <div className={`flex min-w-0 items-center ${expanded ? 'gap-2.5 pl-3' : 'justify-center'}`}>
             {!expanded ? <BrandSeal size="sm" /> : null}
-            {/* One form, at every width. The header used to carry "Claude Code
-                Haha" and swap to this below ~230px of title region, which meant
-                the app answered to two names depending on how the sidebar was
-                dragged. It goes by the short one. */}
+            {/* One form, at every width. The header used to carry a long product
+                name and swap to a short wordmark below ~230px of title region,
+                which meant the app answered to two names depending on how the
+                sidebar was dragged. It goes by the short one. */}
             <span
               className={`sidebar-copy ${expanded ? 'sidebar-copy--visible' : 'sidebar-copy--hidden'} text-base font-bold tracking-tight text-[var(--color-text-primary)]`}
               style={{ fontFamily: 'var(--font-headline)' }}
             >
-              cc-<span className="text-[var(--color-brand)]">haha</span>
+              cc<span className="text-[var(--color-brand)]">max</span>
             </span>
           </div>
           <div className={`flex items-center ${expanded ? 'gap-1.5' : 'flex-col gap-2'}`}>
+            <a
+              href="https://github.com/yaogjim/ccmax"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`sidebar-copy ${expanded ? 'sidebar-copy--visible' : 'sidebar-copy--hidden'} inline-flex items-center justify-center rounded-[var(--radius-sm)] p-1 text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]`}
+              title="GitHub"
+              tabIndex={expanded ? undefined : -1}
+              aria-hidden={!expanded}
+            >
+              <GitHubIcon />
+            </a>
             {/* 折叠态下整个会话列表都不渲染，露一个切不动视图的铃铛只会让人点空。
                 宽度夹到零、退出 tab 顺序，并且 `aria-hidden`——`sidebar-copy--hidden`
                 只是 `max-width:0; opacity:0`，元素仍留在无障碍树里，少了这一条读屏
@@ -2054,7 +2065,8 @@ function getProjectDropPosition(event: React.DragEvent<HTMLElement>): 'before' |
 function readStoredProjectOrder(): string[] {
   if (typeof localStorage === 'undefined') return []
   try {
-    const parsed = JSON.parse(localStorage.getItem(PROJECT_ORDER_STORAGE_KEY) ?? '[]')
+    const raw = readCanonicalFirst(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarProjectOrder) ?? '[]'
+    const parsed = JSON.parse(raw)
     return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : []
   } catch {
     return []
@@ -2064,7 +2076,7 @@ function readStoredProjectOrder(): string[] {
 function writeStoredProjectOrder(projectOrder: string[]): void {
   if (typeof localStorage === 'undefined') return
   try {
-    localStorage.setItem(PROJECT_ORDER_STORAGE_KEY, JSON.stringify(projectOrder))
+    writeCanonical(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarProjectOrder, JSON.stringify(projectOrder))
   } catch {
     // Sidebar ordering is a UI preference; ignore storage failures.
   }
@@ -2073,7 +2085,8 @@ function writeStoredProjectOrder(projectOrder: string[]): void {
 function readStoredProjectPins(): Set<string> {
   if (typeof localStorage === 'undefined') return new Set()
   try {
-    const parsed = JSON.parse(localStorage.getItem(PROJECT_PINNED_STORAGE_KEY) ?? '[]')
+    const raw = readCanonicalFirst(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarPinnedProjects) ?? '[]'
+    const parsed = JSON.parse(raw)
     return new Set(Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : [])
   } catch {
     return new Set()
@@ -2083,7 +2096,7 @@ function readStoredProjectPins(): Set<string> {
 function writeStoredProjectPins(projectKeys: Set<string>): void {
   if (typeof localStorage === 'undefined') return
   try {
-    localStorage.setItem(PROJECT_PINNED_STORAGE_KEY, JSON.stringify([...projectKeys]))
+    writeCanonical(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarPinnedProjects, JSON.stringify([...projectKeys]))
   } catch {
     // Sidebar pinning is a UI preference; ignore storage failures.
   }
@@ -2092,7 +2105,8 @@ function writeStoredProjectPins(projectKeys: Set<string>): void {
 function readStoredProjectHidden(): Set<string> {
   if (typeof localStorage === 'undefined') return new Set()
   try {
-    const parsed = JSON.parse(localStorage.getItem(PROJECT_HIDDEN_STORAGE_KEY) ?? '[]')
+    const raw = readCanonicalFirst(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarHiddenProjects) ?? '[]'
+    const parsed = JSON.parse(raw)
     return new Set(Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : [])
   } catch {
     return new Set()
@@ -2102,7 +2116,7 @@ function readStoredProjectHidden(): Set<string> {
 function writeStoredProjectHidden(projectKeys: Set<string>): void {
   if (typeof localStorage === 'undefined') return
   try {
-    localStorage.setItem(PROJECT_HIDDEN_STORAGE_KEY, JSON.stringify([...projectKeys]))
+    writeCanonical(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarHiddenProjects, JSON.stringify([...projectKeys]))
   } catch {
     // Hidden projects are a local UI preference; ignore storage failures.
   }
@@ -2110,13 +2124,15 @@ function writeStoredProjectHidden(projectKeys: Set<string>): void {
 
 function readStoredProjectOrganization(): SidebarProjectOrganization {
   if (typeof localStorage === 'undefined') return 'recentProject'
-  return normalizeProjectOrganization(localStorage.getItem(PROJECT_ORGANIZATION_STORAGE_KEY))
+  return normalizeProjectOrganization(
+    readCanonicalFirst(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarProjectOrganization),
+  )
 }
 
 function writeStoredProjectOrganization(organization: SidebarProjectOrganization): void {
   if (typeof localStorage === 'undefined') return
   try {
-    localStorage.setItem(PROJECT_ORGANIZATION_STORAGE_KEY, organization)
+    writeCanonical(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarProjectOrganization, organization)
   } catch {
     // Sidebar organization is a UI preference; ignore storage failures.
   }
@@ -2124,13 +2140,15 @@ function writeStoredProjectOrganization(organization: SidebarProjectOrganization
 
 function readStoredProjectSortBy(): SidebarProjectSortBy {
   if (typeof localStorage === 'undefined') return 'updatedAt'
-  return normalizeProjectSortBy(localStorage.getItem(PROJECT_SORT_STORAGE_KEY))
+  return normalizeProjectSortBy(
+    readCanonicalFirst(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarProjectSort),
+  )
 }
 
 function writeStoredProjectSortBy(sortBy: SidebarProjectSortBy): void {
   if (typeof localStorage === 'undefined') return
   try {
-    localStorage.setItem(PROJECT_SORT_STORAGE_KEY, sortBy)
+    writeCanonical(localStorage, DESKTOP_PERSISTENCE_KEYS.sidebarProjectSort, sortBy)
   } catch {
     // Sidebar sorting is a UI preference; ignore storage failures.
   }
@@ -2466,6 +2484,14 @@ function SearchIcon() {
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="11" cy="11" r="7" />
       <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    </svg>
+  )
+}
+
+function GitHubIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z" />
     </svg>
   )
 }

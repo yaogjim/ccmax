@@ -1,7 +1,14 @@
 import { getDesktopHost } from './desktopHost'
+import {
+  APP_ZOOM_STORAGE_KEY,
+  DESKTOP_PERSISTENCE_KEYS,
+  LEGACY_UI_ZOOM_STORAGE_KEY,
+  readAppZoomRaw,
+  writeCanonical,
+  type StorageLike,
+} from './persistenceKeys'
 
-export const APP_ZOOM_STORAGE_KEY = 'cc-haha-app-zoom'
-export const LEGACY_UI_ZOOM_STORAGE_KEY = 'cc-haha-ui-zoom'
+export { APP_ZOOM_STORAGE_KEY, LEGACY_UI_ZOOM_STORAGE_KEY }
 export const DEFAULT_APP_ZOOM = 1
 export const MIN_APP_ZOOM = 0.5
 export const MAX_APP_ZOOM = 2
@@ -10,7 +17,6 @@ export const APP_ZOOM_CONTROL_STEP = 0.01
 
 export type AppZoomAction = 'in' | 'out' | 'reset'
 
-type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
 type KeyboardShortcutInput = Pick<KeyboardEvent, 'altKey' | 'code' | 'ctrlKey' | 'key' | 'metaKey'>
 
 function getDefaultStorage(): StorageLike | null {
@@ -45,21 +51,15 @@ export function isValidStoredAppZoomLevel(value: string | null): boolean {
 export function readStoredAppZoomLevel(storage: StorageLike | null = getDefaultStorage()): number {
   if (!storage) return DEFAULT_APP_ZOOM
   try {
-    const stored = storage.getItem(APP_ZOOM_STORAGE_KEY)
-    if (stored !== null) return normalizeAppZoomLevel(stored)
-    return normalizeAppZoomLevel(storage.getItem(LEGACY_UI_ZOOM_STORAGE_KEY))
+    return normalizeAppZoomLevel(readAppZoomRaw(storage))
   } catch {
     return DEFAULT_APP_ZOOM
   }
 }
 
 function persistAppZoomLevel(level: number, storage: StorageLike | null = getDefaultStorage()) {
-  if (!storage) return
-  try {
-    storage.setItem(APP_ZOOM_STORAGE_KEY, String(level))
-  } catch {
-    // localStorage can be unavailable in hardened browser contexts.
-  }
+  // Normal writes only touch the canonical key — never mirror to legacy zoom keys.
+  writeCanonical(storage, DESKTOP_PERSISTENCE_KEYS.appZoom, String(level))
 }
 
 function setCssAppZoomMode(level: number, mode: 'css' | 'native') {

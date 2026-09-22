@@ -5,6 +5,8 @@ import process from 'node:process'
 import type { AppModeConfig, AppModeSetInput } from '../../src/lib/desktopHost/types'
 
 const APP_MODE_FILE = 'app-mode.json'
+const CANONICAL_APP_PORTABLE_DIR_MARKER = 'CCMAX_APP_PORTABLE_DIR'
+const LEGACY_APP_PORTABLE_DIR_MARKER = 'CC_HAHA_APP_PORTABLE_DIR'
 
 export type AppModeAppLike = {
   getPath(name: 'exe' | 'home' | 'userData'): string
@@ -89,8 +91,17 @@ function normalizedCustomDir(app: AppModeAppLike, value: string | null | undefin
   return normalized
 }
 
+// Canonical marker wins when the property exists (even empty/'0' suppresses
+// legacy). Legacy '1' is only a fallback when the canonical property is absent.
+function isAppManagedPortableEnv(env: NodeJS.ProcessEnv): boolean {
+  if (Object.hasOwn(env, CANONICAL_APP_PORTABLE_DIR_MARKER)) {
+    return env[CANONICAL_APP_PORTABLE_DIR_MARKER] === '1'
+  }
+  return env[LEGACY_APP_PORTABLE_DIR_MARKER] === '1'
+}
+
 function externallyControlled(env: NodeJS.ProcessEnv): boolean {
-  return Boolean(env.CLAUDE_CONFIG_DIR && env.CC_HAHA_APP_PORTABLE_DIR !== '1')
+  return Boolean(env.CLAUDE_CONFIG_DIR && !isAppManagedPortableEnv(env))
 }
 
 // The app-managed portable selection is process-local derived state; the
@@ -99,9 +110,10 @@ function externallyControlled(env: NodeJS.ProcessEnv): boolean {
 // spawned by quitAndInstall()), otherwise the child would trust a snapshot
 // that may no longer match the persisted mode (#1160).
 export function clearAppManagedPortableEnv(env: NodeJS.ProcessEnv = process.env): void {
-  if (env.CC_HAHA_APP_PORTABLE_DIR !== '1') return
+  if (!isAppManagedPortableEnv(env)) return
   delete env.CLAUDE_CONFIG_DIR
-  delete env.CC_HAHA_APP_PORTABLE_DIR
+  delete env[CANONICAL_APP_PORTABLE_DIR_MARKER]
+  delete env[LEGACY_APP_PORTABLE_DIR_MARKER]
   delete env.WEBVIEW2_USER_DATA_FOLDER
 }
 
@@ -138,7 +150,9 @@ export function applyStartupPortableMode(
   const webViewDataDir = path.join(customDir, 'EBWebView')
   fs.mkdirSync(webViewDataDir, { recursive: true })
   env.CLAUDE_CONFIG_DIR = customDir
-  env.CC_HAHA_APP_PORTABLE_DIR = '1'
+  env[CANONICAL_APP_PORTABLE_DIR_MARKER] = '1'
+  // Dual-write legacy so residual consumers that only know the old key still work.
+  env[LEGACY_APP_PORTABLE_DIR_MARKER] = '1'
   env.WEBVIEW2_USER_DATA_FOLDER = webViewDataDir
   return customDir
 }
@@ -157,7 +171,7 @@ export function getAppMode(
       mode: 'portable',
       portableDir: customDir,
       activeConfigDir: customDir,
-      configDirSource: envConfigDir && env.CC_HAHA_APP_PORTABLE_DIR !== '1'
+      configDirSource: envConfigDir && !isAppManagedPortableEnv(env)
         ? 'environment'
         : 'portable',
     }

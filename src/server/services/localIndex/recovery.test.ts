@@ -44,6 +44,7 @@ describe('local index recovery', () => {
       ['', 'database'],
       ['-wal', 'wal'],
       ['-shm', 'shm'],
+      ['-journal', 'journal'],
     ] as const) {
       await writeFile(`${databasePath}${suffix}`, contents)
     }
@@ -60,7 +61,30 @@ describe('local index recovery', () => {
     expect(await readFile(join(result.backupPath, 'index-v1.sqlite'), 'utf-8')).toBe('database')
     expect(await readFile(join(result.backupPath, 'index-v1.sqlite-wal'), 'utf-8')).toBe('wal')
     expect(await readFile(join(result.backupPath, 'index-v1.sqlite-shm'), 'utf-8')).toBe('shm')
+    expect(await readFile(join(result.backupPath, 'index-v1.sqlite-journal'), 'utf-8')).toBe('journal')
     expect(await readFile(sourcePath, 'utf-8')).toBe('canonical-source')
+  })
+
+  test('backs up under the active ccmax namespace when the primary database is in use', async () => {
+    const scope = await createTempDir()
+    const databasePath = join(scope, 'ccmax', 'db', 'index-v1.sqlite')
+    await mkdir(dirname(databasePath), { recursive: true })
+    await writeFile(databasePath, 'primary-database')
+    await writeFile(`${databasePath}-journal`, 'primary-journal')
+
+    const result = await backupLocalIndexDatabaseFamily({
+      scope,
+      databasePath,
+      reason: 'MANUAL_REBUILD',
+      now: () => Date.UTC(2026, 6, 16),
+    })
+
+    expect(relative(join(scope, 'ccmax', 'db', 'backups'), result.backupPath))
+      .not.toStartWith('..')
+    expect(await readFile(join(result.backupPath, 'index-v1.sqlite'), 'utf-8'))
+      .toBe('primary-database')
+    expect(await readFile(join(result.backupPath, 'index-v1.sqlite-journal'), 'utf-8'))
+      .toBe('primary-journal')
   })
 
   test('auto-recovers confirmed corruption but never busy, read-only, disk-full, or future schema', () => {

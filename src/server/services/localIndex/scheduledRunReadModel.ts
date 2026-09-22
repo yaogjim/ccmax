@@ -1,9 +1,9 @@
 import * as fs from 'node:fs/promises'
 import * as crypto from 'node:crypto'
 import type { Stats } from 'node:fs'
-import { join } from 'node:path'
 import { getClaudeConfigHomeDir } from '../../../utils/envUtils.js'
 import {
+  getScheduledRunIndexDatabasePath,
   openScheduledRunIndex,
   type ScheduledRunIndex,
   type ScheduledRunRecord,
@@ -74,7 +74,7 @@ export function captureScheduledRunReadModelTarget(
   return {
     scope,
     sourcePath,
-    databasePath: join(scope, 'cc-haha', 'db', 'scheduled-runs-v1.sqlite'),
+    databasePath: getScheduledRunIndexDatabasePath(),
   }
 }
 

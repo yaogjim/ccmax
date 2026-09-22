@@ -1,8 +1,11 @@
 /**
  * Provider Service — preset-based provider configuration
  *
- * Storage: ~/.claude/cc-haha/providers.json (lightweight index)
- * Active provider env vars written to ~/.claude/cc-haha/settings.json
+ * Storage: <fork-owned>/providers.json (lightweight index)
+ * Active provider env vars written to <fork-owned>/settings.json
+ * Fork-owned root follows resolveForkOwnedDir(): prefer ccmax when present,
+ * else legacy cc-haha, else default write target ccmax.
+ * Settings I/O is delegated to ManagedSettingsService (same root).
  * (isolated from the original Claude Code's ~/.claude/settings.json)
  */
 
@@ -14,6 +17,7 @@ import { buildOpenaiEndpoint } from '../proxy/openaiEndpoint.js'
 import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.js'
 import { readRecoverableJsonFile } from './recoverableJsonFile.js'
 import { ManagedSettingsService } from './managedSettingsService.js'
+import { resolveForkOwnedDir } from '../../utils/envUtils.js'
 import { anthropicToOpenaiChat } from '../proxy/transform/anthropicToOpenaiChat.js'
 import { anthropicToOpenaiResponses } from '../proxy/transform/anthropicToOpenaiResponses.js'
 import { resolveRequestCompatibility } from '../proxy/transform/requestCompatibility.js'
@@ -183,8 +187,9 @@ export class ProviderService {
     return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
   }
 
+  /** Fork-owned storage root; keeps the legacy method name as a wrapper. */
   private getCcHahaDir(): string {
-    return path.join(this.getConfigDir(), 'cc-haha')
+    return resolveForkOwnedDir()
   }
 
   private getIndexPath(): string {

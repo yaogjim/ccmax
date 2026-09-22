@@ -82,6 +82,10 @@ CLAUDE.md
 !CLAUDE.md
 
 .learnings/
+task/todo.md
+.cursor/
+.history/
+.specstory
 
 # Computer Use native helper build output (SwiftPM)
 native/cu-helper/.build/

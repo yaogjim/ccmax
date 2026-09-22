@@ -2,18 +2,12 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 
 import { generateDocsManifest, paths } from './generate-docs-manifest.mjs'
-
-const distDir = path.join(paths.siteDir, 'dist')
+import { SITE_BASE_PATH, toAbsoluteUrl } from '../src/lib/site.js'
 
 // GitHub Pages 项目站：上传的产物根会被映射到 /ccmax/，所以公开地址都挂在
 // https://yaogjim.github.io/ccmax/ 下，而物理产物仍然直接落在 dist/（不嵌套 ccmax）。
-const siteOrigin = 'https://yaogjim.github.io'
-const siteBasePath = '/ccmax/'
-
-/** 把站点内的逻辑 route（`/`、`/en`、`/start/install`）拼成公开绝对地址。 */
-function toAbsoluteUrl(route) {
-  return `${siteOrigin}${siteBasePath}${String(route).replace(/^\/+/, '')}`
-}
+// origin / base / 公开 URL 的组合一律来自 src/lib/site.js，不在本脚本里再写一份。
+const distDir = path.join(paths.siteDir, 'dist')
 
 async function pathExists(targetPath) {
   return fs.access(targetPath).then(() => true, () => false)
@@ -201,7 +195,7 @@ async function writeSitemap(records) {
 
   await fs.writeFile(
     path.join(distDir, 'robots.txt'),
-    `User-agent: *\nAllow: ${siteBasePath}\n\nSitemap: ${toAbsoluteUrl('/sitemap.xml')}\n`
+    `User-agent: *\nAllow: ${SITE_BASE_PATH}\n\nSitemap: ${toAbsoluteUrl('/sitemap.xml')}\n`
   )
 }
 

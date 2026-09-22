@@ -20,7 +20,7 @@ const MAX_PET_SIZE = 192
 const DEFAULT_PET_SIZE = 144
 const MAX_PET_SESSION_ID_LENGTH = 200
 const MAX_SKILL_MARKET_URL_LENGTH = 2_048
-const DEFAULT_PROFILE_SUBTITLE = 'github.com/NanmiCoder/cc-haha'
+const DEFAULT_PROFILE_SUBTITLE = 'github.com/yaogjim/ccmax'
 const DEFAULT_PET_ID = 'dada-code'
 
 const AVATAR_CONTENT_TYPES = {
@@ -96,7 +96,7 @@ const DEFAULT_SIDEBAR_PROJECT_PREFERENCES: SidebarProjectPreferences = {
 }
 
 const DEFAULT_PROFILE_PREFERENCES: DesktopProfilePreferences = {
-  displayName: 'cc-haha',
+  displayName: 'ccmax',
   subtitle: DEFAULT_PROFILE_SUBTITLE,
   avatarFile: null,
   avatarUpdatedAt: null,

@@ -7,8 +7,11 @@ import {
   GROK_OFFICIAL_PROVIDER_ID,
 } from '../constants/grokOfficialProvider'
 import { normalizeRuntimeSelection } from '../lib/runtimeSelection'
-
-const STORAGE_KEY = 'cc-haha-session-runtime'
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  readCanonicalFirst,
+  writeCanonical,
+} from '../lib/persistenceKeys'
 // Session-list metadata can lag behind runtime changes or arrive out of order.
 // Protect local choices until the server confirms them. Object identity also
 // lets callers discard list responses started before a choice/confirmation.
@@ -83,7 +86,7 @@ function normalizeSelections(
 function loadSelections(): Record<string, RuntimeSelection> {
   if (typeof localStorage === 'undefined') return {}
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = readCanonicalFirst(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.sessionRuntime)
     if (!raw) return {}
     const parsed = JSON.parse(raw) as Record<string, RuntimeSelection>
     if (!parsed || typeof parsed !== 'object') return {}
@@ -97,11 +100,11 @@ function loadSelections(): Record<string, RuntimeSelection> {
 
 function persistSelections(selections: Record<string, RuntimeSelection>) {
   if (typeof localStorage === 'undefined') return
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(selections))
-  } catch {
-    // noop
-  }
+  writeCanonical(
+    globalThis.localStorage,
+    DESKTOP_PERSISTENCE_KEYS.sessionRuntime,
+    JSON.stringify(selections),
+  )
 }
 
 export const useSessionRuntimeStore = create<SessionRuntimeStore>((set) => ({

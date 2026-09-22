@@ -108,6 +108,33 @@ describe('provider presets API', () => {
     expect(await response.json()).toEqual({ presets: PROVIDER_PRESETS })
   })
 
+  test('GET /api/providers/presets exposes ccmax promo copy while preserving referral urls', async () => {
+    const { req, url, segments } = makeRequest('GET', '/api/providers/presets')
+    const response = await handleProvidersApi(req, url, segments)
+    expect(response.status).toBe(200)
+
+    const body = await response.json() as {
+      presets: Array<{ id: string; promoText?: string; apiKeyUrl?: string }>
+    }
+    const byId = new Map(body.presets.map((preset) => [preset.id, preset]))
+
+    const expected = [
+      {
+        id: 'zhipuglm',
+        promoText: '智谱 GLM 为 ccmax 用户准备了专属邀请福利，使用此链接注册后可领取新用户权益。',
+        apiKeyUrl: 'https://www.bigmodel.cn/invite?icode=d41B2qi8Z5xNwTGLNPPF3OZLO2QH3C0EBTSr%2BArzMw4%3D',
+      },
+    ] as const
+
+    for (const item of expected) {
+      const preset = byId.get(item.id)
+      expect(preset?.promoText).toBe(item.promoText)
+      expect(preset?.promoText).toContain('ccmax')
+      expect(preset?.promoText).not.toContain('cc-haha')
+      expect(preset?.apiKeyUrl).toBe(item.apiKeyUrl)
+    }
+  })
+
   test('configured presets include built-in official and custom entries', () => {
     expect(PROVIDER_PRESETS.some((preset) => preset.id === 'official')).toBe(true)
     expect(PROVIDER_PRESETS.some((preset) => preset.id === 'custom')).toBe(true)
@@ -255,7 +282,7 @@ describe('provider presets API', () => {
     expect(deepseek?.modelContextWindows?.['deepseek-v4-pro']).toBe(1000000)
     expect(deepseek?.modelContextWindows?.['deepseek-v4-flash']).toBe(1000000)
     expect(zhipu?.apiKeyUrl).toBe('https://www.bigmodel.cn/invite?icode=d41B2qi8Z5xNwTGLNPPF3OZLO2QH3C0EBTSr%2BArzMw4%3D')
-    expect(zhipu?.promoText).toContain('cc-haha')
+    expect(zhipu?.promoText).toContain('ccmax')
     expect(zhipu?.defaultEnv?.CC_HAHA_SEND_DISABLED_THINKING).toBeUndefined()
     expect(zhipu?.modelContextWindows?.['glm-5.3']).toBe(1000000)
     expect(zhipu?.modelContextWindows?.['glm-5.3-flash']).toBe(1000000)
@@ -304,16 +331,16 @@ describe('provider presets API', () => {
     expect(custom?.defaultEnv).toBeUndefined()
   })
 
-  test('GET and PUT /api/providers/settings read and write cc-haha settings.json', async () => {
+  test('GET and PUT /api/providers/settings read and write ccmax settings.json', async () => {
     const initial = {
       env: {
         ANTHROPIC_MODEL: 'glm-5.1',
       },
       model: 'glm-5.1',
     }
-    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.mkdir(path.join(tmpDir, 'ccmax'), { recursive: true })
     await fs.writeFile(
-      path.join(tmpDir, 'cc-haha', 'settings.json'),
+      path.join(tmpDir, 'ccmax', 'settings.json'),
       JSON.stringify(initial, null, 2),
       'utf-8',
     )
@@ -333,7 +360,7 @@ describe('provider presets API', () => {
     const putRes = await handleProvidersApi(putReq.req, putReq.url, putReq.segments)
     expect(putRes.status).toBe(200)
 
-    const updatedRaw = await fs.readFile(path.join(tmpDir, 'cc-haha', 'settings.json'), 'utf-8')
+    const updatedRaw = await fs.readFile(path.join(tmpDir, 'ccmax', 'settings.json'), 'utf-8')
     expect(JSON.parse(updatedRaw)).toEqual(updateBody)
   })
 

@@ -324,7 +324,7 @@ describe('CronScheduler', () => {
     expect(logContent.runs[0].prompt).toBe('echo test')
     await expect(fs.stat(path.join(
       tmpDir,
-      'cc-haha',
+      'ccmax',
       'db',
       'scheduled-runs-v1.sqlite',
     ))).rejects.toMatchObject({ code: 'ENOENT' })
@@ -370,7 +370,7 @@ describe('CronScheduler', () => {
       await resetScheduledRunReadModelForTests()
       const scopeADatabasePath = path.join(
         scopeA,
-        'cc-haha',
+        'ccmax',
         'db',
         'scheduled-runs-v1.sqlite',
       )
@@ -412,7 +412,7 @@ describe('CronScheduler', () => {
 
     const scopeADatabasePath = path.join(
       scopeA,
-      'cc-haha',
+      'ccmax',
       'db',
       'scheduled-runs-v1.sqlite',
     )
@@ -426,7 +426,7 @@ describe('CronScheduler', () => {
     }
     await expect(fs.stat(path.join(
       scopeB,
-      'cc-haha',
+      'ccmax',
       'db',
       'scheduled-runs-v1.sqlite',
     ))).rejects.toMatchObject({ code: 'ENOENT' })

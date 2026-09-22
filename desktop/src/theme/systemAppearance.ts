@@ -28,15 +28,30 @@ import {
   type LightThemeMode,
   type ThemeMode,
 } from '../types/settings'
+import {
+  DARK_THEME_STORAGE_KEY,
+  DESKTOP_PERSISTENCE_KEYS,
+  FOLLOW_SYSTEM_THEME_STORAGE_KEY,
+  LEGACY_DARK_THEME_STORAGE_KEY,
+  LEGACY_FOLLOW_SYSTEM_THEME_STORAGE_KEY,
+  LEGACY_LIGHT_THEME_STORAGE_KEY,
+  LEGACY_THEME_STORAGE_KEY,
+  LIGHT_THEME_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+  readCanonicalFirst,
+  type StorageLike,
+} from '../lib/persistenceKeys'
 
 export type SystemAppearance = 'dark' | 'light'
 
 export const DARK_SCHEME_QUERY = '(prefers-color-scheme: dark)'
 
-export const THEME_STORAGE_KEY = 'cc-haha-theme'
-export const FOLLOW_SYSTEM_THEME_STORAGE_KEY = 'cc-haha-follow-system-theme'
-export const LIGHT_THEME_STORAGE_KEY = 'cc-haha-light-theme'
-export const DARK_THEME_STORAGE_KEY = 'cc-haha-dark-theme'
+export {
+  THEME_STORAGE_KEY,
+  FOLLOW_SYSTEM_THEME_STORAGE_KEY,
+  LIGHT_THEME_STORAGE_KEY,
+  DARK_THEME_STORAGE_KEY,
+}
 
 export const DEFAULT_THEME: ThemeMode = 'white'
 export const DEFAULT_LIGHT_THEME: LightThemeMode = 'white'
@@ -121,9 +136,13 @@ export function subscribeSystemAppearance(
 
 const THEME_KEYS: readonly string[] = [
   THEME_STORAGE_KEY,
+  LEGACY_THEME_STORAGE_KEY,
   FOLLOW_SYSTEM_THEME_STORAGE_KEY,
+  LEGACY_FOLLOW_SYSTEM_THEME_STORAGE_KEY,
   LIGHT_THEME_STORAGE_KEY,
+  LEGACY_LIGHT_THEME_STORAGE_KEY,
   DARK_THEME_STORAGE_KEY,
+  LEGACY_DARK_THEME_STORAGE_KEY,
 ]
 
 /**
@@ -149,9 +168,9 @@ export function subscribeThemeStorageChanges(onChange: () => void): () => void {
   return () => window.removeEventListener('storage', listener)
 }
 
-type StorageLike = Pick<Storage, 'getItem' | 'setItem'>
+type LocalStorageLike = StorageLike
 
-function getStorage(): StorageLike | null {
+function getStorage(): LocalStorageLike | null {
   try {
     return globalThis.localStorage ?? null
   } catch {
@@ -159,13 +178,13 @@ function getStorage(): StorageLike | null {
   }
 }
 
-export function readStoredTheme(storage: StorageLike | null = getStorage()): ThemeMode {
-  const stored = safeRead(storage, THEME_STORAGE_KEY)
+export function readStoredTheme(storage: LocalStorageLike | null = getStorage()): ThemeMode {
+  const stored = readCanonicalFirst(storage, DESKTOP_PERSISTENCE_KEYS.theme)
   return isThemeMode(stored) ? stored : DEFAULT_THEME
 }
 
-export function readStoredLightTheme(storage: StorageLike | null = getStorage()): LightThemeMode {
-  const stored = safeRead(storage, LIGHT_THEME_STORAGE_KEY)
+export function readStoredLightTheme(storage: LocalStorageLike | null = getStorage()): LightThemeMode {
+  const stored = readCanonicalFirst(storage, DESKTOP_PERSISTENCE_KEYS.lightTheme)
   if (isLightThemeMode(stored)) return stored
   // Not chosen yet: fall back to the manual theme when that one is a paper
   // ground, so someone already running celadon keeps it as their light half.
@@ -173,8 +192,8 @@ export function readStoredLightTheme(storage: StorageLike | null = getStorage())
   return isLightThemeMode(theme) ? theme : DEFAULT_LIGHT_THEME
 }
 
-export function readStoredDarkTheme(storage: StorageLike | null = getStorage()): DarkThemeMode {
-  const stored = safeRead(storage, DARK_THEME_STORAGE_KEY)
+export function readStoredDarkTheme(storage: LocalStorageLike | null = getStorage()): DarkThemeMode {
+  const stored = readCanonicalFirst(storage, DESKTOP_PERSISTENCE_KEYS.darkTheme)
   if (isDarkThemeMode(stored)) return stored
   const theme = readStoredTheme(storage)
   return isDarkTheme(theme) && isDarkThemeMode(theme) ? theme : DEFAULT_DARK_THEME
@@ -186,18 +205,9 @@ export function readStoredDarkTheme(storage: StorageLike | null = getStorage()):
  * the presence of a stored theme and keep their current fixed appearance, so
  * an update never silently repaints someone's app.
  */
-export function readStoredFollowSystemTheme(storage: StorageLike | null = getStorage()): boolean {
-  const stored = safeRead(storage, FOLLOW_SYSTEM_THEME_STORAGE_KEY)
+export function readStoredFollowSystemTheme(storage: LocalStorageLike | null = getStorage()): boolean {
+  const stored = readCanonicalFirst(storage, DESKTOP_PERSISTENCE_KEYS.followSystemTheme)
   if (stored === '1') return true
   if (stored === '0') return false
-  return safeRead(storage, THEME_STORAGE_KEY) === null
-}
-
-function safeRead(storage: StorageLike | null, key: string): string | null {
-  if (!storage) return null
-  try {
-    return storage.getItem(key)
-  } catch {
-    return null
-  }
+  return readCanonicalFirst(storage, DESKTOP_PERSISTENCE_KEYS.theme) === null
 }

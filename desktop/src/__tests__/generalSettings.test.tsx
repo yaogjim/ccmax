@@ -1476,7 +1476,7 @@ describe('Settings > General tab', () => {
       expect(desktopNotificationsMock.requestDesktopNotificationPermission).toHaveBeenCalledTimes(1)
     })
     expect(desktopNotificationsMock.notifyDesktop).toHaveBeenCalledWith({
-      title: 'Claude Code Haha notifications are enabled',
+      title: 'ccmax notifications are enabled',
       body: 'Permission prompts and completed agent replies will now use system notifications.',
     })
   })

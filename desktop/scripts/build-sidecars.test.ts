@@ -19,9 +19,9 @@ function readBuildScript() {
   return readFileSync(path.resolve(import.meta.dirname, 'build-sidecars.ts'), 'utf8')
 }
 
-function readCliLauncher() {
+function readDevelopmentCliLauncher() {
   return readFileSync(
-    path.resolve(import.meta.dirname, '../../bin/claude-haha'),
+    path.resolve(import.meta.dirname, '../../bin/ccmax'),
     'utf8',
   )
 }
@@ -367,11 +367,15 @@ describe('build-sidecars Windows x64 target mapping', () => {
   })
 
   it('compiles the sidecar with the transcript classifier feature', () => {
-    expect(readBuildScript()).toContain("features: ['TRANSCRIPT_CLASSIFIER']")
+    expect(readBuildScript()).toContain(
+      "features: ['TRANSCRIPT_CLASSIFIER', 'LODESTONE']",
+    )
   })
 
-  it('starts the development CLI with the transcript classifier feature', () => {
-    expect(readCliLauncher()).toContain('--feature=TRANSCRIPT_CLASSIFIER')
+  it('starts the physical development CLI with the transcript classifier feature', () => {
+    const launcher = readDevelopmentCliLauncher()
+    expect(launcher).toContain('--feature=TRANSCRIPT_CLASSIFIER')
+    expect(launcher).toContain('--feature=LODESTONE')
   })
 
   it('wires the opt-in compiled sidecar smoke into the native gate', () => {
@@ -582,7 +586,7 @@ describe.skipIf(!compiledSidecarSmokeEnabled)('compiled sidecar local-index smok
     const authenticationProofs: CompiledSidecarAuthProof[] = []
     const databasePath = joinPath(
       configDir,
-      'cc-haha',
+      'ccmax',
       'db',
       'index-v1.sqlite',
     )

@@ -1,6 +1,13 @@
 import { create } from 'zustand'
 import { getDesktopHost } from '../lib/desktopHost'
 import type { DesktopHost, DesktopUpdate } from '../lib/desktopHost'
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  DISMISSED_UPDATE_VERSION_STORAGE_KEY,
+  readCanonicalFirst,
+  safeRemoveItem,
+  writeCanonical,
+} from '../lib/persistenceKeys'
 import type { UpdateProxySettings } from '../types/settings'
 import { useSettingsStore } from './settingsStore'
 
@@ -20,7 +27,6 @@ type CheckOptions = {
   autoDownload?: boolean
 }
 
-const DISMISSED_UPDATE_VERSION_KEY = 'cc-haha-dismissed-update-version'
 const RELAUNCH_WATCHDOG_MS = 15_000
 
 type UpdateStore = {
@@ -76,7 +82,7 @@ function readDismissedUpdateVersion(): string | null {
   if (typeof window === 'undefined') return null
 
   try {
-    return window.localStorage.getItem(DISMISSED_UPDATE_VERSION_KEY)
+    return readCanonicalFirst(window.localStorage, DESKTOP_PERSISTENCE_KEYS.dismissedUpdateVersion)
   } catch {
     return null
   }
@@ -87,9 +93,9 @@ function writeDismissedUpdateVersion(version: string | null) {
 
   try {
     if (version) {
-      window.localStorage.setItem(DISMISSED_UPDATE_VERSION_KEY, version)
+      writeCanonical(window.localStorage, DESKTOP_PERSISTENCE_KEYS.dismissedUpdateVersion, version)
     } else {
-      window.localStorage.removeItem(DISMISSED_UPDATE_VERSION_KEY)
+      safeRemoveItem(window.localStorage, DISMISSED_UPDATE_VERSION_STORAGE_KEY)
     }
   } catch {
     // Ignore storage write failures.

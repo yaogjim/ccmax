@@ -5,27 +5,21 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    // Determine if we should start in portable mode and set CLAUDE_CONFIG_DIR
-    // before any Tauri/WebView2 initialization.
-    //
-    // Mode resolution order:
-    //   1. External CLAUDE_CONFIG_DIR env var (batch script etc.) — always respected
-    //   2. Persisted app-mode.json saying "portable"
-    //   3. Auto-detect: default portable dir already has data files
-    //
-    // In "default" mode the app does NOT set CLAUDE_CONFIG_DIR itself.
-    // It relies on the env var (if set externally) or falls back to system dirs.
-    // All existing std::env::var("CLAUDE_CONFIG_DIR") checks in lib.rs handle this.
+    // 1) Always prepare app-config identity before any Tauri/WebView2 init.
+    // Active path is published to CCMAX_TAURI_APP_CONFIG_DIR for lib consumers.
+    let prepared = ccmax_lib::app_identity::prepare_and_publish_active_app_config();
 
-    if let Some(portable_dir) = determine_startup_portable_dir() {
+    // 2) Portable Claude config: external CLAUDE_CONFIG_DIR still highest.
+    // Otherwise resolve portable mode from local / primary / active|legacy / auto-detect.
+    if let Some(portable_dir) = determine_startup_portable_dir(prepared.as_ref()) {
         std::env::set_var(
             "CLAUDE_CONFIG_DIR",
             portable_dir.to_string_lossy().to_string(),
         );
-        std::env::set_var("CC_HAHA_APP_PORTABLE_DIR", "1");
+        ccmax_lib::app_identity::mark_portable_dir_env();
     }
 
-    // If CLAUDE_CONFIG_DIR is set (either from env or from our startup logic above),
+    // If CLAUDE_CONFIG_DIR is set (external or our startup logic),
     // redirect WebView2 user data folder so EBWebView cache lives alongside it.
     if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         let webview_data = PathBuf::from(&config_dir).join("EBWebView");
@@ -35,106 +29,122 @@ fn main() {
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_data);
     }
 
-    claude_code_desktop_lib::run()
+    // 3) WebView profile policy after portable / WebView2 override, before run().
+    // Publishes CCMAX_TAURI_WEBVIEW_DATA_DIR for later main/preview builders.
+    let _ = ccmax_lib::webview_identity::prepare_and_publish_active_webview_profile();
+
+    ccmax_lib::run()
 }
 
 /// Determine if we should start in portable mode.
 /// Returns the portable config directory path if yes, None for default mode.
-fn determine_startup_portable_dir() -> Option<PathBuf> {
-    // 1. 如果外部已经设置了 CLAUDE_CONFIG_DIR 环境变量，我们不应该覆盖它，直接返回 None 让 main 保持原样
-    if std::env::var("CLAUDE_CONFIG_DIR").is_ok() {
-        return None;
-    }
+fn determine_startup_portable_dir(
+    prepared: Option<&ccmax_lib::app_identity::PrepareAppConfigProfileResult>,
+) -> Option<PathBuf> {
+    use ccmax_lib::app_identity::{
+        determine_portable_dir_from_sources, resolve_system_config_base_runtime,
+        system_app_mode_lookup_dirs,
+    };
 
+    let external_set = std::env::var("CLAUDE_CONFIG_DIR").is_ok();
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
     let mut default_portable = exe_dir.to_path_buf();
     default_portable.push("CLAUDE_CONFIG_DIR");
 
-    // 辅助函数：读取 app-mode.json 获取模式和自定义便携路径
-    fn get_mode_from_config(dir: &std::path::Path) -> Option<(String, Option<PathBuf>)> {
-        let path = dir.join("app-mode.json");
-        let data = std::fs::read_to_string(&path).ok()?;
-        let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
-        let mode = parsed
-            .get("mode")
-            .and_then(|m| m.as_str())
-            .unwrap_or("default")
-            .to_ascii_lowercase();
-        let portable_dir = parsed
-            .get("portable_dir")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from);
-        Some((mode, portable_dir))
-    }
-
-    // 2. 优先检查便携目录本地的配置文件（保证移动便携版到新电脑依然生效，并能正确处理切回默认模式）
-    if let Some((mode, portable_dir)) = get_mode_from_config(&default_portable) {
-        if mode == "portable" {
-            if dir_has_portable_data(&default_portable) {
-                return Some(default_portable.clone());
-            }
-            return Some(portable_dir.unwrap_or(default_portable.clone()));
-        } else {
-            return None; // 明确设置了 default，直接使用系统默认
+    let system_dirs = match resolve_system_config_base_runtime() {
+        Some(base) => {
+            let active = prepared.map(|p| p.active_path.as_path());
+            system_app_mode_lookup_dirs(&base, active)
         }
+        None => Vec::new(),
+    };
+
+    determine_portable_dir_from_sources(&default_portable, &system_dirs, external_set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ccmax_lib::app_identity::{
+        determine_portable_dir_from_sources, dir_has_portable_data,
+        resolve_app_config_profile_paths, resolve_system_config_base, system_app_mode_lookup_dirs,
+        SystemOs, LEGACY_APP_IDENTIFIER, PRIMARY_APP_IDENTIFIER,
+    };
+    use std::fs;
+    use std::path::Path;
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "ccmax-tauri-main-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 
-    // 3. 检查系统全局配置
-    #[cfg(target_os = "windows")]
-    let system_config: Option<PathBuf> = std::env::var("APPDATA").ok().map(PathBuf::from);
-    #[cfg(target_os = "macos")]
-    let system_config: Option<PathBuf> = std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join("Library").join("Application Support"));
-    #[cfg(target_os = "linux")]
-    let system_config: Option<PathBuf> = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".config"))
-        });
-
-    if let Some(ref sys_cfg) = system_config {
-        // 修复：必须使用 Tauri 默认的 bundle identifier
-        let app_subdir = sys_cfg.join("com.claude-code-haha.desktop");
-        if let Some((mode, portable_dir)) = get_mode_from_config(&app_subdir) {
-            if mode == "portable" {
-                return Some(portable_dir.unwrap_or(default_portable.clone()));
-            } else {
-                return None; // 明确设置了 default
-            }
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
         }
+        fs::write(path, contents).unwrap();
     }
 
-    // 4. 自动检测：如果默认便携目录中已经存在数据文件，则自动进入便携模式
-    fn dir_has_portable_data(dir: &std::path::Path) -> bool {
-        if !dir.is_dir() {
-            return false;
-        }
-        [
-            "settings.json",
-            ".claude.json",
-            ".mcp.json",
-            "window-state.json",
-            "terminal-config.json",
-        ]
-            .iter()
-            .any(|f| dir.join(f).is_file())
-            || dir.join("Cache").is_dir()
-            || dir.join("EBWebView").is_dir()
-            || dir.join("projects").is_dir()
-            || dir.join("skills").is_dir()
-            || dir.join("plugins").is_dir()
-            || dir.join("cowork_plugins").is_dir()
-            || dir.join("cc-haha").is_dir()
+    #[test]
+    fn app_mode_lookup_primary_before_legacy_deduped() {
+        let root = temp_root("lookup");
+        let paths = resolve_app_config_profile_paths(&root);
+        let dirs = system_app_mode_lookup_dirs(&root, Some(&paths.primary_path));
+        assert_eq!(dirs[0], paths.primary_path);
+        assert!(dirs.iter().any(|d| d == &paths.legacy_path));
+        // primary appears once even when also passed as prepared active
+        assert_eq!(dirs.iter().filter(|d| *d == &paths.primary_path).count(), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 
-    if dir_has_portable_data(&default_portable) {
-        return Some(default_portable);
+    #[test]
+    fn portable_auto_detect_ccmax_namespace() {
+        let root = temp_root("auto-ccmax");
+        let portable = root.join("CLAUDE_CONFIG_DIR");
+        fs::create_dir_all(portable.join("ccmax")).unwrap();
+        assert!(dir_has_portable_data(&portable));
+        let resolved = determine_portable_dir_from_sources(&portable, &[], false);
+        assert_eq!(resolved, Some(portable));
+        let _ = fs::remove_dir_all(&root);
     }
 
-    None
+    #[test]
+    fn system_base_identifiers_match_spec() {
+        assert_eq!(LEGACY_APP_IDENTIFIER, "com.claude-code-haha.desktop");
+        assert_eq!(PRIMARY_APP_IDENTIFIER, "com.ccmax.desktop");
+        let base =
+            resolve_system_config_base(SystemOs::Windows, Some("C:/AppData"), None, None).unwrap();
+        let paths = resolve_app_config_profile_paths(base);
+        assert!(paths.legacy_path.ends_with("com.claude-code-haha.desktop"));
+        assert!(paths.primary_path.ends_with("com.ccmax.desktop"));
+    }
+
+    #[test]
+    fn local_portable_mode_wins_over_system() {
+        let root = temp_root("local-wins");
+        let portable = root.join("CLAUDE_CONFIG_DIR");
+        let primary = root.join(PRIMARY_APP_IDENTIFIER);
+        fs::create_dir_all(&portable).unwrap();
+        fs::create_dir_all(&primary).unwrap();
+        write_file(&portable.join("app-mode.json"), r#"{"mode":"portable"}"#);
+        write_file(
+            &primary.join("app-mode.json"),
+            r#"{"mode":"portable","portable_dir":"/system-should-not-win"}"#,
+        );
+        // Local portable without data uses default portable path (not system custom).
+        let resolved = determine_portable_dir_from_sources(&portable, &[primary], false);
+        assert_eq!(resolved, Some(portable));
+        let _ = fs::remove_dir_all(&root);
+    }
 }

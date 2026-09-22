@@ -1,18 +1,33 @@
 [CmdletBinding()]
 param(
+  [string]$PrimaryPerUserInstallDir = '',
+  [string]$PrimaryPerMachineInstallDir = '',
+  [string]$LegacyPerUserInstallDir = '',
+  [string]$LegacyPerMachineInstallDir = '',
   [string]$PerUserInstallDir = '',
   [string]$PerMachineInstallDir = '',
   [string]$CandidateInstallDir = '',
+  [string]$PrimaryUserDataDir = '',
+  [string]$LegacyUserDataDir = '',
   [string]$UserDataDir = '',
   [string]$RecoveryRoot = '',
-  [string]$ProcessName = 'Claude Code Haha.exe',
+  [string]$ProcessName = 'ccmax.exe',
+  [string]$ProcessNames = '',
   [string]$ActiveConfigDir = $env:CLAUDE_CONFIG_DIR,
-  [string]$ActiveConfigManaged = $env:CC_HAHA_APP_PORTABLE_DIR,
+  [string]$ActiveConfigManaged = '',
   [ValidateSet('trusted-user', 'trusted-uac-outer', 'untrusted-elevated')]
   [string]$InstallerIdentitySafety = 'trusted-user',
   [switch]$SkipProcessCheck,
   [switch]$SelfTest
 )
+
+if ([string]::IsNullOrWhiteSpace($ActiveConfigManaged)) {
+  if (-not [string]::IsNullOrWhiteSpace([string]$env:CCMAX_APP_PORTABLE_DIR)) {
+    $ActiveConfigManaged = [string]$env:CCMAX_APP_PORTABLE_DIR
+  } else {
+    $ActiveConfigManaged = [string]$env:CC_HAHA_APP_PORTABLE_DIR
+  }
+}
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -259,12 +274,46 @@ function Test-LegacyPortableData {
       return $true
     }
   }
-  foreach ($childDir in @('Cache', 'EBWebView', 'projects', 'skills', 'plugins', 'cowork_plugins', 'cc-haha')) {
+  foreach ($childDir in @('Cache', 'EBWebView', 'projects', 'skills', 'plugins', 'cowork_plugins', 'ccmax', 'cc-haha')) {
     if (Test-Path -LiteralPath (Join-Path $Dir $childDir) -PathType Container) {
       return $true
     }
   }
   return $false
+}
+
+function Get-NormalizedNameList {
+  param([AllowEmptyString()][string[]]$Values)
+
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+  $result = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($value in $Values) {
+    if ([string]::IsNullOrWhiteSpace($value)) {
+      continue
+    }
+    foreach ($part in ([string]$value).Split(@(';', ','), [StringSplitOptions]::RemoveEmptyEntries)) {
+      $trimmed = $part.Trim()
+      if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        continue
+      }
+      if ($seen.Add($trimmed)) {
+        $result.Add($trimmed)
+      }
+    }
+  }
+  return $result.ToArray()
+}
+
+function Test-ProfileHasUserState {
+  param([Parameter(Mandatory = $true)][string]$ConfigDir)
+
+  if (-not (Test-Path -LiteralPath $ConfigDir -PathType Container)) {
+    return $false
+  }
+  if (Test-Path -LiteralPath (Join-Path $ConfigDir 'app-mode.json') -PathType Leaf) {
+    return $true
+  }
+  return (Test-LegacyPortableData -Dir $ConfigDir)
 }
 
 function Resolve-LegacyConfiguredPath {
@@ -279,11 +328,8 @@ function Resolve-LegacyConfiguredPath {
   return [IO.Path]::GetFullPath($Value)
 }
 
-function Get-LegacyActiveSource {
-  param(
-    [Parameter(Mandatory = $true)][string]$InstallDir,
-    $SystemMode
-  )
+function Get-InstallLocalLegacySource {
+  param([Parameter(Mandatory = $true)][string]$InstallDir)
 
   $legacyDir = Join-Path $InstallDir 'CLAUDE_CONFIG_DIR'
   $legacyMode = Read-AppMode -ConfigDir $legacyDir
@@ -299,21 +345,43 @@ function Get-LegacyActiveSource {
     }
     return Resolve-LegacyConfiguredPath -Value $legacyMode.PortableDir -Source (Join-Path $legacyDir 'app-mode.json')
   }
-
-  if ($null -ne $SystemMode) {
-    if ($SystemMode.Mode -ne 'portable') {
-      return $null
-    }
-    if ([string]::IsNullOrWhiteSpace([string]$SystemMode.PortableDir)) {
-      return $legacyDir
-    }
-    return Resolve-LegacyConfiguredPath -Value $SystemMode.PortableDir -Source 'system app-mode.json'
-  }
-
   if (Test-LegacyPortableData -Dir $legacyDir) {
     return $legacyDir
   }
   return $null
+}
+
+function Get-ProfilePointedLegacySource {
+  param(
+    [Parameter(Mandatory = $true)][string]$InstallDir,
+    $SystemMode
+  )
+
+  if ($null -eq $SystemMode -or $SystemMode.Mode -ne 'portable') {
+    return $null
+  }
+  $legacyDir = Join-Path $InstallDir 'CLAUDE_CONFIG_DIR'
+  if ([string]::IsNullOrWhiteSpace([string]$SystemMode.PortableDir)) {
+    if ((Test-Path -LiteralPath $legacyDir -PathType Container) -or
+        (Test-LegacyPortableData -Dir $legacyDir)) {
+      return $legacyDir
+    }
+    return $null
+  }
+  return Resolve-LegacyConfiguredPath -Value $SystemMode.PortableDir -Source 'system app-mode.json'
+}
+
+function Get-LegacyActiveSource {
+  param(
+    [Parameter(Mandatory = $true)][string]$InstallDir,
+    $SystemMode
+  )
+
+  $local = Get-InstallLocalLegacySource -InstallDir $InstallDir
+  if (-not [string]::IsNullOrWhiteSpace([string]$local)) {
+    return $local
+  }
+  return (Get-ProfilePointedLegacySource -InstallDir $InstallDir -SystemMode $SystemMode)
 }
 
 function Get-ExistingInstallDirs {
@@ -358,12 +426,15 @@ function Get-PotentialInstallDirs {
 function Get-UnsafeLegacySource {
   param(
     [Parameter(Mandatory = $true)][string[]]$InstallDirs,
-    [Parameter(Mandatory = $true)][string]$UserDataDir,
+    [AllowEmptyString()][string]$PrimaryUserDataDir = '',
+    [AllowEmptyString()][string]$LegacyUserDataDir = '',
+    [AllowEmptyString()][string]$UserDataDir = '',
     [AllowEmptyString()][string]$ActiveConfigDir,
     [AllowEmptyString()][string]$ActiveConfigManaged
   )
 
   $sources = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+  $sourceProfiles = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
   $activeInsideInstall = $false
   $activeOutsideInstall = $false
   $active = $null
@@ -376,7 +447,7 @@ function Get-UnsafeLegacySource {
       if (Test-PathMayBeDeleted -InstallDir $installDir -Candidate $active) {
         $activeInsideInstall = $true
         if ($ActiveConfigManaged -ne '1') {
-          throw "Active CLAUDE_CONFIG_DIR is managed outside Claude Code Haha and points inside an application install directory. Move or remove that environment variable before upgrading: $active"
+          throw "Active CLAUDE_CONFIG_DIR is managed outside ccmax and points inside an application install directory. Move or remove that environment variable before upgrading: $active"
         }
         if (Test-SamePath -Left $installDir -Right $active) {
           throw "The active data directory is the application install root itself: $active"
@@ -385,6 +456,7 @@ function Get-UnsafeLegacySource {
           $canonicalActive = Get-CanonicalPathIdentity $active
           if (-not $sources.ContainsKey($canonicalActive)) {
             $sources.Add($canonicalActive, $active)
+            $sourceProfiles[$canonicalActive] = 'active-env'
           }
         }
         break
@@ -395,53 +467,107 @@ function Get-UnsafeLegacySource {
     }
   }
 
-  if ($activeOutsideInstall -and $ActiveConfigManaged -eq '1') {
-    # The app-managed active directory lives outside every install directory,
-    # so removing the old version cannot touch it. A persisted mode that is
-    # missing, stale, or unresolvable here (the mode was switched without a
-    # restart, or the installer's APPDATA differs from the app's known-folder
-    # view) must not block the upgrade: fall back to treating the directory as
-    # externally managed. Install-contained legacy data is still guarded by
-    # the external-active check below.
-    $systemMode = Read-AppMode -ConfigDir $UserDataDir
-    if ($null -ne $systemMode) {
+  $resolvedPrimaryUserData = if (-not [string]::IsNullOrWhiteSpace($PrimaryUserDataDir)) {
+    $PrimaryUserDataDir
+  } else {
+    ''
+  }
+  $resolvedLegacyUserData = if (-not [string]::IsNullOrWhiteSpace($LegacyUserDataDir)) {
+    $LegacyUserDataDir
+  } else {
+    ''
+  }
+  if ([string]::IsNullOrWhiteSpace($resolvedPrimaryUserData) -and
+      [string]::IsNullOrWhiteSpace($resolvedLegacyUserData) -and
+      -not [string]::IsNullOrWhiteSpace($UserDataDir)) {
+    # Single-profile callers keep the historical UserDataDir slot as legacy.
+    $resolvedLegacyUserData = $UserDataDir
+  } elseif ([string]::IsNullOrWhiteSpace($resolvedLegacyUserData) -and
+            -not [string]::IsNullOrWhiteSpace($UserDataDir) -and
+            ( [string]::IsNullOrWhiteSpace($resolvedPrimaryUserData) -or
+              -not ($UserDataDir.Equals($resolvedPrimaryUserData, [StringComparison]::OrdinalIgnoreCase)))) {
+    $resolvedLegacyUserData = $UserDataDir
+  }
+
+  function Resolve-ProfileSystemMode {
+    param([AllowEmptyString()][string]$ProfileDir)
+
+    if ([string]::IsNullOrWhiteSpace($ProfileDir) -or
+        -not (Test-Path -LiteralPath $ProfileDir -PathType Container)) {
+      return $null
+    }
+    if ($activeOutsideInstall -and $ActiveConfigManaged -eq '1') {
+      # The app-managed active directory lives outside every install directory,
+      # so removing the old version cannot touch it. A persisted mode that is
+      # missing, stale, or unresolvable here must not block the upgrade.
+      $systemMode = Read-AppMode -ConfigDir $ProfileDir
+      if ($null -eq $systemMode) {
+        return $null
+      }
       if ($systemMode.Mode -ne 'portable' -or
           [string]::IsNullOrWhiteSpace([string]$systemMode.PortableDir)) {
-        $systemMode = $null
-      } else {
-        try {
-          $persistedActive = Resolve-LegacyConfiguredPath -Value $systemMode.PortableDir -Source 'system app-mode.json'
-          if (-not (Test-SamePath -Left $active -Right $persistedActive)) {
-            $systemMode = $null
-          }
-        } catch {
-          $systemMode = $null
-        }
+        return $null
       }
+      try {
+        $persistedActive = Resolve-LegacyConfiguredPath -Value $systemMode.PortableDir -Source 'system app-mode.json'
+        if (-not (Test-SamePath -Left $active -Right $persistedActive)) {
+          return $null
+        }
+      } catch {
+        return $null
+      }
+      return $systemMode
     }
-  } elseif ($activeOutsideInstall) {
-    $systemMode = $null
-  } else {
-    $systemMode = Read-AppMode -ConfigDir $UserDataDir
+    if ($activeOutsideInstall) {
+      return $null
+    }
+    return (Read-AppMode -ConfigDir $ProfileDir)
   }
-  foreach ($installDir in $InstallDirs) {
-    $source = Get-LegacyActiveSource -InstallDir $installDir -SystemMode $systemMode
-    if ([string]::IsNullOrWhiteSpace([string]$source) -or
-        -not (Test-Path -LiteralPath $source -PathType Container)) {
-      continue
+
+  function Register-InstallContainedSource {
+    param(
+      [AllowEmptyString()][string]$Source,
+      [Parameter(Mandatory = $true)][string]$ProfileKind
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Source) -or
+        -not (Test-Path -LiteralPath $Source -PathType Container)) {
+      return
     }
     foreach ($possiblyDeletedRoot in $InstallDirs) {
-      if (Test-PathMayBeDeleted -InstallDir $possiblyDeletedRoot -Candidate $source) {
-        if (Test-SamePath -Left $possiblyDeletedRoot -Right $source) {
-          throw "The active data directory is the application install root itself: $source"
+      if (Test-PathMayBeDeleted -InstallDir $possiblyDeletedRoot -Candidate $Source) {
+        if (Test-SamePath -Left $possiblyDeletedRoot -Right $Source) {
+          throw "The active data directory is the application install root itself: $Source"
         }
-        $canonicalSource = Get-CanonicalPathIdentity $source
+        $canonicalSource = Get-CanonicalPathIdentity $Source
         if (-not $sources.ContainsKey($canonicalSource)) {
-          $sources.Add($canonicalSource, $source)
+          $sources.Add($canonicalSource, $Source)
+          $sourceProfiles[$canonicalSource] = $ProfileKind
         }
         break
       }
     }
+  }
+
+  # Primary-first profile pointers, then install-local fingerprints. Same
+  # canonical path dedupes; distinct paths fail closed.
+  $primarySystemMode = Resolve-ProfileSystemMode -ProfileDir $resolvedPrimaryUserData
+  $legacySystemMode = Resolve-ProfileSystemMode -ProfileDir $resolvedLegacyUserData
+
+  foreach ($installDir in $InstallDirs) {
+    if ($null -ne $primarySystemMode -and $primarySystemMode.Mode -eq 'portable') {
+      Register-InstallContainedSource `
+        -Source (Get-ProfilePointedLegacySource -InstallDir $installDir -SystemMode $primarySystemMode) `
+        -ProfileKind 'primary'
+    }
+    if ($null -ne $legacySystemMode -and $legacySystemMode.Mode -eq 'portable') {
+      Register-InstallContainedSource `
+        -Source (Get-ProfilePointedLegacySource -InstallDir $installDir -SystemMode $legacySystemMode) `
+        -ProfileKind 'legacy'
+    }
+    Register-InstallContainedSource `
+      -Source (Get-InstallLocalLegacySource -InstallDir $installDir) `
+      -ProfileKind 'install-fingerprint'
   }
 
   if ($activeOutsideInstall) {
@@ -454,7 +580,13 @@ function Get-UnsafeLegacySource {
     throw "Multiple distinct legacy data sources may be removed; refusing to guess which one is active: $($sources.Values -join ', ')"
   }
   if ($sources.Count -eq 1) {
-    return @($sources.Values)[0]
+    $canonical = @($sources.Keys)[0]
+    return [pscustomobject]@{
+      Path = $sources[$canonical]
+      ProfileKind = $sourceProfiles[$canonical]
+      PrimaryUserDataDir = $resolvedPrimaryUserData
+      LegacyUserDataDir = $resolvedLegacyUserData
+    }
   }
   return $null
 }
@@ -522,8 +654,14 @@ function Assert-NoUndiscoveredLegacySources {
 function Assert-NoRunningApplication {
   param(
     [Parameter(Mandatory = $true)][string[]]$InstallDirs,
-    [Parameter(Mandatory = $true)][string]$ProcessName
+    [Parameter(Mandatory = $true)][string]$ProcessName,
+    [AllowEmptyString()][string]$ProcessNames = ''
   )
+
+  $appProcessNames = @(Get-NormalizedNameList -Values @($ProcessName, $ProcessNames))
+  if ($appProcessNames.Count -eq 0) {
+    throw 'At least one application process name is required to fail closed on unknown executable paths.'
+  }
 
   $deadline = [DateTime]::UtcNow.AddSeconds(30)
   do {
@@ -535,11 +673,18 @@ function Assert-NoRunningApplication {
 
     $matching = New-Object 'System.Collections.Generic.List[string]'
     $hasUnknownAppPath = $false
+    $unknownNames = New-Object 'System.Collections.Generic.List[string]'
     foreach ($process in $processes) {
       $executablePath = [string]$process.ExecutablePath
       if ([string]::IsNullOrWhiteSpace($executablePath)) {
-        if (([string]$process.Name).Equals($ProcessName, [StringComparison]::OrdinalIgnoreCase)) {
-          $hasUnknownAppPath = $true
+        foreach ($name in $appProcessNames) {
+          if (([string]$process.Name).Equals($name, [StringComparison]::OrdinalIgnoreCase)) {
+            $hasUnknownAppPath = $true
+            if (-not $unknownNames.Contains($name)) {
+              $unknownNames.Add($name)
+            }
+            break
+          }
         }
         continue
       }
@@ -557,7 +702,7 @@ function Assert-NoRunningApplication {
   } while ([DateTime]::UtcNow -lt $deadline)
 
   if ($hasUnknownAppPath) {
-    throw "Cannot verify the executable path of a running $ProcessName process. Close the app and run the installer again."
+    throw "Cannot verify the executable path of a running $($unknownNames -join ', ') process. Close the app and run the installer again."
   }
   throw "An application process is still running from an installation that may contain legacy data: $($matching -join ', '). Close the app and run the installer again."
 }
@@ -693,9 +838,12 @@ function Invoke-LegacyRecovery {
   param(
     [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$InstallDirs,
     [AllowEmptyCollection()][AllowEmptyString()][string[]]$SharedInstallDirs = @(),
-    [Parameter(Mandatory = $true)][string]$UserDataDir,
+    [AllowEmptyString()][string]$PrimaryUserDataDir = '',
+    [AllowEmptyString()][string]$LegacyUserDataDir = '',
+    [AllowEmptyString()][string]$UserDataDir = '',
     [Parameter(Mandatory = $true)][string]$RecoveryRoot,
     [Parameter(Mandatory = $true)][string]$ProcessName,
+    [AllowEmptyString()][string]$ProcessNames = '',
     [AllowEmptyString()][string]$ActiveConfigDir,
     [AllowEmptyString()][string]$ActiveConfigManaged = '',
     [string]$InstallerIdentitySafety = 'trusted-user',
@@ -714,6 +862,8 @@ function Invoke-LegacyRecovery {
 
   $source = Get-UnsafeLegacySource `
     -InstallDirs $existingInstallDirs `
+    -PrimaryUserDataDir $PrimaryUserDataDir `
+    -LegacyUserDataDir $LegacyUserDataDir `
     -UserDataDir $UserDataDir `
     -ActiveConfigDir $ActiveConfigDir `
     -ActiveConfigManaged $ActiveConfigManaged
@@ -723,39 +873,101 @@ function Invoke-LegacyRecovery {
     $potentialSharedInstallDirs = @(Get-PotentialInstallDirs -InstallDirs $sharedInstallDirInputs)
     $existingSharedInstallDirs = @(Get-ExistingInstallDirs -InstallDirs $potentialSharedInstallDirs)
   }
-  if ($existingSharedInstallDirs.Count -gt 0) {
-    Assert-NoUndiscoveredLegacySources -InstallDirs $existingSharedInstallDirs -ActiveSource $source
+  $sourceProfileKind = 'install-fingerprint'
+  $resolvedPrimaryUserData = $PrimaryUserDataDir
+  $resolvedLegacyUserData = $LegacyUserDataDir
+  $sourcePath = $null
+  if ($null -ne $source -and $source -is [string]) {
+    $sourcePath = [string]$source
+  } elseif ($null -ne $source) {
+    $sourcePath = [string]$source.Path
+    $sourceProfileKind = [string]$source.ProfileKind
+    if (-not [string]::IsNullOrWhiteSpace([string]$source.PrimaryUserDataDir)) {
+      $resolvedPrimaryUserData = [string]$source.PrimaryUserDataDir
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$source.LegacyUserDataDir)) {
+      $resolvedLegacyUserData = [string]$source.LegacyUserDataDir
+    }
   }
-  if ([string]::IsNullOrWhiteSpace([string]$source)) {
+  if ($existingSharedInstallDirs.Count -gt 0) {
+    Assert-NoUndiscoveredLegacySources -InstallDirs $existingSharedInstallDirs -ActiveSource $sourcePath
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$sourcePath)) {
     return $null
   }
   if ($InstallerIdentitySafety -eq 'untrusted-elevated') {
     throw 'Legacy data recovery was requested from an elevated installer without the original user process. Run the installer normally (not as Administrator) so recovery is written to the correct Windows user profile.'
   }
   if (-not $SkipProcessCheck) {
-    Assert-NoRunningApplication -InstallDirs $existingInstallDirs -ProcessName $ProcessName
+    Assert-NoRunningApplication `
+      -InstallDirs $existingInstallDirs `
+      -ProcessName $ProcessName `
+      -ProcessNames $ProcessNames
+  }
+
+  $modeTargets = New-Object 'System.Collections.Generic.List[string]'
+  if ($sourceProfileKind -eq 'primary' -and -not [string]::IsNullOrWhiteSpace($resolvedPrimaryUserData)) {
+    $modeTargets.Add($resolvedPrimaryUserData)
+  } elseif ($sourceProfileKind -eq 'legacy' -and -not [string]::IsNullOrWhiteSpace($resolvedLegacyUserData)) {
+    $modeTargets.Add($resolvedLegacyUserData)
+  } elseif ($sourceProfileKind -eq 'active-env') {
+    if (-not [string]::IsNullOrWhiteSpace($resolvedPrimaryUserData)) {
+      $modeTargets.Add($resolvedPrimaryUserData)
+    } elseif (-not [string]::IsNullOrWhiteSpace($resolvedLegacyUserData)) {
+      $modeTargets.Add($resolvedLegacyUserData)
+    } elseif (-not [string]::IsNullOrWhiteSpace($UserDataDir)) {
+      $modeTargets.Add($UserDataDir)
+    }
+  } else {
+    # Install-fingerprint only: never overwrite an existing primary profile;
+    # conservatively update legacy (or single UserDataDir) only.
+    if (-not [string]::IsNullOrWhiteSpace($resolvedPrimaryUserData) -and
+        (Test-ProfileHasUserState -ConfigDir $resolvedPrimaryUserData)) {
+      if (-not [string]::IsNullOrWhiteSpace($resolvedLegacyUserData)) {
+        $modeTargets.Add($resolvedLegacyUserData)
+      } elseif (-not [string]::IsNullOrWhiteSpace($UserDataDir)) {
+        $modeTargets.Add($UserDataDir)
+      } else {
+        throw "Install-contained legacy data was recovered while primary profile already has user state; refusing to overwrite primary: $resolvedPrimaryUserData"
+      }
+    } elseif (-not [string]::IsNullOrWhiteSpace($resolvedLegacyUserData)) {
+      $modeTargets.Add($resolvedLegacyUserData)
+    } elseif (-not [string]::IsNullOrWhiteSpace($UserDataDir)) {
+      $modeTargets.Add($UserDataDir)
+    } elseif (-not [string]::IsNullOrWhiteSpace($resolvedPrimaryUserData)) {
+      $modeTargets.Add($resolvedPrimaryUserData)
+    } else {
+      throw 'Recovery found install-contained data but no profile directory was provided for mode metadata.'
+    }
   }
 
   foreach ($installDir in $potentialInstallDirs) {
-    if (Test-PathMayBeDeleted -InstallDir $installDir -Candidate $UserDataDir) {
-      throw "The mode metadata directory is inside an application install directory: $UserDataDir"
+    foreach ($modeTarget in $modeTargets) {
+      if (Test-PathMayBeDeleted -InstallDir $installDir -Candidate $modeTarget) {
+        throw "The mode metadata directory is inside an application install directory: $modeTarget"
+      }
     }
     if (Test-PathMayBeDeleted -InstallDir $installDir -Candidate $RecoveryRoot) {
       throw "The recovery destination is inside an application install directory: $RecoveryRoot"
     }
   }
 
-  $destination = Copy-VerifiedTree -Source $source -RecoveryRoot $RecoveryRoot
-  $finalSource = @(Get-TreeManifest -Root $source)
+  $destination = Copy-VerifiedTree -Source $sourcePath -RecoveryRoot $RecoveryRoot
+  $finalSource = @(Get-TreeManifest -Root $sourcePath)
   $finalDestination = @(Get-TreeManifest -Root $destination)
   Assert-TreeManifestsEqual `
     -Expected $finalSource `
     -Actual $finalDestination `
     -Message 'Legacy data changed after the verified recovery copy was finalized; the installer stopped before removing the old version.'
   if (-not $SkipProcessCheck) {
-    Assert-NoRunningApplication -InstallDirs $existingInstallDirs -ProcessName $ProcessName
+    Assert-NoRunningApplication `
+      -InstallDirs $existingInstallDirs `
+      -ProcessName $ProcessName `
+      -ProcessNames $ProcessNames
   }
-  Write-AppModeAtomically -UserDataDir $UserDataDir -CustomDir $destination
+  foreach ($modeTarget in $modeTargets) {
+    Write-AppModeAtomically -UserDataDir $modeTarget -CustomDir $destination
+  }
   return $destination
 }
 
@@ -885,7 +1097,7 @@ function Run-SelfTest {
         -RecoveryRoot (Join-Path $testRoot 'unmanaged recovery') -ProcessName $ProcessName `
         -ActiveConfigDir $managedLegacy -ActiveConfigManaged '' -SkipProcessCheck | Out-Null
     } catch {
-      $unmanagedFailed = $_.Exception.Message.Contains('managed outside Claude Code Haha')
+      $unmanagedFailed = $_.Exception.Message.Contains('managed outside ccmax')
     }
     Assert-SelfTest -Condition $unmanagedFailed -Message 'unsafe external CLAUDE_CONFIG_DIR did not fail closed'
 
@@ -1128,6 +1340,105 @@ function Run-SelfTest {
     }
     Assert-SelfTest -Condition $junctionFailed -Message 'install-contained junction source was silently skipped'
 
+    $fourSlotRoot = Join-Path $testRoot 'four-slot'
+    $slotA = Join-Path $fourSlotRoot 'primary-user'
+    $slotB = Join-Path $fourSlotRoot 'legacy-user'
+    $slotC = Join-Path $fourSlotRoot 'primary-machine'
+    $slotD = Join-Path $fourSlotRoot 'legacy-machine'
+    foreach ($slot in @($slotA, $slotB, $slotC, $slotD)) {
+      $legacySlot = Join-Path $slot 'CLAUDE_CONFIG_DIR'
+      New-Item -ItemType Directory -Path $legacySlot -Force | Out-Null
+      Set-Content -LiteralPath (Join-Path $legacySlot 'settings.json') -Value "data-$([IO.Path]::GetFileName($slot))" -NoNewline
+      Write-TestMode -Dir $legacySlot -Value @{ mode = 'portable'; portable_dir = $null }
+    }
+    $fourSlotFailed = $false
+    try {
+      Invoke-LegacyRecovery `
+        -InstallDirs @($slotA, $slotB, $slotC, $slotD) `
+        -SharedInstallDirs @($slotC, $slotD) `
+        -PrimaryUserDataDir (Join-Path $fourSlotRoot 'primary profile') `
+        -LegacyUserDataDir (Join-Path $fourSlotRoot 'legacy profile') `
+        -RecoveryRoot (Join-Path $fourSlotRoot 'recovery') `
+        -ProcessName 'ccmax.exe' -ProcessNames 'Claude Code Haha.exe' `
+        -ActiveConfigDir '' -SkipProcessCheck | Out-Null
+    } catch {
+      $fourSlotFailed = $_.Exception.Message.Contains('Multiple distinct legacy data sources')
+    }
+    Assert-SelfTest -Condition $fourSlotFailed -Message 'four registry install roots were collapsed instead of fail-closed on ambiguity'
+
+    $dedupeInstall = Join-Path $testRoot 'dedupe install'
+    $dedupeLegacy = Join-Path $dedupeInstall 'CLAUDE_CONFIG_DIR'
+    New-Item -ItemType Directory -Path $dedupeLegacy -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $dedupeLegacy 'settings.json') -Value 'dedupe-source' -NoNewline
+    Write-TestMode -Dir $dedupeLegacy -Value @{ mode = 'portable'; portable_dir = $null }
+    $dedupePrimaryProfile = Join-Path $testRoot 'dedupe primary profile'
+    $dedupeLegacyProfile = Join-Path $testRoot 'dedupe legacy profile'
+    Write-TestMode -Dir $dedupePrimaryProfile -Value @{ mode = 'default'; portable_dir = $null }
+    Write-TestMode -Dir $dedupeLegacyProfile -Value @{ mode = 'default'; portable_dir = $null }
+    $dedupeRecovered = Invoke-LegacyRecovery `
+      -InstallDirs @($dedupeInstall, $dedupeInstall, "$dedupeInstall\") `
+      -SharedInstallDirs @($dedupeInstall) `
+      -PrimaryUserDataDir $dedupePrimaryProfile `
+      -LegacyUserDataDir $dedupeLegacyProfile `
+      -RecoveryRoot (Join-Path $testRoot 'dedupe recovery') `
+      -ProcessName 'ccmax.exe' -ProcessNames 'Claude Code Haha.exe' `
+      -ActiveConfigDir '' -SkipProcessCheck
+    Assert-SelfTest -Condition ((Get-Content -LiteralPath (Join-Path $dedupeRecovered 'settings.json') -Raw) -eq 'dedupe-source') -Message 'canonical install-dir dedupe dropped the only source'
+    # Install-fingerprint must not overwrite an existing primary profile.
+    $dedupePrimaryMode = Get-Content -LiteralPath (Join-Path $dedupePrimaryProfile 'app-mode.json') -Raw | ConvertFrom-Json
+    Assert-SelfTest -Condition ($dedupePrimaryMode.mode -eq 'default') -Message 'existing primary profile was overwritten by install-fingerprint recovery'
+    $dedupeLegacyMode = Get-Content -LiteralPath (Join-Path $dedupeLegacyProfile 'app-mode.json') -Raw | ConvertFrom-Json
+    Assert-SelfTest -Condition ($dedupeLegacyMode.mode -eq 'portable' -and $dedupeLegacyMode.portable_dir -eq $dedupeRecovered) -Message 'install-fingerprint recovery did not conservatively update legacy profile'
+
+    $primaryPointerInstall = Join-Path $testRoot 'primary pointer install'
+    $primaryPointerData = Join-Path $primaryPointerInstall 'CLAUDE_CONFIG_DIR'
+    $primaryPointerProfile = Join-Path $testRoot 'primary pointer profile'
+    $legacyPointerProfile = Join-Path $testRoot 'legacy pointer profile'
+    New-Item -ItemType Directory -Path $primaryPointerData -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $primaryPointerData 'settings.json') -Value 'primary-profile-source' -NoNewline
+    Write-TestMode -Dir $primaryPointerProfile -Value @{ mode = 'portable'; portable_dir = $primaryPointerData }
+    Write-TestMode -Dir $legacyPointerProfile -Value @{ mode = 'default'; portable_dir = $null }
+    $primaryPointerRecovered = Invoke-LegacyRecovery `
+      -InstallDirs @($primaryPointerInstall) `
+      -PrimaryUserDataDir $primaryPointerProfile `
+      -LegacyUserDataDir $legacyPointerProfile `
+      -RecoveryRoot (Join-Path $testRoot 'primary pointer recovery') `
+      -ProcessName 'ccmax.exe' -ProcessNames 'Claude Code Haha.exe' `
+      -ActiveConfigDir '' -SkipProcessCheck
+    Assert-SelfTest -Condition ((Get-Content -LiteralPath (Join-Path $primaryPointerRecovered 'settings.json') -Raw) -eq 'primary-profile-source') -Message 'primary profile source was not recovered'
+    $primaryPointerMode = Get-Content -LiteralPath (Join-Path $primaryPointerProfile 'app-mode.json') -Raw | ConvertFrom-Json
+    Assert-SelfTest -Condition ($primaryPointerMode.portable_dir -eq $primaryPointerRecovered) -Message 'primary profile mode was not updated for a primary-owned source'
+    $legacyPointerMode = Get-Content -LiteralPath (Join-Path $legacyPointerProfile 'app-mode.json') -Raw | ConvertFrom-Json
+    Assert-SelfTest -Condition ($legacyPointerMode.mode -eq 'default') -Message 'legacy profile was modified for a primary-owned source'
+
+    $ccmaxFingerprintInstall = Join-Path $testRoot 'ccmax fingerprint install'
+    $ccmaxFingerprintLegacy = Join-Path $ccmaxFingerprintInstall 'CLAUDE_CONFIG_DIR'
+    $ccmaxFingerprintDir = Join-Path $ccmaxFingerprintLegacy 'ccmax'
+    New-Item -ItemType Directory -Path $ccmaxFingerprintDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $ccmaxFingerprintDir 'marker.txt') -Value 'ccmax-owned' -NoNewline
+    $ccmaxFingerprintRecovered = Invoke-LegacyRecovery `
+      -InstallDirs @($ccmaxFingerprintInstall) `
+      -UserDataDir (Join-Path $testRoot 'ccmax fingerprint app data') `
+      -RecoveryRoot (Join-Path $testRoot 'ccmax fingerprint recovery') `
+      -ProcessName 'ccmax.exe' -ProcessNames 'Claude Code Haha.exe' `
+      -ActiveConfigDir '' -SkipProcessCheck
+    Assert-SelfTest -Condition (Test-Path -LiteralPath (Join-Path $ccmaxFingerprintRecovered 'ccmax\marker.txt') -PathType Leaf) -Message 'ccmax fork-owned fingerprint was not recovered'
+
+    $newEnvPreferred = $false
+    $envManagedInstall = Join-Path $testRoot 'new-env managed install'
+    $envManagedLegacy = Join-Path $envManagedInstall 'CLAUDE_CONFIG_DIR'
+    New-Item -ItemType Directory -Path $envManagedLegacy -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $envManagedLegacy 'settings.json') -Value 'new-env-managed' -NoNewline
+    $envManagedRecovered = Invoke-LegacyRecovery `
+      -InstallDirs @($envManagedInstall) `
+      -UserDataDir (Join-Path $testRoot 'new-env app data') `
+      -RecoveryRoot (Join-Path $testRoot 'new-env recovery') `
+      -ProcessName 'ccmax.exe' -ProcessNames 'Claude Code Haha.exe' `
+      -ActiveConfigDir $envManagedLegacy -ActiveConfigManaged '1' -SkipProcessCheck
+    Assert-SelfTest -Condition ((Get-Content -LiteralPath (Join-Path $envManagedRecovered 'settings.json') -Raw) -eq 'new-env-managed') -Message 'CCMAX-managed active config was not recovered'
+    $newEnvPreferred = $true
+    Assert-SelfTest -Condition $newEnvPreferred -Message 'new portable managed env preference was not exercised'
+
     [Console]::Out.WriteLine('Legacy install data recovery self-test passed.')
   } finally {
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -1140,12 +1451,43 @@ try {
     exit 0
   }
 
+  $installDirCandidates = @(
+    $PrimaryPerUserInstallDir,
+    $LegacyPerUserInstallDir,
+    $PerUserInstallDir,
+    $PrimaryPerMachineInstallDir,
+    $LegacyPerMachineInstallDir,
+    $PerMachineInstallDir,
+    $CandidateInstallDir
+  )
+  # Historical single-slot form remains as a source contract: -SharedInstallDirs @($PerMachineInstallDir)
+  $sharedInstallDirCandidates = @(
+    $PrimaryPerMachineInstallDir,
+    $LegacyPerMachineInstallDir,
+    $PerMachineInstallDir
+  )
+  $resolvedPrimaryUserDataDir = if (-not [string]::IsNullOrWhiteSpace($PrimaryUserDataDir)) {
+    $PrimaryUserDataDir
+  } else {
+    ''
+  }
+  $resolvedLegacyUserDataDir = if (-not [string]::IsNullOrWhiteSpace($LegacyUserDataDir)) {
+    $LegacyUserDataDir
+  } elseif (-not [string]::IsNullOrWhiteSpace($UserDataDir)) {
+    $UserDataDir
+  } else {
+    ''
+  }
+
   $result = Invoke-LegacyRecovery `
-    -InstallDirs @($PerUserInstallDir, $PerMachineInstallDir, $CandidateInstallDir) `
-    -SharedInstallDirs @($PerMachineInstallDir) `
+    -InstallDirs $installDirCandidates `
+    -SharedInstallDirs $sharedInstallDirCandidates `
+    -PrimaryUserDataDir $resolvedPrimaryUserDataDir `
+    -LegacyUserDataDir $resolvedLegacyUserDataDir `
     -UserDataDir $UserDataDir `
     -RecoveryRoot $RecoveryRoot `
     -ProcessName $ProcessName `
+    -ProcessNames $ProcessNames `
     -ActiveConfigDir $ActiveConfigDir `
     -ActiveConfigManaged $ActiveConfigManaged `
     -InstallerIdentitySafety $InstallerIdentitySafety `

@@ -1,3 +1,4 @@
+import { existsSync } from 'fs'
 import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -15,6 +16,38 @@ export const getClaudeConfigHomeDir = memoize(
 
 export function getCcHahaDir(): string {
   return join(getClaudeConfigHomeDir(), 'cc-haha')
+}
+
+/**
+ * Primary fork-owned directory under the Claude config home.
+ * Callers that still write under the legacy name must keep using getCcHahaDir().
+ */
+export function getForkOwnedDir(): string {
+  return join(getClaudeConfigHomeDir(), 'ccmax')
+}
+
+/**
+ * Resolve the on-disk fork-owned directory without migrating data:
+ * prefer an existing `ccmax` dir, else fall back to legacy `cc-haha`, else
+ * return the primary write target `ccmax`.
+ */
+export function resolveForkOwnedDir(): string {
+  const primary = getForkOwnedDir()
+  if (existsSync(primary)) {
+    return primary
+  }
+  const legacy = getCcHahaDir()
+  if (existsSync(legacy)) {
+    return legacy
+  }
+  return primary
+}
+
+/**
+ * Dual-read fork env: CCMAX_${suffix} wins over CC_HAHA_${suffix}.
+ */
+export function readForkEnv(suffix: string): string | undefined {
+  return process.env[`CCMAX_${suffix}`] ?? process.env[`CC_HAHA_${suffix}`]
 }
 
 export function getTeamsDir(): string {

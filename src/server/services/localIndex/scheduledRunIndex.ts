@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto'
-import { join } from 'node:path'
 import { Database } from 'bun:sqlite'
-import { getCcHahaDir, getClaudeConfigHomeDir } from '../../../utils/envUtils.js'
+import { getClaudeConfigHomeDir } from '../../../utils/envUtils.js'
 import {
   LOCAL_INDEX_BUSY_TIMEOUT_MS,
   prepareManagedDatabasePath,
+  resolveActiveManagedDatabasePath,
 } from './managedDatabasePath.js'
 import {
   assertScheduledRunIndexSchemaSupported,
@@ -296,7 +296,10 @@ export function paginateScheduledRunRecords(
 }
 
 export function getScheduledRunIndexDatabasePath(): string {
-  return join(getCcHahaDir(), 'db', 'scheduled-runs-v1.sqlite')
+  return resolveActiveManagedDatabasePath(
+    getClaudeConfigHomeDir(),
+    'scheduled-runs-v1.sqlite',
+  )
 }
 
 export function openScheduledRunIndex(options?: {

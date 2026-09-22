@@ -1,5 +1,7 @@
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Runtime, WebviewBuilder, WebviewUrl};
+use tauri::{
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Runtime, WebviewBuilder, WebviewUrl,
+};
 
 const PREVIEW_LABEL: &str = "preview";
 
@@ -70,8 +72,12 @@ pub async fn preview_open<R: Runtime>(
         .get_window(crate::MAIN_WINDOW_LABEL)
         .ok_or_else(|| "main window not found".to_string())?;
     let init_script = format!("{PREVIEW_TAURI_BRIDGE_SCRIPT}\n{PREVIEW_INIT_SCRIPT}");
-    let builder = WebviewBuilder::new(PREVIEW_LABEL, WebviewUrl::External(target))
-        .initialization_script_for_all_frames(init_script);
+    let builder = crate::apply_prepared_webview_data_dir(
+        WebviewBuilder::new(PREVIEW_LABEL, WebviewUrl::External(target))
+            .initialization_script_for_all_frames(init_script),
+        crate::webview_identity::prepared_active_webview_data_dir(),
+        WebviewBuilder::data_directory,
+    );
     main.add_child(
         builder,
         LogicalPosition::new(bounds.x, bounds.y),
@@ -148,7 +154,9 @@ pub fn preview_message<R: Runtime>(app: AppHandle<R>, raw: String) -> Result<(),
 /// 宿主 → 页面：在子 webview 内 eval 一段 JS。
 #[tauri::command]
 pub async fn preview_eval<R: Runtime>(app: AppHandle<R>, js: String) -> Result<(), String> {
-    let webview = app.get_webview(PREVIEW_LABEL).ok_or_else(|| "preview not open".to_string())?;
+    let webview = app
+        .get_webview(PREVIEW_LABEL)
+        .ok_or_else(|| "preview not open".to_string())?;
     webview.eval(&js).map_err(|e| e.to_string())
 }
 
@@ -158,13 +166,22 @@ mod tests {
 
     #[test]
     fn accepts_http_and_https() {
-        assert_eq!(normalize_preview_url("http://localhost:5173/").unwrap(), "http://localhost:5173/");
-        assert_eq!(normalize_preview_url("https://example.com").unwrap(), "https://example.com");
+        assert_eq!(
+            normalize_preview_url("http://localhost:5173/").unwrap(),
+            "http://localhost:5173/"
+        );
+        assert_eq!(
+            normalize_preview_url("https://example.com").unwrap(),
+            "https://example.com"
+        );
     }
 
     #[test]
     fn trims_whitespace() {
-        assert_eq!(normalize_preview_url("  http://127.0.0.1:8080  ").unwrap(), "http://127.0.0.1:8080");
+        assert_eq!(
+            normalize_preview_url("  http://127.0.0.1:8080  ").unwrap(),
+            "http://127.0.0.1:8080"
+        );
     }
 
     #[test]
@@ -172,5 +189,38 @@ mod tests {
         assert!(normalize_preview_url("file:///etc/passwd").is_err());
         assert!(normalize_preview_url("javascript:alert(1)").is_err());
         assert!(normalize_preview_url("").is_err());
+    }
+
+    struct ProbeBuilder {
+        data_directory: Option<std::path::PathBuf>,
+    }
+
+    impl ProbeBuilder {
+        fn data_directory(mut self, path: std::path::PathBuf) -> Self {
+            self.data_directory = Some(path);
+            self
+        }
+    }
+
+    #[test]
+    fn preview_consumes_the_same_prepared_webview_data_dir_decision() {
+        let path = std::path::PathBuf::from("/tmp/ccmax-stage24b-preview");
+        let with_path = crate::apply_prepared_webview_data_dir(
+            ProbeBuilder {
+                data_directory: None,
+            },
+            Some(path.clone()),
+            ProbeBuilder::data_directory,
+        );
+        assert_eq!(with_path.data_directory, Some(path));
+
+        let without_path = crate::apply_prepared_webview_data_dir(
+            ProbeBuilder {
+                data_directory: None,
+            },
+            None,
+            ProbeBuilder::data_directory,
+        );
+        assert_eq!(without_path.data_directory, None);
     }
 }

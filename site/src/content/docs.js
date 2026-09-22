@@ -1,50 +1,17 @@
 import { Marked, Renderer } from 'marked'
 import DOMPurify from 'dompurify'
 import { docsContent, docsIndex, imageSizes, sections } from '../generated/docs-index'
+import { cleanRoute, toSiteHref, withoutSiteBase } from '../lib/site.js'
 
 const EXTERNAL_PROTOCOL = /^(?:[a-z][a-z\d+.-]*:|\/\/)/i
-const SITE_BASE = `/${String(import.meta.env.BASE_URL || '/').replace(/^\/+|\/+$/g, '')}`
-  .replace(/\/{2,}/g, '/')
-  .replace(/\/$/, '') || '/'
+
+export { toSiteHref }
 
 /* ── 路由归一化 ─────────────────────────────────────────────── */
-
-function cleanRoute(route) {
-  const withoutQuery = route.split(/[?#]/, 1)[0]
-  let normalized = decodeURIComponent(withoutQuery || '/')
-    .replace(/\\/g, '/')
-    .replace(/\/{2,}/g, '/')
-    .replace(/(?:\.md|\.html)$/i, '')
-
-  if (!normalized.startsWith('/')) normalized = `/${normalized}`
-  if (normalized !== '/') normalized = normalized.replace(/\/+$/, '')
-  return normalized
-}
 
 function splitHref(href) {
   const match = href.match(/^([^?#]*)([?#].*)?$/)
   return { path: match?.[1] || '', suffix: match?.[2] || '' }
-}
-
-export function toSiteHref(href) {
-  if (!href || href.startsWith('#') || EXTERNAL_PROTOCOL.test(href)) return href
-
-  const { path: rawPath, suffix } = splitHref(href)
-  const route = /\.html$/i.test(rawPath)
-    ? `/${decodeURIComponent(rawPath).replace(/^\/+/, '').replace(/\/{2,}/g, '/')}`
-    : cleanRoute(rawPath)
-
-  if (SITE_BASE === '/') return `${route}${suffix}`
-  if (route === SITE_BASE || route.startsWith(`${SITE_BASE}/`)) return `${route}${suffix}`
-  return `${SITE_BASE}${route}${suffix}`
-}
-
-function withoutSiteBase(pathname) {
-  const route = cleanRoute(pathname)
-  if (SITE_BASE === '/') return route
-  if (route === SITE_BASE) return '/'
-  if (route.startsWith(`${SITE_BASE}/`)) return route.slice(SITE_BASE.length)
-  return route
 }
 
 /* ── 索引 ───────────────────────────────────────────────────── */
@@ -374,7 +341,7 @@ export function renderMarkdown(doc, markdown) {
     const resolvedHref = resolveDocAsset(doc, href)
     const titleAttribute = title ? ` title="${escapeAttribute(title)}"` : ''
     // 带上真实像素尺寸，浏览器才能在图片下载完之前按比例留位，正文不会跳。
-    const size = imageSizes[resolvedHref.split(/[?#]/, 1)[0]]
+    const size = imageSizes[withoutSiteBase(resolvedHref.split(/[?#]/, 1)[0])]
     const sizeAttributes = size ? ` width="${size[0]}" height="${size[1]}"` : ''
     // 竖图（手机截图、聊天软件的扫码页）在正文列宽下能铺满两屏，得单独限高。
     // 构建期就知道比例，所以这里标出来，CSS 不用去猜文件名。

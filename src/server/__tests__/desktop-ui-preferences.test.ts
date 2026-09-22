@@ -83,8 +83,8 @@ describe('DesktopUiPreferencesService', () => {
     expect(result.preferences).toEqual({
       schemaVersion: 6,
       profile: {
-        displayName: 'cc-haha',
-        subtitle: 'github.com/NanmiCoder/cc-haha',
+        displayName: 'ccmax',
+        subtitle: 'github.com/yaogjim/ccmax',
         avatarFile: null,
         avatarUpdatedAt: null,
       },
@@ -140,8 +140,8 @@ describe('DesktopUiPreferencesService', () => {
       schemaVersion: 6,
       futureField: { keep: true },
       profile: {
-        displayName: 'cc-haha',
-        subtitle: 'github.com/NanmiCoder/cc-haha',
+        displayName: 'ccmax',
+        subtitle: 'github.com/yaogjim/ccmax',
         avatarFile: null,
         avatarUpdatedAt: null,
       },
@@ -163,8 +163,8 @@ describe('DesktopUiPreferencesService', () => {
       schemaVersion: 6,
       futureField: { keep: true },
       profile: {
-        displayName: 'cc-haha',
-        subtitle: 'github.com/NanmiCoder/cc-haha',
+        displayName: 'ccmax',
+        subtitle: 'github.com/yaogjim/ccmax',
         avatarFile: null,
         avatarUpdatedAt: null,
       },
@@ -195,7 +195,8 @@ describe('DesktopUiPreferencesService', () => {
 
     expect(result.exists).toBe(false)
     expect(result.preferences.sidebar.hiddenProjects).toEqual([])
-    expect(result.preferences.profile.displayName).toBe('cc-haha')
+    expect(result.preferences.profile.displayName).toBe('ccmax')
+    expect(result.preferences.profile.subtitle).toBe('github.com/yaogjim/ccmax')
     expect(result.preferences.pet).toEqual(DEFAULT_PET_PREFERENCES)
     expect(result.preferences.projectDisplayNames).toEqual({})
     expect(files.some((name) => name.startsWith('desktop-ui.json.invalid-'))).toBe(true)
@@ -808,8 +809,8 @@ describe('desktop UI preferences API', () => {
       preferences: {
         schemaVersion: 6,
         profile: {
-          displayName: 'cc-haha',
-          subtitle: 'github.com/NanmiCoder/cc-haha',
+          displayName: 'ccmax',
+          subtitle: 'github.com/yaogjim/ccmax',
           avatarFile: null,
           avatarUpdatedAt: null,
         },
@@ -837,8 +838,8 @@ describe('desktop UI preferences API', () => {
       preferences: {
         schemaVersion: 6,
         profile: {
-          displayName: 'cc-haha',
-          subtitle: 'github.com/NanmiCoder/cc-haha',
+          displayName: 'ccmax',
+          subtitle: 'github.com/yaogjim/ccmax',
           avatarFile: null,
           avatarUpdatedAt: null,
         },

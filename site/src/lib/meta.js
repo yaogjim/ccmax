@@ -1,4 +1,4 @@
-const SITE_ORIGIN = 'https://cchaha.ai'
+import { toAbsoluteUrl, withoutSiteBase } from './site.js'
 
 function upsert(selector, create) {
   let node = document.head.querySelector(selector)
@@ -49,13 +49,14 @@ export function setPageMeta({ alternate, canonical, description, lang, title }) 
   setMetaContent('name', 'description', description)
   setMetaContent('property', 'og:title', title)
   setMetaContent('property', 'og:description', description)
-  setMetaContent('property', 'og:url', canonical ? `${SITE_ORIGIN}${canonical}` : null)
+  setMetaContent('property', 'og:url', canonical ? toAbsoluteUrl(canonical) : null)
 
-  setLink('canonical', canonical ? `${SITE_ORIGIN}${canonical}` : null)
+  setLink('canonical', canonical ? toAbsoluteUrl(canonical) : null)
 
   if (canonical) {
-    const isEnglish = canonical === '/en' || canonical.startsWith('/en/')
-    setLink('alternate', `${SITE_ORIGIN}${canonical}`, isEnglish ? 'en' : 'zh-Hans')
-    setLink('alternate', alternate ? `${SITE_ORIGIN}${alternate}` : null, isEnglish ? 'zh-Hans' : 'en')
+    const logical = withoutSiteBase(canonical)
+    const isEnglish = logical === '/en' || logical.startsWith('/en/')
+    setLink('alternate', toAbsoluteUrl(canonical), isEnglish ? 'en' : 'zh-Hans')
+    setLink('alternate', alternate ? toAbsoluteUrl(alternate) : null, isEnglish ? 'zh-Hans' : 'en')
   }
 }

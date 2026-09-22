@@ -5,6 +5,7 @@ import * as path from 'node:path'
 import { openLocalIndexDatabase } from './database.js'
 import { openScheduledRunIndex } from './scheduledRunIndex.js'
 import { openTraceIndexDatabase } from './traceDatabase.js'
+import { prepareManagedDatabasePath } from './managedDatabasePath.js'
 
 const roots: string[] = []
 
@@ -31,10 +32,10 @@ describe('managed SQLite database paths', () => {
       const root = await tempRoot(filename)
       const scope = path.join(root, 'config')
       const outside = path.join(root, 'outside')
-      await fs.mkdir(path.join(scope, 'cc-haha'), { recursive: true })
+      await fs.mkdir(path.join(scope, 'ccmax'), { recursive: true })
       await fs.mkdir(outside)
-      await fs.symlink(outside, path.join(scope, 'cc-haha', 'db'))
-      const databasePath = path.join(scope, 'cc-haha', 'db', filename)
+      await fs.symlink(outside, path.join(scope, 'ccmax', 'db'))
+      const databasePath = path.join(scope, 'ccmax', 'db', filename)
 
       expect(() => openDatabase({ path: databasePath, scope })).toThrow(
         expect.objectContaining({ code: 'LOCAL_INDEX_UNSAFE_PATH' }),
@@ -51,7 +52,7 @@ describe('managed SQLite database paths', () => {
     const scope = path.join(root, 'config-link')
     await fs.mkdir(realScope)
     await fs.symlink(realScope, scope)
-    const databasePath = path.join(scope, 'cc-haha', 'db', 'index-v1.sqlite')
+    const databasePath = path.join(scope, 'ccmax', 'db', 'index-v1.sqlite')
 
     const database = openLocalIndexDatabase({ path: databasePath, scope })
     database.close()
@@ -59,10 +60,34 @@ describe('managed SQLite database paths', () => {
     expect((await fs.lstat(databasePath)).isFile()).toBe(true)
   })
 
+  test('accepts either managed namespace and rejects arbitrary paths', async () => {
+    const root = await tempRoot('dual-namespace')
+    const scope = path.join(root, 'config')
+    const primary = path.join(scope, 'ccmax', 'db', 'index-v1.sqlite')
+    const legacy = path.join(scope, 'cc-haha', 'db', 'index-v1.sqlite')
+    const arbitrary = path.join(scope, 'other', 'db', 'index-v1.sqlite')
+
+    expect(() => prepareManagedDatabasePath({
+      databasePath: primary,
+      filename: 'index-v1.sqlite',
+      scope,
+    })).not.toThrow()
+    expect(() => prepareManagedDatabasePath({
+      databasePath: legacy,
+      filename: 'index-v1.sqlite',
+      scope,
+    })).not.toThrow()
+    expect(() => prepareManagedDatabasePath({
+      databasePath: arbitrary,
+      filename: 'index-v1.sqlite',
+      scope,
+    })).toThrow(expect.objectContaining({ code: 'LOCAL_INDEX_UNSAFE_PATH' }))
+  })
+
   test('rejects an existing database-file symlink', async () => {
     const root = await tempRoot('file-symlink')
     const scope = path.join(root, 'config')
-    const databaseDir = path.join(scope, 'cc-haha', 'db')
+    const databaseDir = path.join(scope, 'ccmax', 'db')
     const outside = path.join(root, 'outside.sqlite')
     await fs.mkdir(databaseDir, { recursive: true })
     await fs.writeFile(outside, '')
@@ -77,7 +102,7 @@ describe('managed SQLite database paths', () => {
   test('rejects an existing database-file hardlink to an outside inode', async () => {
     const root = await tempRoot('file-hardlink')
     const scope = path.join(root, 'config')
-    const databaseDir = path.join(scope, 'cc-haha', 'db')
+    const databaseDir = path.join(scope, 'ccmax', 'db')
     const outside = path.join(root, 'outside.sqlite')
     await fs.mkdir(databaseDir, { recursive: true })
     await fs.writeFile(outside, 'outside-owned')

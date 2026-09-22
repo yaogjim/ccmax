@@ -2,17 +2,16 @@
   "name": "claude-code-desktop",
   "private": true,
   "version": "0.6.5",
-  "description": "Desktop coding agent workbench for Claude Code Haha.",
-  "homepage": "https://github.com/NanmiCoder/cc-haha",
+  "description": "Desktop coding agent workbench for ccmax.",
+  "homepage": "https://github.com/yaogjim/ccmax",
   "author": {
-    "name": "NanmiCoder",
-    "email": "relakkes@gmail.com"
+    "name": "ccmax contributors"
   },
   "type": "module",
   "main": "electron-dist/main.cjs",
   "build": {
-    "appId": "com.claude-code-haha.desktop",
-    "productName": "Claude Code Haha",
+    "appId": "com.ccmax.desktop",
+    "productName": "ccmax",
     "asar": true,
     "asarUnpack": [
       "dist/**",
@@ -24,7 +23,7 @@
       "src-tauri/binaries/**",
       "node_modules/@ngrok/**"
     ],
-    "artifactName": "Claude-Code-Haha-${version}-${os}-${arch}.${ext}",
+    "artifactName": "ccmax-${version}-${os}-${arch}.${ext}",
     "npmRebuild": false,
     "directories": {
       "output": "build-artifacts/electron"
@@ -74,13 +73,13 @@
       ],
       "icon": "src-tauri/icons",
       "category": "Development",
-      "maintainer": "NanmiCoder <relakkes@gmail.com>"
+      "maintainer": "ccmax contributors"
     },
     "publish": [
       {
         "provider": "github",
-        "owner": "NanmiCoder",
-        "repo": "cc-haha"
+        "owner": "yaogjim",
+        "repo": "ccmax"
       }
     ]
   },

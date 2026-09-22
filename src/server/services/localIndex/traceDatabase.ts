@@ -1,9 +1,9 @@
-import { join } from 'node:path'
 import { Database } from 'bun:sqlite'
-import { getCcHahaDir, getClaudeConfigHomeDir } from '../../../utils/envUtils.js'
+import { getClaudeConfigHomeDir } from '../../../utils/envUtils.js'
 import {
   LOCAL_INDEX_BUSY_TIMEOUT_MS,
   prepareManagedDatabasePath,
+  resolveActiveManagedDatabasePath,
 } from './managedDatabasePath.js'
 import {
   assertTraceIndexSchemaSupported,
@@ -43,7 +43,10 @@ type OwnedStatement = {
 }
 
 export function getTraceIndexDatabasePath(): string {
-  return join(getCcHahaDir(), 'db', 'trace-index-v1.sqlite')
+  return resolveActiveManagedDatabasePath(
+    getClaudeConfigHomeDir(),
+    'trace-index-v1.sqlite',
+  )
 }
 
 function configureConnection(database: Database): void {

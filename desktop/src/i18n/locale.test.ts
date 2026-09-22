@@ -67,10 +67,22 @@ describe('locale detection', () => {
     expect(document.documentElement.lang).toBe('zh-TW')
   })
 
-  it('keeps a stored English preference instead of defaulting back to Chinese', async () => {
-    // The merged tree stores the display locale under main's LOCALE_STORAGE_KEY
-    // ('cc-haha-locale'); the picked commit's test used the ccmax canonical key,
-    // which nothing in this tree reads any more.
+  it('prefers the canonical locale key when legacy also exists', async () => {
+    window.localStorage.setItem('ccmax-locale', 'jp')
+    window.localStorage.setItem('cc-haha-locale', 'zh-TW')
+    const host = {
+      getLocalePreference: vi.fn().mockResolvedValue(null),
+      getPreferredSystemLanguages: vi.fn().mockResolvedValue(['en-US']),
+      setLocalePreference: vi.fn().mockResolvedValue(undefined),
+      onLocaleChanged: vi.fn().mockResolvedValue(() => {}),
+    }
+
+    await expect(initializeLocale(host)).resolves.toBe('jp')
+  })
+
+  it('keeps a legacy stored English preference instead of defaulting back to Chinese', async () => {
+    // The legacy key stays readable when the canonical one is absent, so an
+    // install that picked English before the ccmax key existed keeps it.
     window.localStorage.setItem('cc-haha-locale', 'en')
     const host = {
       getLocalePreference: vi.fn().mockResolvedValue(null),

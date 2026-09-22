@@ -73,6 +73,9 @@ describe('HahaGrokOAuthService', () => {
     callback.searchParams.set('state', session.state)
     const callbackResponse = await previousFetch(callback)
     expect(callbackResponse.status).toBe(200)
+    const callbackBody = await callbackResponse.text()
+    expect(callbackBody).toContain('return to ccmax')
+    expect(callbackBody).not.toContain('Claude Code Haha')
     expect(await service.loadTokens()).toMatchObject({
       accessToken: 'grok-access',
       refreshToken: 'grok-refresh',

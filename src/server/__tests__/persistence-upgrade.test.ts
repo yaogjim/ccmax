@@ -106,7 +106,8 @@ describe('persistent storage upgrade migrations', () => {
     expect(activeId).toBe('provider-1')
 
     await service.updateProvider('provider-1', { name: 'Renamed Provider' })
-    const rewritten = JSON.parse(await fs.readFile(path.join(ccHahaDir, 'providers.json'), 'utf-8')) as {
+    // After copy, resolveForkOwnedDir prefers ccmax for writes.
+    const rewritten = JSON.parse(await fs.readFile(path.join(tempDir, 'ccmax', 'providers.json'), 'utf-8')) as {
       rootFutureField?: unknown
       providers?: Array<Record<string, unknown>>
     }
@@ -466,4 +467,207 @@ describe('persistent storage upgrade migrations', () => {
     expect(rewritten.providers[1].requestCompatibility.futureParameter).toBe('keep')
     expect(rewritten.providers[0].futureProvider).toBe('keep')
   })
+
+  test('copies legacy cc-haha fork dir into ccmax when primary is missing', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    const ccmaxDir = path.join(tempDir, 'ccmax')
+    await fs.mkdir(ccHahaDir, { recursive: true })
+    const providers = {
+      schemaVersion: CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
+      activeId: 'copied-provider',
+      providers: [{
+        id: 'copied-provider',
+        presetId: 'custom',
+        name: 'Copied Provider',
+        apiKey: 'copied-token',
+        baseUrl: 'https://copied.example.test',
+        models: { main: 'm', haiku: 'm', sonnet: 'm', opus: 'm' },
+      }],
+      providerOrder: ['copied-provider', 'claude-official', 'openai-official', 'grok-official'],
+    }
+    const settings = {
+      env: {
+        ANTHROPIC_BASE_URL: 'https://copied.example.test',
+        ANTHROPIC_AUTH_TOKEN: 'copied-token',
+      },
+    }
+    await fs.writeFile(path.join(ccHahaDir, 'providers.json'), JSON.stringify(providers, null, 2), 'utf-8')
+    await fs.writeFile(path.join(ccHahaDir, 'settings.json'), JSON.stringify(settings, null, 2), 'utf-8')
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    expect(report.migratedEntries).toContain('cc-haha -> ccmax')
+    expect(await pathExists(ccHahaDir)).toBe(true)
+    expect(await pathExists(ccmaxDir)).toBe(true)
+
+    const legacyProviders = JSON.parse(await fs.readFile(path.join(ccHahaDir, 'providers.json'), 'utf-8'))
+    const primaryProviders = JSON.parse(await fs.readFile(path.join(ccmaxDir, 'providers.json'), 'utf-8'))
+    expect(legacyProviders).toMatchObject({ activeId: 'copied-provider' })
+    expect(primaryProviders).toMatchObject({ activeId: 'copied-provider' })
+
+    const service = new ProviderService()
+    const listed = await service.listProviders()
+    expect(listed.activeId).toBe('copied-provider')
+    expect(listed.providers[0]?.name).toBe('Copied Provider')
+  })
+
+  test('does not overwrite an existing ccmax dir when legacy cc-haha is also present', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    const ccmaxDir = path.join(tempDir, 'ccmax')
+    await fs.mkdir(ccHahaDir, { recursive: true })
+    await fs.mkdir(ccmaxDir, { recursive: true })
+    await fs.writeFile(
+      path.join(ccHahaDir, 'providers.json'),
+      JSON.stringify({
+        schemaVersion: CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
+        activeId: 'legacy-only',
+        providers: [{
+          id: 'legacy-only',
+          presetId: 'custom',
+          name: 'Legacy Only',
+          apiKey: 'legacy',
+          baseUrl: 'https://legacy.example.test',
+          models: { main: 'l', haiku: 'l', sonnet: 'l', opus: 'l' },
+        }],
+        providerOrder: ['legacy-only', 'claude-official', 'openai-official', 'grok-official'],
+      }, null, 2),
+      'utf-8',
+    )
+    await fs.writeFile(
+      path.join(ccmaxDir, 'providers.json'),
+      JSON.stringify({
+        schemaVersion: CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
+        activeId: 'primary-only',
+        providers: [{
+          id: 'primary-only',
+          presetId: 'custom',
+          name: 'Primary Only',
+          apiKey: 'primary',
+          baseUrl: 'https://primary.example.test',
+          models: { main: 'p', haiku: 'p', sonnet: 'p', opus: 'p' },
+        }],
+        providerOrder: ['primary-only', 'claude-official', 'openai-official', 'grok-official'],
+      }, null, 2),
+      'utf-8',
+    )
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    expect(report.migratedEntries).not.toContain('cc-haha -> ccmax')
+    const primary = JSON.parse(await fs.readFile(path.join(ccmaxDir, 'providers.json'), 'utf-8')) as {
+      activeId?: string
+    }
+    expect(primary.activeId).toBe('primary-only')
+    expect(await pathExists(ccHahaDir)).toBe(true)
+  })
+
+  test('keeps the legacy cc-haha dir when verified copy into ccmax fails', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    await fs.mkdir(ccHahaDir, { recursive: true })
+    await fs.writeFile(
+      path.join(ccHahaDir, 'providers.json'),
+      JSON.stringify({
+        schemaVersion: CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
+        activeId: null,
+        providers: [],
+        providerOrder: ['claude-official', 'openai-official', 'grok-official'],
+      }, null, 2),
+      'utf-8',
+    )
+
+    // Make the config dir non-writable so the temp copy cannot be created.
+    await fs.chmod(tempDir, 0o555)
+    let report: { migratedEntries: string[]; failures: string[] }
+    try {
+      report = await ensurePersistentStorageUpgraded()
+    } finally {
+      await fs.chmod(tempDir, 0o755)
+    }
+
+    expect(report.migratedEntries).not.toContain('cc-haha -> ccmax')
+    expect(report.failures.some((failure) => failure.startsWith('cc-haha -> ccmax:'))).toBe(true)
+    expect(await pathExists(ccHahaDir)).toBe(true)
+    expect(await pathExists(path.join(tempDir, 'ccmax'))).toBe(false)
+    expect(JSON.parse(await fs.readFile(path.join(ccHahaDir, 'providers.json'), 'utf-8'))).toMatchObject({
+      activeId: null,
+      providers: [],
+    })
+  })
+
+  test('migrates known sqlite families after json dir copy without removing legacy dbs', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    const dbDir = path.join(ccHahaDir, 'db')
+    await fs.mkdir(dbDir, { recursive: true })
+    await fs.writeFile(
+      path.join(ccHahaDir, 'providers.json'),
+      JSON.stringify({
+        schemaVersion: CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
+        activeId: null,
+        providers: [],
+        providerOrder: ['claude-official', 'openai-official', 'grok-official'],
+      }, null, 2),
+      'utf-8',
+    )
+    for (const filename of [
+      'index-v1.sqlite',
+      'trace-index-v1.sqlite',
+      'search-index-v1.sqlite',
+      'scheduled-runs-v1.sqlite',
+    ]) {
+      await fs.writeFile(path.join(dbDir, filename), `legacy-${filename}`)
+      await fs.writeFile(path.join(dbDir, `${filename}-wal`), `wal-${filename}`)
+    }
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    expect(report.migratedEntries).toContain('cc-haha -> ccmax')
+    for (const filename of [
+      'index-v1.sqlite',
+      'trace-index-v1.sqlite',
+      'search-index-v1.sqlite',
+      'scheduled-runs-v1.sqlite',
+    ]) {
+      expect(report.migratedEntries).toContain(`db/${filename}`)
+      expect(await fs.readFile(path.join(tempDir, 'ccmax', 'db', filename), 'utf-8'))
+        .toBe(`legacy-${filename}`)
+      expect(await fs.readFile(path.join(tempDir, 'ccmax', 'db', `${filename}-wal`), 'utf-8'))
+        .toBe(`wal-${filename}`)
+      // Stage 14 directory copy must not have been the only path for DB files —
+      // legacy family remains for retry/fallback.
+      expect(await fs.readFile(path.join(dbDir, filename), 'utf-8'))
+        .toBe(`legacy-${filename}`)
+    }
+    // providers.json is copied by dir migration; db files are not present under
+    // a partial primary that only got JSON (family migration writes them).
+    expect(await pathExists(path.join(tempDir, 'ccmax', 'providers.json'))).toBe(true)
+  })
+
+  test('does not overwrite an existing primary sqlite main during storage upgrade', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    const ccmaxDir = path.join(tempDir, 'ccmax')
+    await fs.mkdir(path.join(ccHahaDir, 'db'), { recursive: true })
+    await fs.mkdir(path.join(ccmaxDir, 'db'), { recursive: true })
+    await fs.writeFile(path.join(ccHahaDir, 'db', 'index-v1.sqlite'), 'legacy-main')
+    await fs.writeFile(path.join(ccmaxDir, 'db', 'index-v1.sqlite'), 'primary-main')
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.migratedEntries).not.toContain('db/index-v1.sqlite')
+    expect(await fs.readFile(path.join(ccmaxDir, 'db', 'index-v1.sqlite'), 'utf-8'))
+      .toBe('primary-main')
+    expect(await fs.readFile(path.join(ccHahaDir, 'db', 'index-v1.sqlite'), 'utf-8'))
+      .toBe('legacy-main')
+  })
 })
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath)
+    return true
+  } catch {
+    return false
+  }
+}

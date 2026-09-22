@@ -2,11 +2,14 @@ import { useEffect } from 'react'
 import { tasksApi } from '../api/tasks'
 import { notifyDesktop } from '../lib/desktopNotifications'
 import { whenDesktopServerReady } from '../lib/desktopRuntime'
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  readCanonicalFirst,
+  writeCanonical,
+} from '../lib/persistenceKeys'
 import type { CronTask, TaskRun } from '../types/task'
 
 const POLL_INTERVAL_MS = 30_000
-const NOTIFIED_RUNS_STORAGE_KEY = 'cc-haha.notifiedDesktopTaskRuns.v1'
-const NOTIFICATION_SCAN_STORAGE_KEY = 'cc-haha.scheduledTaskNotificationScan.v1'
 const MAX_STORED_RUN_IDS = 200
 const NOTIFICATION_PAGE_SIZE = 50
 
@@ -37,7 +40,7 @@ function hasDesktopNotification(task: CronTask | undefined): boolean {
 
 function readNotifiedRunIds(): Set<string> {
   try {
-    const raw = localStorage.getItem(NOTIFIED_RUNS_STORAGE_KEY)
+    const raw = readCanonicalFirst(localStorage, DESKTOP_PERSISTENCE_KEYS.notifiedDesktopTaskRuns)
     const parsed = raw ? JSON.parse(raw) : []
     return new Set(Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [])
   } catch {
@@ -48,7 +51,11 @@ function readNotifiedRunIds(): Set<string> {
 function writeNotifiedRunIds(runIds: Set<string>): void {
   try {
     const trimmed = [...runIds].slice(-MAX_STORED_RUN_IDS)
-    localStorage.setItem(NOTIFIED_RUNS_STORAGE_KEY, JSON.stringify(trimmed))
+    writeCanonical(
+      localStorage,
+      DESKTOP_PERSISTENCE_KEYS.notifiedDesktopTaskRuns,
+      JSON.stringify(trimmed),
+    )
   } catch {
     // Notification dedupe is best-effort; storage failures should not break the app.
   }
@@ -66,7 +73,7 @@ function isBoundary(value: unknown): value is NotificationBoundary {
 
 function readNotificationScanState(): NotificationScanState | null {
   try {
-    const raw = localStorage.getItem(NOTIFICATION_SCAN_STORAGE_KEY)
+    const raw = readCanonicalFirst(localStorage, DESKTOP_PERSISTENCE_KEYS.scheduledTaskNotificationScan)
     if (!raw) return null
     const parsed = JSON.parse(raw) as Partial<NotificationScanState>
     if (
@@ -97,7 +104,11 @@ function readNotificationScanState(): NotificationScanState | null {
 
 function writeNotificationScanState(state: NotificationScanState): void {
   try {
-    localStorage.setItem(NOTIFICATION_SCAN_STORAGE_KEY, JSON.stringify(state))
+    writeCanonical(
+      localStorage,
+      DESKTOP_PERSISTENCE_KEYS.scheduledTaskNotificationScan,
+      JSON.stringify(state),
+    )
   } catch {
     // Catch-up progress is best-effort; delivered IDs remain the final dedupe guard.
   }

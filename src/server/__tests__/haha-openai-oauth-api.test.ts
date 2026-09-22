@@ -7,7 +7,10 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
 import { createServer } from 'net'
-import { handleHahaOpenAIOAuthApi } from '../api/haha-openai-oauth.js'
+import {
+  handleHahaOpenAIOAuthApi,
+  handleHahaOpenAIOAuthCallback,
+} from '../api/haha-openai-oauth.js'
 import { hahaOpenAIOAuthService } from '../services/hahaOpenAIOAuthService.js'
 import { startServer, stopServerRuntimeForShutdown } from '../index.js'
 import { ProviderService } from '../services/providerService.js'
@@ -203,6 +206,32 @@ describe('GET /auth/callback', () => {
       await server.stop(true)
       await stopServerRuntimeForShutdown({ waitForCli: false })
       ProviderService.setServerPort(originalServerPort)
+    }
+  })
+
+  test('success page returns to ccmax without old display name', async () => {
+    const originalComplete = hahaOpenAIOAuthService.completeSession.bind(
+      hahaOpenAIOAuthService,
+    )
+    hahaOpenAIOAuthService.completeSession = (async () => ({
+      accessToken: 'test-access',
+      refreshToken: null,
+      expiresAt: null,
+      email: null,
+      accountId: null,
+    })) as typeof hahaOpenAIOAuthService.completeSession
+
+    try {
+      const url = new URL(
+        'http://localhost:3456/auth/callback?code=auth-code&state=test-state',
+      )
+      const res = await handleHahaOpenAIOAuthCallback(url)
+      expect(res.status).toBe(200)
+      const body = await res.text()
+      expect(body).toContain('return to ccmax')
+      expect(body).not.toContain('Claude Code Haha')
+    } finally {
+      hahaOpenAIOAuthService.completeSession = originalComplete
     }
   })
 })

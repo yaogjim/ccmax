@@ -40,9 +40,12 @@ import { useUIStore } from './uiStore'
 import {
   applyDocumentLocale,
   getInitialLocale,
-  LOCALE_STORAGE_KEY,
   subscribeLocaleChanges,
 } from '../i18n/locale'
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  writeCanonical,
+} from '../lib/persistenceKeys'
 
 export const UI_ZOOM_MIN = MIN_APP_ZOOM
 export const UI_ZOOM_MAX = MAX_APP_ZOOM
@@ -398,7 +401,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setLocale: (locale) => {
     set({ locale })
     applyDocumentLocale(locale)
-    try { localStorage.setItem(LOCALE_STORAGE_KEY, locale) } catch { /* noop */ }
+    try { writeCanonical(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.locale, locale) } catch { /* noop */ }
     void getDesktopHost().app.setLocalePreference(locale).catch((error) => {
       console.error('[desktop] Failed to persist locale preference', error)
     })

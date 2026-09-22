@@ -55,7 +55,7 @@ describe('settingsStore locale defaults', () => {
 
     useSettingsStore.getState().setLocale('jp')
 
-    expect(window.localStorage.getItem('cc-haha-locale')).toBe('jp')
+    expect(window.localStorage.getItem('ccmax-locale')).toBe('jp')
     expect(document.documentElement.lang).toBe('ja')
   })
 
@@ -78,7 +78,7 @@ describe('settingsStore locale defaults', () => {
     await vi.waitFor(() => {
       expect(setLocalePreference).toHaveBeenCalledWith('jp')
     })
-    expect(window.localStorage.getItem('cc-haha-locale')).toBe('jp')
+    expect(window.localStorage.getItem('ccmax-locale')).toBe('jp')
 
     vi.resetModules()
     mockSystemLanguages(['ko-KR'])
@@ -112,7 +112,7 @@ describe('settingsStore locale defaults', () => {
       )
     })
     expect(useSettingsStore.getState().locale).toBe('kr')
-    expect(window.localStorage.getItem('cc-haha-locale')).toBe('kr')
+    expect(window.localStorage.getItem('ccmax-locale')).toBe('kr')
   })
 
   it('applies a locale event from another desktop window', async () => {
@@ -166,7 +166,7 @@ describe('settingsStore UI zoom', () => {
     useSettingsStore.getState().setUiZoom(1.25)
 
     await vi.waitFor(() => {
-      expect(window.localStorage.getItem('cc-haha-app-zoom')).toBe('1.25')
+      expect(window.localStorage.getItem('ccmax-app-zoom')).toBe('1.25')
     })
     expect(useSettingsStore.getState().uiZoom).toBe(1.25)
     expect(document.documentElement.getAttribute('data-app-zoom-percent')).toBe('125')
@@ -178,7 +178,7 @@ describe('settingsStore UI zoom', () => {
     useSettingsStore.getState().setUiZoom(9)
 
     await vi.waitFor(() => {
-      expect(window.localStorage.getItem('cc-haha-app-zoom')).toBe('2')
+      expect(window.localStorage.getItem('ccmax-app-zoom')).toBe('2')
     })
     expect(useSettingsStore.getState().uiZoom).toBe(2)
   })
@@ -1549,7 +1549,7 @@ describe('settingsStore theme persistence', () => {
 
     await useSettingsStore.getState().setTheme('warm-classic')
 
-    expect(window.localStorage.getItem('cc-haha-theme')).toBe('warm-classic')
+    expect(window.localStorage.getItem('ccmax-theme')).toBe('warm-classic')
     expect(updateUser).not.toHaveBeenCalled()
     teardownTheme()
   })

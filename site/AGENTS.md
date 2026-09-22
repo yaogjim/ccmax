@@ -6,7 +6,8 @@ These rules apply to the public landing page and documentation experience under 
 
 - Keep the site independently installable with `npm ci` and buildable with `npm run build`.
 - Keep `npm run check` deterministic, offline, and responsible for site-specific validation beyond compilation.
-- Preserve the GitHub Pages custom-domain contract; production assets and routes must work from the root of `cchaha.ai`. `scripts/prepare-static-output.mjs` hard-fails when the CNAME drifts.
+- Publish to the GitHub Pages project site `https://yaogjim.github.io/ccmax/`. Vite `base` is `/ccmax/`. Public asset and canonical URLs must include that base; physical output stays at `site/dist/<route>/index.html` because Pages maps the uploaded artifact root onto `/ccmax/`. Do not nest `dist/ccmax/` and do not ship a CNAME.
+- `src/lib/site.js` is the only source of origin, base, and public URL composition for Vite config, Node scripts, and browser code.
 - Treat files under `docs/` as the source of truth for long-form Chinese and English documentation. Keep paired public routes aligned when both languages exist.
 - Do not copy private user state, credentials, local filesystem paths, or unredacted product screenshots into the site.
 - Run `bun run check:docs` after site or docs changes and include desktop plus narrow-mobile browser evidence for user-visible layout changes.
@@ -19,7 +20,7 @@ These rules apply to the public landing page and documentation experience under 
 - `content/<id>.js` — one module per document holding the markdown **body** (frontmatter already stripped). `docsContent` maps a route to a dynamic import, so opening one page never downloads the rest.
 - `search-index.js` — lazily imported by the search dialog only.
 
-Routes come from file paths (`docs/start/install.md` → `/start/install`). Renaming a file renames its URL, so add the old path to both `LEGACY_ROUTES` in `src/content/docs.js` and `legacyRoutes` in `scripts/prepare-static-output.mjs`.
+Routes come from file paths (`docs/start/install.md` → `/start/install`). That is the logical route. The public href is `/ccmax/start/install`; the file on disk is still `dist/start/install/index.html`. Renaming a file renames its URL, so add the old path to both `LEGACY_ROUTES` in `src/content/docs.js` and `legacyRoutes` in `scripts/prepare-static-output.mjs`.
 
 Sidebar grouping comes from the `sections` array in the generator — register any new top-level `docs/` directory there or it sorts last with a bare directory name. Order inside a group comes from each document's `order` frontmatter.
 

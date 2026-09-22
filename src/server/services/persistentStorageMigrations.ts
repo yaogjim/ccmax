@@ -10,6 +10,7 @@ import {
   PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,
   PROVIDER_REQUEST_COMPATIBILITY_SCHEMA_VERSION,
 } from '../types/provider.js'
+import { migrateSqliteDatabaseFamilies } from './localIndex/sqliteFamilyMigration.js'
 
 export const CURRENT_PROVIDER_INDEX_SCHEMA_VERSION = PROVIDER_REQUEST_COMPATIBILITY_SCHEMA_VERSION
 
@@ -384,24 +385,110 @@ async function migrateLegacyRootProviders(
   }
 }
 
-async function runPersistentStorageMigrations(configDir: string): Promise<MigrationReport> {
-  const report: MigrationReport = { migratedEntries: [], failures: [] }
-  const ccHahaDir = path.join(configDir, 'cc-haha')
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath)
+    return true
+  } catch {
+    return false
+  }
+}
 
-  await migrateLegacyRootProviders(configDir, ccHahaDir, report)
+function isSqliteFamilyName(name: string): boolean {
+  return (
+    name === 'db' ||
+    name.endsWith('.sqlite') ||
+    name.endsWith('.sqlite-wal') ||
+    name.endsWith('.sqlite-shm') ||
+    name.endsWith('.sqlite-journal') ||
+    name.endsWith('-wal') ||
+    name.endsWith('-shm') ||
+    name.endsWith('-journal')
+  )
+}
+
+/**
+ * When the primary fork-owned dir is missing and the legacy dir exists, copy
+ * fork-owned JSON (and sibling non-DB files) via a temp sibling then rename.
+ * Never copies SQLite/WAL trees (later stage). Never deletes the legacy dir;
+ * never overwrites an existing primary dir.
+ */
+async function maybeCopyLegacyForkDirToPrimary(
+  configDir: string,
+  report: MigrationReport,
+): Promise<void> {
+  const legacyDir = path.join(configDir, 'cc-haha')
+  const primaryDir = path.join(configDir, 'ccmax')
+
+  if (await pathExists(primaryDir)) return
+  if (!(await pathExists(legacyDir))) return
+
+  const tmpDir = path.join(
+    configDir,
+    `ccmax.migrating-${Date.now()}-${randomBytes(3).toString('hex')}`,
+  )
+
+  try {
+    await fs.cp(legacyDir, tmpDir, {
+      recursive: true,
+      errorOnExist: true,
+      filter: (source) => !isSqliteFamilyName(path.basename(source)),
+    })
+    // Refuse to clobber a primary that appeared after the existence check.
+    if (await pathExists(primaryDir)) {
+      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {})
+      return
+    }
+    await fs.rename(tmpDir, primaryDir)
+    report.migratedEntries.push('cc-haha -> ccmax')
+  } catch (error) {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {})
+    // Never remove or rewrite the legacy directory on failure.
+    report.failures.push(
+      `cc-haha -> ccmax: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+async function migrateForkOwnedJsonDir(
+  dir: string,
+  entryPrefix: string,
+  report: MigrationReport,
+): Promise<void> {
+  if (!(await pathExists(dir))) return
 
   await migrateJsonEntry(
-    path.join(ccHahaDir, 'providers.json'),
-    'cc-haha/providers.json',
+    path.join(dir, 'providers.json'),
+    `${entryPrefix}/providers.json`,
     report,
     migrateProvidersIndex,
   )
   await migrateJsonEntry(
-    path.join(ccHahaDir, 'settings.json'),
-    'cc-haha/settings.json',
+    path.join(dir, 'settings.json'),
+    `${entryPrefix}/settings.json`,
     report,
     migrateManagedSettings,
   )
+}
+
+async function runPersistentStorageMigrations(configDir: string): Promise<MigrationReport> {
+  const report: MigrationReport = { migratedEntries: [], failures: [] }
+  const ccHahaDir = path.join(configDir, 'cc-haha')
+  const ccmaxDir = path.join(configDir, 'ccmax')
+
+  // Keep root → cc-haha import before copy so a fresh install that only has
+  // root providers.json still lands in the legacy dir, then gets copied.
+  await migrateLegacyRootProviders(configDir, ccHahaDir, report)
+  await maybeCopyLegacyForkDirToPrimary(configDir, report)
+
+  // Dual-run schema migrations: primary first (resolveForkOwnedDir prefers it),
+  // then legacy so old-path fixtures stay upgraded without deleting legacy data.
+  await migrateForkOwnedJsonDir(ccmaxDir, 'ccmax', report)
+  await migrateForkOwnedJsonDir(ccHahaDir, 'cc-haha', report)
+
+  // SQLite families are intentionally excluded from the directory copy above.
+  // Migrate each known DB family only when the primary main is still missing.
+  await migrateSqliteDatabaseFamilies(configDir, report)
 
   return report
 }

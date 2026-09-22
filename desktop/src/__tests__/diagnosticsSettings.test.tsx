@@ -776,8 +776,13 @@ describe('Settings > Diagnostics tab', () => {
     expect(screen.getByText(/User and active project/i)).toBeInTheDocument()
     expect(screen.getByText('Healthy: 1 · Not configured: 0 · Missing: 0 · Invalid: 1')).toBeInTheDocument()
     expect(screen.queryByText('<project>/.claude/skills')).not.toBeInTheDocument()
-    expect(screen.getByText(/cc-haha-app-zoom/)).toBeInTheDocument()
-    expect(screen.getByText(/cc-haha-ui-zoom/)).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        'Reset only removes regenerable desktop UI state such as open tabs, session runtime, theme, locale, zoom, and schema metadata.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/cc-haha-app-zoom/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/cc-haha-ui-zoom/)).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /Reset safe UI state/i }))
     const dialog = await screen.findByRole('dialog', { name: 'Reset safe UI state' })

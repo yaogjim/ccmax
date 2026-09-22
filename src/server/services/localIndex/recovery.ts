@@ -8,6 +8,10 @@ import {
   stat,
 } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
+import {
+  getLegacyManagedDatabasePath,
+  getPrimaryManagedDatabasePath,
+} from './managedDatabasePath.js'
 
 export type LocalIndexErrorCode =
   | 'SQLITE_CORRUPT'
@@ -85,8 +89,10 @@ export function isConfirmedLocalIndexCorruption(error: unknown): boolean {
 }
 
 function assertManagedDatabasePath(scope: string, databasePath: string): void {
-  const expected = resolve(scope, 'cc-haha', 'db', 'index-v1.sqlite')
-  if (resolve(databasePath) !== expected) {
+  const primary = getPrimaryManagedDatabasePath(scope, 'index-v1.sqlite')
+  const legacy = getLegacyManagedDatabasePath(scope, 'index-v1.sqlite')
+  const resolved = resolve(databasePath)
+  if (resolved !== primary && resolved !== legacy) {
     throw new LocalIndexRecoveryError(LOCAL_INDEX_UNSAFE_PATH)
   }
 }
@@ -108,17 +114,23 @@ async function prepareManagedBackupsRoot(
   databasePath: string,
 ): Promise<string> {
   const normalizedScope = resolve(scope)
-  await mkdir(normalizedScope, { recursive: true })
-  const ccHahaDir = join(normalizedScope, 'cc-haha')
-  const databaseDir = join(ccHahaDir, 'db')
-  const backupsRoot = join(databaseDir, 'backups')
-  if (dirname(resolve(databasePath)) !== databaseDir) {
+  const resolvedDatabasePath = resolve(databasePath)
+  const databaseDir = dirname(resolvedDatabasePath)
+  const namespaceDir = dirname(databaseDir)
+  const namespace = basename(namespaceDir)
+  if (namespace !== 'ccmax' && namespace !== 'cc-haha') {
     throw new LocalIndexRecoveryError(LOCAL_INDEX_UNSAFE_PATH)
   }
+  if (join(normalizedScope, namespace, 'db') !== databaseDir) {
+    throw new LocalIndexRecoveryError(LOCAL_INDEX_UNSAFE_PATH)
+  }
+  await mkdir(normalizedScope, { recursive: true })
+  const backupsRoot = join(databaseDir, 'backups')
   // The configured scope is the trust boundary. Managed descendants must be
   // real directories so a rebuild can never follow a redirected database or
-  // backup ancestor outside that boundary.
-  await ensureManagedDirectory(ccHahaDir)
+  // backup ancestor outside that boundary. Backups stay in the active DB
+  // namespace (ccmax or cc-haha).
+  await ensureManagedDirectory(namespaceDir)
   await ensureManagedDirectory(databaseDir)
   await ensureManagedDirectory(backupsRoot)
   return backupsRoot
@@ -189,7 +201,12 @@ export async function backupLocalIndexDatabaseFamily(options: {
   const token = randomUUID().slice(0, 8)
   const pendingPath = join(backupsRoot, `.pending-${stamp}-${token}`)
   const backupPath = join(backupsRoot, `${stamp}-${options.reason.toLowerCase()}-${token}`)
-  const family = [options.databasePath, `${options.databasePath}-wal`, `${options.databasePath}-shm`]
+  const family = [
+    options.databasePath,
+    `${options.databasePath}-wal`,
+    `${options.databasePath}-shm`,
+    `${options.databasePath}-journal`,
+  ]
   const moved: Array<{ source: string; destination: string }> = []
 
   await mkdir(pendingPath)

@@ -6,7 +6,10 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
-import { handleHahaOAuthApi } from '../api/haha-oauth.js'
+import {
+  handleHahaOAuthApi,
+  handleHahaOAuthCallback,
+} from '../api/haha-oauth.js'
 import { hahaOAuthService } from '../services/hahaOAuthService.js'
 
 let tmpDir: string
@@ -142,5 +145,36 @@ describe('DELETE /api/haha-oauth', () => {
     const res = await handleHahaOAuthApi(req, url, segments)
     expect(res.status).toBe(200)
     expect(await hahaOAuthService.loadTokens()).toBeNull()
+  })
+})
+
+describe('GET /callback success brand', () => {
+  beforeEach(setup)
+  afterEach(teardown)
+
+  test('success page returns to ccmax without old display name', async () => {
+    const originalComplete = hahaOAuthService.completeSession.bind(
+      hahaOAuthService,
+    )
+    hahaOAuthService.completeSession = (async () => ({
+      accessToken: 'test-access',
+      refreshToken: null,
+      expiresAt: null,
+      scopes: [],
+      subscriptionType: null,
+    })) as typeof hahaOAuthService.completeSession
+
+    try {
+      const url = new URL(
+        'http://localhost:3456/callback?code=auth-code&state=test-state',
+      )
+      const res = await handleHahaOAuthCallback(url)
+      expect(res.status).toBe(200)
+      const body = await res.text()
+      expect(body).toContain('return to ccmax')
+      expect(body).not.toContain('Claude Code Haha')
+    } finally {
+      hahaOAuthService.completeSession = originalComplete
+    }
   })
 })

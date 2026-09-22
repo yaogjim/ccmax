@@ -9,6 +9,7 @@
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { resolveForkOwnedDir } from '../../utils/envUtils.js'
 import { ProviderService } from './providerService.js'
 import { SettingsService } from './settingsService.js'
 import {
@@ -1741,7 +1742,7 @@ export class ConversationService {
             // running/idle boundary or a disconnected renderer can kill that
             // follow-up after the fixed idle grace period.
             CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
-            CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.claude-code-haha.desktop',
+            CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.ccmax.desktop',
           }
         : {}),
       ...(sdkUrl && traceCaptureEnabled
@@ -1909,11 +1910,9 @@ export class ConversationService {
       return true
     }
 
-    const configDir =
-      process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
-    const ccHahaDir = path.join(configDir, 'cc-haha')
-    const providersIndexPath = path.join(ccHahaDir, 'providers.json')
-    const settingsPath = path.join(ccHahaDir, 'settings.json')
+    const forkOwnedDir = resolveForkOwnedDir()
+    const providersIndexPath = path.join(forkOwnedDir, 'providers.json')
+    const settingsPath = path.join(forkOwnedDir, 'settings.json')
 
     if (fs.existsSync(providersIndexPath)) {
       return true
@@ -1975,9 +1974,7 @@ export class ConversationService {
       return false
     }
 
-    const configDir =
-      process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
-    const settingsPath = path.join(configDir, 'cc-haha', 'settings.json')
+    const settingsPath = path.join(resolveForkOwnedDir(), 'settings.json')
     try {
       const raw = fs.readFileSync(settingsPath, 'utf-8')
       const parsed = JSON.parse(raw) as { env?: Record<string, string> }

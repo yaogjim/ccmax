@@ -39,7 +39,7 @@ describe('tabStore', () => {
     await useTabStore.getState().restoreTabs()
     expect(useTabStore.getState().tabs[0]).toMatchObject({ sessionId: MARKET_TAB_ID, type: 'market' })
     useTabStore.getState().saveTabs()
-    expect(JSON.parse(localStorage.getItem('cc-haha-open-tabs')!).openTabs[0].type).toBe('market')
+    expect(JSON.parse(localStorage.getItem('ccmax-open-tabs')!).openTabs[0].type).toBe('market')
   })
 
   beforeEach(() => {
@@ -184,7 +184,7 @@ describe('tabStore', () => {
       activeTabId: '__workbench__session-a',
     })
     useTabStore.getState().saveTabs()
-    expect(JSON.parse(localStorage.getItem('cc-haha-open-tabs')!)).toEqual({
+    expect(JSON.parse(localStorage.getItem('ccmax-open-tabs')!)).toEqual({
       openTabs: [{ sessionId: 'session-a', title: 'Task A', type: 'session' }], activeTabId: 'session-a',
     })
   })
@@ -207,7 +207,7 @@ describe('tabStore', () => {
       },
     ])
     expect(useTabStore.getState().activeTabId).toBe('__subagent__session-1__tool-1')
-    expect(localStorage.getItem('cc-haha-open-tabs')).toBe(JSON.stringify({
+    expect(localStorage.getItem('ccmax-open-tabs')).toBe(JSON.stringify({
       openTabs: [],
       activeTabId: null,
     }))
@@ -230,7 +230,7 @@ describe('tabStore', () => {
       teamMemberAgentId: 'reviewer@review-team',
       returnTabId: workbenchTabId,
     })
-    expect(localStorage.getItem('cc-haha-open-tabs')).toBe(JSON.stringify({
+    expect(localStorage.getItem('ccmax-open-tabs')).toBe(JSON.stringify({
       openTabs: [{ sessionId: 'session-1', title: 'Lead session', type: 'session' }],
       activeTabId: 'session-1',
     }))
@@ -559,6 +559,10 @@ it('maps both legacy market entry points to one canonical tab', () => {
 })
 
 it('restores duplicate legacy markets as one tab and retains their active selection', async () => {
+  // Canonical keys win over legacy on read, so drop any canonical payload a
+  // previous test wrote before seeding the legacy-only state an upgraded
+  // install would have.
+  localStorage.clear()
   useTabStore.setState({ tabs: [], activeTabId: null })
   vi.mocked(sessionsApi.list).mockResolvedValue({ sessions: [] } as never)
   localStorage.setItem('cc-haha-open-tabs', JSON.stringify({ openTabs: [

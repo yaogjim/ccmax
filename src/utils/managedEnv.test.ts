@@ -157,4 +157,38 @@ describe('managedEnv', () => {
     expect(process.env.CC_HAHA_IMAGE_MODEL).toBe('grok-imagine-image-quality')
     expect(process.env.CLAUDE_CODE_PROVIDER_MAX_OUTPUT_TOKENS).toBe('96000')
   })
+
+  test('reads managed settings env from legacy cc-haha when only that dir exists', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'settings.json'), {
+      env: {
+        ANTHROPIC_MODEL: 'legacy-only-model',
+        ANTHROPIC_AUTH_TOKEN: 'legacy-token',
+      },
+    })
+
+    applySafeConfigEnvironmentVariables()
+
+    expect(process.env.ANTHROPIC_MODEL).toBe('legacy-only-model')
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe('legacy-token')
+  })
+
+  test('prefers ccmax settings over legacy cc-haha when both dirs exist', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'settings.json'), {
+      env: {
+        ANTHROPIC_MODEL: 'legacy-model',
+        ANTHROPIC_AUTH_TOKEN: 'legacy-token',
+      },
+    })
+    await writeJson(path.join(tmpDir, 'ccmax', 'settings.json'), {
+      env: {
+        ANTHROPIC_MODEL: 'ccmax-model',
+        ANTHROPIC_AUTH_TOKEN: 'ccmax-token',
+      },
+    })
+
+    applySafeConfigEnvironmentVariables()
+
+    expect(process.env.ANTHROPIC_MODEL).toBe('ccmax-model')
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe('ccmax-token')
+  })
 })

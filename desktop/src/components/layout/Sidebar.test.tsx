@@ -244,11 +244,11 @@ import { resetSettingsNavigationStore, showSkillMarket } from '../../stores/sett
 import type { SessionListItem } from '../../types/session'
 import type { PerSessionState } from '../../stores/chatStore'
 
-const PROJECT_ORDER_STORAGE_KEY = 'cc-haha-sidebar-project-order'
-const PROJECT_PINNED_STORAGE_KEY = 'cc-haha-sidebar-pinned-projects'
-const PROJECT_HIDDEN_STORAGE_KEY = 'cc-haha-sidebar-hidden-projects'
-const PROJECT_ORGANIZATION_STORAGE_KEY = 'cc-haha-sidebar-project-organization'
-const PROJECT_SORT_STORAGE_KEY = 'cc-haha-sidebar-project-sort'
+const PROJECT_ORDER_STORAGE_KEY = 'ccmax-sidebar-project-order'
+const PROJECT_PINNED_STORAGE_KEY = 'ccmax-sidebar-pinned-projects'
+const PROJECT_HIDDEN_STORAGE_KEY = 'ccmax-sidebar-hidden-projects'
+const PROJECT_ORGANIZATION_STORAGE_KEY = 'ccmax-sidebar-project-organization'
+const PROJECT_SORT_STORAGE_KEY = 'ccmax-sidebar-project-sort'
 const realCreateSession = useSessionStore.getInitialState().createSession
 const realFetchSessions = useSessionStore.getInitialState().fetchSessions
 
@@ -473,6 +473,11 @@ describe('Sidebar', () => {
     window.localStorage.removeItem(PROJECT_HIDDEN_STORAGE_KEY)
     window.localStorage.removeItem(PROJECT_ORGANIZATION_STORAGE_KEY)
     window.localStorage.removeItem(PROJECT_SORT_STORAGE_KEY)
+    window.localStorage.removeItem('cc-haha-sidebar-project-order')
+    window.localStorage.removeItem('cc-haha-sidebar-pinned-projects')
+    window.localStorage.removeItem('cc-haha-sidebar-hidden-projects')
+    window.localStorage.removeItem('cc-haha-sidebar-project-organization')
+    window.localStorage.removeItem('cc-haha-sidebar-project-sort')
 
     useTabStore.setState({ tabs: [], activeTabId: null })
     useSessionStore.setState({
@@ -515,6 +520,11 @@ describe('Sidebar', () => {
     window.localStorage.removeItem(PROJECT_HIDDEN_STORAGE_KEY)
     window.localStorage.removeItem(PROJECT_ORGANIZATION_STORAGE_KEY)
     window.localStorage.removeItem(PROJECT_SORT_STORAGE_KEY)
+    window.localStorage.removeItem('cc-haha-sidebar-project-order')
+    window.localStorage.removeItem('cc-haha-sidebar-pinned-projects')
+    window.localStorage.removeItem('cc-haha-sidebar-hidden-projects')
+    window.localStorage.removeItem('cc-haha-sidebar-project-organization')
+    window.localStorage.removeItem('cc-haha-sidebar-project-sort')
   })
 
   it('opens a new tab when creating a session from the sidebar', async () => {
@@ -539,19 +549,20 @@ describe('Sidebar', () => {
     expect(screen.getByTestId('sidebar-title-region')).toHaveAttribute('data-desktop-drag-region')
   })
 
-  // The header used to render both "Claude Code Haha" and "cc-haha" and hide
-  // one with a container query, so the app answered to two names depending on
-  // how far the sidebar had been dragged. Only the short one ships now — and
-  // the long one must not linger in the DOM, since a display-hidden copy still
-  // reaches screen readers and in-page search.
+  // The header used to render both a long product name and a short wordmark
+  // and hide one with a container query, so the app answered to two names
+  // depending on how far the sidebar had been dragged. Only the short one
+  // ships now — and the long one must not linger in the DOM, since a
+  // display-hidden copy still reaches screen readers and in-page search.
   it('renders one wordmark and it is the short one', () => {
     render(<Sidebar />)
 
     const region = screen.getByTestId('sidebar-title-region')
 
-    expect(region).toHaveTextContent('cc-haha')
+    expect(region).toHaveTextContent('ccmax')
     expect(region).not.toHaveTextContent('Claude Code')
     expect(region.querySelector('a[href="https://github.com/NanmiCoder/cc-haha"]')).toBeNull()
+    expect(region.querySelector('a[href="https://github.com/yaogjim/ccmax"]')).toBeTruthy()
   })
 
   it('groups sessions by project and expands overflow rows', () => {
@@ -2102,9 +2113,9 @@ describe('Sidebar', () => {
   it('shows the brand mark only on the rail, where the wordmark is clamped away', async () => {
     render(<Sidebar />)
 
-    // Scope to the wordmark's own row — the brand mark beside it is also an svg
-    // and would answer a looser query.
-    const brandRow = () => screen.getByText('haha').closest('div')
+    // Scope to the wordmark's own row — the GitHub link in the same header is
+    // also an svg and would answer a looser query.
+    const brandRow = () => screen.getByText('max').closest('div')
 
     // Expanded, the name carries the brand and the mark beside it is clutter.
     expect(brandRow()?.querySelector('svg')).toBeNull()
@@ -2912,5 +2923,61 @@ describe('Sidebar', () => {
       expect(bell).toBeInTheDocument()
       expect(bell).not.toHaveAttribute('tabindex', '-1')
     })
+  })
+
+  it('reads brand-legacy sidebar project prefs and writes only canonical keys', async () => {
+    window.localStorage.setItem('cc-haha-sidebar-project-order', JSON.stringify([
+      '/workspace/beta',
+      '/workspace/alpha',
+    ]))
+    window.localStorage.setItem('cc-haha-sidebar-pinned-projects', JSON.stringify(['/workspace/beta']))
+    window.localStorage.setItem('cc-haha-sidebar-hidden-projects', JSON.stringify(['/workspace/gamma']))
+    window.localStorage.setItem('cc-haha-sidebar-project-organization', 'project')
+    window.localStorage.setItem('cc-haha-sidebar-project-sort', 'createdAt')
+    const now = new Date().toISOString()
+    useSessionStore.setState({
+      sessions: [
+        makeSession('alpha-1', 'Alpha Session', '/workspace/alpha', now),
+        makeSession('beta-1', 'Beta Session', '/workspace/beta', now),
+        makeSession('gamma-1', 'Gamma Session', '/workspace/gamma', now),
+      ],
+    })
+
+    render(<Sidebar />)
+
+    expect(projectGroupNames().slice(0, 2)).toEqual(['beta', 'alpha'])
+    expect(screen.queryByText('gamma')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Project actions for beta' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Unpin Project' }))
+
+    await waitFor(() => {
+      expect(JSON.parse(window.localStorage.getItem(PROJECT_PINNED_STORAGE_KEY) ?? '[]')).toEqual([])
+    })
+    // Legacy key is retained; normal writes only touch canonical.
+    expect(window.localStorage.getItem('cc-haha-sidebar-pinned-projects')).toBe(JSON.stringify(['/workspace/beta']))
+    expect(JSON.parse(window.localStorage.getItem(PROJECT_PINNED_STORAGE_KEY) ?? 'null')).toEqual([])
+  })
+
+  it('prefers canonical sidebar project prefs over conflicting legacy values', () => {
+    window.localStorage.setItem(PROJECT_ORDER_STORAGE_KEY, JSON.stringify([
+      '/workspace/alpha',
+      '/workspace/beta',
+    ]))
+    window.localStorage.setItem('cc-haha-sidebar-project-order', JSON.stringify([
+      '/workspace/beta',
+      '/workspace/alpha',
+    ]))
+    const now = new Date().toISOString()
+    useSessionStore.setState({
+      sessions: [
+        makeSession('alpha-1', 'Alpha Session', '/workspace/alpha', now),
+        makeSession('beta-1', 'Beta Session', '/workspace/beta', now),
+      ],
+    })
+
+    render(<Sidebar />)
+
+    expect(projectGroupNames().slice(0, 2)).toEqual(['alpha', 'beta'])
   })
 })

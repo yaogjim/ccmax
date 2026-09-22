@@ -27,6 +27,10 @@ use tauri_plugin_shell::{
     ShellExt,
 };
 
+pub mod app_identity;
+mod profile_handoff;
+pub mod webview_identity;
+
 #[cfg(target_os = "macos")]
 mod macos_notifications {
     use std::ffi::{CStr, CString};
@@ -291,25 +295,13 @@ fn write_app_mode_config(config_dir: &Path, config: &AppModeConfig) {
 
 /// Check if a directory contains portable config/data files.
 fn dir_has_portable_data(dir: &Path) -> bool {
-    if !dir.is_dir() {
-        return false;
-    }
-    [
-        "settings.json",
-        ".claude.json",
-        ".mcp.json",
-        WINDOW_STATE_FILE,
-        TERMINAL_CONFIG_FILE,
-    ]
-        .iter()
-        .any(|f| dir.join(f).is_file())
-        || dir.join("Cache").is_dir()
-        || dir.join("EBWebView").is_dir()
-        || dir.join("projects").is_dir()
-        || dir.join("skills").is_dir()
-        || dir.join("plugins").is_dir()
-        || dir.join("cowork_plugins").is_dir()
-        || dir.join("cc-haha").is_dir()
+    app_identity::dir_has_portable_data(dir)
+}
+
+/// Unified active app-config path for all app-owned consumers.
+/// Priority: portable CLAUDE_CONFIG_DIR > prepared CCMAX_TAURI_APP_CONFIG_DIR > Tauri default.
+fn resolve_app_config_dir(app: &AppHandle) -> Option<PathBuf> {
+    app_identity::resolve_active_app_config_dir_runtime(app.path().app_config_dir().ok())
 }
 
 /// Resolve the default portable config directory: exe_dir/CLAUDE_CONFIG_DIR.
@@ -361,17 +353,13 @@ impl TerminalConfig {
 }
 
 fn terminal_config_path(app: &AppHandle) -> Option<PathBuf> {
-    // honour CLAUDE_CONFIG_DIR for portable installs
-    std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .map(|dir| PathBuf::from(&dir).join(TERMINAL_CONFIG_FILE))
-        .or_else(|| match app.path().app_config_dir() {
-            Ok(dir) => Some(dir.join(TERMINAL_CONFIG_FILE)),
-            Err(err) => {
-                eprintln!("[desktop] failed to resolve app config dir: {err}");
-                None
-            }
-        })
+    match resolve_app_config_dir(app) {
+        Some(dir) => Some(dir.join(TERMINAL_CONFIG_FILE)),
+        None => {
+            eprintln!("[desktop] failed to resolve app config dir");
+            None
+        }
+    }
 }
 
 impl Default for TerminalConfig {
@@ -552,11 +540,9 @@ fn cancel_update_install(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn get_app_mode(app: AppHandle) -> serde_json::Value {
     let env_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok().map(PathBuf::from);
-    let active_config_dir = env_config_dir
-        .clone()
-        .or_else(|| app.path().app_config_dir().ok());
+    let active_config_dir = resolve_app_config_dir(&app);
     let config_dir_source = if env_config_dir.is_some() {
-        if std::env::var_os("CC_HAHA_APP_PORTABLE_DIR").is_some() {
+        if app_identity::is_portable_dir_marker_set() {
             "portable"
         } else {
             "environment"
@@ -583,14 +569,9 @@ fn set_app_mode(
     mode: String,
     portable_dir: Option<String>,
 ) -> Result<(), String> {
-    // 确定当前正在使用的配置目录
-    let active_config_dir = if let Ok(cd) = std::env::var("CLAUDE_CONFIG_DIR") {
-        std::path::PathBuf::from(&cd)
-    } else {
-        app.path()
-            .app_config_dir()
-            .map_err(|e| format!("resolve app config dir: {e}"))?
-    };
+    // 确定当前正在使用的配置目录（portable > prepared active > Tauri default）
+    let active_config_dir = resolve_app_config_dir(&app)
+        .ok_or_else(|| "resolve app config dir: unavailable".to_string())?;
 
     let (app_mode, portable_dir, target_portable_dir) = if mode == "portable" {
         let selected_dir = portable_dir
@@ -640,11 +621,14 @@ fn set_app_mode(
         }
     }
 
-    // 修复：同时始终将模式状态写入系统默认配置目录，
-    // 以防止应用层切换模式后，main.rs在下一次启动时读取到旧的系统全局状态
-    if let Ok(sys_dir) = app.path().app_config_dir() {
-        if sys_dir != active_config_dir {
-            write_app_mode_config(&sys_dir, &config);
+    // Keep primary (and prepared active when distinct) in sync so next boot
+    // reads the intended mode before identifier flip.
+    if let Some(base) = app_identity::resolve_system_config_base_runtime() {
+        let prepared = app_identity::prepared_active_app_config_dir();
+        for sys_dir in app_identity::system_app_mode_write_dirs(&base, prepared.as_deref()) {
+            if sys_dir != active_config_dir {
+                write_app_mode_config(&sys_dir, &config);
+            }
         }
     }
 
@@ -734,22 +718,14 @@ fn is_window_state_visible_on_any_monitor(
 }
 
 fn window_state_path(app: &AppHandle) -> Option<PathBuf> {
-    // honour CLAUDE_CONFIG_DIR so portable installs keep window-state.json
-    // and terminal-config.json alongside the config dir instead of
-    // %APPDATA%\com.claude-code-haha.desktop\.
-    resolve_portable_state_path().or_else(|| match app.path().app_config_dir() {
-        Ok(dir) => Some(dir.join(WINDOW_STATE_FILE)),
-        Err(err) => {
-            eprintln!("[desktop] failed to resolve app config dir: {err}");
+    // portable CLAUDE_CONFIG_DIR > prepared active app-config > Tauri default
+    match resolve_app_config_dir(app) {
+        Some(dir) => Some(dir.join(WINDOW_STATE_FILE)),
+        None => {
+            eprintln!("[desktop] failed to resolve app config dir");
             None
         }
-    })
-}
-
-fn resolve_portable_state_path() -> Option<PathBuf> {
-    std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .map(|dir| PathBuf::from(&dir).join(WINDOW_STATE_FILE))
+    }
 }
 
 fn server_state_path() -> Option<PathBuf> {
@@ -919,6 +895,68 @@ fn save_main_window_state(app: &AppHandle) {
     write_stored_window_state(app, &state);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainWindowConfigError {
+    Missing,
+    Duplicate,
+}
+
+impl MainWindowConfigError {
+    fn message(self, label: &str) -> String {
+        match self {
+            Self::Missing => format!("missing window config for label `{label}`"),
+            Self::Duplicate => format!("duplicate window config for label `{label}`"),
+        }
+    }
+}
+
+fn select_unique_window_config<'a>(
+    windows: &'a [tauri::utils::config::WindowConfig],
+    label: &str,
+) -> Result<&'a tauri::utils::config::WindowConfig, MainWindowConfigError> {
+    let mut found = None;
+    for window in windows {
+        if window.label == label {
+            if found.is_some() {
+                return Err(MainWindowConfigError::Duplicate);
+            }
+            found = Some(window);
+        }
+    }
+    found.ok_or(MainWindowConfigError::Missing)
+}
+
+fn apply_prepared_webview_data_dir<B>(
+    builder: B,
+    prepared: Option<PathBuf>,
+    apply: impl FnOnce(B, PathBuf) -> B,
+) -> B {
+    match prepared {
+        Some(path) => apply(builder, path),
+        None => builder,
+    }
+}
+
+fn create_main_window(app: &tauri::App) -> tauri::Result<()> {
+    let config = select_unique_window_config(&app.config().app.windows, MAIN_WINDOW_LABEL)
+        .map_err(|err| {
+            let kind = match err {
+                MainWindowConfigError::Missing => ErrorKind::NotFound,
+                MainWindowConfigError::Duplicate => ErrorKind::InvalidData,
+            };
+            IoError::new(kind, err.message(MAIN_WINDOW_LABEL))
+        })?
+        .clone();
+
+    let builder = apply_prepared_webview_data_dir(
+        tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?,
+        webview_identity::prepared_active_webview_data_dir(),
+        tauri::WebviewWindowBuilder::data_directory,
+    );
+    builder.build()?;
+    Ok(())
+}
+
 fn restore_main_window_state(app: &AppHandle) {
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
         return;
@@ -950,13 +988,13 @@ fn show_main_window(app: &AppHandle) {
 
 fn setup_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let menu = MenuBuilder::new(app)
-        .text(TRAY_SHOW_ID, "Show Claude Code Haha")
+        .text(TRAY_SHOW_ID, "Show ccmax")
         .separator()
-        .text(TRAY_QUIT_ID, "Quit Claude Code Haha")
+        .text(TRAY_QUIT_ID, "Quit ccmax")
         .build()?;
 
     let mut tray = TrayIconBuilder::with_id("main-tray")
-        .tooltip("Claude Code Haha")
+        .tooltip("ccmax")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -2127,16 +2165,90 @@ fn kill_windows_sidecars() {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_terminal_output, default_utf8_locale, dir_has_portable_data, ensure_utf8_locale,
-        has_meaningful_intersection, is_browser_safe_port, is_persistable_window_state,
-        normalize_terminal_bash_path, parse_env_block, parse_h5_fixed_port,
-        reserve_browser_safe_port, reserve_local_port_with_preference,
-        resolve_agent_powershell_path_override, resolve_desktop_terminal_shell,
-        resolve_terminal_cwd, run_notification_bridge, select_h5_dist_dir, DesktopTerminalConfig,
-        StoredServerState, StoredWindowState, TerminalHostPlatform, SERVER_BIND_HOST,
-        SERVER_CONTROL_HOST,
+        apply_prepared_webview_data_dir, decode_terminal_output, default_utf8_locale,
+        dir_has_portable_data, ensure_utf8_locale, has_meaningful_intersection,
+        is_browser_safe_port, is_persistable_window_state, normalize_terminal_bash_path,
+        parse_env_block, parse_h5_fixed_port, reserve_browser_safe_port,
+        reserve_local_port_with_preference, resolve_agent_powershell_path_override,
+        resolve_desktop_terminal_shell, resolve_terminal_cwd, run_notification_bridge,
+        select_h5_dist_dir, select_unique_window_config, DesktopTerminalConfig,
+        MainWindowConfigError, StoredServerState, StoredWindowState, TerminalHostPlatform,
+        MAIN_WINDOW_LABEL, SERVER_BIND_HOST, SERVER_CONTROL_HOST,
     };
-    use std::{collections::HashMap, fs, net::TcpListener};
+    use crate::app_identity::{
+        is_portable_dir_marker_set, resolve_active_app_config_dir, ACTIVE_APP_CONFIG_ENV,
+        LEGACY_PORTABLE_DIR_ENV, PORTABLE_DIR_ENV,
+    };
+    use std::{
+        collections::HashMap,
+        fs,
+        net::TcpListener,
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+    };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn active_app_config_resolver_prefers_portable_then_prepared_then_default() {
+        let portable = PathBuf::from("/tmp/portable-config");
+        let prepared = PathBuf::from("/tmp/prepared-config");
+        let tauri_default = PathBuf::from("/tmp/tauri-default");
+        assert_eq!(
+            resolve_active_app_config_dir(
+                Some(portable.clone()),
+                Some(prepared.clone()),
+                Some(tauri_default.clone()),
+            ),
+            Some(portable)
+        );
+        assert_eq!(
+            resolve_active_app_config_dir(
+                None,
+                Some(prepared.clone()),
+                Some(tauri_default.clone())
+            ),
+            Some(prepared)
+        );
+        assert_eq!(
+            resolve_active_app_config_dir(None, None, Some(tauri_default.clone())),
+            Some(tauri_default)
+        );
+    }
+
+    #[test]
+    fn portable_marker_prefers_new_env_key() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(PORTABLE_DIR_ENV);
+        std::env::remove_var(LEGACY_PORTABLE_DIR_ENV);
+        assert!(!is_portable_dir_marker_set());
+        std::env::set_var(LEGACY_PORTABLE_DIR_ENV, "1");
+        assert!(is_portable_dir_marker_set());
+        std::env::remove_var(LEGACY_PORTABLE_DIR_ENV);
+        std::env::set_var(PORTABLE_DIR_ENV, "1");
+        assert!(is_portable_dir_marker_set());
+        std::env::remove_var(PORTABLE_DIR_ENV);
+        let _ = ACTIVE_APP_CONFIG_ENV;
+    }
+
+    #[test]
+    fn portable_fingerprint_includes_ccmax_namespace() {
+        let root = std::env::temp_dir().join(format!(
+            "ccmax-lib-portable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("ccmax")).unwrap();
+        assert!(dir_has_portable_data(&root));
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn window_state_rejects_too_small_sizes() {
@@ -2313,10 +2425,8 @@ mod tests {
     #[test]
     fn terminal_cwd_defaults_to_portable_config_dir_when_present() {
         let original = std::env::var_os("CLAUDE_CONFIG_DIR");
-        let dir = std::env::temp_dir().join(format!(
-            "cchh-terminal-portable-cwd-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cchh-terminal-portable-cwd-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create portable config dir");
         std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
 
@@ -2334,10 +2444,8 @@ mod tests {
 
     #[test]
     fn portable_data_detection_includes_cli_state_dirs() {
-        let root = std::env::temp_dir().join(format!(
-            "cchh-portable-data-detect-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cchh-portable-data-detect-{}", std::process::id()));
         let skills = root.join("skills");
         fs::create_dir_all(&skills).expect("create skills dir");
 
@@ -2454,7 +2562,10 @@ mod tests {
             None
         );
         // Out of range, wrong type, missing, or null all fall back to None.
-        assert_eq!(parse_h5_fixed_port(r#"{"h5Access":{"fixedPort":80}}"#), None);
+        assert_eq!(
+            parse_h5_fixed_port(r#"{"h5Access":{"fixedPort":80}}"#),
+            None
+        );
         assert_eq!(
             parse_h5_fixed_port(r#"{"h5Access":{"fixedPort":70000}}"#),
             None
@@ -2589,6 +2700,102 @@ mod tests {
 
         assert!(ran_on_worker);
     }
+
+    fn window_config_with_label(label: &str) -> tauri::utils::config::WindowConfig {
+        let mut config = tauri::utils::config::WindowConfig::default();
+        config.label = label.to_string();
+        config
+    }
+
+    struct ProbeBuilder {
+        data_directory: Option<PathBuf>,
+    }
+
+    impl ProbeBuilder {
+        fn data_directory(mut self, path: PathBuf) -> Self {
+            self.data_directory = Some(path);
+            self
+        }
+    }
+
+    #[test]
+    fn selects_the_unique_main_window_config() {
+        let windows = vec![
+            window_config_with_label("other"),
+            window_config_with_label(MAIN_WINDOW_LABEL),
+        ];
+        let selected = select_unique_window_config(&windows, MAIN_WINDOW_LABEL).unwrap();
+        assert_eq!(selected.label, MAIN_WINDOW_LABEL);
+    }
+
+    #[test]
+    fn rejects_a_missing_main_window_config() {
+        let windows = vec![window_config_with_label("other")];
+        let err = select_unique_window_config(&windows, MAIN_WINDOW_LABEL).unwrap_err();
+        assert_eq!(err, MainWindowConfigError::Missing);
+        assert_eq!(
+            err.message(MAIN_WINDOW_LABEL),
+            "missing window config for label `main`"
+        );
+    }
+
+    #[test]
+    fn rejects_a_duplicate_main_window_config() {
+        let windows = vec![
+            window_config_with_label(MAIN_WINDOW_LABEL),
+            window_config_with_label(MAIN_WINDOW_LABEL),
+        ];
+        let err = select_unique_window_config(&windows, MAIN_WINDOW_LABEL).unwrap_err();
+        assert_eq!(err, MainWindowConfigError::Duplicate);
+        assert_eq!(
+            err.message(MAIN_WINDOW_LABEL),
+            "duplicate window config for label `main`"
+        );
+    }
+
+    #[test]
+    fn applies_prepared_webview_data_dir_only_when_present() {
+        let path = PathBuf::from("/tmp/ccmax-stage24b-webview");
+        let with_path = apply_prepared_webview_data_dir(
+            ProbeBuilder {
+                data_directory: None,
+            },
+            Some(path.clone()),
+            ProbeBuilder::data_directory,
+        );
+        assert_eq!(with_path.data_directory, Some(path));
+
+        let without_path = apply_prepared_webview_data_dir(
+            ProbeBuilder {
+                data_directory: None,
+            },
+            None,
+            ProbeBuilder::data_directory,
+        );
+        assert_eq!(without_path.data_directory, None);
+    }
+
+    #[test]
+    fn main_and_preview_share_the_same_prepared_path_decision() {
+        let path = PathBuf::from("/tmp/ccmax-stage24b-shared");
+        let prepared = Some(path.clone());
+        let main = apply_prepared_webview_data_dir(
+            ProbeBuilder {
+                data_directory: None,
+            },
+            prepared.clone(),
+            ProbeBuilder::data_directory,
+        );
+        let preview = apply_prepared_webview_data_dir(
+            ProbeBuilder {
+                data_directory: None,
+            },
+            prepared,
+            ProbeBuilder::data_directory,
+        );
+        assert_eq!(main.data_directory, preview.data_directory);
+        assert_eq!(main.data_directory, Some(path));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2607,7 +2814,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_server_url,
             restart_adapters_sidecar,
@@ -2698,6 +2904,7 @@ pub fn run() {
 
     let app = builder
         .setup(|app| {
+            create_main_window(app)?;
             setup_system_tray(app)?;
             macos_notifications::install_click_handler(app.handle().clone());
             restore_main_window_state(&app.handle());

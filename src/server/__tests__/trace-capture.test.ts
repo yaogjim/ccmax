@@ -137,13 +137,13 @@ describe('trace capture service', () => {
     await expect(fs.stat(canonicalB)).rejects.toMatchObject({ code: 'ENOENT' })
     expect((await fs.lstat(path.join(
       scopeA,
-      'cc-haha',
+      'ccmax',
       'db',
       'trace-index-v1.sqlite',
     ))).isFile()).toBe(true)
     await expect(fs.stat(path.join(
       scopeB,
-      'cc-haha',
+      'ccmax',
       'db',
       'trace-index-v1.sqlite',
     ))).rejects.toMatchObject({ code: 'ENOENT' })
@@ -193,7 +193,7 @@ describe('trace capture service', () => {
     ] as const) {
       const database = new Database(path.join(
         scope,
-        'cc-haha',
+        'ccmax',
         'db',
         'trace-index-v1.sqlite',
       ), { readonly: true })
@@ -250,7 +250,7 @@ describe('trace capture service', () => {
 
     const databaseB = new Database(path.join(
       scopeB,
-      'cc-haha',
+      'ccmax',
       'db',
       'trace-index-v1.sqlite',
     ), { readonly: true })
@@ -2408,7 +2408,7 @@ describe('trace read cache', () => {
       response: { status: 200, body: { ok: true } },
     })
     clearTraceCaptureStateForTests()
-    const databasePath = path.join(tmpDir, 'cc-haha', 'db', 'trace-index-v1.sqlite')
+    const databasePath = getTraceIndexDatabasePath()
     await fs.writeFile(databasePath, 'not a sqlite database')
 
     const list = await traceCaptureService.listSessionTraces()

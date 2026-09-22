@@ -1,6 +1,12 @@
+import {
+  DESKTOP_PERSISTENCE_KEYS,
+  LOCALE_STORAGE_KEY,
+  readCanonicalFirst,
+} from '../lib/persistenceKeys'
+
 export type Locale = 'en' | 'zh' | 'zh-TW' | 'jp' | 'kr'
 
-export const LOCALE_STORAGE_KEY = 'cc-haha-locale'
+export { LOCALE_STORAGE_KEY }
 
 const VALID_LOCALES: readonly Locale[] = ['en', 'zh', 'zh-TW', 'jp', 'kr']
 const DOCUMENT_LANG: Record<Locale, string> = {
@@ -67,7 +73,7 @@ export function resolveSupportedLocale(languageTags: readonly string[]): Locale 
 
 export function readStoredLocale(): Locale | null {
   try {
-    const stored = localStorage.getItem(LOCALE_STORAGE_KEY)
+    const stored = readCanonicalFirst(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.locale)
     if (isLocale(stored)) return stored
   } catch {
     // localStorage can be unavailable in locked-down browser contexts.

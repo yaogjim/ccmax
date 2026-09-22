@@ -2,6 +2,8 @@ import { afterEach, describe, expect, mock, test } from 'bun:test'
 import * as fsPromises from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import * as lockfile from './utils/lockfile.js'
+import * as sleepUtils from './utils/sleep.js'
 
 const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
 let testConfigDir: string | null = null
@@ -35,91 +37,166 @@ describe('prompt history persistence', () => {
       | 'rollback-fails'
       | 'read-fails'
       | 'unexpected-tail' = 'partial-then-success'
+    const appendEntered: Deferred[] = []
+    const appendSettled: Deferred[] = []
+    const flushReleased: Deferred[] = []
+    let flushReleases = 0
+    let truncateSettled = createDeferred()
+    let reconcileReadSettled = createDeferred()
+    let retryDelayEntered = createDeferred()
+    let retryDelayRelease = createDeferred()
+    let retryDelayFinished = createDeferred()
     const realAppendFile = fsPromises.appendFile
     const realReadFile = fsPromises.readFile
     const realTruncate = fsPromises.truncate
+    const realSleep = sleepUtils.sleep
+    const realLock = lockfile.lock
+
+    const waitForNextAppend = (): Promise<void> =>
+      latchAt(appendSettled, appendCalls).promise
+
+    const waitForNextFlushRelease = (): Promise<void> =>
+      latchAt(flushReleased, flushReleases).promise
+
+    const armRetryDelay = (): void => {
+      retryDelayEntered = createDeferred()
+      retryDelayRelease = createDeferred()
+      retryDelayFinished = createDeferred()
+    }
+
+    const observeRetryDelay = async (): Promise<void> => {
+      await retryDelayEntered.promise
+      retryDelayRelease.resolve()
+      await retryDelayFinished.promise
+      await Promise.resolve()
+    }
+
+    mock.module('./utils/sleep.js', () => ({
+      ...sleepUtils,
+      sleep: async (
+        ms: number,
+        signal?: AbortSignal,
+        opts?: Parameters<typeof sleepUtils.sleep>[2],
+      ) => {
+        if (ms === 500) {
+          retryDelayEntered.resolve()
+          await retryDelayRelease.promise
+          retryDelayFinished.resolve()
+          return
+        }
+        return realSleep(ms, signal, opts)
+      },
+    }))
+    mock.module('./utils/lockfile.js', () => ({
+      ...lockfile,
+      lock: async (
+        ...args: Parameters<typeof lockfile.lock>
+      ): ReturnType<typeof lockfile.lock> => {
+        const release = await realLock(...args)
+        return async () => {
+          try {
+            await release()
+          } finally {
+            latchAt(flushReleased, flushReleases).resolve()
+            flushReleases += 1
+          }
+        }
+      },
+    }))
     mock.module('fs/promises', () => ({
       ...fsPromises,
       appendFile: async (...args: Parameters<typeof fsPromises.appendFile>) => {
         appendCalls += 1
         behaviorCalls += 1
-        if (behavior === 'partial-then-success' && behaviorCalls === 1) {
-          const payload = Buffer.from(String(args[1]))
-          await realAppendFile(
-            args[0],
-            payload.subarray(0, Math.floor(payload.length / 2)),
-            { mode: 0o600 },
-          )
-          throw new Error('injected partial append failure')
+        const invocation = appendCalls - 1
+        latchAt(appendEntered, invocation).resolve()
+        try {
+          if (behavior === 'partial-then-success' && behaviorCalls === 1) {
+            const payload = Buffer.from(String(args[1]))
+            await realAppendFile(
+              args[0],
+              payload.subarray(0, Math.floor(payload.length / 2)),
+              { mode: 0o600 },
+            )
+            throw new Error('injected partial append failure')
+          }
+          if (behavior === 'full-then-error' && behaviorCalls === 1) {
+            await realAppendFile(...args)
+            throw new Error('injected post-commit append failure')
+          }
+          if (behavior === 'rollback-fails' && behaviorCalls === 1) {
+            const payload = Buffer.from(String(args[1]))
+            await realAppendFile(
+              args[0],
+              payload.subarray(0, Math.floor(payload.length / 2)),
+              { mode: 0o600 },
+            )
+            throw new Error('injected partial append failure')
+          }
+          if (behavior === 'read-fails' && behaviorCalls === 1) {
+            throw new Error('injected append failure before reconciliation read')
+          }
+          if (behavior === 'unexpected-tail' && behaviorCalls === 1) {
+            await realAppendFile(args[0], 'not-a-payload-prefix', {
+              mode: 0o600,
+            })
+            throw new Error('injected append with unexpected tail')
+          }
+          return await realAppendFile(...args)
+        } finally {
+          latchAt(appendSettled, invocation).resolve()
         }
-        if (behavior === 'full-then-error' && behaviorCalls === 1) {
-          await realAppendFile(...args)
-          throw new Error('injected post-commit append failure')
-        }
-        if (behavior === 'rollback-fails' && behaviorCalls === 1) {
-          const payload = Buffer.from(String(args[1]))
-          await realAppendFile(
-            args[0],
-            payload.subarray(0, Math.floor(payload.length / 2)),
-            { mode: 0o600 },
-          )
-          throw new Error('injected partial append failure')
-        }
-        if (behavior === 'read-fails' && behaviorCalls === 1) {
-          throw new Error('injected append failure before reconciliation read')
-        }
-        if (behavior === 'unexpected-tail' && behaviorCalls === 1) {
-          await realAppendFile(args[0], 'not-a-payload-prefix', {
-            mode: 0o600,
-          })
-          throw new Error('injected append with unexpected tail')
-        }
-        return realAppendFile(...args)
       },
       readFile: async (...args: Parameters<typeof fsPromises.readFile>) => {
-        if (behavior === 'read-fails' && behaviorCalls === 1) {
-          throw new Error('injected reconciliation read failure')
+        try {
+          if (behavior === 'read-fails' && behaviorCalls === 1) {
+            throw new Error('injected reconciliation read failure')
+          }
+          return await realReadFile(...args)
+        } finally {
+          reconcileReadSettled.resolve()
         }
-        return realReadFile(...args)
       },
       truncate: async (...args: Parameters<typeof fsPromises.truncate>) => {
-        if (behavior === 'rollback-fails') {
-          throw new Error('injected rollback failure')
+        try {
+          if (behavior === 'rollback-fails') {
+            throw new Error('injected rollback failure')
+          }
+          return await realTruncate(...args)
+        } finally {
+          truncateSettled.resolve()
         }
-        return realTruncate(...args)
       },
     }))
 
     const history = await import('./history.js')
     history.clearPendingHistoryEntries()
+    const firstPartialDone = waitForNextAppend()
+    const firstFlushDone = waitForNextFlushRelease()
     history.addToHistory('FIRST_SENTINEL_你好😀')
 
-    await waitFor(() => appendCalls === 1)
+    await firstPartialDone
+    await truncateSettled.promise
+    await firstFlushDone
+    const firstRetryDone = waitForNextAppend()
+    const firstRetryFlushDone = waitForNextFlushRelease()
+    await observeRetryDelay()
+    await firstRetryDone
+    await firstRetryFlushDone
     const historyPath = join(configDir, 'history.jsonl')
-    await waitFor(async () => {
-      const contents = await fsPromises
-        .readFile(historyPath, 'utf8')
-        .catch(() => '')
-      // The failed append already contains the sentinel before rollback.
-      // Wait for the retry's complete JSONL record, not that transient prefix.
-      if (!contents.endsWith('\n')) return false
-      try {
-        return contents.trimEnd().split('\n').some(line =>
-          JSON.parse(line).display === 'FIRST_SENTINEL_你好😀',
-        )
-      } catch {
-        return false
-      }
-    })
 
     const contents = await fsPromises.readFile(historyPath, 'utf8')
     expect(contents.match(/FIRST_SENTINEL/g)).toHaveLength(1)
 
     behavior = 'full-then-error'
     behaviorCalls = 0
+    reconcileReadSettled = createDeferred()
+    const fullThenErrorDone = waitForNextAppend()
+    const fullThenErrorFlushDone = waitForNextFlushRelease()
     history.addToHistory('SECOND_SENTINEL')
-    await waitFor(() => behaviorCalls === 1)
-    await Bun.sleep(600)
+    await fullThenErrorDone
+    await reconcileReadSettled.promise
+    await fullThenErrorFlushDone
 
     const reconciled = await fsPromises.readFile(historyPath, 'utf8')
     expect(reconciled.match(/FIRST_SENTINEL/g)).toHaveLength(1)
@@ -132,18 +209,16 @@ describe('prompt history persistence', () => {
     Date.now = () => 1_234_567_890
     behavior = 'partial-then-success'
     behaviorCalls = 1
+    const sameTimeDone = waitForNextAppend()
+    const sameTimeFlushDone = waitForNextFlushRelease()
     try {
       history.addToHistory('SAME_TIME_A')
       history.addToHistory('SAME_TIME_B')
     } finally {
       Date.now = realDateNow
     }
-    await waitFor(async () => {
-      const current = await fsPromises.readFile(historyPath, 'utf8')
-      return (
-        current.includes('SAME_TIME_A') && current.includes('SAME_TIME_B')
-      )
-    })
+    await sameTimeDone
+    await sameTimeFlushDone
     history.removeLastFromHistory()
     const visible: string[] = []
     for await (const entry of history.makeHistoryReader()) {
@@ -156,9 +231,15 @@ describe('prompt history persistence', () => {
     history.clearPendingHistoryEntries()
     behavior = 'rollback-fails'
     behaviorCalls = 0
+    truncateSettled = createDeferred()
+    armRetryDelay()
+    const rollbackAppendDone = waitForNextAppend()
+    const rollbackFlushDone = waitForNextFlushRelease()
     history.addToHistory('POISONED_SENTINEL')
-    await waitFor(() => behaviorCalls === 1)
-    await Bun.sleep(600)
+    await rollbackAppendDone
+    await truncateSettled.promise
+    await rollbackFlushDone
+    await observeRetryDelay()
     expect(behaviorCalls).toBe(1)
     const pending: string[] = []
     for await (const entry of history.makeHistoryReader()) {
@@ -171,32 +252,54 @@ describe('prompt history persistence', () => {
     history.clearPendingHistoryEntries()
     behavior = 'read-fails'
     behaviorCalls = 0
+    reconcileReadSettled = createDeferred()
+    armRetryDelay()
+    const readFailAppendDone = waitForNextAppend()
+    const readFailFlushDone = waitForNextFlushRelease()
     history.addToHistory('READ_FAILURE_SENTINEL')
-    await waitFor(() => behaviorCalls === 1)
-    await Bun.sleep(600)
+    await readFailAppendDone
+    await reconcileReadSettled.promise
+    await readFailFlushDone
+    await observeRetryDelay()
     expect(behaviorCalls).toBe(1)
 
     history.clearPendingHistoryEntries()
     behavior = 'unexpected-tail'
     behaviorCalls = 0
+    reconcileReadSettled = createDeferred()
+    armRetryDelay()
+    const unexpectedTailDone = waitForNextAppend()
+    const unexpectedTailFlushDone = waitForNextFlushRelease()
     history.addToHistory('UNEXPECTED_TAIL_SENTINEL')
-    await waitFor(() => behaviorCalls === 1)
-    await Bun.sleep(600)
+    await unexpectedTailDone
+    await reconcileReadSettled.promise
+    await unexpectedTailFlushDone
+    await observeRetryDelay()
     expect(behaviorCalls).toBe(1)
 
     history.clearPendingHistoryEntries()
   })
 })
 
-async function waitFor(
-  predicate: () => boolean | Promise<boolean>,
-  timeoutMs = 2_000,
-): Promise<void> {
-  const startedAt = Date.now()
-  while (!(await predicate())) {
-    if (Date.now() - startedAt > timeoutMs) {
-      throw new Error(`condition not met within ${timeoutMs}ms`)
-    }
-    await Bun.sleep(10)
+type Deferred<T = void> = {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (reason?: unknown) => void
+}
+
+function createDeferred<T = void>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+function latchAt(latches: Deferred[], index: number): Deferred {
+  while (latches.length <= index) {
+    latches.push(createDeferred())
   }
+  return latches[index]!
 }

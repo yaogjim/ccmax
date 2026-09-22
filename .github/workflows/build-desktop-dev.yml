@@ -146,7 +146,7 @@ jobs:
         id: collect
         shell: bash
         run: |
-          STAGING="desktop/build-artifacts/ci-Claude-Code-Haha-v${{ steps.version.outputs.version }}-${{ matrix.artifact_name }}"
+          STAGING="desktop/build-artifacts/ci-ccmax-v${{ steps.version.outputs.version }}-${{ matrix.artifact_name }}"
           mkdir -p "$STAGING"
           find desktop/build-artifacts/electron -maxdepth 1 -type f \
             \( -name "*.dmg" -o -name "*.exe" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.yml" \) \
@@ -162,7 +162,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Claude-Code-Haha-v${{ steps.version.outputs.version }}-${{ matrix.artifact_name }}
+          name: ccmax-v${{ steps.version.outputs.version }}-${{ matrix.artifact_name }}
           path: ${{ steps.collect.outputs.staging_dir }}
           retention-days: 7
           if-no-files-found: warn

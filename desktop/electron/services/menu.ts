@@ -142,7 +142,7 @@ export async function installApplicationMenu(
     return
   }
 
-  const template = buildApplicationMenuTemplate(app.name || 'Claude Code Haha', destination => {
+  const template = buildApplicationMenuTemplate(app.name || 'ccmax', destination => {
     getMainWindow()?.webContents.send(ELECTRON_EVENT_CHANNELS.nativeMenuNavigate, destination)
   }, platform, {
     hide: () => {

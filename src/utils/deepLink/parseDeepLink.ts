@@ -1,16 +1,17 @@
 /**
  * Deep Link URI Parser
  *
- * Parses `claude-cli://open` URIs. All parameters are optional:
+ * Parses `ccmax://open` (primary) and legacy `claude-cli://open` URIs.
+ * All parameters are optional:
  *   q    — pre-fill the prompt input (not submitted)
  *   cwd  — working directory (absolute path)
  *   repo — owner/name slug, resolved against githubRepoPaths config
  *
  * Examples:
- *   claude-cli://open
- *   claude-cli://open?q=hello+world
+ *   ccmax://open
+ *   ccmax://open?q=hello+world
  *   claude-cli://open?q=fix+tests&repo=owner/repo
- *   claude-cli://open?cwd=/path/to/project
+ *   ccmax://open?cwd=/path/to/project
  *
  * Security: values are URL-decoded, Unicode-sanitized, and rejected if they
  * contain ASCII control characters (newlines etc. can act as command
@@ -20,7 +21,14 @@
 
 import { partiallySanitizeUnicode } from '../sanitization.js'
 
-export const DEEP_LINK_PROTOCOL = 'claude-cli'
+export const DEEP_LINK_PROTOCOL = 'ccmax'
+export const LEGACY_DEEP_LINK_PROTOCOL = 'claude-cli'
+export const SUPPORTED_DEEP_LINK_PROTOCOLS = [
+  DEEP_LINK_PROTOCOL,
+  LEGACY_DEEP_LINK_PROTOCOL,
+] as const
+
+type SupportedDeepLinkProtocol = (typeof SUPPORTED_DEEP_LINK_PROTOCOLS)[number]
 
 export type DeepLinkAction = {
   query?: string
@@ -76,22 +84,42 @@ const MAX_QUERY_LENGTH = 5000
  */
 const MAX_CWD_LENGTH = 4096
 
+function isSupportedDeepLinkProtocol(
+  scheme: string,
+): scheme is SupportedDeepLinkProtocol {
+  return (SUPPORTED_DEEP_LINK_PROTOCOLS as readonly string[]).includes(scheme)
+}
+
 /**
- * Parse a claude-cli:// URI into a structured action.
+ * Normalize a product deep-link URI. Accepts primary `ccmax` and legacy
+ * `claude-cli`, with or without the `://` separator. Any other scheme —
+ * including upstream `claude://` / `cc://` — is rejected here.
+ */
+function normalizeDeepLinkUri(uri: string): string | null {
+  const schemeMatch = /^([a-z][a-z0-9+.-]*):/i.exec(uri)
+  if (!schemeMatch) {
+    return null
+  }
+  const scheme = schemeMatch[1]!.toLowerCase()
+  if (!isSupportedDeepLinkProtocol(scheme)) {
+    return null
+  }
+  return uri.startsWith(`${scheme}://`)
+    ? uri
+    : uri.replace(`${scheme}:`, `${scheme}://`)
+}
+
+/**
+ * Parse a ccmax:// or legacy claude-cli:// URI into a structured action.
  *
  * @throws {Error} if the URI is malformed or contains dangerous characters
  */
 export function parseDeepLink(uri: string): DeepLinkAction {
-  // Normalize: accept with or without the trailing colon in protocol
-  const normalized = uri.startsWith(`${DEEP_LINK_PROTOCOL}://`)
-    ? uri
-    : uri.startsWith(`${DEEP_LINK_PROTOCOL}:`)
-      ? uri.replace(`${DEEP_LINK_PROTOCOL}:`, `${DEEP_LINK_PROTOCOL}://`)
-      : null
+  const normalized = normalizeDeepLinkUri(uri)
 
   if (!normalized) {
     throw new Error(
-      `Invalid deep link: expected ${DEEP_LINK_PROTOCOL}:// scheme, got "${uri}"`,
+      `Invalid deep link: expected ${DEEP_LINK_PROTOCOL}:// or ${LEGACY_DEEP_LINK_PROTOCOL}:// scheme, got "${uri}"`,
     )
   }
 
@@ -153,7 +181,7 @@ export function parseDeepLink(uri: string): DeepLinkAction {
 }
 
 /**
- * Build a claude-cli:// deep link URL.
+ * Build the current-product `ccmax://open` deep link URL.
  */
 export function buildDeepLink(action: DeepLinkAction): string {
   const url = new URL(`${DEEP_LINK_PROTOCOL}://open`)

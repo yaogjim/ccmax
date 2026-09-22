@@ -897,7 +897,7 @@ export const SettingsSchema = lazySchema(() =>
               .enum(['disable'])
               .optional()
               .describe(
-                'Prevent claude-cli:// protocol handler registration with the OS',
+                'Prevent ccmax:// and legacy claude-cli:// protocol handler registration with the OS',
               ),
           }
         : {}),

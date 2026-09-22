@@ -71,12 +71,23 @@ function seedStorage(stored: {
   follow?: string
   lightTheme?: string
   darkTheme?: string
+  /** When set, writes the canonical key in addition to (or instead of) legacy. */
+  useCanonical?: boolean
+  /** When set with useCanonical, also write a conflicting legacy value. */
+  legacyConflictTheme?: string
 }) {
   window.localStorage.clear()
-  if (stored.theme !== undefined) window.localStorage.setItem('cc-haha-theme', stored.theme)
-  if (stored.follow !== undefined) window.localStorage.setItem('cc-haha-follow-system-theme', stored.follow)
-  if (stored.lightTheme !== undefined) window.localStorage.setItem('cc-haha-light-theme', stored.lightTheme)
-  if (stored.darkTheme !== undefined) window.localStorage.setItem('cc-haha-dark-theme', stored.darkTheme)
+  const themeKey = stored.useCanonical ? 'ccmax-theme' : 'cc-haha-theme'
+  const followKey = stored.useCanonical ? 'ccmax-follow-system-theme' : 'cc-haha-follow-system-theme'
+  const lightKey = stored.useCanonical ? 'ccmax-light-theme' : 'cc-haha-light-theme'
+  const darkKey = stored.useCanonical ? 'ccmax-dark-theme' : 'cc-haha-dark-theme'
+  if (stored.theme !== undefined) window.localStorage.setItem(themeKey, stored.theme)
+  if (stored.follow !== undefined) window.localStorage.setItem(followKey, stored.follow)
+  if (stored.lightTheme !== undefined) window.localStorage.setItem(lightKey, stored.lightTheme)
+  if (stored.darkTheme !== undefined) window.localStorage.setItem(darkKey, stored.darkTheme)
+  if (stored.legacyConflictTheme !== undefined) {
+    window.localStorage.setItem('cc-haha-theme', stored.legacyConflictTheme)
+  }
 }
 
 /** What the app bundle would land on for the same stored state. */
@@ -241,5 +252,28 @@ describe('index.html pre-hydration theme script', () => {
 
     stubMatchMedia(true)
     expect(runBootstrapScript().theme).toBe('ink-blue')
+  })
+
+  it('reads legacy-only theme keys for first paint', () => {
+    seedStorage({ theme: 'dark', follow: '0' })
+    stubMatchMedia(false)
+    expect(runBootstrapScript().theme).toBe('dark')
+  })
+
+  it('reads canonical-only theme keys for first paint', () => {
+    seedStorage({ theme: 'ink-blue', follow: '0', useCanonical: true })
+    stubMatchMedia(false)
+    expect(runBootstrapScript().theme).toBe('ink-blue')
+  })
+
+  it('prefers canonical over conflicting legacy theme keys', () => {
+    seedStorage({
+      theme: 'dark',
+      follow: '0',
+      useCanonical: true,
+      legacyConflictTheme: 'white',
+    })
+    stubMatchMedia(false)
+    expect(runBootstrapScript().theme).toBe('dark')
   })
 })

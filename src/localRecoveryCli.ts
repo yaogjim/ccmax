@@ -9,7 +9,7 @@ type RecoveryInput = NodeJS.ReadableStream & { isTTY?: boolean }
 function printHelp(): void {
   process.stdout.write(
     [
-      'Usage: claude-haha [options] [prompt]',
+      'Usage: ccmax [options] [prompt]',
       '',
       'Local recovery mode for this leaked source tree.',
       '',
@@ -35,7 +35,7 @@ function printHelp(): void {
 }
 
 function printVersion(): void {
-  process.stdout.write('999.0.0-local (Claude Code local recovery)\n')
+  process.stdout.write('999.0.0-local (ccmax local recovery)\n')
 }
 
 function parseArgs(argv: string[]) {

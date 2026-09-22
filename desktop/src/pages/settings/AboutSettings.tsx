@@ -9,17 +9,20 @@ import { MarkdownRenderer } from '../../components/markdown/MarkdownRenderer'
 import { useUpdateStore } from '../../stores/updateStore'
 import { formatBytes } from '../../lib/formatBytes'
 import { getDesktopHost } from '../../lib/desktopHost'
+import { publicAssetPath } from '../../lib/publicAsset'
 import { BrandSeal } from '../../components/composite/BrandSeal'
 import { isValidHttpProxyUrl } from '../settings/shared'
 
 /**
- * The About panel: version, update channel and the project's release notes.
+ * The About panel: version, update channel and the project's links.
  *
- * Moved verbatim out of `Settings.tsx`. `isValidHttpProxyUrl` stayed in
- * `./shared`, since the General panel needs it too.
+ * Moved out of `Settings.tsx`. Product repo/issues/releases stay here;
+ * `isValidHttpProxyUrl` stayed in `./shared`, since the General panel needs it too.
  */
 
-const GITHUB_RELEASES = 'https://github.com/NanmiCoder/cc-haha/releases'
+const GITHUB_REPO = 'https://github.com/yaogjim/ccmax'
+const GITHUB_ISSUES = `${GITHUB_REPO}/issues`
+const GITHUB_RELEASES = `${GITHUB_REPO}/releases`
 
 export function AboutSettings() {
   const t = useTranslation()
@@ -145,7 +148,7 @@ export function AboutSettings() {
     <div className="w-full min-w-0 max-w-2xl mx-auto flex flex-col items-center py-6">
       {/* Logo + App Name + Version */}
       <BrandSeal size="xl" className="mb-4" />
-      <h1 className="text-xl font-bold text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-headline)' }}>Claude Code Haha</h1>
+      <h1 className="text-xl font-bold text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-headline)' }}>ccmax</h1>
       {version && (
         <div className="mt-1 flex items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
           <span>{t('settings.about.version')} {version}</span>
@@ -156,7 +159,21 @@ export function AboutSettings() {
         </div>
       )}
 
-      <Card radius="xl" surface="low" padding="none" className="mt-6 w-full p-4">
+      {/* GitHub Repo */}
+      <div className="mt-6 w-full">
+        <button
+          onClick={() => openUrl(GITHUB_REPO)}
+          className="w-full flex items-center gap-3 px-4 py-3 rounded-[var(--radius-xl)] border border-[var(--color-border)] hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
+        >
+          <img src={publicAssetPath('icons/github.svg')} alt="GitHub" className="w-5 h-5 opacity-70" />
+          <div className="flex-1 text-left">
+            <div className="text-sm font-medium text-[var(--color-text-primary)]">yaogjim/ccmax</div>
+            <div className="text-xs text-[var(--color-text-tertiary)]">{t('settings.about.starHint')}</div>
+          </div>
+        </button>
+      </div>
+
+      <Card radius="xl" surface="low" padding="none" className="mt-4 w-full p-4">
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-medium text-[var(--color-text-primary)]">{t('settings.about.updates')}</div>
@@ -343,6 +360,19 @@ export function AboutSettings() {
           )}
         </div>
       </Card>
+
+      <div className="mt-6 w-full">
+        <button
+          onClick={() => openUrl(GITHUB_ISSUES)}
+          className="w-full flex items-center gap-3 px-4 py-3 rounded-[var(--radius-xl)] border border-[var(--color-border)] hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
+        >
+          <span className="material-symbols-outlined text-[20px] text-[var(--color-text-tertiary)]">feedback</span>
+          <div className="flex-1 text-left">
+            <div className="text-sm font-medium text-[var(--color-text-primary)]">{t('settings.about.feedback')}</div>
+            <div className="text-xs text-[var(--color-text-tertiary)]">{t('settings.about.feedbackDesc')}</div>
+          </div>
+        </button>
+      </div>
     </div>
   )
 }

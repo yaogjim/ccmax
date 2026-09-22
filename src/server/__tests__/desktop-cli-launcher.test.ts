@@ -4,9 +4,12 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 import {
+  buildManagedPathBlock,
   buildWindowsLauncherWrapper,
   ensureDesktopCliLauncherInstalled,
   getDesktopCliCommandName,
+  getDesktopCliLegacyCommandName,
+  upsertManagedPathBlock,
 } from '../services/desktopCliLauncherService.js'
 
 const isWindows = process.platform === 'win32'
@@ -74,34 +77,38 @@ describe('ensureDesktopCliLauncherInstalled', () => {
     await rm(tempSourceDir, { recursive: true, force: true })
   })
 
-  unixOnly('installs a launcher wrapper in the user bin dir and configures PATH', async () => {
+  unixOnly('installs primary and legacy launcher wrappers and configures PATH', async () => {
     const sourcePath = join(tempSourceDir, 'claude-sidecar')
     await writeFile(sourcePath, '#!/bin/sh\necho desktop-sidecar\n', 'utf8')
     await chmod(sourcePath, 0o755)
     process.env.CLAUDE_CLI_PATH = sourcePath
 
     const status = await ensureDesktopCliLauncherInstalled()
-    const launcherPath = join(tempHome, '.local', 'bin', 'claude-haha')
+    const launcherPath = join(tempHome, '.local', 'bin', 'ccmax')
+    const legacyLauncherPath = join(tempHome, '.local', 'bin', 'claude-haha')
     const shellConfigPath = join(tempHome, '.zshrc')
 
     expect(status.supported).toBe(true)
     expect(status.installed).toBe(true)
-    expect(status.command).toBe('claude-haha')
+    expect(status.command).toBe('ccmax')
     expect(status.launcherPath).toBe(launcherPath)
     expect(status.availableInNewTerminals).toBe(true)
     expect(status.needsTerminalRestart).toBe(true)
     expect(status.configTarget).toBe(shellConfigPath)
 
     const launcher = await readFile(launcherPath, 'utf8')
+    const legacyLauncher = await readFile(legacyLauncherPath, 'utf8')
     expect(launcher).toContain(`SIDECAR='${sourcePath}'`)
     expect(launcher).toContain('cli --app-root "$APP_ROOT" "$@"')
     expect(launcher).toContain('/usr/bin/script -q /dev/null')
+    expect(launcher).toContain('ccmax launcher could not find bundled sidecar')
+    expect(legacyLauncher).toBe(launcher)
     expect(await readFile(shellConfigPath, 'utf8')).toContain(
       'export PATH="$HOME/.local/bin:$PATH"',
     )
   })
 
-  unixOnly('pins portable config dir in the installed launcher wrapper', async () => {
+  unixOnly('pins portable config dir in both installed launcher wrappers', async () => {
     const sourcePath = join(tempSourceDir, 'claude-sidecar')
     const portableDir = join(tempHome, 'portable-config')
     await writeFile(sourcePath, '#!/bin/sh\necho desktop-sidecar\n', 'utf8')
@@ -111,12 +118,84 @@ describe('ensureDesktopCliLauncherInstalled', () => {
 
     await ensureDesktopCliLauncherInstalled()
 
-    const launcher = await readFile(join(tempHome, '.local', 'bin', 'claude-haha'), 'utf8')
-    expect(launcher).toContain(`export CLAUDE_CONFIG_DIR='${portableDir}'`)
+    const primary = await readFile(join(tempHome, '.local', 'bin', 'ccmax'), 'utf8')
+    const legacy = await readFile(join(tempHome, '.local', 'bin', 'claude-haha'), 'utf8')
+    expect(primary).toContain(`export CLAUDE_CONFIG_DIR='${portableDir}'`)
+    expect(legacy).toBe(primary)
+  })
+
+  unixOnly('writes a new managed PATH block with the ccmax marker', async () => {
+    const sourcePath = join(tempSourceDir, 'claude-sidecar')
+    await writeFile(sourcePath, '#!/bin/sh\necho desktop-sidecar\n', 'utf8')
+    await chmod(sourcePath, 0o755)
+    process.env.CLAUDE_CLI_PATH = sourcePath
+
+    await ensureDesktopCliLauncherInstalled()
+
+    const shellConfig = await readFile(join(tempHome, '.zshrc'), 'utf8')
+    expect(shellConfig).toContain('# >>> ccmax PATH >>>')
+    expect(shellConfig).toContain('# <<< ccmax PATH <<<')
+    expect(shellConfig).not.toContain('Claude Code Haha PATH')
+    expect(shellConfig).toContain('export PATH="$HOME/.local/bin:$PATH"')
+  })
+
+  unixOnly('updates an existing managed PATH block in place without duplicating it', async () => {
+    const binDir = join(tempHome, '.local', 'bin')
+    const existingBlock = buildManagedPathBlock('zsh', binDir, tempHome)
+    const existing = [
+      '# user config',
+      existingBlock,
+      '# more config',
+      '',
+    ].join('\n')
+
+    const nextBlock = buildManagedPathBlock('zsh', join(tempHome, 'custom', 'bin'), tempHome)
+    const next = upsertManagedPathBlock(existing, nextBlock)
+    const startMarker = '# >>> ccmax PATH >>>'
+    const endMarker = '# <<< ccmax PATH <<<'
+
+    expect(next).toContain(startMarker)
+    expect(next).toContain(endMarker)
+    expect(next.indexOf(startMarker)).toBe(next.lastIndexOf(startMarker))
+    expect(next.indexOf(endMarker)).toBe(next.lastIndexOf(endMarker))
+    expect(next).toContain('# user config')
+    expect(next).toContain('# more config')
+    expect(next).toContain(`export PATH="${join(tempHome, 'custom', 'bin')}:$PATH"`)
+  })
+
+  unixOnly('migrates a legacy Claude Code Haha PATH block in place without duplicating it', async () => {
+    const binDir = join(tempHome, '.local', 'bin')
+    const legacyBlock = [
+      '# >>> Claude Code Haha PATH >>>',
+      `export PATH="${binDir}:$PATH"`,
+      '# <<< Claude Code Haha PATH <<<',
+    ].join('\n')
+    const existing = [
+      '# user config',
+      legacyBlock,
+      '# more config',
+      '',
+    ].join('\n')
+
+    const nextBlock = buildManagedPathBlock('zsh', binDir, tempHome)
+    const next = upsertManagedPathBlock(existing, nextBlock)
+
+    expect(next).toContain('# >>> ccmax PATH >>>')
+    expect(next).toContain('# <<< ccmax PATH <<<')
+    expect(next).not.toContain('Claude Code Haha PATH')
+    expect(next.indexOf('# >>> ccmax PATH >>>')).toBe(
+      next.lastIndexOf('# >>> ccmax PATH >>>'),
+    )
+    expect(next).toContain('# user config')
+    expect(next).toContain('# more config')
+    expect(next).toContain('export PATH="$HOME/.local/bin:$PATH"')
   })
 
   it('uses a Windows cmd launcher so portable env can be injected', () => {
-    expect(getDesktopCliCommandName('win32')).toBe('claude-haha.cmd')
+    expect(getDesktopCliCommandName('win32')).toBe('ccmax.cmd')
+    expect(getDesktopCliLegacyCommandName('win32')).toBe('claude-haha.cmd')
+    expect(getDesktopCliCommandName('darwin')).toBe('ccmax')
+    expect(getDesktopCliLegacyCommandName('darwin')).toBe('claude-haha')
 
     process.env.CLAUDE_CONFIG_DIR = 'C:\\Portable\\ClaudeConfig'
     const wrapper = buildWindowsLauncherWrapper('C:\\Apps\\cc-haha\\claude-sidecar.exe')
@@ -125,6 +204,7 @@ describe('ensureDesktopCliLauncherInstalled', () => {
     expect(wrapper).toContain(
       '"%SIDECAR%" cli --app-root "%APP_ROOT%" %*',
     )
+    expect(wrapper).toContain('ccmax launcher could not find bundled sidecar')
   })
 
   it('reports unsupported status when the current launcher is not a bundled sidecar', async () => {
@@ -136,6 +216,6 @@ describe('ensureDesktopCliLauncherInstalled', () => {
 
     expect(status.supported).toBe(false)
     expect(status.installed).toBe(false)
-    expect(status.command).toBe('claude-haha')
+    expect(status.command).toBe('ccmax')
   })
 })

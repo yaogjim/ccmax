@@ -1359,7 +1359,7 @@ describe('ConversationService', () => {
     )) as Record<string, string>
 
     expect(env.CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID).toBe(
-      'com.claude-code-haha.desktop',
+      'com.ccmax.desktop',
     )
     expect(env.CC_HAHA_DESKTOP_SERVER_URL).toBe('http://127.0.0.1:3456')
     expect(env.CC_HAHA_TRACE_API_CALLS).toBe('1')

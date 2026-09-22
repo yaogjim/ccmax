@@ -17,6 +17,7 @@ import {
 } from '../services/traceCaptureService.js'
 import type { CreateProviderInput } from '../types/provider.js'
 import { buildComputerUseTools } from '../../vendor/computer-use-mcp/tools.js'
+import { resolveForkOwnedDir } from '../../utils/envUtils.js'
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -97,13 +98,13 @@ function sampleInput(overrides?: Partial<CreateProviderInput>): CreateProviderIn
 
 /** Read the settings.json written to the temp config dir */
 async function readSettings(): Promise<Record<string, unknown>> {
-  const raw = await fs.readFile(path.join(tmpDir, 'cc-haha', 'settings.json'), 'utf-8')
+  const raw = await fs.readFile(path.join(resolveForkOwnedDir(), 'settings.json'), 'utf-8')
   return JSON.parse(raw) as Record<string, unknown>
 }
 
 /** Read the providers.json written to the temp config dir */
 async function readProvidersConfig(): Promise<Record<string, unknown>> {
-  const raw = await fs.readFile(path.join(tmpDir, 'cc-haha', 'providers.json'), 'utf-8')
+  const raw = await fs.readFile(path.join(resolveForkOwnedDir(), 'providers.json'), 'utf-8')
   return JSON.parse(raw) as Record<string, unknown>
 }
 
@@ -332,7 +333,90 @@ describe('ProviderService', () => {
       const svc = new ProviderService()
       await svc.addProvider(sampleInput())
 
-      await expect(fs.readFile(path.join(tmpDir, 'cc-haha', 'settings.json'), 'utf-8')).rejects.toThrow()
+      await expect(fs.readFile(path.join(resolveForkOwnedDir(), 'settings.json'), 'utf-8')).rejects.toThrow()
+    })
+
+    test('fresh install writes providers under ccmax', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({ name: 'Fresh' }))
+
+      const primaryProviders = path.join(tmpDir, 'ccmax', 'providers.json')
+      const legacyProviders = path.join(tmpDir, 'cc-haha', 'providers.json')
+      const config = JSON.parse(await fs.readFile(primaryProviders, 'utf-8')) as {
+        providers: Array<{ id: string; name: string }>
+      }
+
+      expect(config.providers).toHaveLength(1)
+      expect(config.providers[0].id).toBe(provider.id)
+      expect(config.providers[0].name).toBe('Fresh')
+      await expect(fs.access(legacyProviders)).rejects.toThrow()
+    })
+
+    test('legacy-only fixture migrates to ccmax and keeps cc-haha', async () => {
+      await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+      const seeded = {
+        id: 'legacy-seed',
+        ...sampleInput({ name: 'Legacy Seed' }),
+      }
+      await fs.writeFile(
+        path.join(tmpDir, 'cc-haha', 'providers.json'),
+        JSON.stringify({ activeId: null, providers: [seeded], providerOrder: [seeded.id] }),
+        'utf-8',
+      )
+
+      const svc = new ProviderService()
+      const listed = await svc.listProviders()
+      expect(listed.providers).toHaveLength(1)
+      expect(listed.providers[0].name).toBe('Legacy Seed')
+
+      await svc.addProvider(sampleInput({ name: 'Legacy Append' }))
+      const primary = JSON.parse(
+        await fs.readFile(path.join(tmpDir, 'ccmax', 'providers.json'), 'utf-8'),
+      ) as { providers: Array<{ name: string }> }
+      const legacy = JSON.parse(
+        await fs.readFile(path.join(tmpDir, 'cc-haha', 'providers.json'), 'utf-8'),
+      ) as { providers: Array<{ name: string }> }
+      // After verified-copy, primary reads/writes land on ccmax; legacy dir is retained.
+      expect(primary.providers.map((p) => p.name)).toEqual(['Legacy Seed', 'Legacy Append'])
+      expect(legacy.providers.map((p) => p.name)).toEqual(['Legacy Seed'])
+    })
+
+    test('when ccmax and cc-haha both exist, providers prefer ccmax', async () => {
+      await fs.mkdir(path.join(tmpDir, 'ccmax'), { recursive: true })
+      await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+      await fs.writeFile(
+        path.join(tmpDir, 'cc-haha', 'providers.json'),
+        JSON.stringify({
+          activeId: null,
+          providers: [{ id: 'legacy-only', ...sampleInput({ name: 'Legacy Only' }) }],
+          providerOrder: ['legacy-only'],
+        }),
+        'utf-8',
+      )
+      await fs.writeFile(
+        path.join(tmpDir, 'ccmax', 'providers.json'),
+        JSON.stringify({
+          activeId: null,
+          providers: [{ id: 'primary-only', ...sampleInput({ name: 'Primary Only' }) }],
+          providerOrder: ['primary-only'],
+        }),
+        'utf-8',
+      )
+
+      const svc = new ProviderService()
+      const listed = await svc.listProviders()
+      expect(listed.providers).toHaveLength(1)
+      expect(listed.providers[0].name).toBe('Primary Only')
+
+      await svc.addProvider(sampleInput({ name: 'Primary Append' }))
+      const primary = JSON.parse(
+        await fs.readFile(path.join(tmpDir, 'ccmax', 'providers.json'), 'utf-8'),
+      ) as { providers: Array<{ name: string }> }
+      const legacy = JSON.parse(
+        await fs.readFile(path.join(tmpDir, 'cc-haha', 'providers.json'), 'utf-8'),
+      ) as { providers: Array<{ name: string }> }
+      expect(primary.providers.map((p) => p.name)).toEqual(['Primary Only', 'Primary Append'])
+      expect(legacy.providers.map((p) => p.name)).toEqual(['Legacy Only'])
     })
 
     test('custom providers keep thinking compatibility without narrowing CLI effort', async () => {

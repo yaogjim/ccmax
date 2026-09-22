@@ -250,6 +250,8 @@ describe('HahaOpenAIOAuthService — session management', () => {
 
       expect(res.status).toBe(200)
       expect(res.body).toContain('OpenAI Login Successful')
+      expect(res.body).toContain('return to ccmax')
+      expect(res.body).not.toContain('Claude Code Haha')
       expect(tokenRequestBody).toContain('code=auth-code')
       expect(tokenRequestBody).toContain(
         `redirect_uri=${encodeURIComponent(`http://localhost:${callbackPort}/auth/callback`)}`,

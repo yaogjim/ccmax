@@ -17,7 +17,21 @@ describe('resolveSidecarInvocation', () => {
     })
   })
 
-  it('defaults claude-haha invocations to cli mode', () => {
+  it('defaults ccmax invocations to cli mode with app root from exec dir', () => {
+    expect(
+      resolveSidecarInvocation(
+        ['plugin', 'install', 'demo'],
+        '/Users/demo/.local/bin/ccmax',
+        null,
+      ),
+    ).toEqual({
+      mode: 'cli',
+      restArgs: ['plugin', 'install', 'demo'],
+      defaultAppRoot: '/Users/demo/.local/bin',
+    })
+  })
+
+  it('defaults legacy claude-haha invocations to the same cli mode', () => {
     expect(
       resolveSidecarInvocation(
         ['plugin', 'install', 'demo'],
@@ -28,6 +42,33 @@ describe('resolveSidecarInvocation', () => {
       mode: 'cli',
       restArgs: ['plugin', 'install', 'demo'],
       defaultAppRoot: '/Users/demo/.local/bin',
+    })
+  })
+
+  it('accepts Windows executable names for both primary and legacy commands', () => {
+    for (const execPath of [
+      'ccmax.exe',
+      'claude-haha.exe',
+      'C:\\Users\\demo\\.local\\bin\\ccmax.exe',
+      'C:\\Users\\demo\\.local\\bin\\claude-haha.exe',
+    ]) {
+      const result = resolveSidecarInvocation(['mcp', 'list'], execPath, null)
+      expect(result.mode).toBe('cli')
+      expect(result.restArgs).toEqual(['mcp', 'list'])
+    }
+  })
+
+  it('does not mis-route unknown executable names into cli mode', () => {
+    expect(
+      resolveSidecarInvocation(
+        ['plugin', 'install', 'demo'],
+        '/Users/demo/.local/bin/something-else',
+        null,
+      ),
+    ).toEqual({
+      mode: null,
+      restArgs: ['plugin', 'install', 'demo'],
+      defaultAppRoot: null,
     })
   })
 })

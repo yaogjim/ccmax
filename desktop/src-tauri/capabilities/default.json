@@ -104,7 +104,6 @@
     "dialog:allow-confirm",
     "notification:default",
     "process:allow-exit",
-    "process:allow-restart",
-    "updater:default"
+    "process:allow-restart"
   ]
 }

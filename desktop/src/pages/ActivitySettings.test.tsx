@@ -113,8 +113,8 @@ describe('ActivitySettings', () => {
       preferences: {
         schemaVersion: 2,
         profile: {
-          displayName: 'cc-haha',
-          subtitle: 'github.com/NanmiCoder/cc-haha',
+          displayName: 'ccmax',
+          subtitle: 'github.com/yaogjim/ccmax',
           avatarFile: null,
           avatarUpdatedAt: null,
         },
@@ -151,8 +151,8 @@ describe('ActivitySettings', () => {
       preferences: {
         schemaVersion: 2,
         profile: {
-          displayName: 'cc-haha',
-          subtitle: 'github.com/NanmiCoder/cc-haha',
+          displayName: 'ccmax',
+          subtitle: 'github.com/yaogjim/ccmax',
           avatarFile: 'profile/avatar.png',
           avatarUpdatedAt: '2026-05-09T12:00:00.000Z',
         },
@@ -170,8 +170,8 @@ describe('ActivitySettings', () => {
       preferences: {
         schemaVersion: 2,
         profile: {
-          displayName: 'cc-haha',
-          subtitle: 'github.com/NanmiCoder/cc-haha',
+          displayName: 'ccmax',
+          subtitle: 'github.com/yaogjim/ccmax',
           avatarFile: null,
           avatarUpdatedAt: null,
         },
@@ -198,12 +198,12 @@ describe('ActivitySettings', () => {
 
     expect(getStatsMock).toHaveBeenCalledWith('all')
 
-    expect(screen.getByText('cc-haha')).toBeInTheDocument()
-    expect(screen.getByAltText('cc-haha avatar')).toHaveAttribute('src', '/app-icon.png')
-    expect(screen.getByAltText('cc-haha avatar')).toHaveClass('scale-[1.28]')
-    expect(screen.getByRole('link', { name: 'github.com/NanmiCoder/cc-haha' })).toHaveAttribute(
+    expect(screen.getByText('ccmax')).toBeInTheDocument()
+    expect(screen.getByAltText('ccmax avatar')).toHaveAttribute('src', '/app-icon.png')
+    expect(screen.getByAltText('ccmax avatar')).toHaveClass('scale-[1.28]')
+    expect(screen.getByRole('link', { name: 'github.com/yaogjim/ccmax' })).toHaveAttribute(
       'href',
-      'https://github.com/NanmiCoder/cc-haha',
+      'https://github.com/yaogjim/ccmax',
     )
     expect(screen.getByText('Token Activity')).toBeInTheDocument()
     expect(screen.getByText('Total tokens')).toBeInTheDocument()
@@ -245,6 +245,38 @@ describe('ActivitySettings', () => {
     })
     expect(todayCell).toBeInTheDocument()
     expect(screen.queryByRole('gridcell', { name: /May 10, 2026/i })).not.toBeInTheDocument()
+  })
+
+  it('keeps an explicitly persisted legacy profile without migrating it', async () => {
+    getPreferencesMock.mockResolvedValueOnce({
+      exists: true,
+      preferences: {
+        schemaVersion: 2,
+        profile: {
+          displayName: 'cc-haha',
+          subtitle: 'github.com/NanmiCoder/cc-haha',
+          avatarFile: null,
+          avatarUpdatedAt: null,
+        },
+        sidebar: {
+          projectOrder: [],
+          pinnedProjects: [],
+          hiddenProjects: [],
+          projectOrganization: 'recentProject',
+          projectSortBy: 'updatedAt',
+        },
+      },
+    })
+
+    render(<ActivitySettings />)
+    await flushActivityLoad()
+
+    expect(screen.getByText('cc-haha')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'github.com/NanmiCoder/cc-haha' })).toHaveAttribute(
+      'href',
+      'https://github.com/NanmiCoder/cc-haha',
+    )
+    expect(screen.queryByText('ccmax')).not.toBeInTheDocument()
   })
 
   it('shows a compact hover preview without a persistent selected-day panel', async () => {
@@ -399,7 +431,7 @@ describe('ActivitySettings', () => {
     await flushActivityLoad()
 
     expect(deleteProfileAvatarMock).toHaveBeenCalled()
-    expect(screen.getByAltText('cc-haha avatar')).toHaveAttribute('src', '/app-icon.png')
+    expect(screen.getByAltText('ccmax avatar')).toHaveAttribute('src', '/app-icon.png')
   })
 
   it('shows localized duration details and the empty usage state', async () => {

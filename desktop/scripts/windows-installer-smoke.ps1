@@ -13,19 +13,19 @@ if ($env:CI -ne 'true') {
 
 $resolvedArtifactsDir = (Resolve-Path -LiteralPath $ArtifactsDir).Path
 $installers = @(Get-ChildItem -LiteralPath $resolvedArtifactsDir -File |
-  Where-Object { $_.Name -like "Claude-Code-Haha-*-win-$Arch.exe" })
+  Where-Object { $_.Name -like "ccmax-*-win-$Arch.exe" })
 if ($installers.Count -ne 1) {
   throw "Expected exactly one Windows $Arch installer in $resolvedArtifactsDir, found $($installers.Count)."
 }
 $installer = $installers[0].FullName
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) "cc-haha-installer-smoke-$([Guid]::NewGuid().ToString('N'))"
-$installDir = Join-Path $testRoot '中文 安装目录\Claude Code Haha'
+$installDir = Join-Path $testRoot '中文 安装目录\ccmax'
 $appData = Join-Path $testRoot 'AppData\Roaming'
 $localAppData = Join-Path $testRoot 'AppData\Local'
 $userProfile = Join-Path $testRoot 'UserProfile'
-$appExe = Join-Path $installDir 'Claude Code Haha.exe'
-$uninstaller = Join-Path $installDir 'Uninstall Claude Code Haha.exe'
+$appExe = Join-Path $installDir 'ccmax.exe'
+$uninstaller = Join-Path $installDir 'Uninstall ccmax.exe'
 $recoveryHelper = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\build\recover-legacy-install-data.ps1')).Path
 $processHelper = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\build\check-install-processes.ps1')).Path
 $siblingProcess = $null
@@ -33,7 +33,7 @@ $installProcess = $null
 $bundledHelperProcess = $null
 
 $savedEnvironment = @{}
-foreach ($name in @('APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'CLAUDE_CONFIG_DIR', 'CC_HAHA_APP_PORTABLE_DIR', 'COMPLUS_Version')) {
+foreach ($name in @('APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'CLAUDE_CONFIG_DIR', 'CCMAX_APP_PORTABLE_DIR', 'CC_HAHA_APP_PORTABLE_DIR', 'COMPLUS_Version')) {
   $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 
@@ -111,6 +111,7 @@ function Test-IsProcessElevated {
 # process carrying one -- whoever started it -- reads as "the app is still
 # running". Keep this in sync with installer.nsh.
 $installerFallbackImageNames = @(
+  'ccmax.exe',
   'Claude Code Haha.exe',
   'claude-sidecar-x86_64-pc-windows-msvc.exe',
   'claude-sidecar-aarch64-pc-windows-msvc.exe',
@@ -338,7 +339,8 @@ function Invoke-InstalledApplicationSmoke {
             -Stage 'Installed application Unicode-path smoke cleanup' `
             -Arguments @(
               '-InstallDir', $InstallDirectory,
-              '-ProcessName', 'Claude Code Haha.exe',
+              '-ProcessName', 'ccmax.exe',
+              '-ProcessNames', 'ccmax.exe;Claude Code Haha.exe',
               '-Action', 'KillForce',
               '-InstallerPid', [string]$PID,
               '-InstallerParentPid', '0'
@@ -374,16 +376,26 @@ function Invoke-LegacyRecoveryDiagnostic {
     'Bypass',
     '-File',
     $recoveryHelper,
+    '-PrimaryPerUserInstallDir',
+    $installDir,
+    '-LegacyPerUserInstallDir',
+    $installDir,
     '-PerUserInstallDir',
     $installDir,
     '-CandidateInstallDir',
     $installDir,
+    '-PrimaryUserDataDir',
+    (Join-Path $appData 'ccmax'),
+    '-LegacyUserDataDir',
+    (Join-Path $appData 'Claude Code Haha'),
     '-UserDataDir',
     (Join-Path $appData 'Claude Code Haha'),
     '-RecoveryRoot',
-    (Join-Path $userProfile 'Claude Code Haha Data\Recovered'),
+    (Join-Path $userProfile 'ccmax Data\Recovered'),
     '-ProcessName',
-    'Claude Code Haha.exe',
+    'ccmax.exe',
+    '-ProcessNames',
+    'ccmax.exe;Claude Code Haha.exe',
     '-InstallerIdentitySafety',
     'trusted-user'
   )
@@ -406,6 +418,7 @@ try {
   $env:LOCALAPPDATA = $localAppData
   $env:USERPROFILE = $userProfile
   Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
+  Remove-Item Env:CCMAX_APP_PORTABLE_DIR -ErrorAction SilentlyContinue
   Remove-Item Env:CC_HAHA_APP_PORTABLE_DIR -ErrorAction SilentlyContinue
 
   # Baseline before anything here starts a process. Whatever this prints was put
@@ -444,7 +457,8 @@ try {
     -ExpectedExitCode 0 `
     -Arguments @(
       '-InstallDir', $installDir,
-      '-ProcessName', 'Claude Code Haha.exe',
+      '-ProcessName', 'ccmax.exe',
+      '-ProcessNames', 'ccmax.exe;Claude Code Haha.exe',
       '-Action', 'Find',
       '-InstallerPid', [string]$PID,
       '-InstallerParentPid', [string]$installProcess.Id

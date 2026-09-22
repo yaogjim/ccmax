@@ -203,10 +203,21 @@ describe('stored appearance preferences', () => {
     expect(readStoredDarkTheme(window.localStorage)).toBe('dark')
   })
 
+  it('prefers canonical theme keys over conflicting legacy values', () => {
+    window.localStorage.setItem('ccmax-theme', 'dark')
+    window.localStorage.setItem('cc-haha-theme', 'white')
+    expect(readStoredTheme(window.localStorage)).toBe('dark')
+
+    window.localStorage.setItem('ccmax-follow-system-theme', '0')
+    window.localStorage.setItem('cc-haha-follow-system-theme', '1')
+    expect(readStoredFollowSystemTheme(window.localStorage)).toBe(false)
+  })
+
   it('survives storage that throws instead of returning a value', () => {
     const storage = {
       getItem: () => { throw new Error('storage disabled') },
       setItem: () => {},
+      removeItem: () => {},
     }
 
     expect(readStoredTheme(storage)).toBe('white')

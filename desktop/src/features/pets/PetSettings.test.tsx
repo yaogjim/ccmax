@@ -153,7 +153,9 @@ describe('PetSettings', () => {
     expect(screen.getByText('补补 Bubu')).toBeInTheDocument()
     expect(screen.getByText('回回 Huihui')).toBeInTheDocument()
     expect(screen.getByText('Moon Cat')).toBeInTheDocument()
-    expect(screen.getByText((content) => content.includes('${CLAUDE_CONFIG_DIR:-~/.claude}/cc-haha/pets'))).toBeInTheDocument()
+    expect(screen.getByText('Custom pet packages are stored in the local app data folder.')).toBeInTheDocument()
+    expect(screen.queryByText((content) => content.includes('cc-haha/pets'))).not.toBeInTheDocument()
+    expect(screen.queryByText((content) => content.includes('ccmax/pets'))).not.toBeInTheDocument()
     expect(screen.getByText('1 custom pet folders were skipped because they are invalid.')).toBeInTheDocument()
   })
 

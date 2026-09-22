@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 
 import { generateDocsManifest, paths } from './scripts/generate-docs-manifest.mjs'
+import { SITE_BASE_PATH, isSitePath, withoutSiteBase } from './src/lib/site.js'
 
 const imageMimeTypes = {
   '.avif': 'image/avif',
@@ -22,7 +23,8 @@ function docsManifestPlugin() {
     },
     configureServer(server) {
       server.middlewares.use(async (request, response, next) => {
-        const pathname = decodeURIComponent(new URL(request.url, 'http://localhost').pathname)
+        const rawPath = decodeURIComponent(new URL(request.url, 'http://localhost').pathname)
+        const pathname = isSitePath(rawPath) ? withoutSiteBase(rawPath) : rawPath
         const extension = path.extname(pathname).toLowerCase()
         if (!imageMimeTypes[extension]) {
           next()
@@ -60,6 +62,7 @@ function docsManifestPlugin() {
 }
 
 export default defineConfig({
+  base: SITE_BASE_PATH,
   plugins: [docsManifestPlugin()],
   build: {
     outDir: 'dist',

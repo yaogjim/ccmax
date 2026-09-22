@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { ProviderService } from '../services/providerService.js'
+import { resolveForkOwnedDir } from '../../utils/envUtils.js'
 
 const MODEL_MAPPING = {
   main: 'MiniMax-M3',
@@ -32,8 +33,8 @@ describe('provider settings isolation', () => {
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
 
-  async function readCcHahaSettings(): Promise<Record<string, unknown>> {
-    const raw = await fs.readFile(path.join(tmpDir, 'cc-haha', 'settings.json'), 'utf-8')
+  async function readForkSettings(): Promise<Record<string, unknown>> {
+    const raw = await fs.readFile(path.join(resolveForkOwnedDir(), 'settings.json'), 'utf-8')
     return JSON.parse(raw)
   }
 
@@ -46,7 +47,7 @@ describe('provider settings isolation', () => {
     }
   }
 
-  test('activating a provider writes only cc-haha/settings.json', async () => {
+  test('activating a provider writes only fork-owned settings.json under ccmax on fresh install', async () => {
     const minimax = await service.addProvider({
       presetId: 'minimax',
       name: 'MiniMax',
@@ -58,7 +59,7 @@ describe('provider settings isolation', () => {
 
     await service.activateProvider(minimax.id)
 
-    const settings = await readCcHahaSettings()
+    const settings = await readForkSettings()
     const env = settings.env as Record<string, string>
     expect(env.ANTHROPIC_BASE_URL).toBe('https://api.minimaxi.com/anthropic')
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-fake-test-key-for-testing-only')
@@ -69,10 +70,14 @@ describe('provider settings isolation', () => {
       'MiniMax-M2.7': 204800,
       'MiniMax-M2.7-highspeed': 204800,
     })
+    expect(path.join(resolveForkOwnedDir(), 'settings.json')).toBe(
+      path.join(tmpDir, 'ccmax', 'settings.json'),
+    )
+    await expect(fs.access(path.join(tmpDir, 'cc-haha', 'settings.json'))).rejects.toThrow()
     expect(await originalSettingsExists()).toBe(false)
   })
 
-  test('switching providers replaces managed env without creating settings.json', async () => {
+  test('switching providers replaces managed env without creating root settings.json', async () => {
     const minimax = await service.addProvider({
       presetId: 'minimax',
       name: 'MiniMax',
@@ -94,7 +99,7 @@ describe('provider settings isolation', () => {
     })
 
     await service.activateProvider(minimax.id)
-    let settings = await readCcHahaSettings()
+    let settings = await readForkSettings()
     let env = settings.env as Record<string, string>
     expect(env.ANTHROPIC_BASE_URL).toBe('https://api.minimaxi.com/anthropic')
     expect(JSON.parse(env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toMatchObject({
@@ -104,7 +109,7 @@ describe('provider settings isolation', () => {
     })
 
     await service.activateProvider(relay.id)
-    settings = await readCcHahaSettings()
+    settings = await readForkSettings()
     env = settings.env as Record<string, string>
     expect(env.ANTHROPIC_BASE_URL).toBe('https://api.jiekou.ai/anthropic')
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-fake-test-key-for-testing-only')
@@ -117,7 +122,7 @@ describe('provider settings isolation', () => {
     expect(await originalSettingsExists()).toBe(false)
   })
 
-  test('activation preserves unrelated cc-haha settings and env', async () => {
+  test('activation preserves unrelated legacy fork settings after migrate to ccmax', async () => {
     await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
     await fs.writeFile(
       path.join(tmpDir, 'cc-haha', 'settings.json'),
@@ -143,13 +148,25 @@ describe('provider settings isolation', () => {
     })
     await service.activateProvider(provider.id)
 
-    const settings = await readCcHahaSettings()
+    const settings = await readForkSettings()
     const env = settings.env as Record<string, string>
+    // Migration copies cc-haha → ccmax; subsequent writes prefer ccmax.
+    expect(path.join(resolveForkOwnedDir(), 'settings.json')).toBe(
+      path.join(tmpDir, 'ccmax', 'settings.json'),
+    )
     expect(env.ANTHROPIC_BASE_URL).toBe('https://api.jiekou.ai/anthropic')
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk_test')
     expect(env.ANTHROPIC_API_KEY).toBe('')
     expect(settings.customField).toBe('should_be_preserved')
     expect(env.EXISTING_VAR).toBe('should_be_preserved')
+
+    // Legacy dir remains; activation must not rewrite or delete it.
+    const legacy = JSON.parse(
+      await fs.readFile(path.join(tmpDir, 'cc-haha', 'settings.json'), 'utf-8'),
+    ) as { customField?: string; env?: Record<string, string> }
+    expect(legacy.customField).toBe('should_be_preserved')
+    expect(legacy.env?.EXISTING_VAR).toBe('should_be_preserved')
+    expect(legacy.env?.ANTHROPIC_BASE_URL).toBeUndefined()
   })
 
   test('activateOfficial removes only provider-managed env', async () => {
@@ -169,7 +186,7 @@ describe('provider settings isolation', () => {
     await service.activateProvider(provider.id)
     await service.activateOfficial()
 
-    const settings = await readCcHahaSettings()
+    const settings = await readForkSettings()
     const env = settings.env as Record<string, string> | undefined
     expect(env?.ANTHROPIC_BASE_URL).toBeUndefined()
     expect(env?.ANTHROPIC_API_KEY).toBeUndefined()
@@ -178,7 +195,46 @@ describe('provider settings isolation', () => {
     expect(env?.EXISTING_VAR).toBe('keep-me')
   })
 
-  test('providers.json and cc-haha/settings.json stay isolated from Claude settings.json', async () => {
+  test('when both fork dirs exist, activation settings prefer ccmax', async () => {
+    await fs.mkdir(path.join(tmpDir, 'ccmax'), { recursive: true })
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'settings.json'),
+      JSON.stringify({ env: { LEGACY_ONLY: 'legacy' } }, null, 2),
+    )
+    await fs.writeFile(
+      path.join(tmpDir, 'ccmax', 'settings.json'),
+      JSON.stringify({ env: { PRIMARY_ONLY: 'primary' } }, null, 2),
+    )
+
+    const provider = await service.addProvider({
+      presetId: 'custom',
+      name: 'Relay',
+      baseUrl: 'https://api.jiekou.ai/anthropic',
+      apiKey: 'sk_test',
+      models: {
+        main: 'claude-opus-4-7',
+        haiku: 'claude-haiku-4-5',
+        sonnet: 'claude-sonnet-4-6',
+        opus: 'claude-opus-4-7',
+      },
+    })
+    await service.activateProvider(provider.id)
+
+    const primary = JSON.parse(
+      await fs.readFile(path.join(tmpDir, 'ccmax', 'settings.json'), 'utf-8'),
+    ) as { env: Record<string, string> }
+    const legacy = JSON.parse(
+      await fs.readFile(path.join(tmpDir, 'cc-haha', 'settings.json'), 'utf-8'),
+    ) as { env: Record<string, string> }
+
+    expect(primary.env.ANTHROPIC_BASE_URL).toBe('https://api.jiekou.ai/anthropic')
+    expect(primary.env.PRIMARY_ONLY).toBe('primary')
+    expect(legacy.env.LEGACY_ONLY).toBe('legacy')
+    expect(legacy.env.ANTHROPIC_BASE_URL).toBeUndefined()
+  })
+
+  test('providers.json and fork settings stay isolated from Claude settings.json', async () => {
     await fs.writeFile(
       path.join(tmpDir, 'settings.json'),
       JSON.stringify({
@@ -204,8 +260,11 @@ describe('provider settings isolation', () => {
     expect(original.env.ANTHROPIC_API_KEY).toBe('original-key')
     expect(original.effortLevel).toBe('high')
 
-    const haha = await readCcHahaSettings()
-    const env = haha.env as Record<string, string>
+    const forkSettings = await readForkSettings()
+    const env = forkSettings.env as Record<string, string>
+    expect(path.join(resolveForkOwnedDir(), 'settings.json')).toBe(
+      path.join(tmpDir, 'ccmax', 'settings.json'),
+    )
     expect(env.ANTHROPIC_BASE_URL).toBe('https://api.minimaxi.com/anthropic')
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-haha-key')
     expect(env.ANTHROPIC_API_KEY).toBe('')

@@ -3,6 +3,12 @@ import path from 'node:path'
 
 import { generateDocsManifest, paths } from './generate-docs-manifest.mjs'
 import { readImageSize } from './image-size.mjs'
+import {
+  SITE_BASE,
+  SITE_BASE_PATH,
+  SITE_ORIGIN,
+  toAbsoluteUrl
+} from '../src/lib/site.js'
 
 const markdownTargetPattern = /!?\[[^\]]*]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g
 const htmlTargetPattern = /<(?:a|img)\b[^>]*?\b(?:href|src)=["']([^"']+)["'][^>]*>/gi
@@ -258,9 +264,150 @@ async function checkLocaleRedirect() {
     problems.push(`index.html: 内联语言脚本的中文判定与 src/lib/locale.js 的 ${chineseTag} 不一致`)
   }
 
-  // 少了这道判断，/en/start 这类地址也会被卷进分流。
-  if (!shellSource.includes("window.location.pathname.replace(/\\/+$/, '') !== ''")) {
-    problems.push('index.html: 内联语言脚本缺少「只在根路径生效」的判断')
+  if (!moduleSource.includes("from './site.js'")) {
+    problems.push('src/lib/locale.js: 没有复用共享 site 模块判断站点根')
+  }
+
+  if (!shellSource.includes("%BASE_URL%")) {
+    problems.push('index.html: 内联语言脚本没有用 Vite %BASE_URL% 注入构建 base')
+  }
+
+  if (shellSource.includes("window.location.pathname.replace(/\\/+$/, '') !== ''")) {
+    problems.push('index.html: 内联语言脚本仍把 URL 根当成站点根')
+  }
+
+  if (!shellSource.includes("var base = '%BASE_URL%'.replace(/\\/+$/, '')")) {
+    problems.push('index.html: 内联语言脚本没有把 %BASE_URL% 收成站点根再比较')
+  }
+
+  if (!shellSource.includes('if (path !== base) return')) {
+    problems.push('index.html: 内联语言脚本缺少「只在站点根生效」的判断')
+  }
+
+  if (!shellSource.includes("window.location.replace(base + '/en' + window.location.search + window.location.hash)")) {
+    problems.push('index.html: 英文跳转没有落到 base+/en 并保留 search/hash')
+  }
+
+  return problems
+}
+
+async function collectDistTextFiles(distDir) {
+  const files = []
+  const entries = await fs.readdir(distDir, { withFileTypes: true, recursive: true })
+  for (const entry of entries) {
+    if (!entry.isFile() || !/\.(?:html|css|js|txt|xml)$/i.test(entry.name)) continue
+    const directory = entry.parentPath || entry.path
+    files.push(path.join(directory, entry.name))
+  }
+  return files
+}
+
+function hasRootLocalAsset(content, kind) {
+  if (kind === 'css') {
+    return /url\(\s*['"]?\/(?!ccmax\/)/i.test(content)
+  }
+  if (kind === 'html') {
+    return /(?:href|src)=["']\/(?!ccmax\/)(?:assets|fonts|images|src)\//i.test(content)
+  }
+  if (kind === 'js') {
+    return /["']\/assets\//.test(content)
+  }
+  return false
+}
+
+async function checkBuiltSite() {
+  const problems = []
+  const distDir = path.join(paths.siteDir, 'dist')
+  if (!await exists(distDir)) {
+    problems.push('site/dist: missing; build the site before checking Pages artifacts')
+    return problems
+  }
+
+  if (await exists(path.join(distDir, 'CNAME'))) {
+    problems.push('site/dist/CNAME: must not exist')
+  }
+  if (await exists(path.join(distDir, 'ccmax'))) {
+    problems.push('site/dist/ccmax: physical artifact must not nest the public base')
+  }
+
+  const requiredFiles = [
+    'index.html',
+    'en/index.html',
+    'start/index.html',
+    'docs/index.html',
+    '404.html',
+    'sitemap.xml',
+    'robots.txt'
+  ]
+  for (const relative of requiredFiles) {
+    if (!await exists(path.join(distDir, relative))) {
+      problems.push(`site/dist/${relative}: missing route skeleton or SEO file`)
+    }
+  }
+
+  const homeCanonical = toAbsoluteUrl('/')
+  const englishCanonical = toAbsoluteUrl('/en')
+  const startCanonical = toAbsoluteUrl('/start')
+  const sitemapUrl = toAbsoluteUrl('/sitemap.xml')
+
+  const home = await exists(path.join(distDir, 'index.html'))
+    ? await fs.readFile(path.join(distDir, 'index.html'), 'utf8')
+    : ''
+  const english = await exists(path.join(distDir, 'en/index.html'))
+    ? await fs.readFile(path.join(distDir, 'en/index.html'), 'utf8')
+    : ''
+  const start = await exists(path.join(distDir, 'start/index.html'))
+    ? await fs.readFile(path.join(distDir, 'start/index.html'), 'utf8')
+    : ''
+  const sitemap = await exists(path.join(distDir, 'sitemap.xml'))
+    ? await fs.readFile(path.join(distDir, 'sitemap.xml'), 'utf8')
+    : ''
+  const robots = await exists(path.join(distDir, 'robots.txt'))
+    ? await fs.readFile(path.join(distDir, 'robots.txt'), 'utf8')
+    : ''
+
+  if (home && !home.includes(`rel="canonical" href="${homeCanonical}"`)) {
+    problems.push(`site/dist/index.html: canonical must be ${homeCanonical}`)
+  }
+  if (english && !english.includes(`rel="canonical" href="${englishCanonical}"`)) {
+    problems.push(`site/dist/en/index.html: canonical must be ${englishCanonical}`)
+  }
+  if (start && !start.includes(`rel="canonical" href="${startCanonical}"`)) {
+    problems.push(`site/dist/start/index.html: canonical must be ${startCanonical}`)
+  }
+  if (home && !home.includes(`property="og:url" content="${homeCanonical}"`)) {
+    problems.push('site/dist/index.html: og:url must match the Chinese home canonical')
+  }
+  if (english && !english.includes('hreflang="en"')) {
+    problems.push('site/dist/en/index.html: missing English hreflang')
+  }
+  if (robots !== `User-agent: *\nAllow: ${SITE_BASE_PATH}\n\nSitemap: ${sitemapUrl}\n`) {
+    problems.push('site/dist/robots.txt: must allow /ccmax/ and point sitemap at the Pages URL')
+  }
+  if (sitemap && !sitemap.includes(`<loc>${homeCanonical}</loc>`)) {
+    problems.push('site/dist/sitemap.xml: missing Chinese home URL')
+  }
+  if (sitemap && !sitemap.includes(`<loc>${englishCanonical}</loc>`)) {
+    problems.push('site/dist/sitemap.xml: missing English home URL')
+  }
+  if (sitemap.includes(`${SITE_ORIGIN}${SITE_BASE}${SITE_BASE}`)) {
+    problems.push('site/dist/sitemap.xml: duplicated /ccmax/ccmax in public URLs')
+  }
+
+  if (SITE_ORIGIN !== 'https://yaogjim.github.io' || SITE_BASE !== '/ccmax' || SITE_BASE_PATH !== '/ccmax/') {
+    problems.push('site/src/lib/site.js: origin/base constants drifted')
+  }
+
+  for (const file of await collectDistTextFiles(distDir)) {
+    const content = await fs.readFile(file, 'utf8')
+    const relative = path.relative(distDir, file)
+    if (content.includes('cchaha.ai')) {
+      problems.push(`site/dist/${relative}: old custom domain must not enter the artifact`)
+    }
+    const kind = path.extname(file).slice(1).toLowerCase()
+    if (hasRootLocalAsset(content, kind)) {
+      problems.push(`site/dist/${relative}: local asset still loads from the URL root`)
+    }
   }
 
   return problems
@@ -299,6 +446,7 @@ async function main() {
   ]))
   const screenshotCheck = await checkAppScreenshotFiles()
   problems.push(...screenshotCheck.problems)
+  problems.push(...await checkBuiltSite())
   let checkedTargets = 0
 
   for (const record of records) {

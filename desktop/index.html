@@ -30,7 +30,7 @@
       guesses from the page otherwise, and guesses gray here.
     -->
     <meta name="theme-color" content="#FFFFFF" />
-    <title>Claude Code Haha</title>
+    <title>ccmax</title>
     <!--
       The Electron window draws its own chrome, but this same document is what
       the H5 remote client loads in a phone browser, where a missing favicon
@@ -80,20 +80,26 @@
             if (meta && BACKGROUND[value]) meta.setAttribute('content', BACKGROUND[value])
           }
 
-          var stored = read('cc-haha-theme')
+          var readFirst = function (canonical, legacy) {
+            var value = read(canonical)
+            if (value !== null) return value
+            return read(legacy)
+          }
+
+          var stored = readFirst('ccmax-theme', 'cc-haha-theme')
           var theme = (has(LIGHT, stored) || isDark(stored)) ? stored : 'white'
 
-          var followRaw = read('cc-haha-follow-system-theme')
+          var followRaw = readFirst('ccmax-follow-system-theme', 'cc-haha-follow-system-theme')
           // Unset means: new install follows the system, existing install
           // (recognised by having a stored theme) keeps its fixed pick.
           var follow = followRaw === '1' || (followRaw !== '0' && stored === null)
 
           if (follow) {
-            var storedLight = read('cc-haha-light-theme')
+            var storedLight = readFirst('ccmax-light-theme', 'cc-haha-light-theme')
             var lightTheme = has(LIGHT, storedLight)
               ? storedLight
               : (has(LIGHT, theme) ? theme : 'white')
-            var storedDark = read('cc-haha-dark-theme')
+            var storedDark = readFirst('ccmax-dark-theme', 'cc-haha-dark-theme')
             var darkTheme = isDark(storedDark) ? storedDark : (isDark(theme) ? theme : 'dark')
             var prefersDark = false
             try {

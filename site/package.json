@@ -11,7 +11,7 @@
     "postbuild": "node scripts/prepare-static-output.mjs",
     "preview": "vite preview --host 0.0.0.0",
     "check:docs": "node scripts/check-docs.mjs",
-    "test": "node --test \"src/**/*.test.js\"",
+    "test": "node --test",
     "check": "npm run check:docs && npm test"
   },
   "dependencies": {

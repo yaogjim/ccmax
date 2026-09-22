@@ -300,7 +300,7 @@ describe('updateStore', () => {
     useUpdateStore.getState().dismissPrompt()
 
     expect(useUpdateStore.getState().shouldPrompt).toBe(false)
-    expect(window.localStorage.getItem('cc-haha-dismissed-update-version')).toBe('0.2.0')
+    expect(window.localStorage.getItem('ccmax-dismissed-update-version')).toBe('0.2.0')
 
     await useUpdateStore.getState().checkForUpdates({ silent: true })
 
@@ -308,6 +308,60 @@ describe('updateStore', () => {
     expect(useUpdateStore.getState().availableVersion).toBe('0.2.0')
     expect(useUpdateStore.getState().shouldPrompt).toBe(false)
     expect(download).toHaveBeenCalledTimes(1)
+  })
+
+  it('honors a legacy dismissed-update key and writes only the canonical key on dismiss', async () => {
+    window.localStorage.setItem('cc-haha-dismissed-update-version', '0.2.0')
+    const download = vi.fn(async (onEvent?: (event: unknown) => void) => {
+      onEvent?.({ event: 'Started', data: { contentLength: 100 } })
+      onEvent?.({ event: 'Finished' })
+    })
+    check.mockResolvedValue({
+      version: '0.2.0',
+      body: 'Bug fixes',
+      download,
+      close: vi.fn().mockResolvedValue(undefined),
+    })
+
+    vi.resetModules()
+    const { useUpdateStore } = await import('./updateStore')
+
+    await useUpdateStore.getState().checkForUpdates({ silent: true })
+    expect(useUpdateStore.getState().shouldPrompt).toBe(false)
+
+    check.mockResolvedValue({
+      version: '0.3.0',
+      body: 'Newer',
+      download,
+      close: vi.fn().mockResolvedValue(undefined),
+    })
+    await useUpdateStore.getState().checkForUpdates()
+    useUpdateStore.getState().dismissPrompt()
+
+    expect(window.localStorage.getItem('ccmax-dismissed-update-version')).toBe('0.3.0')
+    expect(window.localStorage.getItem('cc-haha-dismissed-update-version')).toBe('0.2.0')
+  })
+
+  it('prefers the canonical dismissed-update version over a conflicting legacy value', async () => {
+    window.localStorage.setItem('ccmax-dismissed-update-version', '0.3.0')
+    window.localStorage.setItem('cc-haha-dismissed-update-version', '0.2.0')
+    const download = vi.fn(async (onEvent?: (event: unknown) => void) => {
+      onEvent?.({ event: 'Started', data: { contentLength: 100 } })
+      onEvent?.({ event: 'Finished' })
+    })
+    check.mockResolvedValue({
+      version: '0.3.0',
+      body: 'Notes',
+      download,
+      close: vi.fn().mockResolvedValue(undefined),
+    })
+
+    vi.resetModules()
+    const { useUpdateStore } = await import('./updateStore')
+
+    await useUpdateStore.getState().checkForUpdates({ silent: true })
+    expect(useUpdateStore.getState().shouldPrompt).toBe(false)
+    expect(useUpdateStore.getState().availableVersion).toBe('0.3.0')
   })
 
   it('prompts again when a newer version is available after dismissing an older one', async () => {

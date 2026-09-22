@@ -1,16 +1,19 @@
 /**
  * 站点语言分流。
  *
- * 只有根路径 `/` 会按浏览器语言自动选：中文浏览器留在中文站，其余跳 `/en`。
- * 带语言前缀的地址（`/en`、`/start`、`/en/start`）都是用户点进来的明确意图，一概不动 ——
- * 否则英文用户点一条中文文档链接会被莫名踢走。
+ * 只有站点根 `/ccmax` 与 `/ccmax/` 会按浏览器语言自动选：中文浏览器留在中文站，其余跳 `/ccmax/en`。
+ * URL 根 `/`、其他仓库路径，以及带语言前缀的地址（`/en`、`/start`、`/en/start`）都是明确意图，一概不动 ——
+ * 否则英文用户点一条中文文档链接会被莫名踢走，项目站也不能接管别的 Pages 路径。
  *
- * 手动切过语言之后，选择记进 localStorage，之后回到 `/` 就按记住的来，不再被浏览器语言
+ * 手动切过语言之后，选择记进 localStorage，之后回到站点根就按记住的来，不再被浏览器语言
  * 盖掉；不然导航里的切换器等于没用：浏览器是中文的人切到英文，下次进首页又被弹回中文。
  *
  * 注意：同一套判断在 index.html 里有一份内联副本 —— 首帧就得跳完，等不到这个模块加载。
- * 改 STORAGE_KEY 或判定规则时两处要一起改，check-docs.mjs 会盯着它们不漂移。
+ * 内联副本用 Vite `%BASE_URL%` 注入同一构建 base。改 STORAGE_KEY 或判定规则时两处要一起改，
+ * check-docs.mjs 会盯着它们不漂移。
  */
+
+import { isSiteRoot, toSiteHref } from './site.js'
 
 export const LOCALE_STORAGE_KEY = 'cch-locale'
 
@@ -27,13 +30,13 @@ export function normalizeStoredLocale(value) {
 }
 
 /**
- * 根路径该跳去哪；返回 null 表示留在原地（中文站）。
+ * 站点根该跳去哪；返回 null 表示留在原地（中文站）或不接管该路径。
  */
 export function resolveRootRedirect({ languages, pathname, stored }) {
-  if (String(pathname ?? '/').replace(/\/+$/, '') !== '') return null
+  if (!isSiteRoot(pathname)) return null
 
   const locale = normalizeStoredLocale(stored) || (prefersChinese(languages) ? 'zh' : 'en')
-  return locale === 'en' ? '/en' : null
+  return locale === 'en' ? toSiteHref('/en') : null
 }
 
 export function rememberLocale(locale) {

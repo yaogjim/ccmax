@@ -15,10 +15,13 @@ import { execFileNoThrow } from '../../utils/execFileNoThrow.js'
 import { getShellConfigPaths } from '../../utils/shellConfig.js'
 import { getUserBinDir } from '../../utils/xdg.js'
 
-const DESKTOP_CLI_NAME = 'claude-haha'
-const DESKTOP_CLI_WINDOWS_LEGACY_EXE = `${DESKTOP_CLI_NAME}.exe`
-const PATH_BLOCK_START = '# >>> Claude Code Haha PATH >>>'
-const PATH_BLOCK_END = '# <<< Claude Code Haha PATH <<<'
+const DESKTOP_CLI_NAME = 'ccmax'
+const DESKTOP_CLI_LEGACY_NAME = 'claude-haha'
+const DESKTOP_CLI_WINDOWS_LEGACY_EXE = `${DESKTOP_CLI_LEGACY_NAME}.exe`
+const PATH_BLOCK_START = '# >>> ccmax PATH >>>'
+const PATH_BLOCK_END = '# <<< ccmax PATH <<<'
+const LEGACY_PATH_BLOCK_START = '# >>> Claude Code Haha PATH >>>'
+const LEGACY_PATH_BLOCK_END = '# <<< Claude Code Haha PATH <<<'
 const WINDOWS_PATH_TARGET = 'Windows User PATH'
 const WINDOWS_USER_BIN_EXPR = '%USERPROFILE%\\.local\\bin'
 
@@ -42,6 +45,14 @@ export function getDesktopCliCommandName(
   platform: NodeJS.Platform = process.platform,
 ) {
   return platform === 'win32' ? `${DESKTOP_CLI_NAME}.cmd` : DESKTOP_CLI_NAME
+}
+
+export function getDesktopCliLegacyCommandName(
+  platform: NodeJS.Platform = process.platform,
+) {
+  return platform === 'win32'
+    ? `${DESKTOP_CLI_LEGACY_NAME}.cmd`
+    : DESKTOP_CLI_LEGACY_NAME
 }
 
 export function resolveHomeDir(env: NodeJS.ProcessEnv = process.env) {
@@ -78,17 +89,31 @@ export function isPathEntryPresent(
     })
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function managedPathBlockPattern(start: string, end: string): RegExp {
+  return new RegExp(
+    `${escapeRegExp(start)}[\\s\\S]*?${escapeRegExp(end)}\\n?`,
+    'm',
+  )
+}
+
 export function upsertManagedPathBlock(
   existingContent: string,
   block: string,
 ): string {
-  const escapedStart = PATH_BLOCK_START.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const escapedEnd = PATH_BLOCK_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const pattern = new RegExp(`${escapedStart}[\\s\\S]*?${escapedEnd}\\n?`, 'm')
   const nextBlock = `${block.trimEnd()}\n`
+  const patterns = [
+    managedPathBlockPattern(PATH_BLOCK_START, PATH_BLOCK_END),
+    managedPathBlockPattern(LEGACY_PATH_BLOCK_START, LEGACY_PATH_BLOCK_END),
+  ]
 
-  if (pattern.test(existingContent)) {
-    return existingContent.replace(pattern, nextBlock)
+  for (const pattern of patterns) {
+    if (pattern.test(existingContent)) {
+      return existingContent.replace(pattern, nextBlock)
+    }
   }
 
   const trimmed = existingContent.trimEnd()
@@ -145,6 +170,7 @@ async function ensureDesktopCliLauncherInstalledImpl(): Promise<DesktopCliLaunch
   const homeDir = resolveHomeDir()
   const binDir = getUserBinDir({ homedir: homeDir })
   const launcherPath = join(binDir, getDesktopCliCommandName())
+  const legacyLauncherPath = join(binDir, getDesktopCliLegacyCommandName())
   const sourcePath = resolveBundledSidecarSourcePath()
 
   if (!sourcePath) {
@@ -164,7 +190,7 @@ async function ensureDesktopCliLauncherInstalledImpl(): Promise<DesktopCliLaunch
   let lastError: string | null = null
 
   try {
-    await syncLauncher(sourcePath, launcherPath)
+    await syncLauncher(sourcePath, launcherPath, legacyLauncherPath)
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error)
   }
@@ -234,15 +260,21 @@ function resolveBundledSidecarSourcePath(): string | null {
   return launcher.command
 }
 
-async function syncLauncher(sourcePath: string, targetPath: string) {
+async function syncLauncher(
+  sourcePath: string,
+  targetPath: string,
+  legacyTargetPath: string,
+) {
   await mkdir(dirname(targetPath), { recursive: true })
 
   if (process.platform !== 'win32') {
     await syncUnixLauncherWrapper(sourcePath, targetPath)
+    await syncUnixLauncherWrapper(sourcePath, legacyTargetPath)
     return
   }
 
   await syncWindowsLauncherWrapper(sourcePath, targetPath)
+  await syncWindowsLauncherWrapper(sourcePath, legacyTargetPath)
   await removeLegacyWindowsBinaryLauncher(targetPath)
 }
 
@@ -282,7 +314,7 @@ APP_ROOT=${quotedAppRoot}
 ${configExport}
 
 if [[ ! -x "$SIDECAR" ]]; then
-  echo "claude-haha launcher could not find bundled sidecar: $SIDECAR" >&2
+  echo "ccmax launcher could not find bundled sidecar: $SIDECAR" >&2
   exit 127
 fi
 
@@ -330,7 +362,7 @@ export function buildWindowsLauncherWrapper(sourcePath: string) {
     `set "APP_ROOT=${appRoot}"`,
     configLine.trimEnd(),
     'if not exist "%SIDECAR%" (',
-    '  echo claude-haha launcher could not find bundled sidecar: %SIDECAR% 1>&2',
+    '  echo ccmax launcher could not find bundled sidecar: %SIDECAR% 1>&2',
     '  exit /b 127',
     ')',
     '"%SIDECAR%" cli --app-root "%APP_ROOT%" %*',

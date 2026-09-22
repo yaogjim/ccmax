@@ -1,6 +1,4 @@
 import { describe, expect, it } from 'bun:test'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 
 import {
   ALLOWED_DEAD_IMPORTS,
@@ -8,7 +6,9 @@ import {
   blankNonCode,
   blankingIsSound,
   deadImportKey,
+  findDeadImportedBindingInBlankedCode,
   findDeadImports,
+  findDeadImportsInBlankedCode,
   parseImportClause,
   scanDeadImports,
 } from './dead-imports.ts'
@@ -279,7 +279,7 @@ describe('blankNonCode', () => {
 })
 
 describe('dead imports in owned source', () => {
-  const { dead, scannedFiles, degradedFiles } = scanDeadImports(ROOT)
+  const { dead, scannedFiles, degradedFiles, blankedSources } = scanDeadImports(ROOT)
 
   it('scans the directories it claims to own', () => {
     // An empty or mis-rooted scan passes every other assertion in this file.
@@ -301,18 +301,49 @@ describe('dead imports in owned source', () => {
     ).toEqual([])
   })
 
+  it('matches the full analyser for a targeted dead binding', () => {
+    const source = [
+      "import { used, unused } from './x.js'",
+      "import { plantedDeadImport as onlyImportMention } from './y.js'",
+      'export const value = used(onlyImportMentionedElsewhere)',
+      '',
+    ].join('\n')
+    const blanked = blankNonCode(source)
+
+    expect(findDeadImportedBindingInBlankedCode(blanked, 'unused')).toEqual({ binding: 'unused', line: 1 })
+    expect(findDeadImportedBindingInBlankedCode(blanked, 'used')).toEqual(null)
+    expect(findDeadImportedBindingInBlankedCode(blanked, 'missing')).toEqual(null)
+    expect(findDeadImportedBindingInBlankedCode(blanked, 'onlyImportMention')).toEqual({
+      binding: 'onlyImportMention',
+      line: 2,
+    })
+    const expected = [
+      { binding: 'unused', line: 1 },
+      { binding: 'onlyImportMention', line: 2 },
+    ]
+    expect(findDeadImportsInBlankedCode(blanked)).toEqual(expected)
+    expect(findDeadImportsInBlankedCode(blanked)).toEqual(findDeadImports(source))
+    expect(findDeadImportedBindingInBlankedCode(blanked, 'plantedDeadImport')).toEqual(null)
+  })
+
   it('catches a planted dead import in every file it owns', () => {
     // Fixtures prove the analyser works on code shaped like a fixture. This proves
     // it works on these files, whose import style it has to actually match — the
     // failure that would otherwise leave the check green and blind.
+    const missed: string[] = []
     for (const file of scannedFiles) {
-      const source = readFileSync(join(ROOT, file), 'utf8')
-      const planted = `import { plantedDeadImport } from './__nonexistent.js'\n${source}`
-      expect(
-        findDeadImports(planted).map((hit) => hit.binding),
-        `planted a dead import into ${file} and the check did not report it`,
-      ).toContain('plantedDeadImport')
+      const blanked = blankedSources.get(file)
+      if (!blanked) continue
+      const planted = `import { plantedDeadImport } from './__nonexistent.js'\n${blanked}`
+      const hit = findDeadImportedBindingInBlankedCode(planted, 'plantedDeadImport')
+      if (!hit) missed.push(file)
     }
+
+    expect(
+      missed,
+      'planted a dead import into these files and the check did not report it',
+    ).toEqual([])
+    expect(blankedSources.size).toBe(scannedFiles.length - degradedFiles.length)
   }, 20_000)
 
   it('has no import that nothing references', () => {

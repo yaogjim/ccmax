@@ -1,4 +1,5 @@
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   realpathSync,
@@ -13,6 +14,19 @@ import {
 
 export const LOCAL_INDEX_UNSAFE_PATH = 'LOCAL_INDEX_UNSAFE_PATH' as const
 export const LOCAL_INDEX_BUSY_TIMEOUT_MS = 100
+
+export const MANAGED_DATABASE_NAMESPACES = ['ccmax', 'cc-haha'] as const
+export type ManagedDatabaseNamespace = (typeof MANAGED_DATABASE_NAMESPACES)[number]
+
+export const LOCAL_INDEX_DATABASE_FILENAMES = [
+  'index-v1.sqlite',
+  'trace-index-v1.sqlite',
+  'search-index-v1.sqlite',
+  'scheduled-runs-v1.sqlite',
+] as const
+
+export type LocalIndexDatabaseFilename =
+  (typeof LOCAL_INDEX_DATABASE_FILENAMES)[number]
 
 export class UnsafeLocalIndexPathError extends Error {
   readonly code = LOCAL_INDEX_UNSAFE_PATH
@@ -75,10 +89,53 @@ function assertDatabaseFamilySafe(databasePath: string): void {
   }
 }
 
+export function getPrimaryManagedDatabasePath(
+  scope: string,
+  filename: string,
+): string {
+  return join(resolve(scope), 'ccmax', 'db', filename)
+}
+
+export function getLegacyManagedDatabasePath(
+  scope: string,
+  filename: string,
+): string {
+  return join(resolve(scope), 'cc-haha', 'db', filename)
+}
+
+/**
+ * Synchronous active-database selection:
+ * primary main exists → primary; else legacy main exists → legacy; else primary.
+ * Sidecar-only presence never selects a path.
+ */
+export function resolveActiveManagedDatabasePath(
+  scope: string,
+  filename: string,
+): string {
+  const primary = getPrimaryManagedDatabasePath(scope, filename)
+  if (existsSync(primary)) return primary
+  const legacy = getLegacyManagedDatabasePath(scope, filename)
+  if (existsSync(legacy)) return legacy
+  return primary
+}
+
+export function isAllowedManagedDatabasePath(
+  scope: string,
+  databasePath: string,
+  filename: string,
+): boolean {
+  const resolved = resolve(databasePath)
+  return (
+    resolved === getPrimaryManagedDatabasePath(scope, filename) ||
+    resolved === getLegacyManagedDatabasePath(scope, filename)
+  )
+}
+
 /**
  * Prepares the disposable database directory without following any managed
  * descendant symlink. The configured scope itself is the trust boundary and
  * may intentionally be a symlink (for example, a relocated user config).
+ * Only the managed `ccmax` and `cc-haha` namespaces are accepted.
  */
 export function prepareManagedDatabasePath(options: {
   databasePath: string
@@ -93,8 +150,14 @@ export function prepareManagedDatabasePath(options: {
   }
 
   const lexicalScope = resolve(options.scope)
-  const expectedPath = join(lexicalScope, 'cc-haha', 'db', options.filename)
-  if (databasePath !== expectedPath) throw new UnsafeLocalIndexPathError()
+  const expectedPrimary = getPrimaryManagedDatabasePath(lexicalScope, options.filename)
+  const expectedLegacy = getLegacyManagedDatabasePath(lexicalScope, options.filename)
+  if (databasePath !== expectedPrimary && databasePath !== expectedLegacy) {
+    throw new UnsafeLocalIndexPathError()
+  }
+
+  const namespace: ManagedDatabaseNamespace =
+    databasePath === expectedPrimary ? 'ccmax' : 'cc-haha'
 
   // Recursive creation is restricted to the caller-owned trust root. Every
   // managed descendant is created one component at a time and lstat-verified.
@@ -104,9 +167,9 @@ export function prepareManagedDatabasePath(options: {
   if (!scopeSnapshot.isDirectory() && !scopeSnapshot.isSymbolicLink()) {
     throw new UnsafeLocalIndexPathError()
   }
-  const ccHahaDir = join(lexicalScope, 'cc-haha')
-  const databaseDir = join(ccHahaDir, 'db')
-  ensureRealManagedDirectory(ccHahaDir, trustRoot)
+  const namespaceDir = join(lexicalScope, namespace)
+  const databaseDir = join(namespaceDir, 'db')
+  ensureRealManagedDirectory(namespaceDir, trustRoot)
   ensureRealManagedDirectory(databaseDir, trustRoot)
   assertDatabaseFamilySafe(databasePath)
 }
