@@ -84,6 +84,24 @@ test('private signing fixtures always address their explicit keychain and never 
   expect(() => privateKeychainCommands('/tmp/login.keychain-db', '/tmp/id', 'test')).toThrow()
 })
 
+test('the signed-chain fixture host is bundled and signed as the packaged app id', async () => {
+  // The fixture stands in for the real packaged app. If its host identifier (in
+  // both Info.plist and the codesign --identifier) drifts from build.appId, the
+  // fixture proves a chain the real product can never produce, and the native
+  // policy would deny every call. This was red while the fixture said
+  // `com.claude-code-haha.desktop` and package.json said `com.ccmax.desktop`.
+  const source = await Bun.file(new URL('./computer-use-signed-chain.ts', import.meta.url)).text()
+  const packageJson = JSON.parse(
+    await Bun.file(new URL('../../desktop/package.json', import.meta.url)).text(),
+  ) as { build?: { appId?: string } }
+  const appId = packageJson.build?.appId
+  expect(appId).toBe('com.ccmax.desktop')
+  expect(source).toContain(`<key>CFBundleIdentifier</key><string>${appId}</string>`)
+  expect(source).toContain(`await sign(hostApp, '${appId}')`)
+  // The sidecar keeps the legacy identifier the helper compares against.
+  expect(source).toContain("await sign(executable, 'com.claude-code-haha.desktop.sidecar', entitlements)")
+})
+
 test('an authenticated permission denial cannot be reported as a native GUI replay pass', () => {
   const report = {
     result: {

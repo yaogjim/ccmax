@@ -1999,10 +1999,6 @@ export const zh: Record<TranslationKey, string> = {
   // Settings > About
   'settings.tab.about': '關於',
   'settings.about.version': '版本',
-  'settings.about.changelog': '更新日誌',
-  'settings.about.starHint': '如果這個專案對你有幫助，歡迎給個 Star',
-  'settings.about.feedback': '反饋問題',
-  'settings.about.feedbackDesc': '遇到 Bug 或使用問題，前往 GitHub Issue 提交反饋',
   'settings.about.updates': '應用更新',
   'settings.about.updatesDesc': '檢查 GitHub Releases，下載安裝包，並在安裝後自動重啟。',
 
@@ -2894,6 +2890,9 @@ export const zh: Record<TranslationKey, string> = {
   'newTask.notConfigured': '未配置',
   'newTask.noChannelConfigured': '尚未配置任何 IM 渠道，請前往 設定 → IM 接入 進行配置。',
   'newTask.noChannelSelected': '請至少選擇一個通知渠道。',
+  'newTask.recipientLabel': '通知收件人',
+  'newTask.recipientPlaceholder': '請選擇收件人',
+  'newTask.recipientRequired': '請為每個 IM 渠道選擇收件人。通知只會傳送給你明確選擇的已配對使用者。',
 
   // ─── Cron 描述 ──────────────────────────────────────
   'cron.everyMinute': '每分鐘執行',
@@ -2941,6 +2940,21 @@ export const zh: Record<TranslationKey, string> = {
   'tasks.lastRunAt': '上次執行 ',
   'tasks.outputHintSession': '點選「檢視完整對話」可在會話中檢視完整輸出。',
   'tasks.noOutputText': '暫無輸出內容。',
+  'tasks.delivery.title': '通知狀態',
+  'tasks.delivery.loading': '檢查中',
+  'tasks.delivery.unavailable': '狀態未知',
+  'tasks.delivery.notConfigured': '尚未設定通知',
+  'tasks.delivery.channelInactive': '未啟用',
+  'tasks.delivery.noRecipients': '尚未設定收件人',
+  'tasks.delivery.notSent': '未傳送',
+  'tasks.delivery.sending': '傳送中',
+  'tasks.delivery.delivered': '已送達',
+  'tasks.delivery.partial': '部分送達',
+  'tasks.delivery.failed': '傳送失敗',
+  'tasks.delivery.indeterminate': '狀態不確定',
+  'tasks.delivery.countDelivered': '已送達 {count}',
+  'tasks.delivery.countFailed': '失敗 {count}',
+  'tasks.delivery.countIndeterminate': '不確定 {count}',
 
   // ─── Prompt Editor ──────────────────────────────────────
   'promptEditor.worktree': '工作樹',
@@ -3264,7 +3278,7 @@ export const zh: Record<TranslationKey, string> = {
 
   // ─── Scheduled Tasks Pages ──────────────────────────────────────
   'scheduledPage.title': '定時任務',
-  'scheduledPage.subtitle': '按計劃或在需要時執行任務。在任意會話中輸入 {code} 即可建立。',
+  'scheduledPage.subtitle': '按計劃或在需要時執行任務。可在桌面對話中直接說明要建立或管理的本機任務。',
   'scheduledPage.desktopNotice': '定時任務僅在桌面應用開啟時執行。請確保應用持續執行以按時觸發任務。',
   'scheduledPage.oldSubtitle': '管理自動化運維流程和後臺維護任務。',
   'scheduledPage.executionMode': '執行模式',

@@ -32,18 +32,7 @@ export function ScheduledTasks() {
               {t('scheduledPage.title')}
             </h1>
             <p className="mt-[7px] text-[14.5px] leading-[1.6] text-[var(--color-text-secondary)]">
-              {(() => {
-                const parts = t('scheduledPage.subtitle').split('{code}')
-                return (
-                  <>
-                    {parts[0]}
-                    <code className="rounded-[var(--radius-sm)] bg-[var(--color-surface-container)] px-2 py-0.5 font-mono text-[12.5px] font-medium">
-                      /schedule
-                    </code>
-                    {parts[1]}
-                  </>
-                )
-              })()}
+              {t('scheduledPage.subtitle')}
             </p>
           </div>
           <Button size="lg" className="shrink-0" onClick={() => openModal('new-task')}>{t('tasks.newTask')}</Button>

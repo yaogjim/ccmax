@@ -14,6 +14,11 @@ import { CronService } from '../services/cronService.js'
 import { ProviderService } from '../services/providerService.js'
 import { resetTerminalShellEnvironmentCacheForTests } from '../../utils/terminalShellEnvironment.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
+import {
+  DESKTOP_SERVER_URL_ENV,
+  LOCAL_ACCESS_TOKEN_ENV,
+  isLocalScheduledTaskApiAvailable,
+} from '../../tools/LocalScheduledTaskTool/client.js'
 
 const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
 const originalPath = process.env.PATH
@@ -28,6 +33,7 @@ const originalZdotdir = process.env.ZDOTDIR
 const originalDisableTerminalShellEnv = process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV
 const originalTaskTimeout = process.env.CC_HAHA_TASK_TIMEOUT_MS
 const originalLocalAccessToken = process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+const originalDesktopServerUrl = process.env[DESKTOP_SERVER_URL_ENV]
 const originalSystemProxyUrl = process.env.CC_HAHA_SYSTEM_PROXY_URL
 const originalHttpProxy = process.env.HTTP_PROXY
 const originalHttpsProxy = process.env.HTTPS_PROXY
@@ -125,6 +131,11 @@ function restoreEnv(): void {
     process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = originalLocalAccessToken
   } else {
     delete process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+  }
+  if (originalDesktopServerUrl !== undefined) {
+    process.env[DESKTOP_SERVER_URL_ENV] = originalDesktopServerUrl
+  } else {
+    delete process.env[DESKTOP_SERVER_URL_ENV]
   }
   if (originalSystemProxyUrl !== undefined) {
     process.env.CC_HAHA_SYSTEM_PROXY_URL = originalSystemProxyUrl
@@ -352,6 +363,65 @@ describe('cron scheduler launcher resolution', () => {
     expect(bunWasCalled).toBe(false)
   })
 
+  unixOnly('executeTask still reaches a terminal run when a stored notification has no channel list', async () => {
+    const appRoot = path.join(tmpDir, 'app-root')
+    const sidecarPath = path.join(tmpDir, 'claude-sidecar')
+
+    await fs.mkdir(appRoot, { recursive: true })
+    await fs.writeFile(
+      sidecarPath,
+      [
+        '#!/bin/sh',
+        '/bin/cat >/dev/null',
+        'printf \'%s\\n\' \'{"type":"result","result":"legacy ok"}\'',
+        'exit 0',
+        '',
+      ].join('\n'),
+      'utf-8',
+    )
+    await fs.chmod(sidecarPath, 0o755)
+
+    process.env.CLAUDE_CLI_PATH = sidecarPath
+    process.env.CLAUDE_APP_ROOT = appRoot
+
+    const cronService = new CronService()
+    const scheduler = new CronScheduler(cronService)
+    const created = await cronService.createTask({
+      cron: '* * * * *',
+      prompt: 'legacy notification shape',
+      name: 'Legacy Notification Task',
+      recurring: true,
+      folderPath: tmpDir,
+      notification: { enabled: true, channels: ['desktop'] },
+    })
+
+    // Store the shape an older writer could produce — notifications enabled but
+    // no channel list — and load it back through the real read path so the
+    // scheduler sees exactly what a legacy file would give it.
+    const tasksFilePath = path.join(process.env.CLAUDE_CONFIG_DIR as string, 'scheduled_tasks.json')
+    const raw = JSON.parse(await fs.readFile(tasksFilePath, 'utf-8')) as {
+      tasks: Array<{ notification?: Record<string, unknown> }>
+    }
+    delete raw.tasks[0]!.notification!.channels
+    await fs.writeFile(tasksFilePath, JSON.stringify(raw, null, 2), 'utf-8')
+
+    const reloaded = (await cronService.listTasks()).find((task) => task.id === created.id)
+    expect(reloaded?.notification?.enabled).toBe(true)
+    expect(reloaded?.notificationNeedsRecipients).toBe(true)
+
+    // Before the guard this threw inside executeTask while reading
+    // `.channels.length`, so a finished run was reported to the caller as a
+    // rejection and no delivery status was ever recorded for it.
+    const run = await scheduler.executeTask(reloaded!)
+
+    expect(run.status).toBe('completed')
+    expect(run.output).toBe('legacy ok')
+    expect(run.notificationReport?.ok).toBe(false)
+    expect(run.notificationReport?.issues.map((issue) => issue.code)).toContain(
+      'no_recipients_configured',
+    )
+  })
+
   unixOnly('executeTask passes provider-scoped model runtime to the sidecar', async () => {
     const appRoot = path.join(tmpDir, 'app-root')
     const sidecarPath = path.join(tmpDir, 'claude-sidecar')
@@ -436,6 +506,70 @@ describe('cron scheduler launcher resolution', () => {
     expect(env.CC_HAHA_LOCAL_ACCESS_TOKEN).toBe('desktop-local-secret')
     expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
     expect(env.CLAUDE_CODE_ENTRYPOINT).toBe('sdk-cli')
+  })
+
+  // Regression: a cron run is the one CLI that has no SDK socket, so it cannot
+  // derive a desktop origin the way a conversation session does. It only ever
+  // had the internal token (inherited from the server process), which left
+  // `isLocalScheduledTaskApiAvailable()` false — the model could create a
+  // scheduled task but the task itself could not use LocalScheduledTask /
+  // LocalMessageSend. The server process now carries the loopback origin too,
+  // and this child inherits it.
+  unixOnly('executeTask passes the desktop loopback origin and internal token to the task child', async () => {
+    const appRoot = path.join(tmpDir, 'app-root')
+    const sidecarPath = path.join(tmpDir, 'claude-sidecar')
+    const sidecarEnvPath = path.join(tmpDir, 'sidecar.env')
+
+    await fs.mkdir(appRoot, { recursive: true })
+    await fs.writeFile(
+      sidecarPath,
+      [
+        '#!/bin/sh',
+        `env | sort > "${sidecarEnvPath}"`,
+        '/bin/cat >/dev/null',
+        'printf \'%s\\n\' \'{"type":"result","result":"local env ok"}\'',
+        'exit 0',
+        '',
+      ].join('\n'),
+      'utf-8',
+    )
+    await fs.chmod(sidecarPath, 0o755)
+
+    process.env.CLAUDE_CLI_PATH = sidecarPath
+    process.env.CLAUDE_APP_ROOT = appRoot
+    // Fixture values only — the exact shape the desktop host exports to the
+    // server sidecar. Never a real token, and no network call is made.
+    process.env[DESKTOP_SERVER_URL_ENV] = 'http://127.0.0.1:34561'
+    process.env[LOCAL_ACCESS_TOKEN_ENV] = 'fixture-cron-local-token'
+
+    const cronService = new CronService()
+    const scheduler = new CronScheduler(cronService)
+    const task = await cronService.createTask({
+      cron: '* * * * *',
+      prompt: 'cron local tool visibility',
+      name: 'Local tool task',
+      recurring: true,
+      folderPath: tmpDir,
+    })
+
+    const run = await scheduler.executeTask(task)
+
+    expect(run.status).toBe('completed')
+    expect(run.output).toBe('local env ok')
+
+    const env = Object.fromEntries(
+      (await fs.readFile(sidecarEnvPath, 'utf-8'))
+        .trim()
+        .split('\n')
+        .map((line) => {
+          const index = line.indexOf('=')
+          return [line.slice(0, index), line.slice(index + 1)]
+        }),
+    )
+    expect(env[DESKTOP_SERVER_URL_ENV]).toBe('http://127.0.0.1:34561')
+    expect(env[LOCAL_ACCESS_TOKEN_ENV]).toBe('fixture-cron-local-token')
+    // The gate both local tools read must be satisfied by this exact env.
+    expect(isLocalScheduledTaskApiAvailable(env)).toBe(true)
   })
 
   unixOnly('executeTask applies direct, system, and manual network settings to the sidecar', async () => {

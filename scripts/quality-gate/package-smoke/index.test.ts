@@ -28,6 +28,7 @@ function createRepoRoot() {
       name: 'claude-code-desktop',
       version: '0.3.1',
       build: {
+        appId: 'com.ccmax.desktop',
         productName: 'ccmax',
       },
     }, null, 2),
@@ -54,14 +55,14 @@ function writeFile(rootDir: string, relativePath: string, content: string | Uint
       writeFileSync(join(licensesDir, licenseName), content)
     }
     if (fileName.includes('apple-darwin')) {
-      const helperRoot = join(dirname(fullPath), 'cc-haha-computer-use.app', 'Contents')
+      const helperRoot = join(dirname(fullPath), 'ccmax-computer-use.app', 'Contents')
       mkdirSync(join(helperRoot, 'MacOS'), { recursive: true })
       writeFileSync(
         join(helperRoot, 'Info.plist'),
         '<plist><dict><key>LSMinimumSystemVersion</key><string>14.4</string></dict></plist>',
       )
-      writeFileSync(join(helperRoot, 'MacOS', 'cc-haha-computer-use'), content)
-      const sequence = join(helperRoot, 'Resources', 'cu-helper_cc-haha-computer-use.bundle', 'LensSequence')
+      writeFileSync(join(helperRoot, 'MacOS', 'ccmax-computer-use'), content)
+      const sequence = join(helperRoot, 'Resources', 'cu-helper_ccmax-computer-use.bundle', 'LensSequence')
       mkdirSync(sequence, { recursive: true })
       writeFileSync(join(sequence, 'README.md'), 'Optional cursor frames are absent in this fixture.')
     }
@@ -104,6 +105,9 @@ describe('package smoke args', () => {
     expect(parsePackageSmokeArgs(['--platform', 'macos']).packageKind).toBe('auto')
     expect(parsePackageSmokeArgs(['--platform', 'macos', '--package-kind', 'dir']).packageKind).toBe('dir')
     expect(parsePackageSmokeArgs(['--platform', 'macos', '--require-macos-gatekeeper']).requireMacosGatekeeper).toBe(true)
+    expect(parsePackageSmokeArgs(['--platform', 'macos', '--require-signed-chain']).requireSignedChain).toBe(true)
+    expect(parsePackageSmokeArgs(['--platform', 'macos']).requireSignedChain).toBe(false)
+    expect(parsePackageSmokeArgs(['--platform', 'macos']).requireMacosGatekeeper).toBe(false)
   })
 
   test('maps host platforms to current package-smoke platforms', () => {
@@ -141,7 +145,7 @@ describe('package smoke args', () => {
 describe('final macOS helper cursor resource verification', () => {
   const executionLabel = 'macOS relocated cu-helper cursor resource execution'
   const structureLabel = 'macOS cu-helper cursor resource directory'
-  const sequenceRelative = 'Contents/Resources/cu-helper_cc-haha-computer-use.bundle/LensSequence'
+  const sequenceRelative = 'Contents/Resources/cu-helper_ccmax-computer-use.bundle/LensSequence'
 
   function fixture(arch: 'arm64' | 'x64' = 'arm64') {
     const rootDir = createRepoRoot()
@@ -159,7 +163,7 @@ describe('final macOS helper cursor resource verification', () => {
     writeFile(rootDir, `${pty}/package.json`)
     writeFile(rootDir, `${pty}/prebuilds/darwin-${arch}/pty.node`, thinMachO(arch))
     writeFile(rootDir, `${pty}/prebuilds/darwin-${arch}/spawn-helper`, thinMachO(arch))
-    const helper = join(rootDir, binaries, 'cc-haha-computer-use.app')
+    const helper = join(rootDir, binaries, 'ccmax-computer-use.app')
     return { rootDir, helper, sequence: join(helper, sequenceRelative) }
   }
 
@@ -171,7 +175,7 @@ describe('final macOS helper cursor resource verification', () => {
       commandRunner: (command, args, options) => {
         expect(args).toEqual(['--probe-cursor-resources'])
         expect(command.startsWith(source.helper)).toBe(false)
-        expect(command).toContain('Relocated Helper.app/Contents/MacOS/cc-haha-computer-use')
+        expect(command).toContain('Relocated Helper.app/Contents/MacOS/ccmax-computer-use')
         expect(options?.timeout).toBe(10_000)
         expect(options?.maxBuffer).toBe(1024 * 1024)
         temporaryRoot = options!.cwd
@@ -179,7 +183,7 @@ describe('final macOS helper cursor resource verification', () => {
         expect(options?.env.CFFIXED_USER_HOME).toBe(options?.env.HOME)
         expect(options?.env.CLAUDE_CONFIG_DIR).toBe(join(temporaryRoot, 'home', '.claude'))
         expect(options?.env.OPENAI_API_KEY).toBeUndefined()
-        const resourceDirectory = join(dirname(dirname(command)), 'Resources/cu-helper_cc-haha-computer-use.bundle/LensSequence')
+        const resourceDirectory = join(dirname(dirname(command)), 'Resources/cu-helper_ccmax-computer-use.bundle/LensSequence')
         expect(existsSync(join(resourceDirectory, 'README.md'))).toBe(true)
         return { status: 0, stdout: JSON.stringify({ resourceDirectory, frameCount: 0, proceduralFallback: true }) }
       },
@@ -221,7 +225,7 @@ describe('final macOS helper cursor resource verification', () => {
         if (mode === 'crash') return { status: null, stderr: 'terminated by signal' }
         if (mode === 'invalid-json') return { status: 0, stdout: 'not JSON' }
         const resourceDirectory = mode === 'external-directory' ? source.sequence
-          : join(dirname(dirname(command)), 'Resources/cu-helper_cc-haha-computer-use.bundle/LensSequence')
+          : join(dirname(dirname(command)), 'Resources/cu-helper_ccmax-computer-use.bundle/LensSequence')
         return { status: 0, stdout: JSON.stringify({
           resourceDirectory, frameCount: mode === 'invalid-frames' ? -1 : 0, proceduralFallback: true,
         }) }
@@ -343,7 +347,7 @@ describe('packaged artifact inspection', () => {
 
     writeFile(
       rootDir,
-      `${sidecarRoot}/cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use`,
+      `${sidecarRoot}/ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use`,
       thinMachO('x64'),
     )
 
@@ -378,7 +382,7 @@ describe('packaged artifact inspection', () => {
     writeFile(rootDir, `${nodePtyRoot}/prebuilds/darwin-arm64/spawn-helper`, thinMachO('arm64'))
     writeFile(
       rootDir,
-      `${sidecarRoot}/cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use`,
+      `${sidecarRoot}/ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use`,
       thinMachO('arm64', '14.0'),
     )
 
@@ -520,7 +524,13 @@ describe('packaged artifact inspection', () => {
     expect(report.notes.join('\n')).toContain('notarization ticket validation exited with status 65')
   })
 
-  test('requires one Developer ID signer across host, sidecar, and helper', async () => {
+  /**
+   * Shared fixture for the signing-attestation chain tests. The host identifier
+   * is deliberately `com.ccmax.desktop` (the `build.appId` in the fixture's
+   * desktop/package.json) rather than a hard-coded literal, so a drift between
+   * the native policy and the packaged app id fails here.
+   */
+  function codeSignChainFixture() {
     const rootDir = createRepoRoot()
     tempDirs.push(rootDir)
     const appRoot = 'desktop/build-artifacts/electron/mac-arm64/ccmax.app'
@@ -536,51 +546,157 @@ describe('packaged artifact inspection', () => {
     writeFile(rootDir, `${nodePtyRoot}/prebuilds/darwin-arm64/pty.node`, thinMachO('arm64'))
     writeFile(rootDir, `${nodePtyRoot}/prebuilds/darwin-arm64/spawn-helper`, thinMachO('arm64'))
 
-    const inspect = (sidecarAuthority: string) => inspectPackagedArtifacts(rootDir, {
+    const inspect = (signing: {
+      authority: string
+      team?: string | null
+      timestamp?: string | null
+      sidecarAuthority?: string
+      hostIdentifier?: string
+    }, options: { packageKind: 'dir' | 'release', requireMacosGatekeeper?: boolean, requireSignedChain?: boolean }) =>
+      inspectPackagedArtifacts(rootDir, {
+        platform: 'macos',
+        arch: 'arm64',
+        packageKind: options.packageKind,
+        requireMacosGatekeeper: options.requireMacosGatekeeper,
+        requireSignedChain: options.requireSignedChain,
+        hostPlatform: 'macos',
+        commandRunner: (command, args) => {
+          if (command.endsWith('/spctl')) return { status: 0, stdout: 'accepted', stderr: '' }
+          if (command.endsWith('/codesign') && args[0] === '--verify') {
+            return { status: 0, stdout: '', stderr: '' }
+          }
+          if (command.endsWith('/codesign') && args[0] === '-dv') {
+            const target = args.at(-1) ?? ''
+            const isSidecar = target.includes('claude-sidecar-')
+            const identifier = target.endsWith('ccmax-computer-use.app')
+              ? 'dev.cchaha.cu-helper'
+              : isSidecar
+                ? 'com.claude-code-haha.desktop.sidecar'
+                : (signing.hostIdentifier ?? 'com.ccmax.desktop')
+            const authority = isSidecar
+              ? (signing.sidecarAuthority ?? signing.authority)
+              : signing.authority
+            const lines = [`Identifier=${identifier}`, `Authority=${authority}`]
+            const timestamp = signing.timestamp === undefined
+              ? 'Sep 1, 2026 at 18:43:53'
+              : signing.timestamp
+            if (timestamp) lines.push(`Timestamp=${timestamp}`)
+            lines.push(`TeamIdentifier=${signing.team === undefined ? 'TEAM123456' : (signing.team ?? 'not set')}`)
+            return { status: 0, stdout: '', stderr: lines.join('\n') }
+          }
+          return { status: 0, stdout: '', stderr: '' }
+        },
+      })
+    return { rootDir, inspect }
+  }
+
+  const CHAIN_LABEL = 'macOS Computer Use signing attestation chain'
+
+  test('requires one Developer ID signer across host, sidecar, and helper in a release package', async () => {
+    const { inspect } = codeSignChainFixture()
+
+    const valid = await inspect(
+      { authority: 'Developer ID Application: Example (TEAM123456)' },
+      { packageKind: 'release', requireMacosGatekeeper: true },
+    )
+    expect(valid.passedChecks.some(check => check.label === CHAIN_LABEL)).toBe(true)
+
+    const mismatched = await inspect(
+      { authority: 'Developer ID Application: Example (TEAM123456)', sidecarAuthority: 'Developer ID Application: Other (TEAM123456)' },
+      { packageKind: 'release', requireMacosGatekeeper: true },
+    )
+    expect(mismatched.passed).toBe(false)
+    expect(mismatched.notes.join('\n')).toContain('mismatched signing identity across host, sidecar and helper')
+
+    // Release strictness: the shared certificate must be a Developer ID one.
+    const selfSigned = await inspect(
+      { authority: 'cu-helper-dev', team: null, timestamp: null },
+      { packageKind: 'release', requireMacosGatekeeper: true },
+    )
+    expect(selfSigned.passed).toBe(false)
+    expect(selfSigned.notes.join('\n')).toContain('is not a Developer ID Application signature')
+
+    // ...and it must carry a Team ID and a secure timestamp.
+    const noTimestamp = await inspect(
+      { authority: 'Developer ID Application: Example (TEAM123456)', timestamp: null },
+      { packageKind: 'release', requireMacosGatekeeper: true },
+    )
+    expect(noTimestamp.passed).toBe(false)
+    expect(noTimestamp.notes.join('\n')).toContain('a release artifact needs both')
+  })
+
+  test('accepts one self-signed certificate chain for a local development package', async () => {
+    // Regression anchor: the shipped local build signs host, sidecar and helper
+    // with the self-signed `cu-helper-dev` certificate (`TeamIdentifier=not
+    // set`). Before the fix the check demanded a Developer ID authority and a
+    // Team ID, so the chain could never be verified for the build that actually
+    // needs Computer Use on a machine with no Apple account.
+    const { inspect } = codeSignChainFixture()
+
+    const selfSigned = await inspect(
+      { authority: 'cu-helper-dev', team: null, timestamp: null },
+      { packageKind: 'dir', requireSignedChain: true },
+    )
+    expect(selfSigned.passedChecks.some(check => check.label === CHAIN_LABEL)).toBe(true)
+    expect(selfSigned.notes.join('\n')).toContain('share one certificate')
+
+    // A mixed chain — host on a different certificate than the sidecar — is
+    // still refused, self-signed or not.
+    const mixed = await inspect(
+      { authority: 'cu-helper-dev', team: null, timestamp: null, sidecarAuthority: 'some-other-cert' },
+      { packageKind: 'dir', requireSignedChain: true },
+    )
+    expect(mixed.passed).toBe(false)
+    expect(mixed.notes.join('\n')).toContain('mismatched signing identity across host, sidecar and helper')
+
+    // A host whose bundle identifier drifted from build.appId denies every
+    // Computer Use call at runtime, so it must fail packaging too.
+    const driftedHost = await inspect(
+      {
+        authority: 'cu-helper-dev',
+        team: null,
+        timestamp: null,
+        hostIdentifier: 'com.claude-code-haha.desktop',
+      },
+      { packageKind: 'dir', requireSignedChain: true },
+    )
+    expect(driftedHost.passed).toBe(false)
+    expect(driftedHost.notes.join('\n'))
+      .toContain('expected identifier com.ccmax.desktop, found com.claude-code-haha.desktop')
+  })
+
+  test('does not treat a missing build.appId as a passing host identifier', async () => {
+    const rootDir = createRepoRoot()
+    tempDirs.push(rootDir)
+    writeFileSync(
+      join(rootDir, 'desktop', 'package.json'),
+      JSON.stringify({ name: 'claude-code-desktop', version: '0.3.1', build: { productName: 'ccmax' } }, null, 2),
+    )
+    const appRoot = 'desktop/build-artifacts/electron/mac-arm64/ccmax.app'
+    const resources = `${appRoot}/Contents/Resources`
+    const sidecarRoot = `${resources}/app.asar.unpacked/src-tauri/binaries`
+    const nodePtyRoot = `${resources}/app.asar.unpacked/node_modules/node-pty`
+    writeFile(rootDir, `${appRoot}/Contents/Info.plist`)
+    writeFile(rootDir, `${appRoot}/Contents/MacOS/ccmax`, thinMachO('arm64'))
+    writeFile(rootDir, `${resources}/app.asar`)
+    writeFile(rootDir, `${resources}/app.asar.unpacked/dist/index.html`)
+    writeFile(rootDir, `${sidecarRoot}/claude-sidecar-aarch64-apple-darwin`, thinMachO('arm64'))
+    writeFile(rootDir, `${nodePtyRoot}/package.json`)
+    writeFile(rootDir, `${nodePtyRoot}/prebuilds/darwin-arm64/pty.node`, thinMachO('arm64'))
+    writeFile(rootDir, `${nodePtyRoot}/prebuilds/darwin-arm64/spawn-helper`, thinMachO('arm64'))
+
+    const report = await inspectPackagedArtifacts(rootDir, {
       platform: 'macos',
       arch: 'arm64',
       packageKind: 'dir',
-      requireMacosGatekeeper: true,
+      requireSignedChain: true,
       hostPlatform: 'macos',
-      commandRunner: (command, args) => {
-        if (command.endsWith('/spctl')) return { status: 0, stdout: 'accepted', stderr: '' }
-        if (command.endsWith('/codesign') && args[0] === '--verify') {
-          return { status: 0, stdout: '', stderr: '' }
-        }
-        if (command.endsWith('/codesign') && args[0] === '-dv') {
-          const target = args.at(-1) ?? ''
-          const isSidecar = target.includes('claude-sidecar-')
-          const identifier = target.endsWith('cc-haha-computer-use.app')
-            ? 'dev.cchaha.cu-helper'
-            : isSidecar
-              ? 'com.claude-code-haha.desktop.sidecar'
-              : 'com.claude-code-haha.desktop'
-          const authority = isSidecar
-            ? sidecarAuthority
-            : 'Developer ID Application: Example (TEAM123456)'
-          return {
-            status: 0,
-            stdout: '',
-            stderr: [
-              `Identifier=${identifier}`,
-              `Authority=${authority}`,
-              'Timestamp=Sep 1, 2026 at 18:43:53',
-              'TeamIdentifier=TEAM123456',
-            ].join('\n'),
-          }
-        }
-        return { status: 0, stdout: '', stderr: '' }
-      },
+      commandRunner: () => ({ status: 0, stdout: '', stderr: '' }),
     })
 
-    const valid = await inspect('Developer ID Application: Example (TEAM123456)')
-    expect(valid.passedChecks.some(
-      check => check.label === 'macOS Computer Use signing attestation chain',
-    )).toBe(true)
-
-    const mismatched = await inspect('Developer ID Application: Other (TEAM123456)')
-    expect(mismatched.passed).toBe(false)
-    expect(mismatched.notes.join('\n')).toContain('mismatched Developer ID authority/team')
+    expect(report.productAppId).toBeNull()
+    expect(report.passed).toBe(false)
+    expect(report.notes.join('\n')).toContain('has no build.appId')
   })
 
   test('retries macOS Gatekeeper assessment with a raised file limit when spctl hits open-file limits', async () => {

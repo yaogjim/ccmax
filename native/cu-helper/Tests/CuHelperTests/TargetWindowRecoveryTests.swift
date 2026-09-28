@@ -1,6 +1,6 @@
 import XCTest
 
-@testable import cc_haha_computer_use
+@testable import ccmax_computer_use
 
 @MainActor
 final class TargetWindowRecoveryTests: XCTestCase {

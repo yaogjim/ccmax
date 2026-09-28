@@ -395,7 +395,7 @@ enum ForegroundMutationRunner {
     static func run<T>(
         lease: ForegroundLease,
         targetPID: pid_t? = nil,
-        action: () async throws -> T
+        action: @MainActor () async throws -> T
     ) async throws -> T {
         // Every input path crosses this boundary, including synthetic events
         // that never call AXAction.settle(). A throw can follow a partial

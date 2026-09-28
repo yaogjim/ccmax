@@ -1998,10 +1998,6 @@ Row 9, all 8 cells: continuing from straight down, turning left through lower-le
   // Settings > About
   'settings.tab.about': 'About',
   'settings.about.version': 'Version',
-  'settings.about.changelog': 'Release Notes',
-  'settings.about.starHint': 'If this project helps you, consider giving it a Star',
-  'settings.about.feedback': 'Report an Issue',
-  'settings.about.feedbackDesc': 'Open a GitHub Issue for bugs or usage questions',
   'settings.about.updates': 'App Updates',
   'settings.about.updatesDesc': 'Check GitHub Releases, download the installer, and relaunch after install.',
 
@@ -2893,6 +2889,9 @@ Row 9, all 8 cells: continuing from straight down, turning left through lower-le
   'newTask.notConfigured': 'Not configured',
   'newTask.noChannelConfigured': 'No IM channels configured yet. Go to Settings → IM Adapters to set up.',
   'newTask.noChannelSelected': 'Select at least one notification channel.',
+  'newTask.recipientLabel': 'Notification recipient',
+  'newTask.recipientPlaceholder': 'Select a recipient',
+  'newTask.recipientRequired': 'Select a recipient for each IM channel. Notifications are sent only to the paired user you choose.',
 
   // ─── Cron Descriptions ──────────────────────────────────────
   'cron.everyMinute': 'Runs every minute',
@@ -2940,6 +2939,21 @@ Row 9, all 8 cells: continuing from straight down, turning left through lower-le
   'tasks.lastRunAt': 'Last run: ',
   'tasks.outputHintSession': 'Click "View conversation" to see the full output in session view.',
   'tasks.noOutputText': 'No output available.',
+  'tasks.delivery.title': 'Notification status',
+  'tasks.delivery.loading': 'Checking…',
+  'tasks.delivery.unavailable': 'Status unknown',
+  'tasks.delivery.notConfigured': 'Notifications not configured',
+  'tasks.delivery.channelInactive': 'Not enabled',
+  'tasks.delivery.noRecipients': 'No recipients configured',
+  'tasks.delivery.notSent': 'Not sent',
+  'tasks.delivery.sending': 'Sending',
+  'tasks.delivery.delivered': 'Delivered',
+  'tasks.delivery.partial': 'Partially delivered',
+  'tasks.delivery.failed': 'Delivery failed',
+  'tasks.delivery.indeterminate': 'Delivery unconfirmed',
+  'tasks.delivery.countDelivered': 'Delivered {count}',
+  'tasks.delivery.countFailed': 'Failed {count}',
+  'tasks.delivery.countIndeterminate': 'Unconfirmed {count}',
 
   // ─── Prompt Editor ──────────────────────────────────────
   'promptEditor.worktree': 'worktree',
@@ -3263,7 +3277,7 @@ Row 9, all 8 cells: continuing from straight down, turning left through lower-le
 
   // ─── Scheduled Tasks Pages ──────────────────────────────────────
   'scheduledPage.title': 'Scheduled tasks',
-  'scheduledPage.subtitle': 'Run tasks on a schedule or whenever you need them. Type {code} in any existing session to create one.',
+  'scheduledPage.subtitle': 'Run tasks on a schedule or whenever you need them. Describe the local task you want to create or manage in a desktop conversation.',
   'scheduledPage.desktopNotice': 'Scheduled tasks only run while the desktop app is open. Make sure it stays running for tasks to fire on time.',
   'scheduledPage.oldSubtitle': 'Manage automated operational routines and background maintenance.',
   'scheduledPage.executionMode': 'Execution Mode',

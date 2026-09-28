@@ -1,14 +1,24 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
 import { ProviderService } from '../services/providerService.js'
 import { SettingsService } from '../services/settingsService.js'
+import { CronService } from '../services/cronService.js'
+import { adapterService } from '../services/adapterService.js'
+import {
+  resetNotificationRecoveryStateForTests,
+  sendTaskNotification,
+} from '../services/notificationService.js'
 import {
   CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
   ensurePersistentStorageUpgraded,
   resetPersistentStorageMigrationsForTests,
 } from '../services/persistentStorageMigrations.js'
+import {
+  NOTIFICATION_DELIVERY_SCHEMA_VERSION,
+  NotificationDeliveryStore,
+} from '../services/notificationDeliveryStore.js'
 
 let tempDir: string
 
@@ -660,6 +670,251 @@ describe('persistent storage upgrade migrations', () => {
       .toBe('primary-main')
     expect(await fs.readFile(path.join(ccHahaDir, 'db', 'index-v1.sqlite'), 'utf-8'))
       .toBe('legacy-main')
+  })
+
+  test('upgrades a legacy bare-array notification delivery log with a backup and preserves unknown fields', async () => {
+    const ccmaxDir = path.join(tempDir, 'ccmax')
+    await fs.mkdir(ccmaxDir, { recursive: true })
+    const logPath = path.join(ccmaxDir, 'notification-deliveries.json')
+    // An earlier build wrote a bare array with no schemaVersion wrapper.
+    const legacy = [
+      {
+        deliveryId: 'legacy-1',
+        runId: 'run-legacy',
+        taskId: 'task-legacy',
+        channel: 'telegram',
+        recipientId: '111',
+        outcome: 'delivered',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        futureDeliveryField: { keep: true },
+      },
+    ]
+    await fs.writeFile(logPath, JSON.stringify(legacy), 'utf-8')
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    expect(report.migratedEntries).toContain('ccmax/notification-deliveries.json')
+
+    const migrated = JSON.parse(await fs.readFile(logPath, 'utf-8')) as {
+      schemaVersion?: number
+      records?: Array<Record<string, unknown>>
+    }
+    expect(migrated.schemaVersion).toBe(1)
+    expect(migrated.records?.[0]?.deliveryId).toBe('legacy-1')
+    expect(migrated.records?.[0]?.attempts).toBe(1)
+    expect(migrated.records?.[0]?.futureDeliveryField).toEqual({ keep: true })
+
+    const backups = (await listFiles(ccmaxDir))
+      .filter((file) => file.startsWith('notification-deliveries.json.bak-before-migration-'))
+    expect(backups.length).toBe(1)
+
+    // A second pass must be a no-op: the file already converges on the versioned shape.
+    resetPersistentStorageMigrationsForTests()
+    const second = await ensurePersistentStorageUpgraded()
+    expect(second.migratedEntries).not.toContain('ccmax/notification-deliveries.json')
+    expect((await listFiles(ccmaxDir))
+      .filter((file) => file.startsWith('notification-deliveries.json.bak-before-migration-')).length).toBe(1)
+  })
+
+  test('upgrades a legacy notification delivery log in the legacy cc-haha dir', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    await fs.mkdir(ccHahaDir, { recursive: true })
+    const logPath = path.join(ccHahaDir, 'notification-deliveries.json')
+    await fs.writeFile(logPath, JSON.stringify([
+      {
+        deliveryId: 'legacy-haha',
+        runId: 'run-legacy',
+        taskId: 'task-legacy',
+        channel: 'feishu',
+        recipientId: 'ou_legacy',
+        outcome: 'failed',
+        createdAt: '2026-01-01T00:00:01.000Z',
+      },
+    ]), 'utf-8')
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    expect(report.migratedEntries).toContain('cc-haha/notification-deliveries.json')
+    const migrated = JSON.parse(await fs.readFile(logPath, 'utf-8')) as {
+      schemaVersion?: number
+      records?: Array<{ deliveryId: string }>
+    }
+    expect(migrated.schemaVersion).toBe(1)
+    expect(migrated.records?.[0]?.deliveryId).toBe('legacy-haha')
+  })
+
+  test('quarantines a malformed notification delivery log without blocking startup', async () => {
+    const ccmaxDir = path.join(tempDir, 'ccmax')
+    await fs.mkdir(ccmaxDir, { recursive: true })
+    const logPath = path.join(ccmaxDir, 'notification-deliveries.json')
+    await fs.writeFile(logPath, '[{"deliveryId": ', 'utf-8')
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    const quarantined = (await listFiles(ccmaxDir))
+      .filter((file) => file.startsWith('notification-deliveries.json.invalid-'))
+    expect(quarantined.length).toBe(1)
+    expect(await fs.readFile(logPath, 'utf-8')).toBe('{}\n')
+
+    // A later read converges the placeholder onto the versioned empty store.
+    const store = new NotificationDeliveryStore(logPath)
+    const readBack = await store.read()
+    expect(readBack.schemaVersion).toBe(NOTIFICATION_DELIVERY_SCHEMA_VERSION)
+    expect(readBack.records).toEqual([])
+  })
+})
+
+describe('legacy scheduled task storage compatibility', () => {
+  let legacyDir: string
+  let originalConfigDir: string | undefined
+  let configSpy: ReturnType<typeof spyOn> | undefined
+
+  async function writeTasksFile(tasks: Array<Record<string, unknown>>): Promise<string> {
+    const tasksPath = path.join(legacyDir, 'scheduled_tasks.json')
+    await fs.writeFile(tasksPath, JSON.stringify({ tasks }, null, 2) + '\n', 'utf-8')
+    return tasksPath
+  }
+
+  beforeEach(async () => {
+    legacyDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccmax-legacy-task-'))
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = legacyDir
+    resetPersistentStorageMigrationsForTests()
+    resetNotificationRecoveryStateForTests()
+  })
+
+  afterEach(async () => {
+    configSpy?.mockRestore()
+    configSpy = undefined
+    resetNotificationRecoveryStateForTests()
+    resetPersistentStorageMigrationsForTests()
+    if (originalConfigDir) process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+    else delete process.env.CLAUDE_CONFIG_DIR
+    await fs.rm(legacyDir, { recursive: true, force: true })
+  })
+
+  test('loads a task with no `enabled` field as enabled, preserves the legacy record verbatim, and is idempotent', async () => {
+    const legacy = {
+      tasks: [{
+        id: 'legacy-task',
+        cron: '0 9 * * *',
+        prompt: 'legacy prompt',
+        createdAt: 1,
+        futureTaskField: { keep: true },
+        notification: { enabled: true, channels: ['telegram'], futureNotificationField: 'keep' },
+      }],
+    }
+    const tasksPath = path.join(legacyDir, 'scheduled_tasks.json')
+    await fs.writeFile(tasksPath, JSON.stringify(legacy, null, 2) + '\n', 'utf-8')
+
+    const first = await new CronService().listTasks()
+    expect(first).toHaveLength(1)
+    expect(first[0]!.enabled).toBe(true)
+    // The record predates `recipients`; it must be surfaced for repair, not silently sent.
+    expect(first[0]!.notificationNeedsRecipients).toBe(true)
+    // Unknown fields on the task and inside the notification survive the read.
+    expect(first[0]!.notification).toEqual({
+      enabled: true,
+      channels: ['telegram'],
+      futureNotificationField: 'keep',
+    })
+    expect((first[0] as Record<string, unknown>).futureTaskField).toEqual({ keep: true })
+
+    // Repeated load returns the same view and never rewrites the user file.
+    const second = await new CronService().listTasks()
+    expect(second).toEqual(first)
+
+    // The generic storage-upgrade pass does not own scheduled_tasks.json, so it
+    // must leave the legacy file byte-identical and report no entry for it.
+    const report = await ensurePersistentStorageUpgraded()
+    expect(report.migratedEntries.some((entry) => entry.includes('scheduled_tasks'))).toBe(false)
+    expect(JSON.parse(await fs.readFile(tasksPath, 'utf-8'))).toEqual(legacy)
+
+    // Re-running the upgrade pass is a no-op.
+    resetPersistentStorageMigrationsForTests()
+    expect((await ensurePersistentStorageUpgraded()).migratedEntries).toEqual([])
+  })
+
+  test('never flips an explicit enabled:false, across a write and a later load', async () => {
+    const tasksPath = await writeTasksFile([
+      { id: 'disabled-task', cron: '0 9 * * *', prompt: 'off', createdAt: 1, enabled: false },
+    ])
+    const service = new CronService()
+    expect((await service.listTasks())[0]!.enabled).toBe(false)
+
+    // An unrelated write (the scheduler stamping lastFiredAt) must round-trip false.
+    await service.updateLastFired('disabled-task', new Date().toISOString())
+    const onDisk = JSON.parse(await fs.readFile(tasksPath, 'utf-8')) as {
+      tasks: Array<{ enabled?: boolean }>
+    }
+    expect(onDisk.tasks[0]!.enabled).toBe(false)
+    expect((await new CronService().listTasks())[0]!.enabled).toBe(false)
+  })
+
+  test('does not let one malformed legacy notification break listing every task', async () => {
+    await writeTasksFile([
+      { id: 'missing-channels', cron: '0 9 * * *', prompt: 'bad', createdAt: 1, notification: { enabled: true } },
+      { id: 'healthy', cron: '0 9 * * *', prompt: 'ok', createdAt: 2 },
+    ])
+
+    // Regression anchor: an enabled notification without a `channels` array used
+    // to throw inside listTasks(), failing the whole list (and the scheduler tick).
+    const tasks = await new CronService().listTasks()
+    expect(tasks).toHaveLength(2)
+    expect(tasks.find((task) => task.id === 'missing-channels')?.notificationNeedsRecipients).toBe(true)
+    expect(tasks.find((task) => task.id === 'healthy')?.notificationNeedsRecipients).toBeUndefined()
+  })
+
+  test('refuses to deliver a legacy recipient-less notification: no broadcast, visible failure', async () => {
+    await writeTasksFile([
+      {
+        id: 'legacy-notify',
+        cron: '0 9 * * *',
+        prompt: 'legacy notify',
+        createdAt: 1,
+        notification: { enabled: true, channels: ['telegram'] },
+      },
+    ])
+    const loaded = (await new CronService().listTasks())[0]!
+    expect(loaded.notificationNeedsRecipients).toBe(true)
+
+    // Exactly one paired Telegram user exists, so the legacy config *could* be
+    // auto-filled — but loading it must not broadcast, and must not claim success.
+    configSpy = spyOn(adapterService, 'getRawConfig').mockResolvedValue({
+      telegram: { botToken: 'fake-token', pairedUsers: [{ userId: 111, displayName: 'Only User' }] },
+    } as never)
+
+    let fetchCalls = 0
+    const fetchImpl = (async () => {
+      fetchCalls += 1
+      return Response.json({ ok: true })
+    }) as unknown as typeof fetch
+    const store = new NotificationDeliveryStore(
+      path.join(legacyDir, 'ccmax', 'notification-deliveries.json'),
+    )
+
+    const report = await sendTaskNotification(
+      {
+        id: 'run-legacy',
+        taskId: 'legacy-notify',
+        taskName: 'legacy',
+        startedAt: new Date().toISOString(),
+        status: 'completed',
+        prompt: '',
+      } as never,
+      loaded.notification!,
+      { fetchImpl, store, logger: { error: () => {}, warn: () => {} }, sleep: async () => {} },
+    )
+
+    expect(fetchCalls).toBe(0)
+    expect(report.delivered).toHaveLength(0)
+    expect(report.ok).toBe(false)
+    expect(report.issues.map((issue) => issue.code)).toContain('no_recipients_configured')
+    // Nothing is even enqueued, so the journal cannot imply a send was attempted.
+    expect(await store.list()).toEqual([])
   })
 })
 

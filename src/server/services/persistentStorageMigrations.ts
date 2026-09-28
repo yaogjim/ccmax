@@ -11,6 +11,7 @@ import {
   PROVIDER_REQUEST_COMPATIBILITY_SCHEMA_VERSION,
 } from '../types/provider.js'
 import { migrateSqliteDatabaseFamilies } from './localIndex/sqliteFamilyMigration.js'
+import { normalizeNotificationDeliveryStore } from './notificationDeliveryStore.js'
 
 export const CURRENT_PROVIDER_INDEX_SCHEMA_VERSION = PROVIDER_REQUEST_COMPATIBILITY_SCHEMA_VERSION
 
@@ -468,6 +469,15 @@ async function migrateForkOwnedJsonDir(
     `${entryPrefix}/settings.json`,
     report,
     migrateManagedSettings,
+  )
+  // The notification delivery log also lives in the fork-owned dir and changed
+  // from a bare array to a versioned envelope; forward-migrate it here so a
+  // legacy file is upgraded once at startup, not only on the next append.
+  await migrateJsonEntry(
+    path.join(dir, 'notification-deliveries.json'),
+    `${entryPrefix}/notification-deliveries.json`,
+    report,
+    (value) => ({ ...normalizeNotificationDeliveryStore(value) }),
   )
 }
 

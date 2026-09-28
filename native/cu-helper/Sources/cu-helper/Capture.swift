@@ -35,7 +35,16 @@
 import CoreGraphics
 import Foundation
 import ImageIO
-import ScreenCaptureKit
+// The macOS 15 SDK still ships ScreenCaptureKit without `Sendable` annotations
+// on `SCShareableContent`/`SCDisplay`/`SCWindow`, so awaiting its nonisolated
+// async class methods (`current`, `excludingDesktopWindows`) from the
+// `@MainActor` capture path is diagnosed as a Sendable violation. There is no
+// concurrent access to the enumerated content here — each helper consumes it
+// synchronously before returning — so we adopt the module as `@preconcurrency`
+// (the compiler-suggested remedy, and the same import already used by
+// WindowCaptureStream.swift) instead of restructuring the SCK calls or
+// weakening the language mode.
+@preconcurrency import ScreenCaptureKit
 import UniformTypeIdentifiers
 
 enum WindowShotCaptureSource: String, Equatable, Sendable {

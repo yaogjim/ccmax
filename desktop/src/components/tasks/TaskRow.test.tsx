@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import '@testing-library/jest-dom'
 
 import { TaskRow } from './TaskRow'
@@ -63,5 +63,109 @@ describe('TaskRow', () => {
     fireEvent.click(screen.getByRole('button', { name: 'More actions' }))
     expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument()
+  })
+
+  it('treats a task with no enabled flag as enabled', () => {
+    // Older `scheduled_tasks.json` files predate the `enabled` field. The row
+    // read `task.enabled` directly, so every legacy task rendered as disabled
+    // and its Run button was unavailable.
+    renderRow({ task: { ...task, enabled: undefined as unknown as boolean } })
+    expect(screen.getByRole('status', { name: 'Active' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run now' })).not.toBeDisabled()
+  })
+
+  it('awaits the enable/disable update, surfaces failures, and ignores duplicate confirms', async () => {
+    // Toggle used to fire `updateTask` without awaiting or catching: a failure
+    // was an unhandled rejection with nothing on screen, and a second click on
+    // the confirm button started a second write.
+    let rejectUpdate!: (error: unknown) => void
+    const updateTask = vi.fn(() => new Promise<void>((_resolve, reject) => {
+      rejectUpdate = reject
+    }))
+    useTaskStore.setState({
+      updateTask,
+    } as Partial<ReturnType<typeof useTaskStore.getState>>)
+
+    renderRow()
+    fireEvent.click(screen.getByRole('button', { name: 'More actions' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Disable' }))
+
+    const confirm = screen.getByRole('button', { name: 'Disable' })
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+
+    expect(updateTask).toHaveBeenCalledTimes(1)
+    expect(updateTask).toHaveBeenCalledWith('task-1', { enabled: false })
+
+    await act(async () => {
+      rejectUpdate(new Error('network down'))
+      await Promise.resolve()
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('network down')
+    expect(updateTask).toHaveBeenCalledTimes(1)
+  })
+
+  it('awaits the run, surfaces failures, and ignores duplicate confirms', async () => {
+    // Run used to `console.error` a rejection with nothing on screen, and the
+    // confirm popover closed before the request settled, so a second submit was
+    // only blocked by the disabled trigger.
+    let rejectRun!: (error: unknown) => void
+    const runTask = vi.fn(() => new Promise<void>((_resolve, reject) => {
+      rejectRun = reject
+    }))
+    useTaskStore.setState({
+      runTask,
+    } as Partial<ReturnType<typeof useTaskStore.getState>>)
+
+    renderRow()
+    fireEvent.click(screen.getByRole('button', { name: 'Run now' }))
+    const runConfirms = screen.getAllByRole('button', { name: 'Run now' })
+    const confirm = runConfirms[runConfirms.length - 1]!
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+
+    expect(runTask).toHaveBeenCalledTimes(1)
+    expect(runTask).toHaveBeenCalledWith('task-1')
+
+    await act(async () => {
+      rejectRun(new Error('run failed'))
+      await Promise.resolve()
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('run failed')
+    expect(runTask).toHaveBeenCalledTimes(1)
+  })
+
+  it('awaits the delete, surfaces failures, and ignores duplicate confirms', async () => {
+    // Delete fired `deleteTask` as a floating promise: a rejection was an
+    // unhandled rejection with nothing on screen, and every confirm click
+    // started another delete.
+    let rejectDelete!: (error: unknown) => void
+    const deleteTask = vi.fn(() => new Promise<void>((_resolve, reject) => {
+      rejectDelete = reject
+    }))
+    useTaskStore.setState({
+      deleteTask,
+    } as Partial<ReturnType<typeof useTaskStore.getState>>)
+
+    renderRow()
+    fireEvent.click(screen.getByRole('button', { name: 'More actions' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+
+    const confirm = screen.getByRole('button', { name: 'Delete' })
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+
+    expect(deleteTask).toHaveBeenCalledTimes(1)
+    expect(deleteTask).toHaveBeenCalledWith('task-1')
+
+    await act(async () => {
+      rejectDelete(new Error('delete failed'))
+      await Promise.resolve()
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('delete failed')
+    expect(deleteTask).toHaveBeenCalledTimes(1)
   })
 })

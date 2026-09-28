@@ -233,7 +233,12 @@ function pidsRunningCuHelper(pids: number[]): Set<number> {
     if (res.status !== 0 || !res.stdout) return found
     for (const line of res.stdout.split('\n')) {
       const m = line.trim().match(/^(\d+)\s+(.*)$/)
-      if (m && m[2].includes('cc-haha-computer-use')) found.add(Number.parseInt(m[1], 10))
+      if (
+        m
+        && (m[2].includes('ccmax-computer-use') || m[2].includes('cc-haha-computer-use'))
+      ) {
+        found.add(Number.parseInt(m[1], 10))
+      }
     }
   } catch {
     // ps unavailable → reap nothing (fail safe: never kill unverified pids).

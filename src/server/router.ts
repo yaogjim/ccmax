@@ -6,6 +6,7 @@ import { handleSessionsApi } from './api/sessions.js'
 import { handleSettingsApi } from './api/settings.js'
 import { handleModelsApi } from './api/models.js'
 import { handleScheduledTasksApi } from './api/scheduled-tasks.js'
+import { handleNotificationsApi } from './api/notifications.js'
 import { handleSearchApi } from './api/search.js'
 import { handleAgentsApi } from './api/agents.js'
 import { handleStatusApi } from './api/status.js'
@@ -119,6 +120,9 @@ async function routeApiRequest(req: Request, url: URL): Promise<Response> {
 
     case 'scheduled-tasks':
       return handleScheduledTasksApi(req, url, segments)
+
+    case 'notifications':
+      return handleNotificationsApi(req, url, segments)
 
     case 'search':
       return handleSearchApi(req, url, segments)

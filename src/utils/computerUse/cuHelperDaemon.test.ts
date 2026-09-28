@@ -117,7 +117,7 @@ describe('cu-helper daemon system commands', () => {
     expect(
       __daemonProcessCommandsForTests(
         [101, 202],
-        '/Applications/cc-haha-computer-use.app',
+        '/Applications/ccmax-computer-use.app',
         '/tmp/cu-helper.sock',
       ),
     ).toEqual({
@@ -129,7 +129,7 @@ describe('cu-helper daemon system commands', () => {
         command: '/usr/bin/open',
         args: [
           '-n',
-          '/Applications/cc-haha-computer-use.app',
+          '/Applications/ccmax-computer-use.app',
           '--args',
           'daemon',
           '--socket',

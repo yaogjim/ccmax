@@ -4,6 +4,7 @@
  * GET    /api/scheduled-tasks           — 获取任务列表
  * POST   /api/scheduled-tasks           — 创建任务
  * GET    /api/scheduled-tasks/runs      — 获取所有任务的最近执行记录
+ * GET    /api/scheduled-tasks/runs/:runId/deliveries — 获取该次执行的投递记录
  * GET    /api/scheduled-tasks/:id/runs  — 获取指定任务的执行记录
  * POST   /api/scheduled-tasks/:id/run   — 立即执行指定任务
  * PUT    /api/scheduled-tasks/:id       — 更新任务
@@ -12,9 +13,26 @@
 
 import { CronService, type CronTask } from '../services/cronService.js'
 import { cronScheduler } from '../services/cronScheduler.js'
+import {
+  NotificationDeliveryStore,
+  getNotificationDeliveryStorePath,
+} from '../services/notificationDeliveryStore.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
 
 const cronService = new CronService()
+
+/**
+ * Upper bound on how long the manual-run endpoint waits for the run record to
+ * land before returning. The task itself keeps running in the background.
+ */
+const MANUAL_RUN_START_TIMEOUT_MS = 5_000
+
+/**
+ * Upper bound on how many delivery rows one run query returns. A single run
+ * notifies one recipient per channel, so this only guards against a corrupted
+ * or unexpectedly large log.
+ */
+const MAX_DELIVERIES_PER_RUN = 200
 
 export async function handleScheduledTasksApi(
   req: Request,
@@ -25,8 +43,22 @@ export async function handleScheduledTasksApi(
     const method = req.method
     const taskId = segments[2] // /api/scheduled-tasks/:id  or "runs"
     const subResource = segments[3] // /api/scheduled-tasks/:id/runs
+    const subSubResource = segments[4] // /api/scheduled-tasks/runs/:runId/deliveries
 
-    // ── GET /api/scheduled-tasks/runs ────────────────────────────────────
+    // ── GET /api/scheduled-tasks/runs/:runId/deliveries ──────────────────
+    // The delivery journal for one run: which destinations were attempted and
+    // how each attempt ended. Unknown runs are a 404 so a caller cannot mistake
+    // an empty list for "the run delivered nothing".
+    if (method === 'GET' && taskId === 'runs' && subResource && subSubResource === 'deliveries') {
+      const run = await cronScheduler.getRunDetail(subResource)
+      if (!run) throw ApiError.notFound(`Scheduled run ${subResource} not found`)
+
+      const store = new NotificationDeliveryStore(getNotificationDeliveryStorePath())
+      const deliveries = await store.list({ runId: subResource, limit: MAX_DELIVERIES_PER_RUN })
+      return Response.json({ runId: subResource, deliveries })
+    }
+
+    // ── GET /api/scheduled-tasks/runs/:runId ─────────────────────────────
     if (method === 'GET' && taskId === 'runs' && subResource) {
       const run = await cronScheduler.getRunDetail(subResource)
       if (!run) throw ApiError.notFound(`Scheduled run ${subResource} not found`)
@@ -117,16 +149,35 @@ export async function handleScheduledTasksApi(
 
     // ── POST /api/scheduled-tasks/:id/run ──────────────────────────────────
     // Fire-and-forget: start execution in background, return immediately.
-    // The frontend polls GET /:id/runs to track progress.
+    // The frontend polls GET /:id/runs to track progress. We wait for the
+    // "running" record to be on disk instead of guessing with a fixed delay, so
+    // an immediate poll can always see the run.
     if (method === 'POST' && taskId && subResource === 'run') {
       const tasks = await cronService.listTasks()
       const task = tasks.find((t) => t.id === taskId)
       if (!task) throw ApiError.notFound(`Task ${taskId} not found`)
-      cronScheduler.executeTask(task, { createSession: true }).catch((err) => {
-        console.error(`[ScheduledTasks] Manual run failed for task ${taskId}:`, err)
+
+      let markStarted: () => void = () => {}
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve
       })
-      // Small delay to let appendRun() write the "running" entry to disk
-      await new Promise((r) => setTimeout(r, 200))
+      cronScheduler
+        .executeTask(task, {
+          createSession: true,
+          onRunStarted: () => markStarted(),
+        })
+        .catch((err) => {
+          console.error(`[ScheduledTasks] Manual run failed for task ${taskId}:`, err)
+        })
+        .finally(() => markStarted())
+
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, MANUAL_RUN_START_TIMEOUT_MS)
+        started.then(() => {
+          clearTimeout(timer)
+          resolve()
+        })
+      })
       return Response.json({ ok: true })
     }
 

@@ -1,6 +1,6 @@
 # project.md — ccmax 项目适配声明
 
-> 本文件是项目对全局 agent 规范母版的唯一适配点：只记录项目声明和与母版默认值的差异。完整通用规范由母版加载，项目现有根 `AGENTS.md` 保留为仓库规则入口。
+> 本文件是项目对全局 agent 规范母版的唯一适配点：只记录项目声明和与母版默认值的差异。完整通用规范由母版加载，项目现有根 `AGENTS.md` 保留为仓库规则入口。按项目要求移除的上游内容另见 [`upstream-removals.md`](./upstream-removals.md)。
 
 ```yaml
 project: ccmax
@@ -40,6 +40,7 @@ onboarded: 2026-08-25
 3. **项目结构规则**：`src/`、`desktop/`、`adapters/`、`docs/`、`site/` 及 `.github/` 的嵌套 `AGENTS.md` 继续生效；编辑对应目录前必须先读取最近的嵌套规则。
 4. **用户状态安全**：测试和迁移验证必须使用临时配置目录、假凭据和隔离环境，不得读取或修改真实 `~/.claude`、密钥链、令牌、会话、provider 或 IM 绑定。持久化格式变更必须提供迁移、旧 fixture 和 `bun run check:persistence-upgrade` 证据。
 5. **实时服务限制**：确定性测试通过且用户明确授权前，不运行真实模型、真实消息平台或其他付费/live provider 检查。
+6. **上游内容移除记录**：[`upstream-removals.md`](./upstream-removals.md) 记录按项目要求移除的上游内容（侧栏 GitHub 链接、关于页的更新日志/仓库/反馈/作者/社交入口，以及若干刻意删除的仓库级文件与配置）。合并上游 `main` 时以「这些内容不回来」为默认前提，不需要重新确认；合并后按该文件第四节自查。
 
 ---
 

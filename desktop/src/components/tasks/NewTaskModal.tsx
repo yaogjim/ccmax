@@ -14,9 +14,58 @@ import { DayOfWeekPicker } from './DayOfWeekPicker'
 import { useTranslation } from '../../i18n'
 import { describeCron, isValidCron, parseCron, type FrequencyKey } from '../../lib/cronDescribe'
 import { getSessionSeedWorkDir } from '../../lib/sessionWorkspace'
-import type { CronTask } from '../../types/task'
+import type { CronTask, NotificationRecipientSpec } from '../../types/task'
+import type { PairedUser } from '../../types/adapter'
 
 type NotificationChannel = 'desktop' | 'telegram' | 'feishu'
+
+type ImChannel = 'telegram' | 'feishu'
+
+/** Stable reference so the recipient-sync effect does not rerun every render. */
+const NO_PAIRED_USERS: PairedUser[] = []
+
+/**
+ * Map a stored recipient spec back to a paired user id. The server matches
+ * `{ userId }`, `{ displayName }` or a bare id, so an edit form has to try all
+ * three before deciding the old recipient no longer exists.
+ */
+function recipientIdOf(
+  spec: NotificationRecipientSpec | undefined,
+  pairedUsers: PairedUser[],
+): string {
+  if (spec === undefined) return ''
+  for (const user of pairedUsers) {
+    const id = String(user.userId)
+    if (typeof spec === 'string' || typeof spec === 'number') {
+      if (id === String(spec)) return id
+      continue
+    }
+    if (typeof spec.userId === 'string' || typeof spec.userId === 'number') {
+      if (id === String(spec.userId)) return id
+      continue
+    }
+    if (typeof spec.displayName === 'string' && spec.displayName.trim().length > 0) {
+      if (user.displayName === spec.displayName) return id
+    }
+  }
+  return ''
+}
+
+/** Build the explicit one-element recipient list the server expects. */
+function recipientSpecFor(id: string, pairedUsers: PairedUser[]): NotificationRecipientSpec[] {
+  const match = pairedUsers.find((user) => String(user.userId) === id)
+  return match ? [{ userId: match.userId, displayName: match.displayName }] : []
+}
+
+function recipientOptions(pairedUsers: PairedUser[], placeholder: string) {
+  return [
+    { value: '', label: placeholder },
+    ...pairedUsers.map((user) => ({
+      value: String(user.userId),
+      label: user.displayName ? `${user.displayName} (${String(user.userId)})` : String(user.userId),
+    })),
+  ]
+}
 
 type Props = {
   open: boolean
@@ -73,10 +122,16 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
     if (open) fetchAdapterConfig()
   }, [open])
 
+  const telegramPairedUsers = adapterConfig.telegram?.pairedUsers ?? NO_PAIRED_USERS
+  const feishuPairedUsers = adapterConfig.feishu?.pairedUsers ?? NO_PAIRED_USERS
+
+  // Notification targets are resolved server-side against `pairedUsers` only —
+  // `allowedUsers` is an access allowlist, not a send-to list. A channel with no
+  // paired user can never deliver, so it is not offered.
   const isFeishuConfigured = !!(adapterConfig.feishu?.appId && adapterConfig.feishu?.appSecret
-    && ((adapterConfig.feishu?.pairedUsers?.length ?? 0) > 0 || (adapterConfig.feishu?.allowedUsers?.length ?? 0) > 0))
+    && feishuPairedUsers.length > 0)
   const isTelegramConfigured = !!(adapterConfig.telegram?.botToken
-    && ((adapterConfig.telegram?.pairedUsers?.length ?? 0) > 0 || (adapterConfig.telegram?.allowedUsers?.length ?? 0) > 0))
+    && telegramPairedUsers.length > 0)
 
   const isEdit = !!editTask
   const parsed = editTask ? parseCron(editTask.cron) : null
@@ -102,7 +157,28 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
   const [useWorktree, setUseWorktree] = useState(editTask?.useWorktree || false)
   const [notifyEnabled, setNotifyEnabled] = useState(editTask?.notification?.enabled || false)
   const [notifyChannels, setNotifyChannels] = useState<NotificationChannel[]>(editTask?.notification?.channels || [])
+  const [telegramRecipient, setTelegramRecipient] = useState('')
+  const [feishuRecipient, setFeishuRecipient] = useState('')
+  const [recipientError, setRecipientError] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
+
+  // Older tasks stored a channel without any recipient (the server used to
+  // broadcast). The pairing list loads asynchronously, so resolve the stored
+  // recipient into a select value once it is available instead of silently
+  // starting blank and dropping the old target on save.
+  useEffect(() => {
+    if (!open) return
+    const storedTelegram = editTask?.notification?.recipients?.telegram?.[0]
+    if (storedTelegram !== undefined) {
+      const resolved = recipientIdOf(storedTelegram, telegramPairedUsers)
+      setTelegramRecipient((current) => current || resolved)
+    }
+    const storedFeishu = editTask?.notification?.recipients?.feishu?.[0]
+    if (storedFeishu !== undefined) {
+      const resolved = recipientIdOf(storedFeishu, feishuPairedUsers)
+      setFeishuRecipient((current) => current || resolved)
+    }
+  }, [open, editTask, telegramPairedUsers, feishuPairedUsers])
 
   // Enhanced scheduling state
   const [minuteInterval, setMinuteInterval] = useState(parsed?.minuteInterval || 15)
@@ -126,10 +202,30 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
     (frequency !== 'specificDays' || selectedDays.length > 0) &&
     (!notifyEnabled || notifyChannels.length > 0)
 
+  // Every selected IM channel needs an explicit target. A missing one is
+  // reported on save, never silently sent to everyone.
+  const missingRecipient = notifyEnabled && (
+    (notifyChannels.includes('telegram') && !telegramRecipient) ||
+    (notifyChannels.includes('feishu') && !feishuRecipient)
+  )
+
   const handleSubmit = async () => {
     if (!canSubmit) return
+    if (missingRecipient) {
+      setRecipientError(true)
+      return
+    }
+    setRecipientError(false)
     setIsSubmitting(true)
     try {
+      const recipients: Partial<Record<ImChannel, NotificationRecipientSpec[]>> = {}
+      if (notifyChannels.includes('telegram')) {
+        recipients.telegram = recipientSpecFor(telegramRecipient, telegramPairedUsers)
+      }
+      if (notifyChannels.includes('feishu')) {
+        recipients.feishu = recipientSpecFor(feishuRecipient, feishuPairedUsers)
+      }
+      const hasRecipients = Object.keys(recipients).length > 0
       const payload = {
         name: name.trim(),
         description: description.trim(),
@@ -141,7 +237,7 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
         folderPath: folderPath.trim() || undefined,
         useWorktree: useWorktree || undefined,
         notification: notifyEnabled && notifyChannels.length > 0
-          ? { enabled: true, channels: notifyChannels }
+          ? { enabled: true, channels: notifyChannels, ...(hasRecipients ? { recipients } : {}) }
           : undefined,
       }
       if (isEdit) {
@@ -361,7 +457,7 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
                     </span>
                   }
                   checked={notifyChannels.includes('feishu')}
-                  disabled={!isFeishuConfigured}
+                  disabled={!isFeishuConfigured && !notifyChannels.includes('feishu')}
                   onChange={(e) => {
                     setNotifyChannels((prev) =>
                       e.target.checked ? [...prev, 'feishu'] : prev.filter((c) => c !== 'feishu'),
@@ -377,7 +473,7 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
                     </span>
                   }
                   checked={notifyChannels.includes('telegram')}
-                  disabled={!isTelegramConfigured}
+                  disabled={!isTelegramConfigured && !notifyChannels.includes('telegram')}
                   onChange={(e) => {
                     setNotifyChannels((prev) =>
                       e.target.checked ? [...prev, 'telegram'] : prev.filter((c) => c !== 'telegram'),
@@ -385,6 +481,44 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
                   }}
                 />
               </div>
+
+              {/* One target per selected IM channel. `SelectField` is a single
+                  select on purpose: the server accepts a recipient list, but
+                  the desktop owner picks exactly one, and a channel with no
+                  paired user never reaches this point. */}
+              {notifyChannels.includes('feishu') && (
+                <SelectField
+                  containerClassName="max-w-sm"
+                  label={`${t('settings.adapters.feishu')} · ${t('newTask.recipientLabel')}`}
+                  value={feishuRecipient}
+                  onChange={setFeishuRecipient}
+                  options={recipientOptions(feishuPairedUsers, t('newTask.recipientPlaceholder'))}
+                />
+              )}
+              {notifyChannels.includes('telegram') && (
+                <SelectField
+                  containerClassName="max-w-sm"
+                  label={`${t('settings.adapters.telegram')} · ${t('newTask.recipientLabel')}`}
+                  value={telegramRecipient}
+                  onChange={setTelegramRecipient}
+                  options={recipientOptions(telegramPairedUsers, t('newTask.recipientPlaceholder'))}
+                />
+              )}
+
+              {recipientError && missingRecipient && (
+                <Badge
+                  tone="warning"
+                  size="sm"
+                  wrap
+                  bordered
+                  pill={false}
+                  role="alert"
+                  icon={<span aria-hidden="true" className="material-symbols-outlined text-[13px]">warning</span>}
+                >
+                  {t('newTask.recipientRequired')}
+                </Badge>
+              )}
+
               {notifyChannels.length === 0 && (
                 <Badge
                   tone="warning"

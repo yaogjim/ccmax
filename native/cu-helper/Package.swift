@@ -36,7 +36,7 @@ let package = Package(
       // Privacy lists (Accessibility / Screen Recording) and that the user drags
       // in, so it carries the brand. The source dir stays `Sources/cu-helper`
       // (via `path`) to avoid churning the whole tree.
-      name: "cc-haha-computer-use",
+      name: "ccmax-computer-use",
       dependencies: ["CDisclaim"],
       path: "Sources/cu-helper",
       // Optional click-ripple frames. The directory always exists in the repo
@@ -63,7 +63,7 @@ let package = Package(
     ),
     .testTarget(
       name: "CuHelperTests",
-      dependencies: [.target(name: "cc-haha-computer-use")],
+      dependencies: [.target(name: "ccmax-computer-use")],
       path: "Tests/CuHelperTests",
       swiftSettings: [.swiftLanguageMode(.v6)]
     )

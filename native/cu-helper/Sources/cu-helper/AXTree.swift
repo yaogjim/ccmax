@@ -606,12 +606,12 @@ public enum AXTree {
         var current = root
         for step in path {
             let kids = walkChildren(of: current)
-            let currentFingerprints = kids.map(fingerprint(of:))
+            let currentFingerprints = kids.map { fingerprint(of: $0) }
             guard let childIndex = step.selectedIndex(
                 in: currentFingerprints,
                 childTopologyAt: { index in
                     guard kids.indices.contains(index) else { return nil }
-                    return walkChildren(of: kids[index]).map(fingerprint(of:))
+                    return walkChildren(of: kids[index]).map { fingerprint(of: $0) }
                 }
             ) else {
                 return nil
@@ -859,7 +859,7 @@ public enum AXTree {
     }
 
     private static func usableWindows(_ app: AXUIElement) -> [AXUIElement] {
-        rawWindows(app).filter(isUsableWindow)
+        rawWindows(app).filter { isUsableWindow($0) }
     }
 
     private static func isUsableWindow(_ window: AXUIElement) -> Bool {
@@ -1733,7 +1733,7 @@ public enum AXTree {
                 guard isScrollArea, hasVertical else { return true }
                 return action != "AXScrollLeftByPage" && action != "AXScrollRightByPage"
             }
-            .map(prettyActionName)
+            .map { prettyActionName($0) }
     }
 
     private static func prettyActionName(_ value: String) -> String {

@@ -681,7 +681,7 @@ function requireSignedHelper(): InstalledHelper {
   if (
     relativeBinary.startsWith('..')
     || path.isAbsolute(relativeBinary)
-    || relativeBinary !== path.join('Contents', 'MacOS', 'cc-haha-computer-use')
+    || relativeBinary !== path.join('Contents', 'MacOS', 'ccmax-computer-use')
   ) {
     throw new Error('Installed helper executable is not inside the expected app bundle')
   }

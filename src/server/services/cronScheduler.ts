@@ -12,9 +12,12 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
+import * as lockfile from '../../utils/lockfile.js'
+import { parseCronExpression } from '../../utils/cron.js'
 import { CronService, type CronTask } from './cronService.js'
 import { SessionService } from './sessionService.js'
 import { sendTaskNotification } from './notificationService.js'
+import type { NotificationDeliveryReport } from './notificationService.js'
 import { ProviderService } from './providerService.js'
 import { SettingsService } from './settingsService.js'
 import { isProviderManagedEnvVar } from '../../utils/managedEnvConstants.js'
@@ -57,6 +60,39 @@ export type TaskRun = {
   exitCode?: number
   durationMs?: number
   sessionId?: string // links to a session for rich output rendering
+  /**
+   * Queryable summary of the notification delivery for a terminal run. Written
+   * after the terminal record so a failing or slow notification can never hold
+   * the run at `running`.
+   */
+  notificationReport?: TaskRunNotificationReport
+}
+
+/** A compact, inspectable view of `NotificationDeliveryReport`. */
+export type TaskRunNotificationReport = {
+  ok: boolean
+  delivered: number
+  failed: number
+  indeterminate: number
+  issues: Array<{ channel?: string; code: string; message: string }>
+  recordPath?: string
+}
+
+function summarizeNotificationReport(
+  report: NotificationDeliveryReport,
+): TaskRunNotificationReport {
+  return {
+    ok: report.ok === true,
+    delivered: report.delivered.length,
+    failed: report.failed.length,
+    indeterminate: report.indeterminate.length,
+    issues: report.issues.map((issue) => ({
+      ...(issue.channel ? { channel: issue.channel } : {}),
+      code: issue.code,
+      message: issue.message,
+    })),
+    ...(typeof report.recordPath === 'string' ? { recordPath: report.recordPath } : {}),
+  }
 }
 
 export function buildCronTaskSpawnOptions(
@@ -191,18 +227,22 @@ function singleFieldMatches(part: string, value: number): boolean {
 /**
  * Check whether a standard 5-field cron expression matches the given date.
  * Fields: minute hour day-of-month month day-of-week
+ *
+ * Delegates to `parseCronExpression` — the same parser `assertValidCron` uses
+ * to accept a task — so evaluation and validation cannot drift apart.
+ * Concretely, day-of-week `7` is the accepted Sunday alias, and `*​/n` on
+ * day-of-month/month steps from the field minimum (1), not from 0.
  */
 export function cronMatches(cronExpr: string, date: Date): boolean {
-  const fields = cronExpr.trim().split(/\s+/)
-  if (fields.length !== 5) return false
+  const fields = parseCronExpression(cronExpr)
+  if (!fields) return false
 
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = fields
   return (
-    fieldMatches(minute, date.getMinutes()) &&
-    fieldMatches(hour, date.getHours()) &&
-    fieldMatches(dayOfMonth, date.getDate()) &&
-    fieldMatches(month, date.getMonth() + 1) &&
-    fieldMatches(dayOfWeek, date.getDay())
+    fields.minute.includes(date.getMinutes()) &&
+    fields.hour.includes(date.getHours()) &&
+    fields.dayOfMonth.includes(date.getDate()) &&
+    fields.month.includes(date.getMonth() + 1) &&
+    fields.dayOfWeek.includes(date.getDay())
   )
 }
 
@@ -271,7 +311,10 @@ async function writeRunsFile(
   const dir = path.dirname(filePath)
   await fs.mkdir(dir, { recursive: true })
 
-  const tmpFile = `${filePath}.tmp.${Date.now()}`
+  // A unique temp name per writer. `Date.now()` alone collides when two
+  // tasks finish in the same millisecond, and the loser's rename then fails
+  // with ENOENT (or, worse, publishes the winner's bytes under its own name).
+  const tmpFile = `${filePath}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}`
   const serialized = JSON.stringify(data, null, 2) + '\n'
   try {
     await fs.writeFile(tmpFile, serialized, 'utf-8')
@@ -365,15 +408,46 @@ async function compareScheduledRunPageInShadow(
   )
 }
 
+/**
+ * Serialize a read-modify-write against the runs log. `appendRun`/`updateRun`
+ * read the whole file, mutate it, and rename a temp file over it; two tasks
+ * finishing at the same time (or two server processes sharing a config dir)
+ * would otherwise interleave those steps and silently drop a run. Uses the
+ * same on-disk `proper-lockfile` lock as `CronService`; `realpath: false`
+ * because the log may not exist yet, and the directory is created first.
+ */
+async function withRunsFileLock<T>(
+  filePath: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true })
+  const release = await lockfile.lock(filePath, {
+    realpath: false,
+    retries: {
+      retries: 60,
+      minTimeout: 5,
+      maxTimeout: 50,
+      factor: 1.5,
+    },
+  })
+  try {
+    return await run()
+  } finally {
+    await release().catch(() => {})
+  }
+}
+
 /** Append a run to the log and trim to keep at most MAX_RUNS_PER_TASK per task. */
 async function appendRun(
   run: TaskRun,
   target = captureRunsFileMutationTarget(),
 ): Promise<void> {
-  const data = await readRunsFile(target.sourcePath)
-  data.runs.push(run)
-  trimRuns(data)
-  await writeRunsFile(data, target)
+  await withRunsFileLock(target.sourcePath, async () => {
+    const data = await readRunsFile(target.sourcePath)
+    data.runs.push(run)
+    trimRuns(data)
+    await writeRunsFile(data, target)
+  })
 }
 
 /** Update an existing run in the log (matched by run.id). */
@@ -381,15 +455,17 @@ async function updateRun(
   run: TaskRun,
   target = captureRunsFileMutationTarget(),
 ): Promise<void> {
-  const data = await readRunsFile(target.sourcePath)
-  const idx = data.runs.findIndex((r) => r.id === run.id)
-  if (idx !== -1) {
-    data.runs[idx] = run
-  } else {
-    data.runs.push(run)
-  }
-  trimRuns(data)
-  await writeRunsFile(data, target)
+  await withRunsFileLock(target.sourcePath, async () => {
+    const data = await readRunsFile(target.sourcePath)
+    const idx = data.runs.findIndex((r) => r.id === run.id)
+    if (idx !== -1) {
+      data.runs[idx] = run
+    } else {
+      data.runs.push(run)
+    }
+    trimRuns(data)
+    await writeRunsFile(data, target)
+  })
 }
 
 const MAX_RUNS_PER_TASK = 100
@@ -424,6 +500,39 @@ export function resolveCronTaskTimeoutMs(
   return Number.isInteger(timeoutMs) && timeoutMs > 0
     ? timeoutMs
     : DEFAULT_TASK_TIMEOUT_MS
+}
+
+type TaskWorkDirResolution =
+  | { ok: true; workDir: string }
+  | { ok: false; error: string }
+
+/**
+ * Resolve the run's working directory. An explicitly configured directory that
+ * is missing or not a directory is a fatal, visible error — running the task
+ * in the home directory instead would execute the prompt somewhere the user
+ * never chose. Only an omitted `folderPath` defaults to the home directory.
+ */
+function resolveTaskWorkDir(task: CronTask): TaskWorkDirResolution {
+  const requested = task.folderPath?.trim()
+  if (!requested) {
+    return { ok: true, workDir: os.homedir() }
+  }
+
+  let isDirectory = false
+  try {
+    isDirectory = statSync(requested).isDirectory()
+  } catch {
+    isDirectory = false
+  }
+
+  if (!isDirectory) {
+    return {
+      ok: false,
+      error: `Working directory "${requested}" does not exist or is not a directory; refusing to fall back to the home directory`,
+    }
+  }
+
+  return { ok: true, workDir: requested }
 }
 
 type CronCliResolutionOptions = {
@@ -505,6 +614,64 @@ export function buildCronCliArgs(
     path.join(projectRoot, 'src', 'entrypoints', 'cli.tsx'),
     ...baseArgs,
   ]
+}
+
+// ─── Execution claim ───────────────────────────────────────────────────────────
+
+/**
+ * Tasks currently being executed by any CronScheduler instance in this
+ * process. Complements the per-instance `runningTasks` map: the API handler's
+ * scheduler and the boot-time singleton are different instances in the same
+ * process, so an instance-local check alone would let both spawn the same task.
+ */
+const claimedTaskExecutions = new Set<string>()
+
+function claimTaskExecution(taskId: string): boolean {
+  if (claimedTaskExecutions.has(taskId)) return false
+  claimedTaskExecutions.add(taskId)
+  return true
+}
+
+function releaseTaskExecutionClaim(taskId: string): void {
+  claimedTaskExecutions.delete(taskId)
+}
+
+function getTaskExecutionLockPath(taskId: string): string {
+  const configDir =
+    process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
+  const safeId = taskId.replace(/[^A-Za-z0-9._-]/g, '_')
+  return path.join(configDir, 'scheduled_task_locks', `${safeId}.lock`)
+}
+
+/**
+ * Take the cross-process execution lock for a task. Returns the release
+ * function, or null if another process is already executing it. Uses a
+ * non-blocking `tryLock` (`retries: 0`) so a loser bails out immediately rather
+ * than queueing a second execution behind the first.
+ */
+async function acquireTaskExecutionLock(
+  taskId: string,
+): Promise<(() => Promise<void>) | null> {
+  const lockPath = getTaskExecutionLockPath(taskId)
+  await fs.mkdir(path.dirname(lockPath), { recursive: true })
+  try {
+    return await lockfile.lock(lockPath, { realpath: false, retries: 0 })
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ELOCKED') return null
+    throw err
+  }
+}
+
+/** Execution options for a single task run. */
+export type CronTaskExecutionOptions = {
+  /** Create a Session for rich output viewing (manual "Run Now"). */
+  createSession?: boolean
+  /**
+   * Invoked once the run record is on disk, before the child process is
+   * spawned. Lets the manual-run API return only after the run is visible
+   * instead of guessing with a fixed delay.
+   */
+  onRunStarted?: (run: TaskRun) => void
 }
 
 export class CronScheduler {
@@ -608,41 +775,75 @@ export class CronScheduler {
    * @param task The task to execute
    * @param options.createSession When true, creates a Session for rich output viewing (used for manual "Run Now")
    */
-  async executeTask(task: CronTask, options?: { createSession?: boolean }): Promise<TaskRun> {
+  async executeTask(
+    task: CronTask,
+    options?: CronTaskExecutionOptions,
+  ): Promise<TaskRun> {
     const runLogTarget = captureRunsFileMutationTarget()
 
-    // Prevent concurrent executions of the same task
+    // Prevent concurrent executions of the same task (this instance).
     const existing = this.runningTasks.get(task.id)
     if (existing) {
       console.log(
         `[CronScheduler] Task ${task.id} is already running (runId=${existing.runId}), skipping`,
       )
-      return {
-        id: existing.runId,
-        taskId: task.id,
-        taskName: task.name || task.prompt.slice(0, 60),
-        startedAt: new Date(existing.startedAt).toISOString(),
-        status: 'running',
-        prompt: task.prompt,
-      }
+      return this.runningRunStub(
+        task,
+        existing.runId,
+        new Date(existing.startedAt).toISOString(),
+      )
     }
 
+    // Prevent concurrent executions across CronScheduler instances in this
+    // process, and across processes via an on-disk lock. The API handler's
+    // scheduler and the boot-time singleton are different instances, so an
+    // instance-local check alone would let both spawn the same task.
+    if (!claimTaskExecution(task.id)) {
+      console.log(
+        `[CronScheduler] Task ${task.id} is already running elsewhere, skipping`,
+      )
+      return this.alreadyRunningRun(task, runLogTarget.sourcePath)
+    }
+
+    let releaseExecutionLock: (() => Promise<void>) | undefined
+    try {
+      releaseExecutionLock = await acquireTaskExecutionLock(task.id)
+      if (!releaseExecutionLock) {
+        return this.alreadyRunningRun(task, runLogTarget.sourcePath)
+      }
+      return await this.runTask(task, options, runLogTarget)
+    } finally {
+      await releaseExecutionLock?.().catch(() => {})
+      releaseTaskExecutionClaim(task.id)
+    }
+  }
+
+  /**
+   * The actual execution: create the run record, spawn the CLI, and settle it.
+   * Always returns a run in a terminal state — a throwing environment builder
+   * or `Bun.spawn` is recorded as `failed`, never left at `running`.
+   */
+  private async runTask(
+    task: CronTask,
+    options: CronTaskExecutionOptions | undefined,
+    runLogTarget: RunsFileMutationTarget,
+  ): Promise<TaskRun> {
     const runId = crypto.randomBytes(6).toString('hex')
     const startedAt = new Date().toISOString()
-    let workDir = task.folderPath || os.homedir()
-    if (task.folderPath && (!existsSync(task.folderPath) || !statSync(task.folderPath).isDirectory())) {
-      console.warn(`[cron] task ${task.id}: folderPath "${task.folderPath}" is not a valid directory, falling back to homedir`)
-      workDir = os.homedir()
-    }
-    workDir = this.resolveCanonicalWorkDir(workDir)
+    const workDirResolution = resolveTaskWorkDir(task)
+    // Canonicalize before creating the session so it records the real path,
+    // matching the CLI's own cwd resolution.
+    const canonicalWorkDir = workDirResolution.ok
+      ? this.resolveCanonicalWorkDir(workDirResolution.workDir)
+      : null
 
     // Only create a session when explicitly requested (manual "Run Now"),
     // not for automatic cron runs — avoids flooding the sidebar.
     let sessionId: string | undefined
-    if (options?.createSession) {
+    if (canonicalWorkDir && options?.createSession) {
       try {
         const result = await this.sessionService.createSession(
-          workDir,
+          canonicalWorkDir,
           undefined,
           'bypassPermissions',
         )
@@ -671,6 +872,25 @@ export class CronScheduler {
 
     // Persist the "running" state
     await appendRun(run, runLogTarget)
+    // The run is now visible to history consumers; hand the record back before
+    // any further work so a caller can wait on it deterministically.
+    options?.onRunStarted?.(run)
+
+    if (!workDirResolution.ok) {
+      const completedAt = new Date().toISOString()
+      const settled: TaskRun = {
+        ...run,
+        completedAt,
+        status: 'failed',
+        error: workDirResolution.error,
+        durationMs: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
+      }
+      await updateRun(settled, runLogTarget)
+      await this.finalizeTaskRun(task, settled, runLogTarget)
+      return settled
+    }
+
+    const workDir = canonicalWorkDir ?? workDirResolution.workDir
 
     const inputPayload = JSON.stringify({
       type: 'user',
@@ -693,35 +913,38 @@ export class CronScheduler {
       ...this.getRuntimeArgs(task),
     ])
 
-    const childEnv = await this.buildTaskChildEnv(workDir, task)
     const taskTimeoutMs = resolveCronTaskTimeoutMs()
-    const proc = Bun.spawn(
-      cliArgs,
-      buildCronTaskSpawnOptions(workDir, childEnv),
-    )
+    let timeoutId: Timer | undefined
 
-    this.runningTasks.set(task.id, { proc, startedAt: Date.now(), runId })
-
-    // Write prompt to stdin then close it
+    let settled: TaskRun
     try {
-      proc.stdin.write(inputPayload)
-      proc.stdin.end()
-    } catch {
-      // If writing fails, the process may have already exited
-    }
+      const childEnv = await this.buildTaskChildEnv(workDir, task)
+      const proc = Bun.spawn(
+        cliArgs,
+        buildCronTaskSpawnOptions(workDir, childEnv),
+      )
 
-    // Set up a timeout
-    const timeoutId = setTimeout(() => {
-      if (this.runningTasks.has(task.id)) {
-        try {
-          proc.kill()
-        } catch {
-          // ignore
-        }
+      this.runningTasks.set(task.id, { proc, startedAt: Date.now(), runId })
+
+      // Write prompt to stdin then close it
+      try {
+        proc.stdin.write(inputPayload)
+        proc.stdin.end()
+      } catch {
+        // If writing fails, the process may have already exited
       }
-    }, taskTimeoutMs)
 
-    try {
+      // Set up a timeout
+      timeoutId = setTimeout(() => {
+        if (this.runningTasks.has(task.id)) {
+          try {
+            proc.kill()
+          } catch {
+            // ignore
+          }
+        }
+      }, taskTimeoutMs)
+
       // Collect stdout
       const stdoutChunks: string[] = []
       if (proc.stdout) {
@@ -740,9 +963,6 @@ export class CronScheduler {
 
       // Wait for exit
       const exitCode = await proc.exited
-
-      clearTimeout(timeoutId)
-      this.runningTasks.delete(task.id)
 
       const completedAt = new Date().toISOString()
       const rawOutput = stdoutChunks.join('')
@@ -777,42 +997,114 @@ export class CronScheduler {
         }
       }
 
-      await this.persistScheduledSessionPermission(sessionId, workDir)
-      await updateRun(completedRun, runLogTarget)
-
-      // Send IM notification if configured
-      if (task.notification?.enabled && task.notification.channels.length > 0) {
-        sendTaskNotification(completedRun, task.notification).catch((err) => {
-          console.error(`[CronScheduler] Notification error for task ${task.id}:`, err)
-        })
-      }
-
-      // If non-recurring, disable after first run
-      if (!task.recurring) {
-        await this.cronService.updateTask(task.id, { enabled: false }).catch(() => {
-          // Task may have been deleted
-        })
-      }
-
-      return completedRun
+      settled = completedRun
     } catch (err) {
-      clearTimeout(timeoutId)
-      this.runningTasks.delete(task.id)
-
+      // A throwing environment builder, a throwing `Bun.spawn` (e.g. a missing
+      // launcher binary), or any unexpected error while awaiting the child must
+      // still leave a terminal record. A run stuck at `running` would be
+      // invisible to history consumers and could never be completed by anyone.
       const completedAt = new Date().toISOString()
-      const failedRun: TaskRun = {
+      settled = {
         ...run,
         completedAt,
         status: 'failed',
-        error: (err as Error).message,
+        error: err instanceof Error ? err.message : String(err),
         durationMs:
           new Date(completedAt).getTime() - new Date(startedAt).getTime(),
       }
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId)
+      const current = this.runningTasks.get(task.id)
+      if (current?.runId === runId) {
+        this.runningTasks.delete(task.id)
+      }
+    }
 
-      await this.persistScheduledSessionPermission(sessionId, workDir)
-      await updateRun(failedRun, runLogTarget)
+    await this.persistScheduledSessionPermission(sessionId, workDir)
+    await updateRun(settled, runLogTarget)
+    await this.finalizeTaskRun(task, settled, runLogTarget)
 
-      return failedRun
+    return settled
+  }
+
+  /** Synthetic in-flight run for a task this instance is already executing. */
+  private runningRunStub(
+    task: CronTask,
+    runId: string,
+    startedAt: string,
+  ): TaskRun {
+    return {
+      id: runId,
+      taskId: task.id,
+      taskName: task.name || task.prompt.slice(0, 60),
+      startedAt,
+      status: 'running',
+      prompt: task.prompt,
+    }
+  }
+
+  /**
+   * Return the in-flight run for a task being executed by another scheduler
+   * instance or process. Prefers the on-disk `running` record so callers that
+   * poll history see the real run id.
+   */
+  private async alreadyRunningRun(
+    task: CronTask,
+    logPath: string,
+  ): Promise<TaskRun> {
+    const data = await readRunsFile(logPath).catch(() => ({
+      runs: [] as TaskRun[],
+    }))
+    const running = [...data.runs]
+      .reverse()
+      .find((entry) => entry.taskId === task.id && entry.status === 'running')
+    if (running) return running
+    return this.runningRunStub(
+      task,
+      crypto.randomBytes(6).toString('hex'),
+      new Date().toISOString(),
+    )
+  }
+
+  /**
+   * Post-run side effects: record the notification delivery result and
+   * auto-disable a one-shot task. Runs for every terminal status — including a
+   * synthetic failure from a throwing spawn — so a one-shot task cannot stay
+   * enabled and retry forever. The run's terminal record is already persisted by
+   * the caller, so a failing or slow notification never holds it at `running`.
+   */
+  private async finalizeTaskRun(
+    task: CronTask,
+    run: TaskRun,
+    runLogTarget: RunsFileMutationTarget,
+  ): Promise<void> {
+    // An enabled notification with a malformed stored channel list (a record
+    // written before the API validated it) must not read `.length` here: that
+    // throws before the delivery service can record the visible failure, and
+    // the throw would escape `executeTask` even though the run itself finished.
+    if (task.notification?.enabled) {
+      try {
+        const report = await sendTaskNotification(run, task.notification)
+        if (report) {
+          run.notificationReport = summarizeNotificationReport(report)
+          await updateRun(run, runLogTarget).catch(() => {
+            // The terminal run is already persisted; a failed summary write
+            // must not escalate into a task failure.
+          })
+        }
+      } catch (err) {
+        console.error(
+          `[CronScheduler] Notification error for task ${task.id}:`,
+          err,
+        )
+      }
+    }
+
+    // If non-recurring, disable after first run
+    if (!task.recurring) {
+      await this.cronService.updateTask(task.id, { enabled: false }).catch(() => {
+        // Task may have been deleted
+      })
     }
   }
 
@@ -990,31 +1282,33 @@ export class CronScheduler {
    */
   private async cleanupStaleRuns(): Promise<void> {
     const target = captureRunsFileMutationTarget()
-    const data = await readRunsFile(target.sourcePath)
-    let changed = false
-    const now = Date.now()
-    const taskTimeoutMs = resolveCronTaskTimeoutMs()
+    await withRunsFileLock(target.sourcePath, async () => {
+      const data = await readRunsFile(target.sourcePath)
+      let changed = false
+      const now = Date.now()
+      const taskTimeoutMs = resolveCronTaskTimeoutMs()
 
-    for (const run of data.runs) {
-      if (run.status !== 'running') continue
-      const startedAt = new Date(run.startedAt).getTime()
-      // If "running" for longer than the task timeout + 1-minute buffer,
-      // the owning process is certainly dead.
-      if (now - startedAt > taskTimeoutMs + 60_000) {
-        run.status = 'failed'
-        run.error = 'Process terminated before task could complete'
-        run.completedAt = new Date().toISOString()
-        run.durationMs = now - startedAt
-        changed = true
-        console.log(
-          `[CronScheduler] Cleaned up stale run ${run.id} for task ${run.taskId}`,
-        )
+      for (const run of data.runs) {
+        if (run.status !== 'running') continue
+        const startedAt = new Date(run.startedAt).getTime()
+        // If "running" for longer than the task timeout + 1-minute buffer,
+        // the owning process is certainly dead.
+        if (now - startedAt > taskTimeoutMs + 60_000) {
+          run.status = 'failed'
+          run.error = 'Process terminated before task could complete'
+          run.completedAt = new Date().toISOString()
+          run.durationMs = now - startedAt
+          changed = true
+          console.log(
+            `[CronScheduler] Cleaned up stale run ${run.id} for task ${run.taskId}`,
+          )
+        }
       }
-    }
 
-    if (changed) {
-      await writeRunsFile(data, target)
-    }
+      if (changed) {
+        await writeRunsFile(data, target)
+      }
+    })
   }
 
   // ─── Query helpers ─────────────────────────────────────────────────────────

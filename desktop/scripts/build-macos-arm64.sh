@@ -27,10 +27,14 @@ Environment:
                    certificate. An ad-hoc build cannot use Computer Use.
   REBUILD_NATIVE=1 Run `electron-builder install-app-deps` before packaging.
   MAC_TARGETS      Electron Builder macOS targets. Defaults to "dmg zip".
-  SKIP_PACKAGE_SMOKE=1
-                   Skip package-smoke verification after copying artifacts.
   REQUIRE_MACOS_GATEKEEPER_SMOKE=1
                    Require Gatekeeper approval during post-build package-smoke.
+                   Use only with a Developer ID identity: a self-signed or Apple
+                   Development build cannot pass Gatekeeper. Without it, any
+                   signed non-Developer-ID build still verifies that host,
+                   sidecar and helper share one certificate.
+  SKIP_PACKAGE_SMOKE=1
+                   Skip package-smoke verification after copying artifacts.
   OPEN_OUTPUT=1    Open the canonical artifact output directory in Finder after a successful build.
 EOF
 }
@@ -121,36 +125,54 @@ rm -rf "${DESKTOP_DIR}/src-tauri/binaries/claude-sidecar-"*
 #
 # Preference order mirrors resolveStableSigningIdentity() in
 # desktop/scripts/sign-identity.ts: Developer ID first (long-lived; TCC grants
-# are keyed to the identity, and an Apple Development cert expires yearly).
+# are keyed to the identity, and an Apple Development cert expires yearly), then
+# Apple Development, then the local self-signed development certificate.
 # ---------------------------------------------------------------------------
 SIGN_BUILD_EFFECTIVE="${SIGN_BUILD:-}"
 RESOLVED_SIGN_IDENTITY="${CC_HAHA_SIGN_IDENTITY:-}"
+
+# The one-time self-signed Code Signing certificate shared with
+# native/cu-helper/build.sh. It has no Team ID, but it is stable across
+# rebuilds, which is all the helper's attestation needs when host, sidecar and
+# helper all carry it. Exact quoted match only, so `cu-helper-dev-v2` is not
+# mistaken for it.
+# With `set -euo pipefail`, a missing Developer ID or Apple Development cert
+# must not abort the build before the self-signed fallback can be checked.
+SELF_SIGNED_NAME="cu-helper-dev"
 
 if [[ -z "${RESOLVED_SIGN_IDENTITY}" && "${SIGN_BUILD_EFFECTIVE}" != "0" ]]; then
   RESOLVED_SIGN_IDENTITY="$(
     security find-identity -v -p codesigning 2>/dev/null \
       | grep -E '"Developer ID Application:' \
       | head -1 \
-      | sed -E 's/^[^"]*"([^"]+)".*$/\1/'
+      | sed -E 's/^[^"]*"([^"]+)".*$/\1/' || true
   )"
   if [[ -z "${RESOLVED_SIGN_IDENTITY}" ]]; then
     RESOLVED_SIGN_IDENTITY="$(
       security find-identity -v -p codesigning 2>/dev/null \
         | grep -E '"Apple Development:' \
         | head -1 \
-        | sed -E 's/^[^"]*"([^"]+)".*$/\1/'
+        | sed -E 's/^[^"]*"([^"]+)".*$/\1/' || true
+    )"
+  fi
+  if [[ -z "${RESOLVED_SIGN_IDENTITY}" ]]; then
+    RESOLVED_SIGN_IDENTITY="$(
+      security find-identity -v -p codesigning 2>/dev/null \
+        | grep -E "\"${SELF_SIGNED_NAME}\"" \
+        | head -1 \
+        | sed -E 's/^[^"]*"([^"]+)".*$/\1/' || true
     )"
   fi
 fi
 
-if [[ "${SIGN_BUILD_EFFECTIVE}" == "0" || -z "${RESOLVED_SIGN_IDENTITY}" ]]; then
-  SIGN_BUILD_EFFECTIVE=0
-  if [[ "${SIGN_BUILD:-}" == "0" ]]; then
-    echo "[build-macos-arm64] SIGN_BUILD=0 — building ad-hoc by request."
-  else
-    echo "[build-macos-arm64] No stable signing identity in the keychain — building ad-hoc."
-  fi
+if [[ "${SIGN_BUILD_EFFECTIVE}" == "0" ]]; then
+  echo "[build-macos-arm64] SIGN_BUILD=0 — building ad-hoc by request."
   echo "[build-macos-arm64] NOTE: Computer Use does not work on an ad-hoc build."
+elif [[ -z "${RESOLVED_SIGN_IDENTITY}" ]]; then
+  echo "[build-macos-arm64] No stable signing identity in the keychain; refusing an incomplete Computer Use build." >&2
+  echo "[build-macos-arm64] Create a self-signed '${SELF_SIGNED_NAME}' Code Signing certificate in" >&2
+  echo "[build-macos-arm64] Keychain Access (see native/cu-helper/build.sh), then retry." >&2
+  exit 1
 else
   SIGN_BUILD_EFFECTIVE=1
   # Every signing step reads one of these: build-sidecars.ts and
@@ -162,7 +184,9 @@ else
   # ("Please remove prefix \"Developer ID Application:\" …") — it wants only the
   # common name and picks the certificate type itself. `codesign --sign` on the
   # other hand matches on any unique substring, so the stripped name still
-  # resolves to the exact same certificate for the sidecar and the helper.
+  # resolves to the exact same certificate for the sidecar and the helper. The
+  # local self-signed cert (`${SELF_SIGNED_NAME}`) has no type prefix, so it
+  # passes through unchanged.
   export CSC_NAME="${RESOLVED_SIGN_IDENTITY#Developer ID Application: }"
   CSC_NAME="${CSC_NAME#Apple Development: }"
   export CSC_NAME
@@ -220,9 +244,23 @@ Built at: $(date '+%Y-%m-%d %H:%M:%S %z')
 EOF
 
 if [[ "${SKIP_PACKAGE_SMOKE:-0}" != "1" ]]; then
-  PACKAGE_SMOKE_ARGS=(bun run test:package-smoke --platform macos --arch arm64 --package-kind release --artifacts-dir desktop/build-artifacts/macos-arm64)
+  PACKAGE_SMOKE_KIND=release
+  if [[ "${SIGN_BUILD_EFFECTIVE:-0}" == "1" && "${RESOLVED_SIGN_IDENTITY}" != "Developer ID Application:"* ]]; then
+    # The local signed ZIP still gets archive/update checks in auto mode, while
+    # Developer ID remains mandatory for the separate release policy.
+    PACKAGE_SMOKE_KIND=auto
+  fi
+  PACKAGE_SMOKE_ARGS=(bun run test:package-smoke --platform macos --arch arm64 --package-kind "${PACKAGE_SMOKE_KIND}" --artifacts-dir desktop/build-artifacts/macos-arm64)
   if [[ "${REQUIRE_MACOS_GATEKEEPER_SMOKE:-0}" == "1" ]]; then
     PACKAGE_SMOKE_ARGS+=(--require-macos-gatekeeper)
+  elif [[ "${SIGN_BUILD_EFFECTIVE:-0}" == "1" && "${RESOLVED_SIGN_IDENTITY}" != "Developer ID Application:"* ]]; then
+    # Signed with something other than a Developer ID cert (an Apple Development
+    # or the local self-signed ${SELF_SIGNED_NAME} cert). Gatekeeper approval and
+    # notarization are out of reach for those, but the Computer Use chain
+    # invariant still applies: host, sidecar and helper must share ONE
+    # certificate. Prove it here rather than discovering it at runtime as
+    # `unauthorized_client`.
+    PACKAGE_SMOKE_ARGS+=(--require-signed-chain)
   fi
   echo "[build-macos-arm64] Running package smoke..."
   (cd "${REPO_ROOT}" && "${PACKAGE_SMOKE_ARGS[@]}")

@@ -5,11 +5,13 @@
  * ---------------
  * The native Computer Use helper refuses commands unless its caller chain is
  * cryptographically the desktop app: `ClientAttestation.swift` requires the
- * host (`com.claude-code-haha.desktop`), the sidecar
+ * host (the Electron app, whose identifier is `build.appId` in
+ * `desktop/package.json`), the sidecar
  * (`com.claude-code-haha.desktop.sidecar`) and the helper
- * (`dev.cchaha.cu-helper`) to share one signing certificate — same team, same
- * leaf. If any link is ad-hoc or signed by a different cert, every helper call
- * returns `unauthorized_client` and Computer Use is dead in the water.
+ * (`dev.cchaha.cu-helper`) to share one signing certificate — same leaf, and
+ * the same Team ID when the certificate has one. If any link is ad-hoc or
+ * signed by a different cert, every helper call returns `unauthorized_client`
+ * and Computer Use is dead in the water.
  *
  * Three separate build steps produce those three binaries (electron-builder,
  * `build-sidecars.ts`, `native/cu-helper/build.sh`), so they need one shared
@@ -23,13 +25,26 @@
  *      grants alive across rebuilds.
  *   3. `Apple Development: …` — works, but expires in about a year, and the
  *      replacement cert silently invalidates every TCC grant.
- *   4. none → caller decides (ad-hoc for local unsigned builds).
+ *   4. the local self-signed development certificate (`cu-helper-dev`) — no
+ *      Apple account required. It is self-signed, so it has no Team ID, but it
+ *      is stable across rebuilds, which is all the helper's attestation needs
+ *      as long as host, sidecar and helper all carry it.
+ *   5. none → caller decides (ad-hoc for local unsigned builds).
  *
  * `native/cu-helper/build.sh` mirrors this order in shell; keep the two in sync.
  */
 
 /** A code-signing identity's full common name, as `codesign --sign` wants it. */
 export type SigningIdentity = string
+
+/**
+ * Local self-signed development certificate. No Apple account is needed, so
+ * this is the only stable identity available on a machine with no provisioning
+ * profile — which is why it must be recognized instead of silently degrading to
+ * an ad-hoc build that cannot use Computer Use. MUST equal `SELF_SIGNED_NAME` in
+ * `native/cu-helper/build.sh`.
+ */
+export const SELF_SIGNED_DEVELOPMENT_IDENTITY = 'cu-helper-dev'
 
 export function codesignTimestampArgument(identity: SigningIdentity | null): '--timestamp' | '--timestamp=none' {
   return identity?.startsWith('Developer ID Application:')
@@ -47,8 +62,7 @@ export const SIDECAR_SIGNING_IDENTIFIER = 'com.claude-code-haha.desktop.sidecar'
  * @param securityOutput raw stdout of `security find-identity -v -p codesigning`
  * @param override value of `CC_HAHA_SIGN_IDENTITY`, if set
  * @returns the identity's common name, or null when nothing stable is available
- */
-export function resolveStableSigningIdentity(
+ */export function resolveStableSigningIdentity(
   securityOutput: string,
   override?: string | null,
 ): SigningIdentity | null {
@@ -78,6 +92,9 @@ export function resolveStableSigningIdentity(
   return (
     names.find(name => name.startsWith('Developer ID Application:')) ??
     names.find(name => name.startsWith('Apple Development:')) ??
+    // Exact match only: a cert named `cu-helper-dev-v2` is a different identity
+    // and must not be picked up as the well-known local development cert.
+    names.find(name => name === SELF_SIGNED_DEVELOPMENT_IDENTITY) ??
     null
   )
 }

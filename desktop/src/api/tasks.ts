@@ -1,5 +1,10 @@
 import { api } from './client'
-import type { CronTask, CreateTaskInput, TaskRun } from '../types/task'
+import type {
+  CronTask,
+  CreateTaskInput,
+  NotificationDeliveryRecord,
+  TaskRun,
+} from '../types/task'
 
 type TasksResponse = { tasks: CronTask[] }
 type TaskResponse = { task: CronTask }
@@ -62,5 +67,19 @@ export const tasksApi = {
 
   getRunDetail(runId: string, options?: { signal?: AbortSignal }) {
     return api.get<{ run: TaskRun }>(`/api/scheduled-tasks/runs/${runId}`, options)
+  },
+
+  /**
+   * Per-recipient notification delivery records for one run. The server exposes
+   * the persisted outcomes (`pending`/`delivered`/`failed`/`indeterminate`) so
+   * the panel can show Telegram and Feishu status separately. There is
+   * deliberately no client-side guess: an empty list means nothing was queued,
+   * and a failed request is reported as unknown rather than "not sent".
+   */
+  getRunDeliveries(runId: string, options?: { signal?: AbortSignal }) {
+    return api.get<{ deliveries: NotificationDeliveryRecord[] }>(
+      `/api/scheduled-tasks/runs/${runId}/deliveries`,
+      options,
+    )
   },
 }

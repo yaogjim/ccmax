@@ -40,6 +40,10 @@ The page has **Open accessibility settings** and **Open screen recording setting
 After granting either one you must **fully quit and reopen the app**. macOS reads these permissions once at process start, so without a restart the page will keep reporting them as not granted.
 :::
 
+:::info
+Both grants are recorded **per machine and per signing identity**. For a locally built self-signed app (see [Download and install](../start/install.md)), the signing identity stays stable as long as every build reuses the same self-signed certificate, so the grants survive a rebuild; a different machine needs its own grants. The certificate and its private key stay in that machine's keychain — no export needed.
+:::
+
 Make sure you're granting the permission to the app that actually launches ccmax. Screen Recording detection is occasionally unreliable — if the system settings clearly show it granted but the page still says otherwise, it generally works anyway.
 
 ## Pre-authorized apps

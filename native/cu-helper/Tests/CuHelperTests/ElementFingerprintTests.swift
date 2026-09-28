@@ -1,5 +1,5 @@
 import XCTest
-@testable import cc_haha_computer_use
+@testable import ccmax_computer_use
 
 final class ElementFingerprintTests: XCTestCase {
     private func button(_ identifier: String) -> ElementFingerprint {

@@ -1,12 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import '@testing-library/jest-dom'
 
 import { AboutSettings } from './AboutSettings'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useUpdateStore } from '../../stores/updateStore'
 
-const openMock = vi.fn()
 const getVersionMock = vi.fn()
 
 vi.mock('../../lib/desktopHost', async (importOriginal) => {
@@ -19,18 +18,12 @@ vi.mock('../../lib/desktopHost', async (importOriginal) => {
         ...actual.getDesktopHost().app,
         getVersion: getVersionMock,
       },
-      shell: {
-        ...actual.getDesktopHost().shell,
-        open: openMock,
-      },
     }),
   }
 })
 
 describe('AboutSettings product identity', () => {
   beforeEach(() => {
-    openMock.mockReset()
-    openMock.mockResolvedValue(undefined)
     getVersionMock.mockReset()
     getVersionMock.mockResolvedValue('0.5.3')
     useSettingsStore.setState({ locale: 'en' })
@@ -49,12 +42,15 @@ describe('AboutSettings product identity', () => {
     })
   })
 
-  it('renders product identity without legacy author or social entries', async () => {
+  it('renders the app name, version and update card without legacy author or social entries', async () => {
     render(<AboutSettings />)
 
     expect(screen.getByRole('heading', { name: 'ccmax' })).toBeInTheDocument()
-    expect(screen.getByText('yaogjim/ccmax')).toBeInTheDocument()
-    expect(screen.getByText('Report an Issue')).toBeInTheDocument()
+    expect(screen.getByText('App Updates')).toBeInTheDocument()
+
+    await waitFor(() => {
+      expect(screen.getByText('Version 0.5.3')).toBeInTheDocument()
+    })
 
     expect(screen.queryByText('程序员阿江-Relakkes')).not.toBeInTheDocument()
     expect(screen.queryByText('NanmiCoder')).not.toBeInTheDocument()
@@ -63,36 +59,22 @@ describe('AboutSettings product identity', () => {
     expect(screen.queryByText('Xiaohongshu')).not.toBeInTheDocument()
     expect(screen.queryByText('Social Media')).not.toBeInTheDocument()
     expect(screen.queryByText('Author')).not.toBeInTheDocument()
-
-    await waitFor(() => {
-      expect(screen.getByText('Release Notes')).toBeInTheDocument()
-    })
   })
 
-  it('opens only product repository, releases, and issues links', async () => {
+  // The repository, release-notes and feedback rows were removed from this
+  // panel. A test that only asserted the surviving copy would not notice them
+  // being wired back in, so assert their absence directly.
+  it('keeps the removed repository, release-notes and feedback entries out', async () => {
     render(<AboutSettings />)
 
-    fireEvent.click(screen.getByText('yaogjim/ccmax').closest('button')!)
     await waitFor(() => {
-      expect(openMock).toHaveBeenCalledWith('https://github.com/yaogjim/ccmax')
+      expect(screen.getByText('App Updates')).toBeInTheDocument()
     })
 
-    openMock.mockClear()
-    await waitFor(() => {
-      expect(screen.getByText('Release Notes')).toBeInTheDocument()
-    })
-    fireEvent.click(screen.getByText('Release Notes'))
-    await waitFor(() => {
-      expect(openMock).toHaveBeenCalledWith('https://github.com/yaogjim/ccmax/releases')
-    })
-
-    openMock.mockClear()
-    fireEvent.click(screen.getByText('Report an Issue').closest('button')!)
-    await waitFor(() => {
-      expect(openMock).toHaveBeenCalledWith('https://github.com/yaogjim/ccmax/issues')
-    })
-
-    expect(openMock).toHaveBeenCalledTimes(1)
-    expect(openMock.mock.calls.every(([url]) => String(url).startsWith('https://github.com/yaogjim/ccmax'))).toBe(true)
+    expect(screen.queryByText('yaogjim/ccmax')).not.toBeInTheDocument()
+    expect(screen.queryByText('Release Notes')).not.toBeInTheDocument()
+    expect(screen.queryByText('Report an Issue')).not.toBeInTheDocument()
+    expect(screen.queryByText('If this project helps you, consider giving it a Star')).not.toBeInTheDocument()
+    expect(screen.queryByText('Open a GitHub Issue for bugs or usage questions')).not.toBeInTheDocument()
   })
 })

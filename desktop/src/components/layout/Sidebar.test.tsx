@@ -561,8 +561,11 @@ describe('Sidebar', () => {
 
     expect(region).toHaveTextContent('ccmax')
     expect(region).not.toHaveTextContent('Claude Code')
-    expect(region.querySelector('a[href="https://github.com/NanmiCoder/cc-haha"]')).toBeNull()
-    expect(region.querySelector('a[href="https://github.com/yaogjim/ccmax"]')).toBeTruthy()
+    // The header carried a GitHub link to the project repository. It was removed
+    // on request, and the upstream main merge reintroduced it once already, so
+    // pin its absence in the title region rather than just dropping the old
+    // positive assertion. See `docs/agents/upstream-removals.md`.
+    expect(region.querySelector('a[href*="github.com"]')).toBeNull()
   })
 
   it('groups sessions by project and expands overflow rows', () => {
@@ -2113,8 +2116,8 @@ describe('Sidebar', () => {
   it('shows the brand mark only on the rail, where the wordmark is clamped away', async () => {
     render(<Sidebar />)
 
-    // Scope to the wordmark's own row — the GitHub link in the same header is
-    // also an svg and would answer a looser query.
+    // Scope to the wordmark's own row — the task-view bell in the same header
+    // is also an svg and would answer a looser query.
     const brandRow = () => screen.getByText('max').closest('div')
 
     // Expanded, the name carries the brand and the mark beside it is clutter.

@@ -6,7 +6,7 @@ import path from 'node:path'
 const buildScript = path.resolve(import.meta.dirname, 'build.sh')
 const productIcon = path.resolve(import.meta.dirname, '../../desktop/src-tauri/icons/icon.icns')
 const fixtureDirectories: string[] = []
-const resourceBundleName = 'cu-helper_cc-haha-computer-use.bundle'
+const resourceBundleName = 'cu-helper_ccmax-computer-use.bundle'
 
 function runFixtureCommand(command: string[], options: { cwd?: string, env?: Record<string, string | undefined> } = {}) {
   // File-backed output also works on Bun versions where test subprocesses
@@ -81,8 +81,8 @@ source "$1"
 TEST_BUNDLE_DIR="$2"
 BUILD_DIR="$TEST_BUNDLE_DIR/build"
 BIN_PATH="$TEST_BUNDLE_DIR/fixture-binary"
-RESOURCE_BUNDLE_PATH="$TEST_BUNDLE_DIR/cu-helper_cc-haha-computer-use.bundle"
-APP_PATH="$TEST_BUNDLE_DIR/cc-haha-computer-use.app"
+RESOURCE_BUNDLE_PATH="$TEST_BUNDLE_DIR/cu-helper_ccmax-computer-use.bundle"
+APP_PATH="$TEST_BUNDLE_DIR/ccmax-computer-use.app"
 BUNDLE_ID="dev.cchaha.cu-helper"
 SIGN_IDENTITY="fixture-only"
 RESOLVED_TIMESTAMP_MODE="none"
@@ -105,7 +105,7 @@ wrap_app
 
   return {
     directory,
-    contents: path.join(directory, 'cc-haha-computer-use.app', 'Contents'),
+    contents: path.join(directory, 'ccmax-computer-use.app', 'Contents'),
     exitCode: result.exitCode,
     stderr: result.stderr.toString(),
   }
@@ -115,7 +115,7 @@ function probeFixtureApp(mode: 'packaged' | 'build-path' | 'external-symlink' | 
   const directory = mkdtempSync(path.join(tmpdir(), 'cu-helper-resource-probe-'))
   fixtureDirectories.push(directory)
   const app = path.join(directory, 'source.app')
-  const binary = path.join(app, 'Contents', 'MacOS', 'cc-haha-computer-use')
+  const binary = path.join(app, 'Contents', 'MacOS', 'ccmax-computer-use')
   mkdirSync(path.dirname(binary), { recursive: true })
   mkdirSync(path.join(app, 'Contents', 'Resources', resourceBundleName, 'LensSequence'), { recursive: true })
   writeFileSync(path.join(app, 'Contents', 'Resources', resourceBundleName, 'LensSequence', 'README.md'), 'optional frames fixture')
@@ -205,6 +205,40 @@ function resolveIdentityWithOnlyDeveloperId() {
   }
 }
 
+/**
+ * Drive the REAL identity ladder (including the Developer ID / Apple
+ * Development / self-signed detection helpers) against synthetic
+ * `security find-identity -v -p codesigning` output. Only `security` is stubbed,
+ * so this is the closest hermetic stand-in for a machine whose keychain holds
+ * exactly the listed identities.
+ */
+function resolveIdentityFromSecurityOutput(securityOutput: string) {
+  const directory = mkdtempSync(path.join(tmpdir(), 'cu-helper-identity-'))
+  fixtureDirectories.push(directory)
+  const fixture = path.join(directory, 'security-output')
+  writeFileSync(fixture, securityOutput)
+  const result = runFixtureCommand([
+    'bash',
+    '-c',
+    `
+source "$1"
+SECURITY_FIXTURE="$2"
+security() { cat "$SECURITY_FIXTURE"; }
+unset CC_HAHA_SIGN_IDENTITY CU_HELPER_IDENTITY
+resolve_identity
+printf '%s' "$SIGN_IDENTITY"
+`,
+    'cu-helper-identity-test',
+    buildScript,
+    fixture,
+  ])
+  return {
+    exitCode: result.exitCode,
+    stdout: result.stdout.toString(),
+    stderr: result.stderr.toString(),
+  }
+}
+
 describe('cu-helper build signing timestamp', () => {
   test('uses a secure timestamp for Developer ID distribution signatures', () => {
     expect(
@@ -230,6 +264,50 @@ describe('cu-helper build signing identity', () => {
     expect(result.exitCode).toBe(0)
     expect(result.stdout).toBe('Developer ID Application: Example Corp (TEAM123456)')
   })
+
+  test('adopts the local self-signed certificate when no Apple identity exists', () => {
+    // Regression anchor: this ladder is what makes a machine with no Apple
+    // account produce a STABLE-signed helper. Before the exact-match fix the
+    // substring check could also adopt a lookalike certificate, splitting the
+    // helper off the certificate the host and sidecar were signed with.
+    const result = resolveIdentityFromSecurityOutput(
+      '  1) 1111111111111111111111111111111111111111 "cu-helper-dev"\n'
+      + '     1 valid identities found\n',
+    )
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toBe('cu-helper-dev')
+  })
+
+  test('prefers a real Apple certificate over the self-signed development one', () => {
+    const result = resolveIdentityFromSecurityOutput(
+      '  1) 1111111111111111111111111111111111111111 "cu-helper-dev"\n'
+      + '  2) 5145958D6E31AD0CD6BBACD804A0B357E3CEDEA7 "Developer ID Application: Example Co (TEAM123456)"\n'
+      + '     2 valid identities found\n',
+    )
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toBe('Developer ID Application: Example Co (TEAM123456)')
+  })
+
+  test('refuses a lookalike self-signed name instead of signs with the wrong certificate', () => {
+    const result = resolveIdentityFromSecurityOutput(
+      '  1) 2222222222222222222222222222222222222222 "cu-helper-dev-v2"\n'
+      + '     1 valid identities found\n',
+    )
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stdout).toBe('')
+    expect(result.stderr).toContain('no stable code-signing identity available')
+  })
+
+  test('still fails closed when the keychain has no usable identity at all', () => {
+    const result = resolveIdentityFromSecurityOutput('     0 valid identities found\n')
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stdout).toBe('')
+    expect(result.stderr).toContain('refusing to ad-hoc sign')
+  })
 })
 
 describe('cu-helper architecture-specific build output', () => {
@@ -240,9 +318,9 @@ describe('cu-helper architecture-specific build output', () => {
       expect(result.exitCode).toBe(0)
       expect(result.lines).toEqual([
         result.binDir,
-        path.join(result.binDir, 'cc-haha-computer-use'),
-        path.join(result.binDir, 'cc-haha-computer-use.app'),
-        path.join(result.binDir, 'cu-helper_cc-haha-computer-use.bundle'),
+        path.join(result.binDir, 'ccmax-computer-use'),
+        path.join(result.binDir, 'ccmax-computer-use.app'),
+        path.join(result.binDir, 'cu-helper_ccmax-computer-use.bundle'),
       ])
     },
   )
@@ -267,7 +345,7 @@ describe.skipIf(process.platform !== 'darwin')('cu-helper permission-list app ic
     expect(plist.exitCode).toBe(0)
     const info = JSON.parse(plist.stdout.toString())
     expect(info.CFBundleIdentifier).toBe('dev.cchaha.cu-helper')
-    expect(info.CFBundleExecutable).toBe('cc-haha-computer-use')
+    expect(info.CFBundleExecutable).toBe('ccmax-computer-use')
     expect(info.CFBundleIconFile).toBe('icon.icns')
 
     const expectedIcon = readFileSync(productIcon)

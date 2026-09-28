@@ -41,7 +41,7 @@ describe('resolveCuHelperBinary', () => {
     process.env.CC_HAHA_CU_HELPER_PATH = '/tmp/evil-helper'
     process.env.CLAUDE_APP_ROOT = '/Applications/App.app/Contents/Resources/app.asar'
     const bundled =
-      '/Applications/App.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use'
+      '/Applications/App.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use'
 
     const found = resolveCuHelperBinary(p =>
       p === '/tmp/evil-helper'
@@ -65,10 +65,10 @@ describe('resolveCuHelperBinary', () => {
 
   test('maps Node architectures to matching thin SwiftPM products', () => {
     expect(resolveCuHelperDevelopmentBinary('/repo', 'arm64')).toBe(
-      '/repo/native/cu-helper/.build/arm64/arm64-apple-macosx/release/cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use',
+      '/repo/native/cu-helper/.build/arm64/arm64-apple-macosx/release/ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use',
     )
     expect(resolveCuHelperDevelopmentBinary('/repo', 'x64')).toBe(
-      '/repo/native/cu-helper/.build/x86_64/x86_64-apple-macosx/release/cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use',
+      '/repo/native/cu-helper/.build/x86_64/x86_64-apple-macosx/release/ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use',
     )
     expect(resolveCuHelperDevelopmentBinary('/repo', 'ia32')).toBeNull()
   })
@@ -76,18 +76,18 @@ describe('resolveCuHelperBinary', () => {
   test('resolves the bundled unpacked path from CLAUDE_APP_ROOT (.asar → .asar.unpacked)', () => {
     process.env.CLAUDE_APP_ROOT = '/Applications/App.app/Contents/Resources/app.asar'
     const unpacked =
-      '/Applications/App.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use'
+      '/Applications/App.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use'
     // Probe matches ONLY the unpacked binaries path (not the dev SwiftPM build).
     const found = resolveCuHelperBinary(p => p === unpacked)
     expect(found).toBe(unpacked)
     expect(found).toContain(
-      'app.asar.unpacked/src-tauri/binaries/cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use',
+      'app.asar.unpacked/src-tauri/binaries/ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use',
     )
-    // Must reach the inner executable THROUGH `src-tauri/binaries/cc-haha-computer-use.app`,
-    // not the old bogus `<projectRoot>/binaries/cc-haha-computer-use` guess (no `src-tauri/`
+    // Must reach the inner executable THROUGH `src-tauri/binaries/ccmax-computer-use.app`,
+    // not the old bogus `<projectRoot>/binaries/ccmax-computer-use` guess (no `src-tauri/`
     // segment) and not a bare Mach-O (Screen Recording TCC requires the real .app subject).
     expect(found).toMatch(
-      /[/\\]src-tauri[/\\]binaries[/\\]cc-haha-computer-use\.app[/\\]Contents[/\\]MacOS[/\\]cc-haha-computer-use$/,
+      /[/\\]src-tauri[/\\]binaries[/\\]ccmax-computer-use\.app[/\\]Contents[/\\]MacOS[/\\]ccmax-computer-use$/,
     )
   })
 
@@ -97,7 +97,7 @@ describe('resolveCuHelperBinary', () => {
     const found = resolveCuHelperBinary(
       p =>
         isCurrentDevBinary(p) ||
-        p.endsWith('/app.asar.unpacked/src-tauri/binaries/cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use'),
+        p.endsWith('/app.asar.unpacked/src-tauri/binaries/ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use'),
     )
     expect(found).toContain('app.asar.unpacked')
   })
@@ -117,7 +117,7 @@ describe('resolveCuHelperAppBundle', () => {
   test('derives the .app bundle path from the resolved inner executable', () => {
     const app = resolveCuHelperAppBundle(isCurrentDevBinary)
     expect(app).toContain(`native/cu-helper/.build/${process.arch === 'x64' ? 'x86_64' : 'arm64'}`)
-    expect(app?.endsWith('cc-haha-computer-use.app')).toBe(true)
+    expect(app?.endsWith('ccmax-computer-use.app')).toBe(true)
     // The bundle path stops at `.app` — it must NOT include the inner Contents/MacOS.
     expect(app).not.toContain('Contents')
   })
@@ -196,7 +196,7 @@ describe('callCuHelper', () => {
     process.env.CLAUDE_APP_ROOT =
       '/Applications/Claude Code Haha.app/Contents/Resources/app.asar'
     const nestedBinary =
-      '/Applications/Claude Code Haha.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use'
+      '/Applications/Claude Code Haha.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use'
     __resetCuHelperCache()
     resolveCuHelperBinary(candidate => candidate === nestedBinary)
     let spawnCount = 0

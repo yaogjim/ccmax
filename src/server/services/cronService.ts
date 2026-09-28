@@ -10,10 +10,30 @@ import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
 import { ApiError } from '../middleware/errorHandler.js'
+import * as lockfile from '../../utils/lockfile.js'
+import { parseCronExpression } from '../../utils/cron.js'
+import { adapterService, type PairedUser } from './adapterService.js'
+import {
+  resolveNotificationRecipient,
+  type NotificationRecipientSpec,
+  type TaskNotificationInput,
+} from './notificationService.js'
 
+/** Recipient reference shared with the delivery service (single source of truth). */
+export type TaskNotificationRecipientSpec = NotificationRecipientSpec
+
+type TaskNotificationImChannel = 'telegram' | 'feishu'
+
+/**
+ * The persisted notification shape. `recipients` reuses
+ * `TaskNotificationInput['recipients']` verbatim so the delivery service can
+ * consume a stored task without any translation: a task that turns on a
+ * non-desktop channel names exactly one explicit destination per channel.
+ */
 export type TaskNotificationConfig = {
   enabled: boolean
-  channels: ('desktop' | 'telegram' | 'feishu')[]
+  channels: TaskNotificationInput['channels']
+  recipients?: TaskNotificationInput['recipients']
 }
 
 export type CronTask = {
@@ -35,11 +55,301 @@ export type CronTask = {
   notification?: TaskNotificationConfig
 }
 
+/**
+ * A task as returned by read APIs. `notificationNeedsRecipients` is derived at
+ * read time and never written back: an old task whose notification is on for a
+ * non-desktop channel but has no usable recipient is surfaced as needing setup,
+ * and the delivery service refuses to broadcast it.
+ */
+export type CronTaskView = CronTask & {
+  notificationNeedsRecipients?: boolean
+}
+
 type TasksFile = {
   tasks: CronTask[]
 }
 
 const TASKS_FILE_WRITE_ATTEMPTS = 2
+const NOTIFICATION_CHANNELS = ['desktop', 'telegram', 'feishu'] as const
+const NOTIFICATION_IM_CHANNELS = ['telegram', 'feishu'] as const
+
+type NotificationPairingIndex = Partial<Record<TaskNotificationImChannel, PairedUser[]>>
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isNotificationChannel(value: string): boolean {
+  return (NOTIFICATION_CHANNELS as readonly string[]).includes(value)
+}
+
+function isImChannel(value: string): value is TaskNotificationImChannel {
+  return value === 'telegram' || value === 'feishu'
+}
+
+/**
+ * Structural validation of a single recipient reference. Unknown fields are
+ * rejected rather than silently ignored so a confused payload cannot smuggle a
+ * different target through.
+ */
+function assertValidRecipientSpec(spec: unknown, channel: string): void {
+  if (typeof spec === 'string' || typeof spec === 'number') {
+    if (typeof spec === 'number' && !Number.isFinite(spec)) {
+      throw ApiError.badRequest(`notification.recipients.${channel} contains an invalid recipient`)
+    }
+    if (String(spec).trim().length === 0) {
+      throw ApiError.badRequest(`notification.recipients.${channel} contains an empty recipient`)
+    }
+    return
+  }
+
+  if (!isPlainObject(spec)) {
+    throw ApiError.badRequest(`notification.recipients.${channel} contains an invalid recipient`)
+  }
+
+  for (const key of Object.keys(spec)) {
+    if (key !== 'userId' && key !== 'displayName') {
+      throw ApiError.badRequest(
+        `notification.recipients.${channel} contains an unrecognized recipient field: ${key}`,
+      )
+    }
+  }
+
+  const hasUserId = spec.userId !== undefined
+  const hasDisplayName = spec.displayName !== undefined
+  if (!hasUserId && !hasDisplayName) {
+    throw ApiError.badRequest(
+      `notification.recipients.${channel} contains a recipient without a userId or displayName`,
+    )
+  }
+  if (hasUserId && typeof spec.userId !== 'string' && typeof spec.userId !== 'number') {
+    throw ApiError.badRequest(
+      `notification.recipients.${channel} contains a recipient with an invalid userId`,
+    )
+  }
+  if (hasUserId && String(spec.userId).trim().length === 0) {
+    throw ApiError.badRequest(`notification.recipients.${channel} contains an empty recipient`)
+  }
+  if (
+    hasDisplayName &&
+    (typeof spec.displayName !== 'string' || spec.displayName.trim().length === 0)
+  ) {
+    throw ApiError.badRequest(
+      `notification.recipients.${channel} contains an empty displayName`,
+    )
+  }
+}
+
+/**
+ * Validate a create/update notification payload. Returns the normalized config,
+ * or undefined when the caller is clearing it.
+ *
+ * A non-desktop channel that is on must name exactly one explicit recipient,
+ * and that recipient must resolve to exactly one paired account
+ * (`pairedUsers`). Arbitrary ids, duplicates, ambiguous display names, and
+ * recipients for channels that are not enabled are rejected. `allowedUsers` is
+ * an access allowlist and is never consulted here.
+ */
+export function validateTaskNotification(
+  notification: unknown,
+  pairing: NotificationPairingIndex = {},
+): TaskNotificationConfig | undefined {
+  if (notification === undefined || notification === null) return undefined
+
+  if (!isPlainObject(notification)) {
+    throw ApiError.badRequest('notification must be an object')
+  }
+
+  const enabled = notification.enabled
+  if (typeof enabled !== 'boolean') {
+    throw ApiError.badRequest('notification.enabled must be a boolean')
+  }
+
+  const rawChannels = notification.channels
+  if (!Array.isArray(rawChannels)) {
+    throw ApiError.badRequest('notification.channels must be an array')
+  }
+
+  const seenChannels = new Set<string>()
+  for (const channel of rawChannels) {
+    if (typeof channel !== 'string' || !isNotificationChannel(channel)) {
+      throw ApiError.badRequest(
+        `notification.channels contains an unknown channel: ${String(channel)}`,
+      )
+    }
+    if (seenChannels.has(channel)) {
+      throw ApiError.badRequest(
+        `notification.channels contains a duplicate channel: ${channel}`,
+      )
+    }
+    seenChannels.add(channel)
+  }
+  if (enabled && seenChannels.size === 0) {
+    throw ApiError.badRequest(
+      'notification.channels must select at least one channel when notifications are enabled',
+    )
+  }
+
+  const recipients: Partial<Record<TaskNotificationImChannel, NotificationRecipientSpec[]>> = {}
+  const rawRecipients = notification.recipients
+  if (rawRecipients !== undefined && rawRecipients !== null) {
+    if (!isPlainObject(rawRecipients)) {
+      throw ApiError.badRequest('notification.recipients must be an object')
+    }
+    for (const [channel, value] of Object.entries(rawRecipients)) {
+      if (!isImChannel(channel)) {
+        throw ApiError.badRequest(
+          `notification.recipients has an unknown channel: ${channel}`,
+        )
+      }
+      if (!Array.isArray(value)) {
+        throw ApiError.badRequest(`notification.recipients.${channel} must be an array`)
+      }
+      for (const spec of value) {
+        assertValidRecipientSpec(spec, channel)
+      }
+      recipients[channel] = value as NotificationRecipientSpec[]
+    }
+  }
+
+  for (const channel of Object.keys(recipients) as TaskNotificationImChannel[]) {
+    if (!seenChannels.has(channel)) {
+      throw ApiError.badRequest(
+        `notification.recipients.${channel} is set but the ${channel} channel is not enabled`,
+      )
+    }
+  }
+
+  if (enabled) {
+    for (const channel of NOTIFICATION_IM_CHANNELS) {
+      if (!seenChannels.has(channel)) continue
+      const specs = recipients[channel] ?? []
+      if (specs.length === 0) {
+        throw ApiError.badRequest(
+          `notification channel ${channel} needs exactly one explicit recipient`,
+        )
+      }
+      if (specs.length > 1) {
+        throw ApiError.badRequest(
+          `notification channel ${channel} must have exactly one recipient, got ${specs.length}`,
+        )
+      }
+
+      const resolution = resolveNotificationRecipient(specs[0]!, pairing[channel] ?? [])
+      if (resolution.kind === 'resolved') continue
+      if (resolution.kind === 'ambiguous') {
+        throw ApiError.badRequest(
+          `notification recipient for ${channel} matches multiple paired users; choose one unambiguously`,
+        )
+      }
+      if (resolution.kind === 'not_verified') {
+        throw ApiError.badRequest(
+          `notification recipient for ${channel} is not a paired user on this machine`,
+        )
+      }
+      throw ApiError.badRequest(`notification recipient for ${channel} is invalid`)
+    }
+  }
+
+  return {
+    enabled,
+    channels: rawChannels as TaskNotificationInput['channels'],
+    ...(Object.keys(recipients).length > 0 ? { recipients } : {}),
+  }
+}
+
+/**
+ * True when an enabled notification targets a non-desktop channel that has no
+ * usable recipient. Read-time marker only — the delivery service will not
+ * broadcast, so the app must ask the user to choose a destination.
+ */
+export function taskNotificationNeedsRecipients(
+  notification: TaskNotificationConfig | undefined,
+): boolean {
+  if (!notification || notification.enabled !== true) return false
+  // A record persisted by an older build predates recipient validation (the old
+  // API stored the notification payload unvalidated), so `channels` can be
+  // missing or not an array. Loading must not throw: `listTasks()` maps every
+  // task, so one malformed record would otherwise fail the whole list and stop
+  // the scheduler tick. Surface it as needing repair instead.
+  if (!Array.isArray(notification.channels)) return true
+  return notification.channels.some(
+    (channel) =>
+      channel !== 'desktop' &&
+      (notification.recipients?.[channel]?.length ?? 0) === 0,
+  )
+}
+
+/**
+ * Read the paired-account records needed to verify recipients. Only consulted
+ * when an enabled channel actually needs a target; a desktop-only or disabled
+ * notification never touches adapter config.
+ */
+async function loadNotificationPairingIndex(
+  notification: unknown,
+): Promise<NotificationPairingIndex> {
+  if (!isPlainObject(notification)) return {}
+  const channels = Array.isArray(notification.channels) ? notification.channels : []
+  const needsIm =
+    notification.enabled === true &&
+    channels.some(
+      (channel) => typeof channel === 'string' && isImChannel(channel),
+    )
+  if (!needsIm) return {}
+
+  const config = await adapterService.getRawConfig()
+  return {
+    telegram: config.telegram?.pairedUsers ?? [],
+    feishu: config.feishu?.pairedUsers ?? [],
+  }
+}
+
+/**
+ * A task is enabled unless it says otherwise. Older files predate the
+ * `enabled` field entirely, and the desktop UI counts `task.enabled` with a
+ * plain truthiness check, so a missing flag must read back as enabled rather
+ * than as "off".
+ */
+function normalizeEnabled(enabled: boolean | undefined): boolean {
+  return enabled !== false
+}
+
+function normalizeTask(task: CronTask): CronTask {
+  return { ...task, enabled: normalizeEnabled(task.enabled) }
+}
+
+function assertValidCron(cron: string): void {
+  if (!parseCronExpression(cron)) {
+    throw ApiError.badRequest(`Invalid cron expression: "${cron}"`)
+  }
+}
+
+/**
+ * Serialize a read-modify-write against the task file. `realpath: false`
+ * because the file may not exist yet; the caller's directory is created first.
+ * Cross-instance safe: two CronService objects sharing one config dir take the
+ * same on-disk lock.
+ */
+async function withTasksFileLock<T>(
+  filePath: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true })
+  const release = await lockfile.lock(filePath, {
+    realpath: false,
+    retries: {
+      retries: 60,
+      minTimeout: 5,
+      maxTimeout: 50,
+      factor: 1.5,
+    },
+  })
+  try {
+    return await run()
+  } finally {
+    await release().catch(() => {})
+  }
+}
 
 export class CronService {
   /** 任务文件路径 */
@@ -54,12 +364,27 @@ export class CronService {
   // ---------------------------------------------------------------------------
 
   /** 获取所有任务 */
-  async listTasks(): Promise<CronTask[]> {
+  async listTasks(): Promise<CronTaskView[]> {
     const data = await this.readTasksFile()
     return data.tasks.map((task) => ({
       ...task,
       permissionMode: 'bypassPermissions',
+      ...(taskNotificationNeedsRecipients(task.notification)
+        ? { notificationNeedsRecipients: true }
+        : {}),
     }))
+  }
+
+  /**
+   * Validate a notification payload and resolve its own paired-account view.
+   * Returns undefined when the caller is clearing the notification.
+   */
+  private async resolveNotification(
+    notification: unknown,
+  ): Promise<TaskNotificationConfig | undefined> {
+    if (notification === undefined || notification === null) return undefined
+    const pairing = await loadNotificationPairingIndex(notification)
+    return validateTaskNotification(notification, pairing)
   }
 
   /** 创建新任务 */
@@ -69,58 +394,91 @@ export class CronService {
     if (!task.cron || !task.prompt) {
       throw ApiError.badRequest('Fields "cron" and "prompt" are required')
     }
+    assertValidCron(task.cron)
 
-    const data = await this.readTasksFile()
-    const newTask: CronTask = {
-      ...task,
-      permissionMode: 'bypassPermissions',
-      id: crypto.randomBytes(4).toString('hex'),
-      createdAt: Date.now(),
-    }
-    data.tasks.push(newTask)
-    await this.writeTasksFile(data)
-    return newTask
+    const notification = await this.resolveNotification(task.notification)
+
+    return withTasksFileLock(this.getTasksFilePath(), async () => {
+      const data = await this.readTasksFile()
+      const { notification: _rawNotification, ...rest } = task
+      const newTask: CronTask = {
+        ...rest,
+        ...(notification === undefined ? {} : { notification }),
+        // New tasks default to enabled — matches the desktop UI, which always
+        // sends `enabled: true` on create.
+        enabled: normalizeEnabled(task.enabled),
+        permissionMode: 'bypassPermissions',
+        id: crypto.randomBytes(4).toString('hex'),
+        createdAt: Date.now(),
+      }
+      data.tasks.push(newTask)
+      await this.writeTasksFile(data)
+      return newTask
+    })
   }
 
   /** 更新已有任务 */
   async updateTask(id: string, updates: Partial<CronTask>): Promise<CronTask> {
-    const data = await this.readTasksFile()
-    const index = data.tasks.findIndex((t) => t.id === id)
-    if (index === -1) {
-      throw ApiError.notFound(`Task not found: ${id}`)
-    }
+    const requestedNotification = updates.notification as unknown
+    const hasNotificationUpdate = requestedNotification !== undefined
+    // Validate before taking the task file lock; the recipient check only
+    // depends on the requested payload and the adapter config.
+    const notification = hasNotificationUpdate
+      ? await this.resolveNotification(requestedNotification)
+      : undefined
 
-    // 不允许修改 id 和 createdAt
-    const { id: _id, createdAt: _ca, ...safeUpdates } = updates
-    data.tasks[index] = {
-      ...data.tasks[index],
-      ...safeUpdates,
-      permissionMode: 'bypassPermissions',
-    }
-    await this.writeTasksFile(data)
-    return data.tasks[index]
+    return withTasksFileLock(this.getTasksFilePath(), async () => {
+      const data = await this.readTasksFile()
+      const index = data.tasks.findIndex((t) => t.id === id)
+      if (index === -1) {
+        throw ApiError.notFound(`Task not found: ${id}`)
+      }
+
+      // 不允许修改 id 和 createdAt
+      const { id: _id, createdAt: _ca, ...safeUpdates } = updates
+      if (safeUpdates.cron !== undefined) {
+        assertValidCron(safeUpdates.cron)
+      }
+      if (safeUpdates.enabled !== undefined) {
+        safeUpdates.enabled = normalizeEnabled(safeUpdates.enabled)
+      }
+      if (hasNotificationUpdate) {
+        safeUpdates.notification = notification
+      }
+      data.tasks[index] = {
+        ...data.tasks[index],
+        ...safeUpdates,
+        permissionMode: 'bypassPermissions',
+      }
+      await this.writeTasksFile(data)
+      return data.tasks[index]
+    })
   }
 
   /** 删除任务 */
   async deleteTask(id: string): Promise<void> {
-    const data = await this.readTasksFile()
-    const index = data.tasks.findIndex((t) => t.id === id)
-    if (index === -1) {
-      throw ApiError.notFound(`Task not found: ${id}`)
-    }
-    data.tasks.splice(index, 1)
-    await this.writeTasksFile(data)
+    await withTasksFileLock(this.getTasksFilePath(), async () => {
+      const data = await this.readTasksFile()
+      const index = data.tasks.findIndex((t) => t.id === id)
+      if (index === -1) {
+        throw ApiError.notFound(`Task not found: ${id}`)
+      }
+      data.tasks.splice(index, 1)
+      await this.writeTasksFile(data)
+    })
   }
 
   /** 更新任务的最后执行时间 */
   async updateLastFired(taskId: string, timestamp: string): Promise<void> {
-    const data = await this.readTasksFile()
-    const index = data.tasks.findIndex((t) => t.id === taskId)
-    if (index === -1) {
-      return // Task may have been deleted; silently ignore
-    }
-    data.tasks[index].lastFiredAt = timestamp
-    await this.writeTasksFile(data)
+    await withTasksFileLock(this.getTasksFilePath(), async () => {
+      const data = await this.readTasksFile()
+      const index = data.tasks.findIndex((t) => t.id === taskId)
+      if (index === -1) {
+        return // Task may have been deleted; silently ignore
+      }
+      data.tasks[index].lastFiredAt = timestamp
+      await this.writeTasksFile(data)
+    })
   }
 
   // ---------------------------------------------------------------------------
@@ -136,7 +494,7 @@ export class CronService {
       if (!Array.isArray(parsed.tasks)) {
         return { tasks: [] }
       }
-      return parsed
+      return { tasks: parsed.tasks.map(normalizeTask) }
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         return { tasks: [] }

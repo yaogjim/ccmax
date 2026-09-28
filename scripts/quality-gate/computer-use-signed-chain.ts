@@ -232,7 +232,7 @@ export async function runSignedComputerUseChain(options: SignedChainOptions = {}
     await mkdir(macos, { recursive: true })
     await mkdir(binaries, { recursive: true })
     const host = path.join(macos, 'FixtureHost')
-    await writeFile(path.join(hostApp, 'Contents/Info.plist'), `<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>FixtureHost</string><key>CFBundleIdentifier</key><string>com.claude-code-haha.desktop</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>`)
+    await writeFile(path.join(hostApp, 'Contents/Info.plist'), `<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>FixtureHost</string><key>CFBundleIdentifier</key><string>com.ccmax.desktop</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>`)
     await run('/usr/bin/clang', [path.join(repoRoot, 'scripts/quality-gate/fixtures/computer-use-signed-chain-host.c'), '-o', host])
     const executable = path.join(binaries, `claude-sidecar-${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}-apple-darwin`)
     const build = await Bun.build({
@@ -260,7 +260,7 @@ export async function runSignedComputerUseChain(options: SignedChainOptions = {}
     const buildArgs = ['build', '-c', 'release', '--package-path', packagePath, '--scratch-path', swiftBuild]
     await run('/usr/bin/swift', [...buildArgs, '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist', '-Xlinker', path.join(packagePath, 'Info.plist')], 300_000)
     const binDir = (await run('/usr/bin/swift', [...buildArgs, '--show-bin-path'])).stdout.trim()
-    const helperApp = path.join(directory, 'cc-haha-computer-use.app')
+    const helperApp = path.join(directory, 'ccmax-computer-use.app')
     await mkdir(path.join(helperApp, 'Contents/MacOS'), { recursive: true })
     await mkdir(path.join(helperApp, 'Contents/Resources'), { recursive: true })
     await copyFile(path.join(packagePath, 'Info.plist'), path.join(helperApp, 'Contents/Info.plist'))
@@ -270,13 +270,13 @@ export async function runSignedComputerUseChain(options: SignedChainOptions = {}
       HOME: env.HOME, CFFIXED_USER_HOME: env.HOME, TMPDIR: env.TMPDIR, TMP: env.TMP, TEMP: env.TEMP,
       CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR,
     }), path.join(helperApp, 'Contents/Info.plist')])
-    await copyFile(path.join(binDir, 'cc-haha-computer-use'), path.join(helperApp, 'Contents/MacOS/cc-haha-computer-use'))
-    await cp(path.join(binDir, 'cu-helper_cc-haha-computer-use.bundle'), path.join(helperApp, 'Contents/Resources/cu-helper_cc-haha-computer-use.bundle'), { recursive: true })
+    await copyFile(path.join(binDir, 'ccmax-computer-use'), path.join(helperApp, 'Contents/MacOS/ccmax-computer-use'))
+    await cp(path.join(binDir, 'cu-helper_ccmax-computer-use.bundle'), path.join(helperApp, 'Contents/Resources/cu-helper_ccmax-computer-use.bundle'), { recursive: true })
     await sign(helperApp, 'dev.cchaha.cu-helper')
-    const nested = path.join(binaries, 'cc-haha-computer-use.app')
+    const nested = path.join(binaries, 'ccmax-computer-use.app')
     await cp(helperApp, nested, { recursive: true })
-    await sign(hostApp, 'com.claude-code-haha.desktop')
-    const helperBinary = path.join(helperApp, 'Contents/MacOS/cc-haha-computer-use')
+    await sign(hostApp, 'com.ccmax.desktop')
+    const helperBinary = path.join(helperApp, 'Contents/MacOS/ccmax-computer-use')
     if (signingPlan.requiresPackagedInstall) {
       env.CLAUDE_APP_ROOT = path.join(hostApp, 'Contents/Resources/app.asar')
       env.CU_FIXTURE_REQUIRE_PACKAGED_INSTALL = '1'

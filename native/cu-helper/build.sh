@@ -11,7 +11,7 @@
 #   CU_HELPER_TIMESTAMP_MODE
 #                        (default: auto; secure for Developer ID, none for local development)
 #
-# Output: prints "built: <arch-specific abs path>/cc-haha-computer-use.app"
+# Output: prints "built: <arch-specific abs path>/ccmax-computer-use.app"
 #
 # Stable-identity contract: same cert + same --identifier on every build,
 # --options runtime, a secure timestamp for Developer ID distribution, no ad-hoc.
@@ -115,6 +115,16 @@ SELF_SIGNED_NAME="cu-helper-dev"
 identity_exists() {
   local needle="$1"
   security find-identity -v -p codesigning 2>/dev/null | grep -F "$needle" >/dev/null 2>&1
+}
+
+# Returns 0 only if a codesigning identity's QUOTED common name is exactly $1.
+# The self-signed fallback uses this instead of the substring `identity_exists`
+# so a lookalike such as 'cu-helper-dev-v2' is not adopted as the shared local
+# build certificate: the whole point is that host, sidecar and helper end up on
+# ONE known certificate, and the name is the only thing naming it.
+identity_exactly_exists() {
+  local name="$1"
+  security find-identity -v -p codesigning 2>/dev/null | grep -F "\"${name}\"" >/dev/null 2>&1
 }
 
 # Echoes the first 'Apple Development: ...' identity's full common name, or "".
@@ -231,8 +241,8 @@ resolve_identity() {
     return 0
   fi
 
-  # e) self-signed fallback cert.
-  if identity_exists "$SELF_SIGNED_NAME"; then
+  # e) self-signed fallback cert. Exact name match: see identity_exactly_exists.
+  if identity_exactly_exists "$SELF_SIGNED_NAME"; then
     SIGN_IDENTITY="$SELF_SIGNED_NAME"
     log "identity: $SIGN_IDENTITY (auto-detected self-signed Code Signing cert)"
     return 0
@@ -310,9 +320,9 @@ resolve_build_paths() {
     --scratch-path "$SWIFT_SCRATCH_PATH" \
     --show-bin-path)"
   [ -n "$BIN_DIR" ] || die "swift build --show-bin-path returned an empty path for $ARCH"
-  BIN_PATH="$BIN_DIR/cc-haha-computer-use"
-  APP_PATH="$BIN_DIR/cc-haha-computer-use.app"
-  RESOURCE_BUNDLE_PATH="$BIN_DIR/cu-helper_cc-haha-computer-use.bundle"
+  BIN_PATH="$BIN_DIR/ccmax-computer-use"
+  APP_PATH="$BIN_DIR/ccmax-computer-use.app"
+  RESOURCE_BUNDLE_PATH="$BIN_DIR/cu-helper_ccmax-computer-use.bundle"
 }
 
 build() {
@@ -442,7 +452,7 @@ wrap_app() {
   rm -rf "$APP_PATH"
   mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 
-  cp "$BIN_PATH" "$APP_PATH/Contents/MacOS/cc-haha-computer-use"
+  cp "$BIN_PATH" "$APP_PATH/Contents/MacOS/ccmax-computer-use"
 
   [ -f "$PKG_DIR/Info.plist" ] || die "Info.plist not found at $PKG_DIR/Info.plist (needed for the .app bundle)."
   cp "$PKG_DIR/Info.plist" "$APP_PATH/Contents/Info.plist"
@@ -453,7 +463,7 @@ wrap_app() {
   # NOT also put it in MacOS/ — a nested .bundle there breaks codesign with an
   # "In subcomponent" error. The optional sequence may contain only its README;
   # missing PNGs are supported, a missing declared build resource is not.
-  local res_bundle="${RESOURCE_BUNDLE_PATH:-$BUILD_DIR/$BUILD_CONFIG/cu-helper_cc-haha-computer-use.bundle}"
+  local res_bundle="${RESOURCE_BUNDLE_PATH:-$BUILD_DIR/$BUILD_CONFIG/cu-helper_ccmax-computer-use.bundle}"
   copy_cursor_resources "$res_bundle" "$APP_PATH"
 
   # Sign the WHOLE bundle with the SAME stable identity + hardened runtime.
@@ -495,7 +505,7 @@ verify_relocated_cursor_resources() (
   # before an EXIT trap after die(), so it must remain available for cleanup.
   probe_root="$(mktemp -d "${TMPDIR:-/tmp}/cc-haha-cursor-probe.XXXXXX")"
   trap 'rm -rf "$probe_root"' EXIT
-  local probe_app="$probe_root/cc-haha-computer-use.app"
+  local probe_app="$probe_root/ccmax-computer-use.app"
   local report="$probe_root/resources.json"
   cp -R "$APP_PATH" "$probe_app"
   mkdir -p "$probe_root/home" "$probe_root/config" "$probe_root/tmp"
@@ -505,7 +515,7 @@ verify_relocated_cursor_resources() (
     CFFIXED_USER_HOME="$probe_root/home" \
     CLAUDE_CONFIG_DIR="$probe_root/config" \
     TMPDIR="$probe_root/tmp/" \
-    "$probe_app/Contents/MacOS/cc-haha-computer-use" --probe-cursor-resources >"$report"; then
+    "$probe_app/Contents/MacOS/ccmax-computer-use" --probe-cursor-resources >"$report"; then
     die "Cursor resource probe failed for relocated helper $probe_app"
   fi
 
@@ -514,7 +524,7 @@ verify_relocated_cursor_resources() (
     || die "Cursor resource probe did not report a resourceDirectory"
   resource_directory="$(cd "$resource_directory" 2>/dev/null && pwd -P)" \
     || die "Cursor resource probe reported an unreadable resourceDirectory"
-  local expected_directory="$probe_app/Contents/Resources/cu-helper_cc-haha-computer-use.bundle/LensSequence"
+  local expected_directory="$probe_app/Contents/Resources/cu-helper_ccmax-computer-use.bundle/LensSequence"
   [ -d "$expected_directory" ] || die "Cursor resource probe package is missing $expected_directory"
   expected_directory="$(cd "$expected_directory" && pwd -P)"
   local canonical_app
@@ -542,7 +552,7 @@ main() {
 
   # The ONE machine-readable line on STDOUT — the .app BUNDLE path. The caller
   # (build-sidecars.ts) copies the whole .app; the runtime resolver
-  # (cuHelperBridge.ts) targets <app>/Contents/MacOS/cc-haha-computer-use.
+  # (cuHelperBridge.ts) targets <app>/Contents/MacOS/ccmax-computer-use.
   printf 'built: %s\n' "$APP_PATH"
 }
 

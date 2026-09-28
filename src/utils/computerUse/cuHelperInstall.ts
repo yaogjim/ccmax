@@ -24,7 +24,7 @@ import { resolveCuHelperAppBundle } from './cuHelperBridge.js'
  *
  * WHY THIS EXISTS (the real Screen Recording root cause, proven by tccd logs):
  * macOS resolves the TCC *subject* for Screen Recording to the OUTERMOST `.app`
- * on the running binary's path. When packaged, `cc-haha-computer-use.app` is
+ * on the running binary's path. When packaged, `ccmax-computer-use.app` is
  * NESTED inside the host Electron app (…/Contents/Resources/app.asar.unpacked/…),
  * so the helper's Screen Recording subject becomes the HOST bundle id — granting
  * the helper itself does nothing; only granting the host works. (Accessibility is
@@ -38,15 +38,18 @@ import { resolveCuHelperAppBundle } from './cuHelperBridge.js'
  * helper is its OWN Screen Recording subject, so the user grants the helper ONCE
  * and BOTH Screen Recording + Accessibility land on the same stable identity.
  * TCC matches the grant by the helper's certificate-based designated requirement
- * (Apple Development cert + `dev.cchaha.cu-helper`), so it survives rebuilds and
- * path changes (a fresh path immediately reads "allowed", authReason=4).
+ * (the signing certificate plus the constant `dev.cchaha.cu-helper` identifier),
+ * so it survives rebuilds and path changes (a fresh path immediately reads
+ * "allowed", authReason=4). Any one stable certificate works — a Developer ID, an
+ * Apple Development cert, or the local self-signed `cu-helper-dev` cert — as long
+ * as host, sidecar and helper all carry it.
  *
- * Dev builds (`.build/release/cc-haha-computer-use.app`) are already standalone
+ * Dev builds (`.build/release/ccmax-computer-use.app`) are already standalone
  * (not nested), so they are used in place — no copy, no dev friction.
  */
 
-const APP_NAME = 'cc-haha-computer-use.app'
-const INNER_REL = path.join('Contents', 'MacOS', 'cc-haha-computer-use')
+const APP_NAME = 'ccmax-computer-use.app'
+const INNER_REL = path.join('Contents', 'MacOS', 'ccmax-computer-use')
 const HELPER_IDENTIFIER = 'dev.cchaha.cu-helper'
 const SIDECAR_IDENTIFIER = 'com.claude-code-haha.desktop.sidecar'
 const SIGNED_FINGERPRINT_FILES = [
@@ -218,7 +221,7 @@ function signedBundleFingerprint(
   return hash.digest('hex')
 }
 
-type CodeIdentity = {
+export type CodeIdentity = {
   identifier?: string
   authority?: string
   team?: string
@@ -261,11 +264,28 @@ function codeIdentity(target: string): CodeIdentity | null {
   }
 }
 
-function sameSigner(left: CodeIdentity, right: CodeIdentity): boolean {
-  return Boolean(left.authority && left.team && left.leaf)
-    && left.authority === right.authority
-    && left.team === right.team
+/**
+ * Do two code identities come from the SAME signing certificate?
+ *
+ * The certificate identity the helper's attestation cares about is the
+ * authority (the leaf certificate's common name, which `codesign -dv` prints
+ * first) plus the leaf certificate bytes. A Team ID is compared when either side
+ * carries one, but is deliberately NOT required: the local self-signed
+ * development certificate (`cu-helper-dev`) has `TeamIdentifier=not set`, so a
+ * Team-ID requirement would reject the shipped local build. The install would
+ * then fail closed, the helper would never be relocated to its standalone
+ * Screen Recording path, and Computer Use would break with no signature error to
+ * point at.
+ *
+ * Comparing the leaf keeps this strict: two different certificates that happen
+ * to share a common name still fail, and a mixed-signed install (host on one
+ * cert, helper on another) still fails.
+ */
+export function sameSigner(left: CodeIdentity, right: CodeIdentity): boolean {
+  if (!left.authority || !left.leaf || !right.authority || !right.leaf) return false
+  return left.authority === right.authority
     && left.leaf === right.leaf
+    && (left.team ?? null) === (right.team ?? null)
 }
 
 /**
@@ -273,6 +293,8 @@ function sameSigner(left: CodeIdentity, right: CodeIdentity): boolean {
  * packaged sidecar. Package smoke enforces the same invariant at build time;
  * this check repeats it immediately before each runtime launch because the
  * standalone TCC copy lives in a user-writable directory.
+ *
+ * The requirement is one shared CERTIFICATE, not a Team ID: see `sameSigner`.
  */
 function verifyPackagedHelperSignatures(sourceApp: string, destApp: string): boolean {
   if (process.platform !== 'darwin') return false

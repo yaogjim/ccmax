@@ -27,4 +27,22 @@ describe('tasksApi', () => {
       expect.objectContaining({ method: 'GET' }),
     )
   })
+
+  it('reads per-recipient delivery records for one run', async () => {
+    setBaseUrl('http://127.0.0.1:49237')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ deliveries: [] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    await expect(tasksApi.getRunDeliveries('run-42')).resolves.toEqual({ deliveries: [] })
+
+    // The run id is the path segment the server filters on; a wrong shape here
+    // would silently return every run's deliveries.
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:49237/api/scheduled-tasks/runs/run-42/deliveries',
+      expect.objectContaining({ method: 'GET' }),
+    )
+  })
 })

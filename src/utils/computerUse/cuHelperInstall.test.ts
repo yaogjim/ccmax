@@ -9,32 +9,33 @@ import {
   installedHelperAppBundle,
   installedHelperRoot,
   isNestedInHostApp,
+  sameSigner,
 } from './cuHelperInstall.js'
 
 afterEach(() => __resetInstalledHelperCache())
 
-const INNER = path.join('Contents', 'MacOS', 'cc-haha-computer-use')
+const INNER = path.join('Contents', 'MacOS', 'ccmax-computer-use')
 
 describe('isNestedInHostApp', () => {
   test('true when the helper .app sits inside an OUTER .app (packaged in the host)', () => {
     const nested =
-      '/Applications/Claude Code Haha.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/cc-haha-computer-use.app'
+      '/Applications/Claude Code Haha.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/ccmax-computer-use.app'
     expect(isNestedInHostApp(nested)).toBe(true)
   })
 
   test('false for a standalone path (dev build or the installed copy)', () => {
     expect(
-      isNestedInHostApp('/Users/x/proj/native/cu-helper/.build/release/cc-haha-computer-use.app'),
+      isNestedInHostApp('/Users/x/proj/native/cu-helper/.build/release/ccmax-computer-use.app'),
     ).toBe(false)
-    expect(isNestedInHostApp('/Users/x/.claude/cu-helper/cc-haha-computer-use.app')).toBe(false)
+    expect(isNestedInHostApp('/Users/x/.claude/cu-helper/ccmax-computer-use.app')).toBe(false)
   })
 })
 
 describe('installedHelperAppBundle / installedHelperRoot', () => {
-  test('derive <configHome>/cu-helper[/cc-haha-computer-use.app]', () => {
+  test('derive <configHome>/cu-helper[/ccmax-computer-use.app]', () => {
     expect(installedHelperRoot('/home/.claude')).toBe('/home/.claude/cu-helper')
     expect(installedHelperAppBundle('/home/.claude')).toBe(
-      '/home/.claude/cu-helper/cc-haha-computer-use.app',
+      '/home/.claude/cu-helper/ccmax-computer-use.app',
     )
   })
 })
@@ -49,14 +50,76 @@ describe('standalone helper copy command', () => {
   })
 })
 
+describe('sameSigner', () => {
+  // Real shape of the shipped local build: every binary signed by the self-signed
+  // `cu-helper-dev` cert, which has `TeamIdentifier=not set` and therefore no
+  // team value at all.
+  const selfSigned = {
+    identifier: 'dev.cchaha.cu-helper',
+    authority: 'cu-helper-dev',
+    team: undefined,
+    leaf: 'aaaabbbb',
+  }
+  const otherSelfSigned = {
+    identifier: 'dev.cchaha.cu-helper',
+    authority: 'cu-helper-dev',
+    team: undefined,
+    leaf: 'ccccdddd',
+  }
+  const developerId = {
+    identifier: 'com.claude-code-haha.desktop.sidecar',
+    authority: 'Developer ID Application: Example (TEAM123456)',
+    team: 'TEAM123456',
+    leaf: 'eeeeffff',
+  }
+  const developerIdOlderCert = { ...developerId, leaf: '99990000' }
+
+  test('accepts two links on the same self-signed certificate that has no Team ID', () => {
+    // Regression anchor: this returned false before the fix because it demanded
+    // a Team ID. That made every local self-signed install fail closed, so the
+    // helper was never relocated to its standalone Screen Recording path.
+    expect(sameSigner(selfSigned, selfSigned)).toBe(true)
+  })
+
+  test('accepts two links on the same Developer ID certificate', () => {
+    expect(sameSigner(developerId, developerId)).toBe(true)
+  })
+
+  test('rejects two different certificates that share a common name', () => {
+    expect(sameSigner(selfSigned, otherSelfSigned)).toBe(false)
+  })
+
+  test('rejects a Developer ID link against a non-Developer-ID link', () => {
+    expect(sameSigner(developerId, selfSigned)).toBe(false)
+  })
+
+  test('rejects a re-signed link whose leaf rotated under the same team', () => {
+    // Same team, same authority, different leaf: the binaries were signed with
+    // two different certificates, which is exactly the mixed-signing state the
+    // helper's attestation refuses at runtime.
+    expect(sameSigner(developerId, developerIdOlderCert)).toBe(false)
+  })
+
+  test('rejects a missing proof of identity rather than treating it as a match', () => {
+    expect(sameSigner({ ...selfSigned, leaf: undefined }, { ...selfSigned, leaf: undefined })).toBe(false)
+    expect(sameSigner({ ...selfSigned, authority: undefined }, { ...selfSigned })).toBe(false)
+    expect(sameSigner(selfSigned, { ...selfSigned, leaf: undefined })).toBe(false)
+  })
+
+  test('treats an absent Team ID as equal only to another absent Team ID', () => {
+    expect(sameSigner({ ...selfSigned, team: 'TEAM123456' }, selfSigned)).toBe(false)
+    expect(sameSigner(selfSigned, { ...selfSigned, team: 'TEAM123456' })).toBe(false)
+  })
+})
+
 describe('ensureInstalledHelper', () => {
   const CONFIG = '/cfg'
-  const DEST_APP = path.join(CONFIG, 'cu-helper', 'cc-haha-computer-use.app')
+  const DEST_APP = path.join(CONFIG, 'cu-helper', 'ccmax-computer-use.app')
   const DEST_INNER = path.join(DEST_APP, INNER)
-  const STAGING_APP = path.join(CONFIG, 'cu-helper', '.cc-haha-computer-use.app.staging-test')
+  const STAGING_APP = path.join(CONFIG, 'cu-helper', '.ccmax-computer-use.app.staging-test')
   const NESTED =
-    '/Applications/Claude Code Haha.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/cc-haha-computer-use.app'
-  const STANDALONE = '/dev/native/cu-helper/.build/release/cc-haha-computer-use.app'
+    '/Applications/Claude Code Haha.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/ccmax-computer-use.app'
+  const STANDALONE = '/dev/native/cu-helper/.build/release/ccmax-computer-use.app'
   const BYTES = Buffer.from('helper-binary-v1')
   const HASH = createHash('sha256')
     .update(INNER).update('\0').update(BYTES).update('\0')
@@ -158,7 +221,7 @@ describe('ensureInstalledHelper', () => {
         'Host.app',
         'Contents',
         'Resources',
-        'cc-haha-computer-use.app',
+        'ccmax-computer-use.app',
       )
       const configHome = path.join(tempRoot, 'config')
       const fixtureFiles = [
@@ -207,7 +270,7 @@ describe('ensureInstalledHelper', () => {
         'Host.app',
         'Contents',
         'Resources',
-        'cc-haha-computer-use.app',
+        'ccmax-computer-use.app',
       )
       const configHome = path.join(tempRoot, 'config')
       const destApp = installedHelperAppBundle(configHome)

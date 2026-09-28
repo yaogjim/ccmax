@@ -122,6 +122,6 @@ Issue reports and exported bundles are redacted on a best-effort basis — chat 
 
 ## About
 
-Version, changelog, GitHub repo, feedback link.
+Version and the app-update entry.
 
 **App Updates** checks GitHub Releases, downloads, and restarts to install. Updates use their own proxy setting, separate from **Settings → General** — if updates stall on a corporate network, configure the advanced update proxy here.

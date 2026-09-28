@@ -77,6 +77,8 @@ import { LSPTool } from './tools/LSPTool/LSPTool.js'
 import { ListMcpResourcesTool } from './tools/ListMcpResourcesTool/ListMcpResourcesTool.js'
 import { ReadMcpResourceTool } from './tools/ReadMcpResourceTool/ReadMcpResourceTool.js'
 import { ToolSearchTool } from './tools/ToolSearchTool/ToolSearchTool.js'
+import { LocalScheduledTaskTool } from './tools/LocalScheduledTaskTool/LocalScheduledTaskTool.js'
+import { LocalMessageSendTool } from './tools/LocalScheduledTaskTool/LocalMessageSendTool.js'
 import { EnterPlanModeTool } from './tools/EnterPlanModeTool/EnterPlanModeTool.js'
 import { EnterWorktreeTool } from './tools/EnterWorktreeTool/EnterWorktreeTool.js'
 import { ExitWorktreeTool } from './tools/ExitWorktreeTool/ExitWorktreeTool.js'
@@ -225,6 +227,14 @@ export function getAllBaseTools(): Tools {
     ...(isTodoV2Enabled()
       ? [TaskCreateTool, TaskGetTool, TaskUpdateTool, TaskListTool]
       : []),
+    // Local desktop scheduled tasks. isEnabled() gates on the desktop's
+    // loopback origin + internal token env, so this entry is inert in any
+    // other runtime (plain CLI, adapters without a desktop host).
+    LocalScheduledTaskTool,
+    // Immediate message send to a paired contact, same local-only gate. Kept
+    // separate from LocalScheduledTask so sending a message is its own
+    // explicit, user-requested action.
+    LocalMessageSendTool,
     ...(OverflowTestTool ? [OverflowTestTool] : []),
     ...(CtxInspectTool ? [CtxInspectTool] : []),
     ...(TerminalCaptureTool ? [TerminalCaptureTool] : []),

@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import cc_haha_computer_use
+@testable import ccmax_computer_use
 
 @Suite("Computer Use client attestation policy")
 struct ClientAttestationTests {
@@ -39,7 +39,7 @@ struct ClientAttestationTests {
             pid: 900,
             parentPID: 1,
             path: "/Users/test/Library/Application Support/Claude Code Haha/"
-                + "cc-haha-computer-use.app/Contents/MacOS/cc-haha-computer-use",
+                + "ccmax-computer-use.app/Contents/MacOS/ccmax-computer-use",
             identifier: HelperClientPolicy.helperIdentifier
         )
     }
@@ -78,6 +78,46 @@ struct ClientAttestationTests {
             path: helper.executablePath,
             identifier: HelperClientPolicy.helperIdentifier
         )
+    }
+
+    /// The same process as signed by a certificate with no Team ID, which is
+    /// what a local self-signed `cu-helper-dev` build produces.
+    private func withoutTeam(_ process: AttestedProcess) -> AttestedProcess {
+        var copy = process
+        copy.teamIdentifier = nil
+        return copy
+    }
+
+    @Test("desktop identifier matches the packaged Electron app id")
+    func desktopIdentifierMatchesPackagedAppId() throws {
+        // Cross-file contract with no compiler to enforce it: electron-builder
+        // stamps the host bundle id from `build.appId` in desktop/package.json.
+        // If this constant drifts, the helper denies every Computer Use call
+        // from the real packaged app (`unauthorized_client`) with no other
+        // symptom. This test was red while the constant said
+        // `com.claude-code-haha.desktop` and package.json said
+        // `com.ccmax.desktop`.
+        var directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        var packageJson: URL?
+        for _ in 0..<8 {
+            let candidate = directory.appendingPathComponent("desktop/package.json")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                packageJson = candidate
+                break
+            }
+            directory = directory.deletingLastPathComponent()
+        }
+        let url = try #require(
+            packageJson,
+            "could not locate desktop/package.json by walking up from \(#filePath)"
+        )
+        let data = try Data(contentsOf: url)
+        let root = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let build = try #require(root["build"] as? [String: Any])
+        let appId = try #require(build["appId"] as? String)
+        #expect(HelperClientPolicy.desktopIdentifier == appId)
     }
 
     @Test("accepts only the exact packaged CLI -> server -> Electron chain")
@@ -146,6 +186,62 @@ struct ClientAttestationTests {
         )
     }
 
+    @Test("accepts one self-signed certificate shared by every link")
+    func acceptsSelfSignedSameCertificateChain() {
+        // Regression for the shipped local build: host, sidecar and helper are
+        // all signed by ONE self-signed cert (`Authority=cu-helper-dev`,
+        // `TeamIdentifier=not set`). Attestation must accept that chain as long
+        // as every link carries the same leaf certificate, whether or not a Team
+        // ID exists. Requiring a Team ID is a bug: it denies every Computer Use
+        // call from a local build with `unauthorized_client`.
+        let chain = [cli, server, host].map(withoutTeam)
+        #expect(
+            HelperClientPolicy.authorizeDaemon(
+                peer: chain[0],
+                ancestors: [chain[1], chain[2]],
+                helper: withoutTeam(helper)
+            ) == .allow
+        )
+
+        // A mixed chain — same absence of Team ID but a different leaf — is not
+        // one certificate and must still fail closed.
+        var otherLeaf = withoutTeam(server)
+        otherLeaf.leafCertificate = Data([0xBA, 0xAD])
+        #expect(
+            HelperClientPolicy.authorizeDaemon(
+                peer: chain[0],
+                ancestors: [otherLeaf, chain[2]],
+                helper: withoutTeam(helper)
+            ) == .deny
+        )
+    }
+
+    @Test("rejects an ad-hoc link in an otherwise self-signed chain")
+    func rejectsAdHocLinkInSelfSignedChain() {
+        // Ad-hoc signing has no leaf certificate at all. It cannot be the same
+        // certificate as a self-signed peer, so it must fail closed rather than
+        // being treated as "no Team ID, therefore fine".
+        var adHoc = withoutTeam(cli)
+        adHoc.leafCertificate = nil
+        #expect(
+            HelperClientPolicy.authorizeDaemon(
+                peer: adHoc,
+                ancestors: [withoutTeam(server), withoutTeam(host)],
+                helper: withoutTeam(helper)
+            ) == .deny
+        )
+
+        var adHocHelper = withoutTeam(helper)
+        adHocHelper.leafCertificate = nil
+        #expect(
+            HelperClientPolicy.authorizeDaemon(
+                peer: withoutTeam(cli),
+                ancestors: [withoutTeam(server), withoutTeam(host)],
+                helper: adHocHelper
+            ) == .deny
+        )
+    }
+
     @Test("requires valid signatures and the helper's exact Team ID and leaf signer")
     func rejectsSignatureMismatch() {
         var invalid = cli
@@ -156,22 +252,6 @@ struct ClientAttestationTests {
                 ancestors: [server, host],
                 helper: helper
             ) == .deny
-        )
-
-        var selfSignedHelper = helper
-        selfSignedHelper.teamIdentifier = nil
-        var selfSignedCli = cli
-        selfSignedCli.teamIdentifier = nil
-        var selfSignedServer = server
-        selfSignedServer.teamIdentifier = nil
-        var selfSignedHost = host
-        selfSignedHost.teamIdentifier = nil
-        #expect(
-            HelperClientPolicy.authorizeDaemon(
-                peer: selfSignedCli,
-                ancestors: [selfSignedServer, selfSignedHost],
-                helper: selfSignedHelper
-            ) == .allow
         )
 
         var adHoc = cli
@@ -240,7 +320,7 @@ struct ClientAttestationTests {
         )
 
         var wrongPath = helper
-        wrongPath.executablePath = "/tmp/cc-haha-computer-use"
+        wrongPath.executablePath = "/tmp/ccmax-computer-use"
         #expect(
             HelperClientPolicy.authorizeDaemonPeer(
                 peer: wrongPath,

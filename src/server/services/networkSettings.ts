@@ -136,6 +136,9 @@ export function mergeLoopbackNoProxy(existing: string | undefined): string {
     .split(/[,\s]+/)
     .map(entry => entry.trim())
     .filter(Boolean)
+  // A wildcard already bypasses every destination. Appending loopback hosts
+  // would break shouldBypassProxy's exact '*' match for fetch requests.
+  if (entries.includes('*')) return '*'
   const lowerEntries = new Set(entries.map(entry => entry.toLowerCase()))
 
   for (const entry of LOOPBACK_NO_PROXY_ENTRIES) {

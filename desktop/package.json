@@ -1,7 +1,7 @@
 {
   "name": "claude-code-desktop",
   "private": true,
-  "version": "0.6.5",
+  "version": "0.6.5.2",
   "description": "Desktop coding agent workbench for ccmax.",
   "homepage": "https://github.com/yaogjim/ccmax",
   "author": {
@@ -52,7 +52,7 @@
       "signIgnore": [
         "/Contents/Frameworks/.+\\.(?:pak|bin|dat|nib)$",
         "/Contents/Resources/.+\\.(?:asar|pak|bin|dat|icns|png|jpg|jpeg|gif|svg|ttf|woff|woff2)$",
-        "cc-haha-computer-use\\.app",
+        "ccmax-computer-use\\.app",
         "claude-sidecar-[^/]+$"
       ],
       "notarize": true

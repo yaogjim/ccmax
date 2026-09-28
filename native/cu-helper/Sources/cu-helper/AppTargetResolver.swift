@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import Foundation
 
 struct AppTargetCandidate: Sendable, Equatable {

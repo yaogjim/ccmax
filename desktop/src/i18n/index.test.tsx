@@ -127,4 +127,19 @@ describe('useTranslation', () => {
       expect(resurrected, `${name} still defines silent index-status keys`).toEqual([])
     }
   })
+
+  // The About panel dropped its repository, release-notes and feedback rows.
+  // Keeping the strings would let a later change wire the entries back in.
+  it('carries no key for the removed About-panel entries', () => {
+    const removed = [
+      'settings.about.changelog',
+      'settings.about.starHint',
+      'settings.about.feedback',
+      'settings.about.feedbackDesc',
+    ]
+    for (const [name, locale] of Object.entries(locales)) {
+      const resurrected = Object.keys(locale).filter(key => removed.includes(key))
+      expect(resurrected, `${name} still defines removed About entries`).toEqual([])
+    }
+  })
 })

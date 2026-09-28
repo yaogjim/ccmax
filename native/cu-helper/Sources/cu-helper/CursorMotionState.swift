@@ -84,7 +84,7 @@ enum CursorIndexedActionGate {
     static func perform<Result>(
         moveForAction: () async -> Void,
         recheckStaleness: () throws -> Void,
-        mutate: () async throws -> Result
+        mutate: @MainActor () async throws -> Result
     ) async rethrows -> Result {
         await moveForAction()
         try recheckStaleness()

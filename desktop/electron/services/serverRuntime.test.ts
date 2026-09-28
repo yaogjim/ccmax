@@ -173,6 +173,19 @@ describe('ElectronServerRuntime', () => {
     }
   })
 
+  // Regression: a cron task run has no SDK socket to derive a desktop origin
+  // from, so the server process itself must advertise the loopback origin it
+  // listens on. Without it the cron CLI only had the internal token and could
+  // not see LocalScheduledTask / LocalMessageSend.
+  it('exports the server loopback origin into the server sidecar environment', async () => {
+    const runtime = createRuntime()
+
+    const url = await runtime.startServer()
+
+    expect(url).toBe('http://127.0.0.1:49321')
+    expect(sidecarMocks.serverPlans[0]!.env.CC_HAHA_DESKTOP_SERVER_URL).toBe(url)
+  })
+
   it('gives the server only the dynamic bridge URL while adapters explicitly inherit it', async () => {
     const bridge = {
       start: vi.fn(async () => 'http://127.0.0.1:49123'),

@@ -11,6 +11,7 @@ import { resolveCors, type CorsResolution } from './middleware/cors.js'
 import { requireAuth, requireH5Token } from './middleware/auth.js'
 import { teamWatcher } from './services/teamWatcher.js'
 import { cronScheduler } from './services/cronScheduler.js'
+import { startPendingDeliveryRecovery } from './services/notificationService.js'
 import { handleProxyRequest } from './proxy/handler.js'
 import { ProviderService } from './services/providerService.js'
 import { handleHahaOAuthCallback } from './api/haha-oauth.js'
@@ -275,6 +276,24 @@ export function startServer(port = PORT, host = HOST) {
   // background; without this, getPublicStatus() reports `off` and the sidebar
   // falls through to a full JSONL scan that can exceed the 120s client timeout.
   void localIndexCoordinator.start().catch(() => undefined)
+
+  // A restart leaves `pending` delivery rows behind: the previous process died
+  // before the platform answer was observed, so the desktop panel would show a
+  // permanent "sending" entry until some later send reconciled it. Start the
+  // one-time reconciliation here, before the HTTP server or the cron scheduler
+  // can open a new pending row. It must run *after* the persistent-storage
+  // migration: that migration rewrites ccmax/notification-deliveries.json
+  // without the delivery store's lock, so a pass that ran first could be
+  // clobbered back to `pending` by a migration snapshot. Every send awaits the
+  // same promise, so the first send cannot race the pass. Fire-and-forget on
+  // purpose (the boot path is synchronous) and best-effort: a failure is logged
+  // and never blocks startup.
+  void startPendingDeliveryRecovery({}, { after: ensurePersistentStorageUpgraded() }).catch((error) => {
+    console.error(
+      '[Server] 通知投递启动对账失败，已跳过（不影响启动）',
+      error instanceof Error ? error.message : error,
+    )
+  })
 
   try {
     server = Bun.serve<WebSocketData>({

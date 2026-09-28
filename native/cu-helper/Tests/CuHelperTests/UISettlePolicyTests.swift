@@ -1,6 +1,6 @@
 import XCTest
 
-@testable import cc_haha_computer_use
+@testable import ccmax_computer_use
 
 final class UISettlePolicyTests: XCTestCase {
     /// Nothing has been mutated, so nothing is mid-transition on our account.

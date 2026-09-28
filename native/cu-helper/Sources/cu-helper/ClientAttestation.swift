@@ -22,7 +22,14 @@ enum HelperAuthorizationDecision: Equatable, Sendable {
 /// ancestry and command policy stay exhaustively unit-testable.
 enum HelperClientPolicy {
     static let helperIdentifier = "dev.cchaha.cu-helper"
-    static let desktopIdentifier = "com.claude-code-haha.desktop"
+    /// MUST equal `build.appId` in `desktop/package.json`. The host is the
+    /// Electron app, and electron-builder stamps its bundle identifier from
+    /// that field. `ClientAttestationTests` reads package.json and fails if the
+    /// two drift, because a mismatch denies every Computer Use call from the
+    /// real packaged app with no other visible symptom.
+    static let desktopIdentifier = "com.ccmax.desktop"
+    /// MUST equal `SIDECAR_SIGNING_IDENTIFIER` in `desktop/scripts/sign-identity.ts`
+    /// and `SIDECAR_IDENTIFIER` in `src/utils/computerUse/cuHelperInstall.ts`.
     static let sidecarIdentifier = "com.claude-code-haha.desktop.sidecar"
 
     private static let daemonCommands: Set<String> = [

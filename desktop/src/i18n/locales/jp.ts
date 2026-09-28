@@ -2000,10 +2000,6 @@ export const jp: Record<TranslationKey, string> = {
   // Settings > About
   'settings.tab.about': '情報',
   'settings.about.version': 'バージョン',
-  'settings.about.changelog': 'リリースノート',
-  'settings.about.starHint': 'このプロジェクトが役立った場合は、Star を付けることをご検討ください',
-  'settings.about.feedback': '問題を報告',
-  'settings.about.feedbackDesc': 'バグや使い方の質問について GitHub Issue を作成します',
   'settings.about.updates': 'アプリの更新',
   'settings.about.updatesDesc': 'GitHub Releases を確認し、インストーラーをダウンロードして、インストール後に再起動します。',
 
@@ -2895,6 +2891,9 @@ export const jp: Record<TranslationKey, string> = {
   'newTask.notConfigured': '未設定',
   'newTask.noChannelConfigured': 'IM チャンネルがまだ設定されていません。設定 → IM アダプター でセットアップしてください。',
   'newTask.noChannelSelected': '少なくとも 1 つの通知チャンネルを選択してください。',
+  'newTask.recipientLabel': '通知の宛先',
+  'newTask.recipientPlaceholder': '宛先を選択',
+  'newTask.recipientRequired': '各 IM チャンネルの宛先を選択してください。通知は明示的に選択したペアリング済みユーザーにのみ送信されます。',
 
   // ─── Cron Descriptions ──────────────────────────────────────
   'cron.everyMinute': '毎分実行',
@@ -2942,6 +2941,21 @@ export const jp: Record<TranslationKey, string> = {
   'tasks.lastRunAt': '最終実行: ',
   'tasks.outputHintSession': '「会話を表示」をクリックすると、セッションビューで出力全体を確認できます。',
   'tasks.noOutputText': '利用できる出力はありません。',
+  'tasks.delivery.title': '通知ステータス',
+  'tasks.delivery.loading': '確認中',
+  'tasks.delivery.unavailable': 'ステータス不明',
+  'tasks.delivery.notConfigured': '通知は未設定',
+  'tasks.delivery.channelInactive': '未有効',
+  'tasks.delivery.noRecipients': '宛先が未設定',
+  'tasks.delivery.notSent': '未送信',
+  'tasks.delivery.sending': '送信中',
+  'tasks.delivery.delivered': '送信済み',
+  'tasks.delivery.partial': '一部送信',
+  'tasks.delivery.failed': '送信失敗',
+  'tasks.delivery.indeterminate': 'ステータス不明確',
+  'tasks.delivery.countDelivered': '送信済み {count}',
+  'tasks.delivery.countFailed': '失敗 {count}',
+  'tasks.delivery.countIndeterminate': '不明 {count}',
 
   // ─── Prompt Editor ──────────────────────────────────────
   'promptEditor.worktree': 'worktree',
@@ -3265,7 +3279,7 @@ export const jp: Record<TranslationKey, string> = {
 
   // ─── Scheduled Tasks Pages ──────────────────────────────────────
   'scheduledPage.title': 'スケジュールタスク',
-  'scheduledPage.subtitle': 'タスクをスケジュール実行したり、必要なときに実行したりします。既存のセッションで {code} を入力すると作成できます。',
+  'scheduledPage.subtitle': 'タスクをスケジュール実行したり、必要なときに実行したりします。デスクトップの会話で作成・管理したいローカルタスクを伝えてください。',
   'scheduledPage.desktopNotice': 'スケジュールタスクは、デスクトップアプリが開いている間のみ実行されます。タスクが時間どおりに実行されるよう、アプリを起動したままにしてください。',
   'scheduledPage.oldSubtitle': '自動化された運用ルーチンとバックグラウンドメンテナンスを管理します。',
   'scheduledPage.executionMode': '実行モード',

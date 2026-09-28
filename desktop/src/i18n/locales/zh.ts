@@ -1998,10 +1998,6 @@ export const zh: Record<TranslationKey, string> = {
   // Settings > About
   'settings.tab.about': '关于',
   'settings.about.version': '版本',
-  'settings.about.changelog': '更新日志',
-  'settings.about.starHint': '如果这个项目对你有帮助，欢迎给个 Star',
-  'settings.about.feedback': '反馈问题',
-  'settings.about.feedbackDesc': '遇到 Bug 或使用问题，前往 GitHub Issue 提交反馈',
   'settings.about.updates': '应用更新',
   'settings.about.updatesDesc': '检查 GitHub Releases，下载安装包，并在安装后自动重启。',
 
@@ -2893,6 +2889,9 @@ export const zh: Record<TranslationKey, string> = {
   'newTask.notConfigured': '未配置',
   'newTask.noChannelConfigured': '尚未配置任何 IM 渠道，请前往 设置 → IM 接入 进行配置。',
   'newTask.noChannelSelected': '请至少选择一个通知渠道。',
+  'newTask.recipientLabel': '通知收件人',
+  'newTask.recipientPlaceholder': '请选择收件人',
+  'newTask.recipientRequired': '请为每个 IM 渠道选择收件人。通知只会发送给你明确选择的已配对用户。',
 
   // ─── Cron 描述 ──────────────────────────────────────
   'cron.everyMinute': '每分钟执行',
@@ -2940,6 +2939,21 @@ export const zh: Record<TranslationKey, string> = {
   'tasks.lastRunAt': '上次执行 ',
   'tasks.outputHintSession': '点击「查看完整对话」可在会话中查看完整输出。',
   'tasks.noOutputText': '暂无输出内容。',
+  'tasks.delivery.title': '通知状态',
+  'tasks.delivery.loading': '检查中',
+  'tasks.delivery.unavailable': '状态未知',
+  'tasks.delivery.notConfigured': '尚未配置通知',
+  'tasks.delivery.channelInactive': '未启用',
+  'tasks.delivery.noRecipients': '尚未配置收件人',
+  'tasks.delivery.notSent': '未发送',
+  'tasks.delivery.sending': '发送中',
+  'tasks.delivery.delivered': '已送达',
+  'tasks.delivery.partial': '部分送达',
+  'tasks.delivery.failed': '发送失败',
+  'tasks.delivery.indeterminate': '状态不确定',
+  'tasks.delivery.countDelivered': '已送达 {count}',
+  'tasks.delivery.countFailed': '失败 {count}',
+  'tasks.delivery.countIndeterminate': '不确定 {count}',
 
   // ─── Prompt Editor ──────────────────────────────────────
   'promptEditor.worktree': '工作树',
@@ -3263,7 +3277,7 @@ export const zh: Record<TranslationKey, string> = {
 
   // ─── Scheduled Tasks Pages ──────────────────────────────────────
   'scheduledPage.title': '定时任务',
-  'scheduledPage.subtitle': '按计划或在需要时运行任务。在任意会话中输入 {code} 即可创建。',
+  'scheduledPage.subtitle': '按计划或在需要时运行任务。可在桌面对话中直接说明要创建或管理的本地任务。',
   'scheduledPage.desktopNotice': '定时任务仅在桌面应用打开时运行。请确保应用持续运行以按时触发任务。',
   'scheduledPage.oldSubtitle': '管理自动化运维流程和后台维护任务。',
   'scheduledPage.executionMode': '执行模式',

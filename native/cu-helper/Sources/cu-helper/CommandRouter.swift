@@ -1586,7 +1586,7 @@ public final class CommandRouter {
     private func withForegroundLease<T>(
         command: String,
         target: ProvenProcessTarget,
-        action: () async throws -> T
+        action: @MainActor () async throws -> T
     ) async throws -> T {
         guard CommandForegroundPolicy.requiresLease(command) else {
             throw CUError(
@@ -1621,7 +1621,7 @@ public final class CommandRouter {
         guard AXIsProcessTrusted() else {
             throw CUError(
                 "not_trusted",
-                "Accessibility permission is required. Grant cc-haha-computer-use in System Settings ▸ Privacy & Security ▸ Accessibility."
+                "Accessibility permission is required. Grant ccmax-computer-use in System Settings ▸ Privacy & Security ▸ Accessibility."
             )
         }
     }

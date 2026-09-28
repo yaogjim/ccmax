@@ -697,8 +697,8 @@ describe('build-sidecars cu-helper macOS gating', () => {
 describe.skipIf(!compiledSidecarSmokeEnabled || process.platform !== 'darwin')('staged cu-helper resource smoke', () => {
   it('loads optional cursor resources from a relocated staged app instead of the build tree', async context => {
     const exec = promisify(execFile)
-    const sourceApp = path.resolve(import.meta.dirname, '../src-tauri/binaries/cc-haha-computer-use.app')
-    const inner = path.join('Contents', 'MacOS', 'cc-haha-computer-use')
+    const sourceApp = path.resolve(import.meta.dirname, '../src-tauri/binaries/ccmax-computer-use.app')
+    const inner = path.join('Contents', 'MacOS', 'ccmax-computer-use')
     const { stdout: architectures } = await exec('/usr/bin/lipo', ['-archs', path.join(sourceApp, inner)])
     const hostArch = process.arch === 'arm64' ? 'arm64' : 'x86_64'
     if (!architectures.trim().split(/\s+/).includes(hostArch)) {
@@ -708,7 +708,7 @@ describe.skipIf(!compiledSidecarSmokeEnabled || process.platform !== 'darwin')('
     }
     const fixtureRoot = await mkdtemp(path.join(tmpdir(), 'cu-helper-staged-resources-'))
     try {
-      const app = path.join(fixtureRoot, 'cc-haha-computer-use.app')
+      const app = path.join(fixtureRoot, 'ccmax-computer-use.app')
       await cp(sourceApp, app, { recursive: true, verbatimSymlinks: true })
       const home = path.join(fixtureRoot, 'home')
       const config = path.join(fixtureRoot, 'config')
@@ -730,7 +730,7 @@ describe.skipIf(!compiledSidecarSmokeEnabled || process.platform !== 'darwin')('
       }
       expect(report.resourceDirectory).not.toBeNull()
       expect(await realpath(report.resourceDirectory!)).toBe(await realpath(path.join(
-        app, 'Contents', 'Resources', 'cu-helper_cc-haha-computer-use.bundle', 'LensSequence',
+        app, 'Contents', 'Resources', 'cu-helper_ccmax-computer-use.bundle', 'LensSequence',
       )))
       expect(Number.isInteger(report.frameCount)).toBe(true)
       expect(report.frameCount).toBeGreaterThanOrEqual(0)

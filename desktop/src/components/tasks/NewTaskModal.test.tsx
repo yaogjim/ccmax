@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import '@testing-library/jest-dom'
 
 import { NewTaskModal } from './NewTaskModal'
@@ -8,6 +8,17 @@ import { useProviderStore } from '../../stores/providerStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useTaskStore } from '../../stores/taskStore'
+import type { CronTask } from '../../types/task'
+
+const baseTask: CronTask = {
+  id: 'task-1',
+  name: 'daily-code-review',
+  description: 'Review yesterday’s commits',
+  cron: '0 9 * * *',
+  prompt: 'Look at the commits',
+  enabled: true,
+  createdAt: Date.parse('2026-07-26T09:00:00.000Z'),
+}
 
 afterEach(() => {
   cleanup()
@@ -174,6 +185,106 @@ describe('NewTaskModal', () => {
       expect(screen.getByRole('alert')).toHaveTextContent('Invalid cron expression')
       expect(cronField).toHaveAttribute('aria-invalid', 'true')
       expect(screen.getByRole('button', { name: 'Create task' })).toBeDisabled()
+    })
+  })
+
+  describe('notification recipients', () => {
+    const pairedTelegram = {
+      botToken: 'bot-token',
+      pairedUsers: [
+        { userId: '111', displayName: 'Alice', pairedAt: 1 },
+        { userId: '222', displayName: 'Bob', pairedAt: 1 },
+      ],
+    }
+
+    function renderModal(editTask?: CronTask, telegram: Record<string, unknown> = pairedTelegram) {
+      useSettingsStore.setState({ locale: 'en' })
+      useAdapterStore.setState({
+        fetchConfig: vi.fn(async () => {}),
+        config: { telegram },
+      } as Partial<ReturnType<typeof useAdapterStore.getState>>)
+      return render(<NewTaskModal open onClose={vi.fn()} editTask={editTask} />)
+    }
+
+    function fillRequiredFields() {
+      fireEvent.change(screen.getByLabelText(/^Name/), { target: { value: 'notify me' } })
+      fireEvent.change(screen.getByLabelText(/^Description/), { target: { value: 'desc' } })
+      fireEvent.change(screen.getByPlaceholderText(/Look at the commits/i), {
+        target: { value: 'prompt' },
+      })
+    }
+
+    it('sends one explicitly chosen paired recipient instead of broadcasting', async () => {
+      const createTask = vi.fn(async () => {})
+      useTaskStore.setState({ createTask } as Partial<ReturnType<typeof useTaskStore.getState>>)
+      renderModal()
+
+      fillRequiredFields()
+      fireEvent.click(screen.getByLabelText(/Push notification on completion/))
+      fireEvent.click(screen.getByLabelText(/Telegram/))
+
+      const recipient = screen.getByLabelText(/Notification recipient/)
+      expect(within(recipient).getByRole('option', { name: /Alice/ })).toBeInTheDocument()
+      expect(within(recipient).getByRole('option', { name: /Bob/ })).toBeInTheDocument()
+      fireEvent.change(recipient, { target: { value: '222' } })
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Create task' }))
+        await Promise.resolve()
+      })
+
+      await waitFor(() => expect(createTask).toHaveBeenCalledTimes(1))
+      expect(createTask).toHaveBeenCalledWith(expect.objectContaining({
+        notification: expect.objectContaining({
+          enabled: true,
+          channels: expect.arrayContaining(['telegram']),
+          recipients: { telegram: [{ userId: '222', displayName: 'Bob' }] },
+        }),
+      }))
+    })
+
+    it('requires choosing one of several paired recipients before saving', async () => {
+      const createTask = vi.fn(async () => {})
+      useTaskStore.setState({ createTask } as Partial<ReturnType<typeof useTaskStore.getState>>)
+      renderModal()
+
+      fillRequiredFields()
+      fireEvent.click(screen.getByLabelText(/Push notification on completion/))
+      fireEvent.click(screen.getByLabelText(/Telegram/))
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Create task' }))
+        await Promise.resolve()
+      })
+
+      expect(createTask).not.toHaveBeenCalled()
+      expect(screen.getByRole('alert')).toHaveTextContent(/recipient/i)
+    })
+
+    it('refuses to silently drop a legacy notification that has no recipients', async () => {
+      const updateTask = vi.fn(async () => {})
+      useTaskStore.setState({ updateTask } as Partial<ReturnType<typeof useTaskStore.getState>>)
+      renderModal({
+        ...baseTask,
+        notification: { enabled: true, channels: ['telegram'] },
+      })
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+        await Promise.resolve()
+      })
+
+      expect(updateTask).not.toHaveBeenCalled()
+      expect(screen.getByRole('alert')).toHaveTextContent(/recipient/i)
+    })
+
+    it('disables an IM channel when the platform has no paired recipient', () => {
+      // `allowedUsers` is an access allowlist, not a notification target set —
+      // the server only ever resolves recipients against `pairedUsers`.
+      renderModal(undefined, { botToken: 'bot-token', allowedUsers: [111, 222], pairedUsers: [] })
+
+      fireEvent.click(screen.getByLabelText(/Push notification on completion/))
+      expect(screen.getByLabelText(/Telegram/)).toBeDisabled()
     })
   })
 })

@@ -10,7 +10,9 @@ type Props = {
 
 export function TaskList({ tasks }: Props) {
   const t = useTranslation()
-  const enabledCount = tasks.filter((task) => task.enabled).length
+  // `enabled` predates some task files; the backend treats a missing flag as
+  // enabled, so the stats must too.
+  const enabledCount = tasks.filter((task) => task.enabled !== false).length
   const [expandedLogsId, setExpandedLogsId] = useState<string | null>(null)
 
   return (

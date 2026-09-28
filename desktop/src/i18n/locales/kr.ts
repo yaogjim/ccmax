@@ -2000,10 +2000,6 @@ export const kr: Record<TranslationKey, string> = {
   // Settings > About
   'settings.tab.about': '정보',
   'settings.about.version': '버전',
-  'settings.about.changelog': '릴리스 노트',
-  'settings.about.starHint': '이 프로젝트가 도움이 되었다면 Star를 눌러 주세요',
-  'settings.about.feedback': '문제 신고',
-  'settings.about.feedbackDesc': '버그나 사용 관련 질문은 GitHub Issue를 작성하세요',
   'settings.about.updates': '앱 업데이트',
   'settings.about.updatesDesc': 'GitHub Releases를 확인하고 설치 관리자를 다운로드한 후 설치 후 다시 시작합니다.',
 
@@ -2895,6 +2891,9 @@ export const kr: Record<TranslationKey, string> = {
   'newTask.notConfigured': '구성되지 않음',
   'newTask.noChannelConfigured': '아직 구성된 IM 채널이 없습니다. 설정 → IM 어댑터 에서 설정하세요.',
   'newTask.noChannelSelected': '하나 이상의 알림 채널을 선택하세요.',
+  'newTask.recipientLabel': '알림 수신자',
+  'newTask.recipientPlaceholder': '수신자 선택',
+  'newTask.recipientRequired': '각 IM 채널의 수신자를 선택하세요. 알림은 명시적으로 선택한 페어링된 사용자에게만 전송됩니다.',
 
   // ─── Cron Descriptions ──────────────────────────────────────
   'cron.everyMinute': '매분 실행',
@@ -2942,6 +2941,21 @@ export const kr: Record<TranslationKey, string> = {
   'tasks.lastRunAt': '마지막 실행: ',
   'tasks.outputHintSession': '"대화 보기"를 클릭하면 세션 보기에서 전체 출력을 볼 수 있습니다.',
   'tasks.noOutputText': '사용할 수 있는 출력이 없습니다.',
+  'tasks.delivery.title': '알림 상태',
+  'tasks.delivery.loading': '확인 중',
+  'tasks.delivery.unavailable': '상태 알 수 없음',
+  'tasks.delivery.notConfigured': '알림이 설정되지 않음',
+  'tasks.delivery.channelInactive': '사용 안 함',
+  'tasks.delivery.noRecipients': '수신자가 설정되지 않음',
+  'tasks.delivery.notSent': '전송 안 됨',
+  'tasks.delivery.sending': '전송 중',
+  'tasks.delivery.delivered': '전송됨',
+  'tasks.delivery.partial': '일부 전송됨',
+  'tasks.delivery.failed': '전송 실패',
+  'tasks.delivery.indeterminate': '상태 불확실',
+  'tasks.delivery.countDelivered': '전송됨 {count}',
+  'tasks.delivery.countFailed': '실패 {count}',
+  'tasks.delivery.countIndeterminate': '불확실 {count}',
 
   // ─── Prompt Editor ──────────────────────────────────────
   'promptEditor.worktree': 'worktree',
@@ -3265,7 +3279,7 @@ export const kr: Record<TranslationKey, string> = {
 
   // ─── Scheduled Tasks Pages ──────────────────────────────────────
   'scheduledPage.title': '예약 작업',
-  'scheduledPage.subtitle': '작업을 예약 실행하거나 필요할 때 실행하세요. 기존 세션에서 {code}을(를) 입력하면 만들 수 있습니다.',
+  'scheduledPage.subtitle': '작업을 예약 실행하거나 필요할 때 실행하세요. 데스크톱 대화에서 만들거나 관리할 로컬 작업을 설명하세요.',
   'scheduledPage.desktopNotice': '예약 작업은 데스크톱 앱이 열려 있는 동안에만 실행됩니다. 작업이 제시간에 실행되도록 앱을 계속 실행해 두세요.',
   'scheduledPage.oldSubtitle': '자동화된 운영 루틴과 백그라운드 유지 관리를 관리합니다.',
   'scheduledPage.executionMode': '실행 모드',

@@ -708,7 +708,7 @@ describe('release desktop workflow', () => {
     expect(desktopPackage.build.mac?.signIgnore).toEqual([
       '/Contents/Frameworks/.+\\.(?:pak|bin|dat|nib)$',
       '/Contents/Resources/.+\\.(?:asar|pak|bin|dat|icns|png|jpg|jpeg|gif|svg|ttf|woff|woff2)$',
-      'cc-haha-computer-use\\.app',
+      'ccmax-computer-use\\.app',
       'claude-sidecar-[^/]+$',
     ])
   })

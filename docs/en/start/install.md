@@ -32,30 +32,9 @@ The `.blockmap` and `latest*.yml` files are used by the app's own updater. You d
 2. Drag ccmax into Applications.
 3. Launch it from Applications.
 
-### If macOS says the app is damaged
+### If macOS blocks the first launch
 
-Nothing is actually damaged. macOS quarantines anything downloaded from the web and refuses to launch it without an Apple signature — but it words the error as "damaged", which is thoroughly misleading. Signed and notarized releases skip this entirely; if you have an unsigned build, use one of the two routes below.
-
-**Option 1: the official script (recommended)**
-
-Download `install-macos-unsigned.sh` from the same Release into **the same folder as the DMG** (Downloads, for example), then run:
-
-```bash
-cd ~/Downloads
-bash install-macos-unsigned.sh
-```
-
-The script picks the DMG matching your architecture, mounts it, installs the app into `/Applications`, strips the quarantine attribute, and launches it. Any existing install is moved to the Trash first rather than overwritten in place.
-
-**Option 2: clear the quarantine flag yourself**
-
-If the app is already in Applications:
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/ccmax.app"
-```
-
-Only do this for packages you have confirmed came from this repository's Releases. Never bypass Gatekeeper for software of unknown origin.
+A self-signed build has not been notarized by Apple. After verifying the package source, right-click ccmax in Applications and choose Open; if macOS offers System Settings → Privacy & Security → Open Anyway, the user on the receiving Mac must confirm it. This does not disable Gatekeeper or change system-wide security settings. **Self-signing does not replace Apple notarization**: if macOS only says the app is damaged and provides no per-app approval option, use a Developer ID signature and notarization instead of clearing the quarantine attribute.
 
 ## Windows
 
@@ -99,6 +78,20 @@ cp .env.example .env
 ```
 
 Requires [Bun](https://bun.sh) and Git. This runs the CLI only; for building the desktop app and configuring the local server, see [Command line](../cli/index.md).
+
+### Build the macOS desktop app locally (Apple Silicon)
+
+To package the desktop app yourself, run this from the repository root:
+
+```bash
+./desktop/scripts/build-macos-arm64.sh
+```
+
+**A self-signed build can preserve a complete Computer Use signing chain without an Apple developer certificate, but first launch on another Mac is still subject to Gatekeeper policy.** The build script automatically picks a **stable signing identity** from your keychain — Developer ID first, then Apple Development, then the self-signed `cu-helper-dev` — and puts the host app, the sidecar, and the Computer Use helper on **one certificate**. All three must match: if any of them is ad-hoc or lands on a different certificate, the helper rejects Computer Use with `unauthorized_client`.
+
+Create the self-signed certificate once per machine: open Keychain Access → menu **Certificate Assistant** → **Create a Certificate…**, name it `cu-helper-dev`, set Identity Type to **Self Signed Root** and Certificate Type to **Code Signing**, and leave it in the `login` keychain; the script detects it automatically. The certificate and its private key stay in this machine's keychain — **there is no need to export a p12** — and must not be committed to the repository. Reusing the same certificate every time is what keeps the signing identity stable, so the OS grants survive a rebuild.
+
+Every machine needs its own first-launch confirmation through the macOS prompts above; if macOS does not offer per-app approval for the self-signed build, Developer ID signing and notarization are required rather than clearing quarantine. Then grant **Screen Recording** and **Accessibility**. These grants are per machine and do not travel with the app. See [Computer Use](../desktop/computer-use.md).
 
 ## Updating
 

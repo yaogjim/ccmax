@@ -150,6 +150,16 @@ describe('network settings', () => {
       .toBe(bridgeUrl)
   })
 
+  it('preserves wildcard NO_PROXY while merging loopback exclusions', () => {
+    const settings = normalizeNetworkSettings({ network: { proxy: { mode: 'system', url: '' } } })
+    process.env[SYSTEM_PROXY_URL_ENV] = 'http://127.0.0.1:1183'
+    process.env.NO_PROXY = 'localhost, *'
+
+    expect(buildNetworkEnvironment(settings).NO_PROXY).toBe('*')
+    expect(getNetworkProxyFetchOptions(settings, 'https://api.telegram.org/botfake/sendMessage').proxy)
+      .toBeUndefined()
+  })
+
   it('uses inherited process proxy for non-Electron system-mode servers', () => {
     const settings = normalizeNetworkSettings({
       network: { proxy: { mode: 'system', url: '' } },

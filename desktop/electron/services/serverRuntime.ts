@@ -268,7 +268,7 @@ export class ElectronServerRuntime {
     const url = `http://${SERVER_CONTROL_HOST}:${port}`
     const logs: string[] = []
     let startState: ServerStartState | null = null
-    const env = this.withServerAccessTokens(await this.resolveSidecarBaseEnv())
+    const env = this.withServerAccessTokens(await this.resolveSidecarBaseEnv(), url)
     this.assertCurrentGeneration(generation)
     const plan = createServerPlan({
       desktopRoot: this.desktopRoot,
@@ -403,10 +403,25 @@ export class ElectronServerRuntime {
     }
   }
 
-  private withServerAccessTokens(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  /**
+   * Credentials only the server sidecar may hold, plus the loopback origin that
+   * server is itself listening on.
+   *
+   * The origin has to live in the server's own process env — not only in the
+   * per-session child env `conversationService` derives from an SDK url —
+   * because a cron task run never has an SDK socket to derive it from: it
+   * inherits the server process env instead. Without it the CLI spawned for a
+   * scheduled task cannot see `LocalScheduledTask` / `LocalMessageSend`, both of
+   * which gate on the origin *and* the internal token being present.
+   */
+  private withServerAccessTokens(
+    env: NodeJS.ProcessEnv,
+    serverUrl: string,
+  ): NodeJS.ProcessEnv {
     return {
       ...this.withLocalAccessToken(env),
       CC_HAHA_PET_ACCESS_TOKEN: this.petAccessToken,
+      CC_HAHA_DESKTOP_SERVER_URL: serverUrl,
     }
   }
 

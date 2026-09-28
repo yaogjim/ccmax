@@ -32,30 +32,9 @@ order: 1
 2. 把 ccmax 拖进「应用程序」。
 3. 从「应用程序」打开。
 
-### 如果提示「已损坏，无法打开」
+### 如果 macOS 拦截首次打开
 
-这不是文件坏了。macOS 会给从网上下载的安装包打一个隔离标记（quarantine），遇到没有 Apple 签名的应用就直接拒绝启动，报错文案偏偏写成「已损坏」。经过签名和公证的正式版本不会有这一步；如果你拿到的是未签名构建，用下面两种办法之一放行。
-
-**办法一：用官方脚本（推荐）**
-
-从同一个 Release 里把 `install-macos-unsigned.sh` 下载到和 DMG **同一个文件夹**（比如「下载」），然后在终端里跑：
-
-```bash
-cd ~/Downloads
-bash install-macos-unsigned.sh
-```
-
-脚本会自动挑对架构的 DMG、挂载、把应用装进 `/Applications`、清掉隔离标记再打开。已有的旧版本会先移到废纸篓，不会直接覆盖。
-
-**办法二：手动清隔离标记**
-
-已经把应用拖进「应用程序」了，就直接执行：
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/ccmax.app"
-```
-
-只对你确认来自本仓库 Release 的安装包这么做。来路不明的应用不要绕过 Gatekeeper。
+自签名构建没有 Apple 公证。确认安装包来源后，从「应用程序」中对 ccmax 点右键选择「打开」；如果系统提供「系统设置 → 隐私与安全性 → 仍要打开」，由接收机器的用户亲自确认。此操作不会关闭 Gatekeeper 或改动整机安全设置。**自签名不能替代 Apple 公证**：若系统只提示「已损坏」且不提供逐个应用的确认入口，需要用 Developer ID 签名并公证，不能通过删除隔离属性来伪装成已获系统认可的包。
 
 ## Windows
 
@@ -99,6 +78,20 @@ cp .env.example .env
 ```
 
 需要 [Bun](https://bun.sh) 和 Git。这条路只跑 CLI，桌面端的构建方式和本地服务参数见 [命令行](../cli/index.md)。
+
+### 本地构建 macOS 桌面端（Apple Silicon）
+
+想自己打包桌面端，在仓库根目录跑：
+
+```bash
+./desktop/scripts/build-macos-arm64.sh
+```
+
+**没有正式 Apple 开发者证书也可以构建完整的 Computer Use 签名链，但跨机器首次打开仍受 Gatekeeper 策略限制。** 构建脚本会在钥匙串里自动挑一个**稳定的签名身份**——优先 Developer ID，其次是 Apple Development，最后是自签的 `cu-helper-dev`——并让宿主应用、sidecar 和 Computer Use 助手三者用**同一张证书**。三者签名必须一致：只要有一个是 ad-hoc 或换成了别的证书，助手就会拒绝 Computer Use，报 `unauthorized_client`。
+
+自签证书只需在本机建一次：打开「钥匙串访问」→ 菜单「证书助理」→「创建证书…」，名称填 `cu-helper-dev`，身份类型选「自签名根」，证书类型选「代码签名」，建好后留在 `login` 钥匙串即可，脚本之后会自动认出来。证书和私钥都只留在这台机器的钥匙串里，**不需要导出 p12**，也不要提交进仓库。每次都复用同一张证书，签名身份才稳定，系统授权不会因为重新构建而失效。
+
+换一台机器就要自己重新做一遍：先按上面的 macOS 系统弹窗逐个应用确认首次打开；若系统不允许为自签名包逐个确认，需要 Apple Developer ID 签名及公证，不能通过清除隔离属性替代。然后授予**屏幕录制**和**辅助功能**两项权限。授权记在本机，不跟着应用走。步骤见 [Computer Use](../desktop/computer-use.md)。
 
 ## 升级
 

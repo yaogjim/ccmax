@@ -7,6 +7,7 @@ import { TaskRunsPanel } from './TaskRunsPanel'
 import { NewTaskModal } from './NewTaskModal'
 import { ConfirmPopover } from '@/components/tasks/ConfirmPopover'
 import { Badge, StatusDot } from '@/components/ui/Badge'
+import { ErrorState } from '@/components/ui/ErrorState'
 import { IconButton } from '@/components/ui/IconButton'
 import { useDismissable } from '@/hooks/useDismissable'
 
@@ -24,10 +25,25 @@ export function TaskRow({ task, showLogs, onToggleLogs }: Props) {
   const [showEdit, setShowEdit] = useState(false)
   const [showMenu, setShowMenu] = useState(false)
   const [isRunning, setIsRunning] = useState(false)
+  const [isToggling, setIsToggling] = useState(false)
+  const [isDeleting, setIsDeleting] = useState(false)
+  // One slot for the last mutation that failed: run, toggle and delete all
+  // write here, so a stale toggle error cannot linger next to a fresh run.
+  const [actionError, setActionError] = useState<string | null>(null)
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null)
   const [logsRefreshKey, setLogsRefreshKey] = useState(0)
   const menuRef = useRef<HTMLDivElement>(null)
   const confirmRef = useRef<HTMLDivElement>(null)
+  // Synchronous reentry guards. `isRunning`/`isDeleting` only become visible on
+  // the next render, so a second click dispatched in the same tick would slip
+  // past a state-only check and start a duplicate request.
+  const runInFlightRef = useRef(false)
+  const deleteInFlightRef = useRef(false)
+
+  // `enabled` predates some task files, and the backend treats a missing flag
+  // as enabled. Reading `task.enabled` directly rendered every legacy task as
+  // paused, with its Run button unavailable.
+  const enabled = task.enabled !== false
 
   // Two overlays with independent open states, so two subscriptions rather
   // than one handler branching on both. The hand-rolled version listened on
@@ -41,29 +57,68 @@ export function TaskRow({ task, showLogs, onToggleLogs }: Props) {
   useDismissable({ open: confirmAction !== null, refs: [confirmRef], onDismiss: closeConfirm })
 
   const handleRunNow = async () => {
-    setConfirmAction(null)
+    // Guard before closing the popover: a double click on Confirm would
+    // otherwise enqueue two runs.
+    if (isRunning || runInFlightRef.current) return
+    runInFlightRef.current = true
     setIsRunning(true)
+    setActionError(null)
     if (!showLogs) onToggleLogs() // open logs panel (accordion will close others)
     try {
       await runTask(task.id)
+      setConfirmAction(null)
       setLogsRefreshKey((k) => k + 1)
     } catch (err) {
-      console.error('Failed to run task:', err)
+      // Previously swallowed into `console.error`, so the row looked like it had
+      // accepted the run while nothing happened.
+      setActionError(err instanceof Error ? err.message : String(err))
+      setConfirmAction(null)
     } finally {
+      runInFlightRef.current = false
       setIsRunning(false)
     }
   }
 
-  const handleToggle = () => {
-    setConfirmAction(null)
-    setShowMenu(false)
-    updateTask(task.id, { enabled: !task.enabled })
+  const handleToggle = async () => {
+    // A second click while the first write is still in flight would start a
+    // duplicate update; the confirm popover stays mounted until the promise
+    // settles, so this guard is what actually blocks the repeat.
+    if (isToggling) return
+    setIsToggling(true)
+    setActionError(null)
+    try {
+      await updateTask(task.id, { enabled: !enabled })
+      setConfirmAction(null)
+      setShowMenu(false)
+    } catch (err) {
+      // Previously the rejection was unhandled and the row stayed silent.
+      setActionError(err instanceof Error ? err.message : String(err))
+      setConfirmAction(null)
+      setShowMenu(false)
+    } finally {
+      setIsToggling(false)
+    }
   }
 
-  const handleDelete = () => {
-    setConfirmAction(null)
-    setShowMenu(false)
-    deleteTask(task.id)
+  const handleDelete = async () => {
+    // Delete used to be a floating `deleteTask(id)` call: the rejection never
+    // reached the screen, and every confirm click started another request.
+    if (isDeleting || deleteInFlightRef.current) return
+    deleteInFlightRef.current = true
+    setIsDeleting(true)
+    setActionError(null)
+    try {
+      await deleteTask(task.id)
+      setConfirmAction(null)
+      setShowMenu(false)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err))
+      setConfirmAction(null)
+      setShowMenu(false)
+    } finally {
+      deleteInFlightRef.current = false
+      setIsDeleting(false)
+    }
   }
 
   const menuItem = 'flex items-center gap-2.5 w-full px-3 py-2 text-[13px] text-left rounded-[var(--radius-md)] transition-colors'
@@ -82,9 +137,9 @@ export function TaskRow({ task, showLogs, onToggleLogs }: Props) {
       <div className="group flex items-center gap-3 px-5 py-4 transition-colors hover:bg-[var(--color-surface-hover)]">
         {/* Left: status + info */}
         <StatusDot
-          tone={task.enabled ? 'success' : 'neutral'}
+          tone={enabled ? 'success' : 'neutral'}
           size="lg"
-          label={task.enabled ? t('tasks.active') : t('tasks.disabled')}
+          label={enabled ? t('tasks.active') : t('tasks.disabled')}
         />
         <div className="min-w-0 flex-1">
           <div className="truncate text-[15px] font-bold text-[var(--color-text-primary)]">{task.name}</div>
@@ -106,10 +161,10 @@ export function TaskRow({ task, showLogs, onToggleLogs }: Props) {
                 </span>
               }
               label={t('tasks.runNow')}
-              showTooltip={task.enabled}
-              tone={task.enabled ? 'brand' : 'muted'}
+              showTooltip={enabled}
+              tone={enabled ? 'brand' : 'muted'}
               bordered
-              disabled={isRunning || !task.enabled}
+              disabled={isRunning || !enabled}
               onClick={() => setConfirmAction(confirmAction === 'run' ? null : 'run')}
             />
             {confirmAction === 'run' && (
@@ -165,9 +220,9 @@ export function TaskRow({ task, showLogs, onToggleLogs }: Props) {
                   className={`${menuItem} text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]`}
                 >
                   <span aria-hidden="true" className="material-symbols-outlined text-[16px] text-[var(--color-text-secondary)]">
-                    {task.enabled ? 'pause_circle' : 'play_circle'}
+                    {enabled ? 'pause_circle' : 'play_circle'}
                   </span>
-                  {task.enabled ? t('common.disable') : t('common.enable')}
+                  {enabled ? t('common.disable') : t('common.enable')}
                 </button>
 
                 <div className="my-1 h-px bg-[var(--color-border-separator)]" />
@@ -189,8 +244,8 @@ export function TaskRow({ task, showLogs, onToggleLogs }: Props) {
             {confirmAction === 'toggle' && (
               <div ref={confirmRef}>
                 <ConfirmPopover
-                  message={task.enabled ? t('tasks.confirmDisable') : t('tasks.confirmEnable')}
-                  confirmLabel={task.enabled ? t('common.disable') : t('common.enable')}
+                  message={enabled ? t('tasks.confirmDisable') : t('tasks.confirmEnable')}
+                  confirmLabel={enabled ? t('common.disable') : t('common.enable')}
                   onConfirm={handleToggle}
                   onCancel={() => { setConfirmAction(null); setShowMenu(false) }}
                   cancelLabel={t('common.cancel')}
@@ -212,6 +267,18 @@ export function TaskRow({ task, showLogs, onToggleLogs }: Props) {
           </div>
         </div>
       </div>
+
+      {/* Run / toggle / delete failure — all three used to end in a silent
+          catch or an unhandled rejection, so the row stayed in its old state
+          with nothing on screen. */}
+      {actionError && (
+        <ErrorState
+          size="sm"
+          className="mx-5 mb-3 mt-1"
+          title={t('common.error')}
+          detail={actionError}
+        />
+      )}
 
       {/* Runs panel — full-bleed inside the list card, so it reads as a drawer
           under the row rather than a second card floating inside it. */}

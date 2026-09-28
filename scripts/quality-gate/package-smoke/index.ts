@@ -21,6 +21,8 @@ type InspectOptions = {
   arch?: PackageSmokeArch
   artifactsDir?: string
   requireMacosGatekeeper?: boolean
+  /** Verify host/sidecar/helper share one certificate without requiring a Developer ID. */
+  requireSignedChain?: boolean
   packageKind?: PackageKind
   commandRunner?: PackageSmokeCommandRunner
   hostPlatform?: string
@@ -32,6 +34,7 @@ export type PackageSmokeArgs = {
   arch?: PackageSmokeArch
   artifactsDir?: string
   requireMacosGatekeeper?: boolean
+  requireSignedChain?: boolean
   packageKind?: PackageKind
 }
 
@@ -39,6 +42,8 @@ export type PackageSmokeReport = {
   platform: PackageSmokePlatform
   hostPlatform: string
   productName: string
+  /** `build.appId`: the bundle id the Electron host is actually signed with. */
+  productAppId: string | null
   version: string
   arch?: PackageSmokeArch
   verificationMode: VerificationMode
@@ -55,6 +60,8 @@ export type PackageSmokeReport = {
 type DesktopMetadata = {
   productName: string
   version: string
+  /** `build.appId` from desktop/package.json: the Electron host's bundle id. */
+  appId: string | null
 }
 
 type PackageSmokeCommandResult = {
@@ -73,7 +80,7 @@ type PackageSmokeCommandOptions = {
 type PackageSmokeCommandRunner = (command: string, args: string[], options?: PackageSmokeCommandOptions) => PackageSmokeCommandResult
 
 function usage() {
-  return 'Usage: bun run test:package-smoke --platform <macos|windows|linux> [--arch <x64|arm64>] [--package-kind <auto|dir|release>] [--artifacts-dir <path>] [--require-macos-gatekeeper]'
+  return 'Usage: bun run test:package-smoke --platform <macos|windows|linux> [--arch <x64|arm64>] [--package-kind <auto|dir|release>] [--artifacts-dir <path>] [--require-macos-gatekeeper] [--require-signed-chain]'
 }
 
 function readArgValue(argv: string[], index: number, flag: string) {
@@ -89,6 +96,7 @@ export function parsePackageSmokeArgs(argv: string[]): PackageSmokeArgs {
   let arch: PackageSmokeArch | undefined
   let artifactsDir: string | undefined
   let requireMacosGatekeeper = false
+  let requireSignedChain = false
   let packageKind: PackageKind = 'auto'
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -136,6 +144,11 @@ export function parsePackageSmokeArgs(argv: string[]): PackageSmokeArgs {
       requireMacosGatekeeper = true
       continue
     }
+
+    if (arg === '--require-signed-chain') {
+      requireSignedChain = true
+      continue
+    }
   }
 
   if (!platform) {
@@ -147,6 +160,7 @@ export function parsePackageSmokeArgs(argv: string[]): PackageSmokeArgs {
     arch,
     artifactsDir,
     requireMacosGatekeeper,
+    requireSignedChain,
     packageKind,
   }
 }
@@ -170,6 +184,7 @@ function readDesktopMetadata(rootDir: string): DesktopMetadata {
   return {
     productName: raw.build?.productName ?? raw.productName ?? raw.name ?? 'app',
     version: raw.version ?? 'unknown',
+    appId: raw.build?.appId ?? null,
   }
 }
 
@@ -590,7 +605,7 @@ function addMacosCursorResourceCheck(
   helperApp: string,
   options: InspectOptions,
 ) {
-  const sequenceRelative = 'Contents/Resources/cu-helper_cc-haha-computer-use.bundle/LensSequence'
+  const sequenceRelative = 'Contents/Resources/cu-helper_ccmax-computer-use.bundle/LensSequence'
   const sourceDirectory = join(helperApp, sequenceRelative)
   const structureLabel = 'macOS cu-helper cursor resource directory'
   const executionLabel = 'macOS relocated cu-helper cursor resource execution'
@@ -617,7 +632,7 @@ function addMacosCursorResourceCheck(
     return
   }
   try {
-    const inner = 'Contents/MacOS/cc-haha-computer-use'
+    const inner = 'Contents/MacOS/ccmax-computer-use'
     const architectures = parseMachOArchitectures(readFileSync(join(helperApp, inner)))
     if (!architectures.includes(hostMachOArch as MachOArch)) {
       if (architectures.length === 0) throw new Error('helper has no recognized Mach-O architecture')
@@ -721,6 +736,21 @@ export function parseCodesignMetadata(output: string): CodesignMetadata {
   }
 }
 
+/**
+ * Verify the packaged host/sidecar/helper all carry ONE signing certificate and
+ * the identifiers the native helper's attestation policy expects.
+ *
+ * Two tiers, because the invariant has two halves:
+ *   • ALWAYS — host, sidecar and helper are signed with the same certificate
+ *     (one Authority and one Team Identifier across all three) and carry the
+ *     exact identifiers `ClientAttestation.swift` compares. This is what makes
+ *     Computer Use work at all, and it is equally true of a local self-signed
+ *     `cu-helper-dev` build, which has no Team ID.
+ *   • RELEASE ONLY (`requireDeveloperId`) — the shared certificate must be a
+ *     `Developer ID Application:` one, with a Team ID and a secure timestamp.
+ *     That is the distributable/notarizable bar, so it stays strict for release
+ *     artifacts and is not weakened by allowing self-signed local builds.
+ */
 function addMacosComputerUseAttestationCheck(
   report: PackageSmokeReport,
   rootDir: string,
@@ -728,6 +758,7 @@ function addMacosComputerUseAttestationCheck(
   sidecar: string,
   helperApp: string,
   commandRunner: PackageSmokeCommandRunner,
+  options: { requireDeveloperId: boolean },
 ) {
   const label = 'macOS Computer Use signing attestation chain'
   const record = { label, path: toRelative(rootDir, helperApp) }
@@ -736,8 +767,16 @@ function addMacosComputerUseAttestationCheck(
     return
   }
 
+  if (!report.productAppId) {
+    report.missingChecks.push(record)
+    report.notes.push(
+      `${label} cannot run: desktop/package.json has no build.appId, so the host bundle identifier is unknown.`,
+    )
+    return
+  }
+
   const targets = [
-    { name: 'host', path: appBundle, identifier: 'com.claude-code-haha.desktop', deep: true },
+    { name: 'host', path: appBundle, identifier: report.productAppId, deep: true },
     { name: 'sidecar', path: sidecar, identifier: 'com.claude-code-haha.desktop.sidecar', deep: false },
     { name: 'helper', path: helperApp, identifier: 'dev.cchaha.cu-helper', deep: true },
   ] as const
@@ -757,17 +796,27 @@ function addMacosComputerUseAttestationCheck(
       return
     }
     const parsed = parseCodesignMetadata(`${details.stdout ?? ''}${details.stderr ?? ''}`)
-    if (
-      parsed.identifier !== target.identifier
-      || !parsed.authority?.startsWith('Developer ID Application:')
-      || !parsed.team
-      || !parsed.timestamp
-    ) {
+    if (parsed.identifier !== target.identifier || !parsed.authority) {
       report.missingChecks.push(record)
       report.notes.push(
-        `${label} rejected ${target.name}: identifier=${parsed.identifier ?? 'missing'}, `
-        + `authority=${parsed.authority ?? 'missing'}, team=${parsed.team ?? 'missing'}, `
-        + `timestamp=${parsed.timestamp ? 'present' : 'missing'}.`,
+        `${label} rejected ${target.name}: expected identifier ${target.identifier}, `
+        + `found ${parsed.identifier ?? 'missing'}; authority=${parsed.authority ?? 'missing'}.`,
+      )
+      return
+    }
+    if (options.requireDeveloperId && !parsed.authority.startsWith('Developer ID Application:')) {
+      report.missingChecks.push(record)
+      report.notes.push(
+        `${label} rejected ${target.name}: ${parsed.authority} is not a Developer ID Application `
+        + 'signature, which a release artifact requires.',
+      )
+      return
+    }
+    if (options.requireDeveloperId && (!parsed.team || !parsed.timestamp)) {
+      report.missingChecks.push(record)
+      report.notes.push(
+        `${label} rejected ${target.name}: team=${parsed.team ?? 'missing'}, `
+        + `timestamp=${parsed.timestamp ? 'present' : 'missing'}; a release artifact needs both.`,
       )
       return
     }
@@ -779,22 +828,25 @@ function addMacosComputerUseAttestationCheck(
     report.notes.push(`${label} could not collect metadata for every required executable.`)
     return
   }
-  const [host, sidecarMetadata, helper] = metadata as [
-    CodesignMetadata,
-    CodesignMetadata,
-    CodesignMetadata,
-  ]
-  if (
-    host.authority !== sidecarMetadata.authority
-    || host.authority !== helper.authority
-    || host.team !== sidecarMetadata.team
-    || host.team !== helper.team
-  ) {
+  // One shared certificate: exactly one Authority (the leaf certificate's common
+  // name) and one Team Identifier across host, sidecar and helper. A self-signed
+  // build reports `TeamIdentifier=not set`, which parses to null; null must equal
+  // null there rather than being treated as "no proof".
+  const authorities = new Set(metadata.map(entry => entry.authority))
+  const teams = new Set(metadata.map(entry => entry.team ?? 'not set'))
+  if (authorities.size !== 1 || teams.size !== 1) {
     report.missingChecks.push(record)
-    report.notes.push(`${label} rejected mismatched Developer ID authority/team values.`)
+    report.notes.push(
+      `${label} rejected mismatched signing identity across host, sidecar and helper: `
+      + `authorities=[${[...authorities].join(', ')}], teams=[${[...teams].join(', ')}].`,
+    )
     return
   }
   report.passedChecks.push(record)
+  report.notes.push(
+    `${label}: host, sidecar and helper share one certificate `
+    + `(authority=${[...authorities][0]}, team=${[...teams][0]}).`,
+  )
 }
 
 function addMacosGatekeeperCheck(
@@ -870,6 +922,7 @@ function createReport(
     platform,
     hostPlatform,
     productName: metadata.productName,
+    productAppId: metadata.appId,
     version: metadata.version,
     arch,
     verificationMode,
@@ -925,9 +978,9 @@ function inspectMacosArtifacts(rootDir: string, report: PackageSmokeReport, opti
   const nodePtyDir = join(unpackedDir, 'node_modules', 'node-pty')
   const prebuildsDir = join(nodePtyDir, 'prebuilds')
   const sidecarDir = join(unpackedDir, 'src-tauri', 'binaries')
-  const helperApp = join(sidecarDir, 'cc-haha-computer-use.app')
+  const helperApp = join(sidecarDir, 'ccmax-computer-use.app')
   const helperInfoPlist = join(helperApp, 'Contents', 'Info.plist')
-  const helperExecutable = join(helperApp, 'Contents', 'MacOS', 'cc-haha-computer-use')
+  const helperExecutable = join(helperApp, 'Contents', 'MacOS', 'ccmax-computer-use')
   const hostExecutable = join(contentsDir, 'MacOS', report.productName)
 
   addPresenceCheck(report, rootDir, 'macOS Info.plist', join(contentsDir, 'Info.plist'))
@@ -1013,7 +1066,10 @@ function inspectMacosArtifacts(rootDir: string, report: PackageSmokeReport, opti
   }
 
   report.notes.push('No GUI launch was attempted. Matching macOS helper architectures also run an input-free resource probe from a disposable copy of the final package.')
-  if (options.requireMacosGatekeeper) {
+  // The chain check runs for the release gate AND for the explicit signed-chain
+  // opt-in that local non-Developer-ID builds use; only the release gate also
+  // requires a Developer ID certificate and a Gatekeeper launch approval.
+  if (options.requireMacosGatekeeper || options.requireSignedChain) {
     if (report.arch) {
       const targetTriple = report.arch === 'arm64'
         ? 'aarch64-apple-darwin'
@@ -1025,8 +1081,13 @@ function inspectMacosArtifacts(rootDir: string, report: PackageSmokeReport, opti
         join(sidecarDir, `claude-sidecar-${targetTriple}`),
         helperApp,
         options.commandRunner ?? defaultCommandRunner,
+        { requireDeveloperId: report.packageKind === 'release' },
       )
+    } else {
+      report.notes.push('The macOS Computer Use signing chain was not checked because no --arch was supplied, so the sidecar path is unknown.')
     }
+  }
+  if (options.requireMacosGatekeeper) {
     addMacosGatekeeperCheck(report, rootDir, appBundle, options.commandRunner)
   } else if (report.hostPlatform === 'macos') {
     report.notes.push('macOS Gatekeeper launch approval was not assessed. Add --require-macos-gatekeeper for release-readiness launch policy checks.')
@@ -1318,6 +1379,7 @@ function printReport(report: PackageSmokeReport) {
   }
   console.log(`[package-smoke] packageKind=${report.packageKind}`)
   console.log(`[package-smoke] product=${report.productName} version=${report.version}`)
+  if (report.productAppId) console.log(`[package-smoke] appId=${report.productAppId}`)
   console.log(`[package-smoke] artifactsDir=${report.artifactsDir}`)
 
   if (report.packagedArtifacts.length > 0) {

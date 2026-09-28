@@ -23,6 +23,7 @@ Rules closer to the code take precedence. For the directory you are changing, re
 | React documentation site and build tooling | [site/AGENTS.md](site/AGENTS.md) |
 | CI and quality policy | [.github/AGENTS.md](.github/AGENTS.md), `scripts/pr/`, `scripts/quality-gate/` |
 | Desktop releases and auto-update | `release-notes/`, `scripts/release.ts`, [release guide](docs/internals/contributing.md#发版与自动更新) |
+| ccmax customizations vs upstream (already-removed content) | [docs/agents/project.md](docs/agents/project.md), [removal record](docs/agents/upstream-removals.md) |
 
 ## Implementation Rules
 

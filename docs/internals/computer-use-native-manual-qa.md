@@ -36,7 +36,7 @@
    ```bash
    APP="desktop/build-artifacts/macos-arm64/Claude Code Haha.app"
    B="$APP/Contents/Resources/app.asar.unpacked/src-tauri/binaries"
-   for P in "$APP" "$B/claude-sidecar-aarch64-apple-darwin" "$B/cc-haha-computer-use.app"; do
+   for P in "$APP" "$B/claude-sidecar-aarch64-apple-darwin" "$B/ccmax-computer-use.app"; do
      codesign -dv "$P" 2>&1 | grep -E "^(Identifier|TeamIdentifier)="
    done
    ```
@@ -174,6 +174,6 @@ bun run check:native      # 含 swift test + build:sidecars + 打包 + smoke
 
 打完包后确认：
 ```bash
-codesign -dv --verbose=4 "<app>/Contents/Resources/**/cc-haha-computer-use.app" 2>&1 | grep Identifier
+codesign -dv --verbose=4 "<app>/Contents/Resources/**/ccmax-computer-use.app" 2>&1 | grep Identifier
 ```
 必须仍是 `dev.cchaha.cu-helper` —— 如果变了，说明 electron-builder 重签了它，用户的两项授权会全掉。

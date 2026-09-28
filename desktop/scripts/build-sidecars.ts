@@ -25,8 +25,8 @@ const binariesDir = path.join(desktopRoot, 'src-tauri', 'binaries')
 // `await buildCuHelper()` below) so it is initialized when that runs — a
 // `const` placed after the call site hits the temporal dead zone (ReferenceError).
 // SwiftPM names the resource bundle `${PackageName}_${TargetName}.bundle`.
-// Package stays `cu-helper`; the executable target is now `cc-haha-computer-use`.
-const CU_HELPER_RESOURCE_BUNDLE = 'cu-helper_cc-haha-computer-use.bundle'
+// Package stays `cu-helper`; the executable target is now `ccmax-computer-use`.
+const CU_HELPER_RESOURCE_BUNDLE = 'cu-helper_ccmax-computer-use.bundle'
 
 const targetTriple =
   process.env.SIDECAR_TARGET_TRIPLE ||
@@ -369,17 +369,22 @@ async function buildCuHelper(arch: CuHelperArch) {
   // build.sh now emits the .app BUNDLE path (Screen Recording only works for a
   // real .app bundle subject, not a bare Mach-O). Copy the WHOLE bundle — the
   // resource bundle lives inside it at Contents/Resources/, and the spawnable
-  // executable is at Contents/MacOS/cc-haha-computer-use (see cuHelperBridge.ts).
-  const destApp = path.join(binariesDir, 'cc-haha-computer-use.app')
+  // executable is at Contents/MacOS/ccmax-computer-use (see cuHelperBridge.ts).
+  const destApp = path.join(binariesDir, 'ccmax-computer-use.app')
 
   // Remove any stale copies first (incl. ALL legacy bare-binary / bundle / old
-  // -name artifacts) so `cp -R` does not nest into an existing dir.
+  // -name artifacts) so `cp -R` does not nest into an existing dir. The
+  // `cc-haha-computer-use*` entries are the pre-rename brand, kept only so an
+  // incremental build does not leave two helper bundles side by side; the
+  // `cu-helper*` entries predate the branded executable target entirely.
   await Bun.spawn(
     ['rm', '-rf',
      destApp,
-     path.join(binariesDir, 'cc-haha-computer-use'),         // legacy bare binary
-     path.join(binariesDir, 'cu-helper'),                    // legacy old-name binary
-     path.join(binariesDir, CU_HELPER_RESOURCE_BUNDLE),      // legacy sibling bundle
+     path.join(binariesDir, 'cc-haha-computer-use.app'),      // pre-rename .app
+     path.join(binariesDir, 'cc-haha-computer-use'),          // pre-rename bare binary
+     path.join(binariesDir, 'cu-helper'),                     // legacy old-name binary
+     path.join(binariesDir, CU_HELPER_RESOURCE_BUNDLE),       // stale sibling bundle
+     path.join(binariesDir, 'cu-helper_cc-haha-computer-use.bundle'), // pre-rename sibling bundle
      path.join(binariesDir, 'cu-helper_cu-helper.bundle')],
     { stderr: 'inherit' },
   ).exited
