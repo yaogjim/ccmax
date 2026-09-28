@@ -13,6 +13,11 @@ import { formatBytes } from '../lib/formatBytes'
 import { useUIStore } from '../stores/uiStore'
 import { DoctorPanel } from '../components/doctor/DoctorPanel'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+import { Modal } from '@/components/ui/Modal'
+import { TextArea } from '@/components/ui/TextArea'
+import { getDesktopHost } from '@/lib/desktopHost'
+
+const ISSUE_URL = 'https://github.com/yaogjim/ccmax/issues/new'
 
 export function DiagnosticsSettings() {
   const t = useTranslation()
@@ -24,6 +29,10 @@ export function DiagnosticsSettings() {
   const [isLoading, setIsLoading] = useState(true)
   const [isExporting, setIsExporting] = useState(false)
   const [isCopyingIssueReport, setIsCopyingIssueReport] = useState(false)
+  const [submitDialogOpen, setSubmitDialogOpen] = useState(false)
+  const [isPreparingSubmission, setIsPreparingSubmission] = useState(false)
+  const [submissionReport, setSubmissionReport] = useState<string | null>(null)
+  const [submissionBundlePath, setSubmissionBundlePath] = useState<string | null>(null)
   const [isClearing, setIsClearing] = useState(false)
   const [isRebuildingIndex, setIsRebuildingIndex] = useState(false)
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false)
@@ -177,6 +186,45 @@ export function DiagnosticsSettings() {
     }
   }
 
+  const handlePrepareSubmission = async () => {
+    if (isPreparingSubmission) return
+    setIsPreparingSubmission(true)
+    try {
+      const { report } = await diagnosticsApi.getIssueReport()
+      const { bundle } = await diagnosticsApi.exportBundle()
+      if (!mountedRef.current) return
+      setSubmissionReport(report)
+      setSubmissionBundlePath(bundle.path)
+      setLastExportPath(bundle.path)
+    } catch (error) {
+      if (mountedRef.current) {
+        addToast({
+          type: 'error',
+          message: error instanceof Error ? error.message : t('settings.diagnostics.submit.prepareFailed'),
+        })
+      }
+    } finally {
+      if (mountedRef.current) setIsPreparingSubmission(false)
+    }
+  }
+
+  const handleCopySubmissionReport = async () => {
+    if (!submissionReport) return
+    const copied = await copyTextToClipboard(submissionReport)
+    addToast({
+      type: copied ? 'success' : 'error',
+      message: t(copied ? 'settings.diagnostics.issueReportCopied' : 'settings.diagnostics.issueReportCopyFailed'),
+    })
+  }
+
+  const handleOpenIssue = async () => {
+    try {
+      await getDesktopHost().shell.open(ISSUE_URL)
+    } catch {
+      addToast({ type: 'error', message: t('settings.diagnostics.submit.openFailed') })
+    }
+  }
+
   const handleClear = async () => {
     setIsClearing(true)
     try {
@@ -298,6 +346,14 @@ export function DiagnosticsSettings() {
             <span className="material-symbols-outlined text-[16px]" aria-hidden="true">assignment</span>
             {t('settings.diagnostics.copyIssueReport')}
           </Button>
+          <Button variant="secondary" size="sm" onClick={() => {
+            setSubmissionReport(null)
+            setSubmissionBundlePath(null)
+            setSubmitDialogOpen(true)
+          }}>
+            <span className="material-symbols-outlined text-[16px]" aria-hidden="true">upload_file</span>
+            {t('settings.diagnostics.submit.button')}
+          </Button>
           <Button variant="danger" size="sm" onClick={() => setClearConfirmOpen(true)} loading={isClearing}>
             <span className="material-symbols-outlined text-[16px]" aria-hidden="true">delete</span>
             {t('settings.diagnostics.clearLogs')}
@@ -337,6 +393,48 @@ export function DiagnosticsSettings() {
           </div>
         )}
       </div>
+
+      <Modal
+        open={submitDialogOpen}
+        onClose={() => { if (!isPreparingSubmission) setSubmitDialogOpen(false) }}
+        title={t('settings.diagnostics.submit.title')}
+        footer={submissionReport !== null && submissionBundlePath !== null ? (
+          <>
+            <Button variant="secondary" disabled={!submissionReport.trim()} onClick={() => void handleCopySubmissionReport()}>
+              {t('settings.diagnostics.submit.copy')}
+            </Button>
+            <Button onClick={() => void handleOpenIssue()}>
+              {t('settings.diagnostics.submit.openIssue')}
+            </Button>
+          </>
+        ) : (
+          <Button onClick={() => void handlePrepareSubmission()} loading={isPreparingSubmission}>
+            {t('settings.diagnostics.submit.prepare')}
+          </Button>
+        )}
+      >
+        <div className="space-y-3 text-sm text-[var(--color-text-secondary)]">
+          <p>{t('settings.diagnostics.submit.instructions')}</p>
+          <p className="rounded-[var(--radius-md)] border border-[var(--color-warning)] bg-[var(--color-warning-container)] p-3 text-[var(--color-on-warning-container)]">
+            {t('settings.diagnostics.submit.privacy')}
+          </p>
+          {submissionReport !== null && submissionBundlePath !== null && (
+            <>
+              <TextArea
+                label={t('settings.diagnostics.submit.report')}
+                rows={9}
+                value={submissionReport}
+                onChange={(event) => setSubmissionReport(event.target.value)}
+              />
+              <p className="break-all font-mono text-xs">{submissionBundlePath}</p>
+              <Button variant="secondary" size="sm" onClick={() => void handleOpenDir()}>
+                {t('settings.diagnostics.submit.openFolder')}
+              </Button>
+              <p>{t('settings.diagnostics.submit.nextSteps')}</p>
+            </>
+          )}
+        </div>
+      </Modal>
 
       <ConfirmDialog
         open={rebuildConfirmOpen}

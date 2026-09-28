@@ -699,6 +699,67 @@ describe('Settings > Diagnostics tab', () => {
     }
   })
 
+  it('prepares diagnostics locally and leaves issue submission and attachment to the user', async () => {
+    const originalClipboard = navigator.clipboard
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+
+    try {
+      render(<Settings />)
+      fireEvent.click(screen.getByText('Diagnostics'))
+      fireEvent.click(await screen.findByRole('button', { name: 'Submit diagnostics' }))
+
+      const dialog = screen.getByRole('dialog', { name: 'Report a problem' })
+      expect(within(dialog).getByText(/upload immediately when selected/i)).toBeInTheDocument()
+      expect(diagnosticsApiMock.exportBundle).not.toHaveBeenCalled()
+      expect(diagnosticsApiMock.getIssueReport).not.toHaveBeenCalled()
+      expect(open).not.toHaveBeenCalled()
+
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Prepare report and bundle' }))
+      const report = await within(dialog).findByRole('textbox', { name: /Issue report/i })
+      expect(diagnosticsApiMock.getIssueReport).toHaveBeenCalledTimes(1)
+      expect(diagnosticsApiMock.exportBundle).toHaveBeenCalledTimes(1)
+      expect(within(dialog).getByText('/tmp/claude/cc-haha/diagnostics/exports/cc-haha-diagnostics.tar.gz')).toBeInTheDocument()
+      fireEvent.change(report, { target: { value: '' } })
+      expect(within(dialog).getByRole('button', { name: 'Copy report' })).toBeDisabled()
+      expect(within(dialog).queryByRole('button', { name: 'Prepare report and bundle' })).not.toBeInTheDocument()
+      fireEvent.change(report, { target: { value: 'Reviewed report without private details' } })
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Copy report' }))
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith('Reviewed report without private details'))
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Open bundle folder' }))
+      await waitFor(() => expect(diagnosticsApiMock.openLogDir).toHaveBeenCalledTimes(1))
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Open GitHub issue' }))
+      await waitFor(() => expect(open).toHaveBeenCalledWith(
+        'https://github.com/yaogjim/ccmax/issues/new', '_blank', 'noopener,noreferrer',
+      ))
+      expect(open).toHaveBeenCalledTimes(1)
+    } finally {
+      open.mockRestore()
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: originalClipboard })
+    }
+  })
+
+  it('does not open GitHub or show a stale report if preparation fails', async () => {
+    diagnosticsApiMock.exportBundle.mockRejectedValueOnce(new Error('disk full'))
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    try {
+      render(<Settings />)
+      fireEvent.click(screen.getByText('Diagnostics'))
+      fireEvent.click(await screen.findByRole('button', { name: 'Submit diagnostics' }))
+      const dialog = screen.getByRole('dialog', { name: 'Report a problem' })
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Prepare report and bundle' }))
+      await waitFor(() => expect(useUIStore.getState().toasts.at(-1)?.message).toBe('disk full'))
+      expect(within(dialog).queryByRole('button', { name: 'Open GitHub issue' })).not.toBeInTheDocument()
+      expect(within(dialog).queryByRole('textbox')).not.toBeInTheDocument()
+      expect(open).not.toHaveBeenCalled()
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Prepare report and bundle' }))
+      expect(await within(dialog).findByRole('textbox', { name: /Issue report/i })).toBeInTheDocument()
+    } finally {
+      open.mockRestore()
+    }
+  })
+
   it('copies the exact Event ID and reports success', async () => {
     const originalClipboard = navigator.clipboard
     const writeText = vi.fn().mockResolvedValue(undefined)
