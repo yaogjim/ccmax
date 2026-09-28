@@ -16,13 +16,22 @@
 import { isSiteRoot, toSiteHref } from './site.js'
 
 export const LOCALE_STORAGE_KEY = 'cch-locale'
+export const DEFAULT_LOCALE = 'en'
 
 /** BCP-47 里中文一律是 zh / zh-CN / zh-TW / zh-Hans…，但 zhuang 之类不算。 */
-const CHINESE_TAG = /^zh(?:-|$)/i
+const CHINESE_TAG = /^zh(?:[-_]|$)/i
 
 export function prefersChinese(languages) {
   if (!Array.isArray(languages)) return false
   return languages.some((tag) => typeof tag === 'string' && CHINESE_TAG.test(tag.trim()))
+}
+
+/** 浏览器首选语言 → 'zh' / 'en'。有语言列表时按列表判断，否则退回 language。 */
+export function resolveBrowserLocale({ language, languages } = {}) {
+  if (Array.isArray(languages) && languages.length > 0) {
+    return prefersChinese(languages) ? 'zh' : DEFAULT_LOCALE
+  }
+  return CHINESE_TAG.test(String(language ?? '').trim()) ? 'zh' : DEFAULT_LOCALE
 }
 
 export function normalizeStoredLocale(value) {
@@ -32,10 +41,10 @@ export function normalizeStoredLocale(value) {
 /**
  * 站点根该跳去哪；返回 null 表示留在原地（中文站）或不接管该路径。
  */
-export function resolveRootRedirect({ languages, pathname, stored }) {
+export function resolveRootRedirect({ languages, language, pathname, stored }) {
   if (!isSiteRoot(pathname)) return null
 
-  const locale = normalizeStoredLocale(stored) || (prefersChinese(languages) ? 'zh' : 'en')
+  const locale = normalizeStoredLocale(stored) || resolveBrowserLocale({ language, languages })
   return locale === 'en' ? toSiteHref('/en') : null
 }
 

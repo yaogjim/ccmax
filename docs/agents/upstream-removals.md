@@ -26,7 +26,7 @@ order: 2
 | 版本号右侧 | 「更新日志」链接（跳 GitHub Releases，键 `settings.about.changelog`） | 已移除 |
 | 版本行下方 | GitHub 仓库卡片：仓库名 + 求 Star 提示 | `9c0ec627` 首次移除 → `3d800209` 带回 → 已再次移除 |
 | 更新卡片下方 | 「反馈问题」卡片（跳 GitHub Issues） | `9c0ec627` 首次移除 → `3d800209` 带回 → 已再次移除 |
-| 页面下半部分 | 作者区（`AUTHOR_GITHUB`、`程序员阿江-Relakkes`）与社交入口（`SOCIAL_LINKS`：Bilibili / Douyin / Xiaohongshu） | `9c0ec627` 移除，目前未被带回 |
+| 页面下半部分 | 作者区（`AUTHOR_GITHUB`、`程序员阿江-Relakkes`）与社交入口（`SOCIAL_LINKS`：Bilibili / Douyin / Xiaohongshu）；上游新增的企业微信群二维码入口及 `desktop/public/icons/wechat-group-qr.png` 图片 | `9c0ec627` 首次移除；合并 0.6.7 时继续保持移除 |
 
 保留、不要一起删掉：`BrandSeal` 标记、`ccmax` 标题、版本号、「应用更新」卡片（含「检查更新」和「高级更新代理」）。
 
@@ -55,6 +55,7 @@ order: 2
 | `THIRD_PARTY_LICENSES.md` | 已删除 | `d9f9af52` 删除该文件 |
 | `desktop/src-tauri/tauri.release-ci.json` | 已删除 | `3d800209` 删除该文件 |
 | `docs/public/CNAME` | 已删除，站点构建不生成 CNAME | `3d800209` 删除该文件 |
+| `site/scripts/generate-docs-manifest.mjs` | `excludedDirectoryNames` 必须含 `agents`：`docs/agents/`（本文件与 `project.md`）是内部项目材料，不进 `docs-index.js`、搜索索引、sitemap 或 `dist/agents/` | `check-docs.mjs` 的「docs/agents must stay out of the published manifest」断言 |
 | Tauri 未发布更新器接线：`updater` 配置、capability `updater:default`、`tauri-plugin-updater` 依赖、`tauri_plugin_updater` 初始化 | 保持不接线 | `desktop/src-tauri/tauri-config.test.ts` 的「disables the unpublished Tauri updater wiring completely」逐项固定 |
 
 品牌、产品名、仓库地址、包标识和数据目录这些**改名**要求不在本清单内，见 [`project.md`](./project.md) 的「项目覆盖规则」。
@@ -67,6 +68,7 @@ order: 2
 grep -rn "github.com" desktop/src/components/layout/Sidebar.tsx
 grep -rn "yaogjim/ccmax" desktop/src/pages/settings/ --exclude="*.test.tsx"
 grep -rn "settings\.about\.\(changelog\|starHint\|feedback\)" desktop/src/i18n/locales/
+grep -n "excludedDirectoryNames" site/scripts/generate-docs-manifest.mjs   # 结果里必须有 agents
 ```
 
 再跑回归测试（在 `desktop/` 下）：

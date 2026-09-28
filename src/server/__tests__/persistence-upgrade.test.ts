@@ -13,8 +13,11 @@ import {
 import {
   CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
   ensurePersistentStorageUpgraded,
+  findUnmigratedLegacySessionCollaborationState,
+  migrateLegacySessionCollaborationState,
   resetPersistentStorageMigrationsForTests,
 } from '../services/persistentStorageMigrations.js'
+import { exclusivePublish } from '../services/localIndex/sqliteFamilyMigration.js'
 import {
   NOTIFICATION_DELIVERY_SCHEMA_VERSION,
   NotificationDeliveryStore,
@@ -229,6 +232,7 @@ describe('persistent storage upgrade migrations', () => {
           },
         }],
         providerOrder: ['provider-current', 'claude-official', 'openai-official', 'grok-official'],
+        officialProviderModels: {},
       }, null, 2),
       'utf-8',
     )
@@ -466,6 +470,7 @@ describe('persistent storage upgrade migrations', () => {
     expect(migrated.providers[0].futureProvider).toBe('keep')
     expect(migrated.futureRoot).toEqual({ keep: true })
     expect(migrated.providers[1].requestCompatibility.futureParameter).toBe('keep')
+    expect(migrated.officialProviderModels).toEqual({})
     const backups = (await fs.readdir(dir)).filter(name => name.startsWith('providers.json.bak-before-migration-'))
     expect(backups).toHaveLength(1)
     expect(JSON.parse(await fs.readFile(path.join(dir, backups[0]!), 'utf8'))).toEqual(legacy)
@@ -520,6 +525,182 @@ describe('persistent storage upgrade migrations', () => {
     const listed = await service.listProviders()
     expect(listed.activeId).toBe('copied-provider')
     expect(listed.providers[0]?.name).toBe('Copied Provider')
+  })
+
+  test('copies a legacy-only collaboration inbox into ccmax verbatim and keeps the legacy file', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    const ccmaxDir = path.join(tempDir, 'ccmax')
+    await fs.mkdir(path.join(ccHahaDir, 'session-collaboration'), { recursive: true })
+    // A populated primary dir means the whole-dir copy cannot run, so this only
+    // passes when the dedicated inbox migration exists.
+    await fs.mkdir(ccmaxDir, { recursive: true })
+    const legacyRaw = JSON.stringify({
+      version: 1,
+      revision: 3,
+      members: { worker: { sessionId: 'worker', rootSessionId: 'worker', parentSessionId: null, state: 'idle', stopped: false } },
+      messages: [{
+        id: 'legacy-1',
+        sourceSessionId: 'sender',
+        targetSessionId: 'worker',
+        content: 'before the rename',
+        kind: 'message',
+        status: 'consumed',
+        createdAt: '2024-01-01T00:00:00.000Z',
+      }],
+      futureStoreField: { keep: true },
+    })
+    await fs.writeFile(path.join(ccHahaDir, 'session-collaboration', 'state.json'), legacyRaw, 'utf-8')
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    expect(report.migratedEntries).toContain('cc-haha/session-collaboration/state.json -> ccmax/session-collaboration/state.json')
+    const primary = path.join(ccmaxDir, 'session-collaboration', 'state.json')
+    // Verbatim: unknown fields and formatting survive byte-for-byte.
+    expect(await fs.readFile(primary, 'utf-8')).toBe(legacyRaw)
+    expect(JSON.parse(await fs.readFile(primary, 'utf-8')).futureStoreField).toEqual({ keep: true })
+    // The legacy file is neither rewritten nor removed.
+    expect(await fs.readFile(path.join(ccHahaDir, 'session-collaboration', 'state.json'), 'utf-8')).toBe(legacyRaw)
+    // No temp sibling is left behind.
+    const leftovers = (await listFiles(path.join(ccmaxDir, 'session-collaboration')))
+      .filter((file) => file.includes('.migrating-'))
+    expect(leftovers).toEqual([])
+
+    // A second pass is a no-op because the canonical file now exists.
+    resetPersistentStorageMigrationsForTests()
+    const second = await ensurePersistentStorageUpgraded()
+    expect(second.migratedEntries).not.toContain('cc-haha/session-collaboration/state.json -> ccmax/session-collaboration/state.json')
+    expect(await fs.readFile(primary, 'utf-8')).toBe(legacyRaw)
+  })
+
+  test('never overwrites an existing ccmax collaboration inbox with the legacy one', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    const ccmaxDir = path.join(tempDir, 'ccmax')
+    await fs.mkdir(path.join(ccHahaDir, 'session-collaboration'), { recursive: true })
+    await fs.mkdir(path.join(ccmaxDir, 'session-collaboration'), { recursive: true })
+    const legacyRaw = JSON.stringify({ members: {}, messages: [{ id: 'legacy-1' }] })
+    const primaryRaw = JSON.stringify({ members: {}, messages: [{ id: 'primary-1' }] })
+    await fs.writeFile(path.join(ccHahaDir, 'session-collaboration', 'state.json'), legacyRaw, 'utf-8')
+    await fs.writeFile(path.join(ccmaxDir, 'session-collaboration', 'state.json'), primaryRaw, 'utf-8')
+
+    const report = await ensurePersistentStorageUpgraded()
+
+    expect(report.failures).toEqual([])
+    expect(report.migratedEntries).not.toContain('cc-haha/session-collaboration/state.json -> ccmax/session-collaboration/state.json')
+    expect(await fs.readFile(path.join(ccmaxDir, 'session-collaboration', 'state.json'), 'utf-8')).toBe(primaryRaw)
+    expect(await fs.readFile(path.join(ccHahaDir, 'session-collaboration', 'state.json'), 'utf-8')).toBe(legacyRaw)
+  })
+
+  test('publishes the migrated inbox with an exclusive hard link that cannot replace a file created mid-flight', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    await fs.mkdir(path.join(ccHahaDir, 'session-collaboration'), { recursive: true })
+    const legacyRaw = JSON.stringify({ members: {}, messages: [{ id: 'legacy-1' }] })
+    await fs.writeFile(path.join(ccHahaDir, 'session-collaboration', 'state.json'), legacyRaw, 'utf-8')
+    const primary = path.join(tempDir, 'ccmax', 'session-collaboration', 'state.json')
+    const concurrentRaw = JSON.stringify({ members: {}, messages: [{ id: 'concurrent-1' }] })
+
+    const report = { migratedEntries: [] as string[], failures: [] as string[] }
+    // Regression anchor: the previous rename-based publish replaced any file
+    // created between the `pathExists(primary)` check and the publish itself.
+    // The injected committer creates that file at exactly that instant.
+    await migrateLegacySessionCollaborationState(tempDir, report, {
+      commitFile: async (tempPath, finalPath) => {
+        await fs.writeFile(finalPath, concurrentRaw, 'utf-8')
+        await exclusivePublish(tempPath, finalPath)
+      },
+    })
+
+    expect(report.failures).toEqual([])
+    // The concurrent writer's file must still be there — the rename-based
+    // publish this replaced would have overwritten it with the legacy copy.
+    expect(await fs.readFile(primary, 'utf-8')).toBe(concurrentRaw)
+    expect(report.migratedEntries).toEqual([])
+    expect(await fs.readFile(path.join(ccHahaDir, 'session-collaboration', 'state.json'), 'utf-8')).toBe(legacyRaw)
+    const leftovers = (await listFiles(path.join(tempDir, 'ccmax', 'session-collaboration')))
+      .filter((file) => file.includes('.migrating-'))
+    expect(leftovers).toEqual([])
+  })
+
+  test('the default publish is exclusive, so a pre-existing inbox survives a direct migration call', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    const ccmaxDir = path.join(tempDir, 'ccmax')
+    await fs.mkdir(path.join(ccHahaDir, 'session-collaboration'), { recursive: true })
+    await fs.mkdir(path.join(ccmaxDir, 'session-collaboration'), { recursive: true })
+    const legacyRaw = JSON.stringify({ members: {}, messages: [{ id: 'legacy-1' }] })
+    const primaryRaw = JSON.stringify({ members: {}, messages: [{ id: 'primary-1' }] })
+    await fs.writeFile(path.join(ccHahaDir, 'session-collaboration', 'state.json'), legacyRaw, 'utf-8')
+    await fs.writeFile(path.join(ccmaxDir, 'session-collaboration', 'state.json'), primaryRaw, 'utf-8')
+
+    const report = { migratedEntries: [] as string[], failures: [] as string[] }
+    await migrateLegacySessionCollaborationState(tempDir, report)
+
+    expect(report.failures).toEqual([])
+    expect(report.migratedEntries).toEqual([])
+    expect(await fs.readFile(path.join(ccmaxDir, 'session-collaboration', 'state.json'), 'utf-8')).toBe(primaryRaw)
+  })
+
+  test('reports a real publish failure instead of silently skipping the inbox', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    await fs.mkdir(path.join(ccHahaDir, 'session-collaboration'), { recursive: true })
+    await fs.writeFile(path.join(ccHahaDir, 'session-collaboration', 'state.json'), '{"members":{}}', 'utf-8')
+
+    const report = { migratedEntries: [] as string[], failures: [] as string[] }
+    await migrateLegacySessionCollaborationState(tempDir, report, {
+      commitFile: async () => { throw new Error('link is not supported on this filesystem') },
+    })
+
+    expect(report.migratedEntries).toEqual([])
+    expect(report.failures).toEqual([
+      'cc-haha/session-collaboration/state.json: link is not supported on this filesystem',
+    ])
+    const leftovers = (await listFiles(path.join(tempDir, 'ccmax', 'session-collaboration')))
+      .filter((file) => file.includes('.migrating-'))
+    expect(leftovers).toEqual([])
+  })
+
+  test('surfaces the legacy inbox as unmigrated when the copy fails, leaving both stores untouched', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    await fs.mkdir(path.join(ccHahaDir, 'session-collaboration'), { recursive: true })
+    const legacyPath = path.join(ccHahaDir, 'session-collaboration', 'state.json')
+    const legacyRaw = JSON.stringify({
+      version: 1,
+      revision: 1,
+      members: { worker: { sessionId: 'worker', rootSessionId: 'worker', parentSessionId: null, state: 'idle', stopped: false } },
+      messages: [{
+        id: 'legacy-1', sourceSessionId: 'sender', targetSessionId: 'worker',
+        content: 'queued before the rename', kind: 'message', status: 'queued',
+        createdAt: '2024-01-01T00:00:00.000Z',
+      }],
+    })
+    await fs.writeFile(legacyPath, legacyRaw, 'utf-8')
+
+    const report = { migratedEntries: [] as string[], failures: [] as string[] }
+    await migrateLegacySessionCollaborationState(tempDir, report, {
+      commitFile: async () => { throw new Error('link is not supported on this filesystem') },
+    })
+
+    // Regression anchor: this failure used to be a report-only entry, so the
+    // host started with an empty canonical store that a later write persisted.
+    expect(await findUnmigratedLegacySessionCollaborationState(report, tempDir)).toBe(legacyPath)
+    const primary = path.join(tempDir, 'ccmax', 'session-collaboration', 'state.json')
+    expect(await pathExists(primary)).toBe(false)
+    expect(await fs.readFile(legacyPath, 'utf-8')).toBe(legacyRaw)
+  })
+
+  test('an unrelated migration failure never marks a legacy inbox as unmigrated', async () => {
+    const ccHahaDir = path.join(tempDir, 'cc-haha')
+    await fs.mkdir(path.join(ccHahaDir, 'session-collaboration'), { recursive: true })
+    await fs.writeFile(
+      path.join(ccHahaDir, 'session-collaboration', 'state.json'),
+      JSON.stringify({ members: {}, messages: [{ id: 'legacy-1' }] }),
+      'utf-8',
+    )
+
+    const report = {
+      migratedEntries: [] as string[],
+      failures: ['ccmax/providers.json: provider index is unreadable'],
+    }
+    expect(await findUnmigratedLegacySessionCollaborationState(report, tempDir)).toBeUndefined()
   })
 
   test('does not overwrite an existing ccmax dir when legacy cc-haha is also present', async () => {
@@ -764,6 +945,42 @@ describe('persistent storage upgrade migrations', () => {
     const readBack = await store.read()
     expect(readBack.schemaVersion).toBe(NOTIFICATION_DELIVERY_SCHEMA_VERSION)
     expect(readBack.records).toEqual([])
+  })
+
+  test('preserves valid OAuth model mappings and unknown future entries while dropping malformed known entries', async () => {
+    const dir = path.join(tempDir, 'cc-haha')
+    const file = path.join(dir, 'providers.json')
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(file, JSON.stringify({
+      schemaVersion: 5,
+      activeId: 'openai-official',
+      providers: [],
+      providerOrder: ['openai-official'],
+      officialProviderModels: {
+        'openai-official': {
+          main: 'gpt-6-astra',
+          haiku: 'gpt-6-luna',
+          sonnet: 'gpt-6-sol',
+          opus: 'gpt-6-astra',
+        },
+        'grok-official': { main: 42 },
+        'future-official': { main: 'future-model' },
+      },
+    }))
+
+    const report = await ensurePersistentStorageUpgraded()
+    expect(report.failures).toEqual([])
+    const migrated = JSON.parse(await fs.readFile(file, 'utf8'))
+    expect(migrated.schemaVersion).toBe(CURRENT_PROVIDER_INDEX_SCHEMA_VERSION)
+    expect(migrated.officialProviderModels).toEqual({
+      'openai-official': {
+        main: 'gpt-6-astra',
+        haiku: 'gpt-6-luna',
+        sonnet: 'gpt-6-sol',
+        opus: 'gpt-6-astra',
+      },
+      'future-official': { main: 'future-model' },
+    })
   })
 })
 

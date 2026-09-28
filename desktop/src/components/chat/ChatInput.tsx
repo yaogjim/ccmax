@@ -1,3 +1,7 @@
+import { useSideChatStore } from '@/stores/sideChatStore'
+import { openSideChat } from '@/lib/workspace/openSideChat'
+import { parseSideQuestionCommand } from './composerUtils'
+import { getSessionReferences } from '@/lib/composerMentions'
 import { isComposerReferenceVisible, isComposerSlashCommandVisible } from '@/lib/composerCapabilityVisibility'
 import { useState, useRef, useEffect, useCallback, useMemo, useId } from 'react'
 import { useDismissable } from '@/hooks/useDismissable'
@@ -14,6 +18,7 @@ import { useUIStore } from '../../stores/uiStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useSessionRuntimeStore } from '../../stores/sessionRuntimeStore'
 import { useTeamStore } from '../../stores/teamStore'
+import { useTeamPlanStore } from '@/stores/teamPlanStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import {
   formatWorkspaceReferencePrompt,
@@ -78,6 +83,8 @@ type Attachment = ComposerAttachment
 type ChatInputProps = {
   variant?: 'default' | 'hero'
   compact?: boolean
+  sessionId?: string
+  visible?: boolean
 }
 
 const EMPTY_COMPOSER_REFERENCES: ComposerReferenceCandidate[] = []
@@ -108,6 +115,7 @@ function workspaceReferenceToAttachment(reference: WorkspaceChatReference): Atta
   return {
     id: reference.id,
     name: reference.name,
+    referenceKind: reference.kind === 'chat-selection' ? 'chat-selection' : undefined,
     type: 'file',
     path: reference.kind === 'chat-selection' ? undefined : reference.path,
     isDirectory: reference.isDirectory,
@@ -135,7 +143,7 @@ function insertComposerTokenAtRange(value: string, start: number, end: number, t
   }
 }
 
-export function ChatInput({ variant = 'default', compact = false }: ChatInputProps) {
+export function ChatInput({ variant = 'default', compact = false, sessionId, visible = true }: ChatInputProps) {
   const t = useTranslation()
   const isMobileComposer = useMobileViewport() && !isDesktopRuntime()
   // The shell, not the panel inside it: the panel's own `max-w` changes with
@@ -205,9 +213,10 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     sendQueuedUserMessage,
     setPreparingTurn,
   } = useChatStore()
-  const activeTabId = useTabStore((s) => s.activeTabId)
+  const selectedTabId = useTabStore((s) => s.activeTabId)
+  const activeTabId = sessionId ?? selectedTabId
   const activeTabType = useTabStore((s) =>
-    s.tabs.find((tab) => tab.sessionId === s.activeTabId)?.type,
+    s.tabs.find((tab) => tab.sessionId === (sessionId ?? s.activeTabId))?.type,
   )
   const sessionState = useChatStore((s) => activeTabId ? s.sessions[activeTabId] : undefined)
   const repositoryLaunchDraft = sessionState?.repositoryLaunchDraft
@@ -235,7 +244,9 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     ? `${runtimeSelection.providerId ?? 'official'}:${runtimeSelection.modelId}:${runtimeSelection.effortLevel ?? 'auto'}`
     : undefined
   const runtimeModelLabel = runtimeSelection?.modelId ?? currentModel?.name ?? currentModel?.id
-  const activeSession = useSessionStore((state) => activeTabId ? state.sessions.find((session) => session.id === activeTabId) ?? null : null)
+  const sideChat = useSideChatStore(state => activeTabId ? state.entries[activeTabId] : undefined)
+  const listedSession = useSessionStore((state) => activeTabId ? state.sessions.find((session) => session.id === activeTabId) ?? null : null)
+  const activeSession = listedSession ?? (sideChat ? { ...sideChat, id: sideChat.sessionId, workDirExists: true, workspaceState: 'available' as const, messageCount: 1, projectRoot: sideChat.workDir } : null)
   const loadedMessageCount = sessionState?.messages?.length ?? 0
   const messageCount = Math.max(loadedMessageCount, activeSession?.messageCount ?? 0)
   const memberInfo = useTeamStore((s) => activeTabId ? s.getMemberBySessionId(activeTabId) : null)
@@ -284,6 +295,12 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   const isMemberSession = !!memberInfo || activeTabType === 'subagent'
   const isActive = chatState !== 'idle'
   const hasRunningSubagents = hasRunningSubagentTasks(sessionState?.backgroundAgentTasks)
+  // Approved team processes are tracked by their plan, not background-agent
+  // notifications. Keep Stop available after the review card is dismissed.
+  const hasRunningTeam = useTeamPlanStore(state => {
+    const plan = activeTabId ? state.bySession[activeTabId]?.plan : undefined
+    return plan?.state === 'launching' || plan?.state === 'running'
+  })
   const workspaceState = getSessionWorkspaceState(activeSession)
   const isWorkspaceMissing = workspaceState !== 'available'
   // Both composer branches (hero and inline) and the drop handler share this:
@@ -293,7 +310,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   const hasWorkspaceReferences = !isMemberSession && workspaceReferences.length > 0
   const isHeroComposer = variant === 'hero' && !isMemberSession && !compact
   const resolvedWorkDir = activeSession?.workDir || gitInfo?.workDir || undefined
-  const showLaunchControls = !isMemberSession && messageCount === 0
+  const showLaunchControls = !isMemberSession && !sideChat && messageCount === 0
   // Two different questions, and they used to share one answer.
   //
   // `useCompactChrome` is about context: the shell's padding, its top divider
@@ -407,8 +424,14 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   }, [mentions])
 
   useEffect(() => {
-    composerRef.current?.focus()
-  }, [isActive])
+    if (visible) composerRef.current?.focus()
+  }, [activeTabId, visible])
+
+  useEffect(() => {
+    if (visible) return
+    const focused = document.activeElement
+    if (focused instanceof HTMLElement && panelRef.current?.contains(focused)) focused.blur()
+  }, [visible])
 
   useEffect(() => {
     if (!composerPrefill || !activeTabId) return
@@ -438,7 +461,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     setAtCursorPos(-1)
 
     requestAnimationFrame(() => {
-      composerRef.current?.focus()
+      if (visible) composerRef.current?.focus()
       if (composerPrefill.mode !== 'append') {
         composerRef.current?.setSelectionOffsets(composerPrefill.text.length)
       }
@@ -450,6 +473,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     composerPrefill,
     setComposerAttachments,
     setComposerInput,
+    visible,
   ])
 
   useEffect(() => {
@@ -472,7 +496,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     clearComposerInsertion(activeTabId, composerInsertion.nonce)
 
     requestAnimationFrame(() => {
-      composerRef.current?.focus()
+      if (visible) composerRef.current?.focus()
       composerRef.current?.setSelectionOffsets(next.cursorPos)
     })
   }, [
@@ -480,6 +504,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     addWorkspaceReference,
     clearComposerInsertion,
     composerInsertion,
+    visible,
     isMemberSession,
     setComposerInput,
   ])
@@ -779,6 +804,17 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     const text = input.trim()
     if ((!text && ((!attachments.length && !hasWorkspaceReferences) || isMemberSession)) || isWorkspaceMissing) return
 
+    // Immediate local command: never enter the main turn, launch flow or queue.
+    const sideQuestion = !isMemberSession ? parseSideQuestionCommand(text) : null
+    if (sideQuestion !== null && activeTabId) {
+      void openSideChat(sideChat?.parentSessionId ?? activeTabId, { question: sideQuestion || undefined, submit: true })
+      setComposerInput('', [])
+      setSlashMenuOpen(false)
+      setFileSearchOpen(false)
+      setPlusMenuOpen(false)
+      return
+    }
+
     if (pendingSlashUiAction?.type === 'panel') {
       setLocalSlashPanel(pendingSlashUiAction.command as LocalSlashCommandName)
       setComposerInput('', [])
@@ -815,6 +851,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     // Inline @-mentions travel as the `@"absolute path"` text the CLI already
     // parses. Serialized from the live document — only the doc knows which
     // `@label` is a pill and which is literal text the user typed.
+    const sessionReferences = getSessionReferences(input, mentions)
     const serializedText = (composerRef.current?.getModelContent() ?? input).trim()
     const contentForModel = [workspaceReferencePrompt, serializedText].filter(Boolean).join('\n\n')
     const displayContent = text || (
@@ -847,9 +884,10 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
       }))
     const visibleAttachmentPayload: AttachmentRef[] = [
       ...uploadAttachmentPayload,
-      ...workspaceReferences.map((reference) => ({
+      ...workspaceReferences.map((reference): AttachmentRef => ({
         type: 'file' as const,
         name: reference.name,
+        referenceKind: reference.kind === 'chat-selection' ? 'chat-selection' : undefined,
         path: reference.kind === 'chat-selection' ? undefined : reference.path,
         isDirectory: reference.isDirectory,
         lineStart: reference.lineStart,
@@ -900,12 +938,14 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     if (!isMemberSession && targetChatState !== 'idle') {
       queueUserMessage(targetSessionId, {
         content: contentForModel,
+        sessionReferences,
         attachments: [...uploadAttachmentPayload, ...workspaceAttachmentPayload],
         displayContent,
         displayAttachments: visibleAttachmentPayload,
       })
     } else {
       sendMessage(targetSessionId, contentForModel, [...uploadAttachmentPayload, ...workspaceAttachmentPayload], {
+        sessionReferences,
         displayContent,
         displayAttachments: visibleAttachmentPayload,
       })
@@ -1020,7 +1060,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     void filesToComposerAttachments(files)
       .then((nextAttachments) => {
         if (pasteGeneration !== pasteGenerationRef.current) return
-        if (pastedSessionId !== useTabStore.getState().activeTabId) return
+        if (pastedSessionId !== previousActiveTabIdRef.current) return
         if (nextAttachments.length === 0) return
         setComposerAttachments((prev) => [...prev, ...nextAttachments])
       })
@@ -1031,8 +1071,10 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   }
 
   const appendFiles = useCallback((files: FileList | File[]) => {
+    const generation = pasteGenerationRef.current
     void filesToComposerAttachments(files)
       .then((nextAttachments) => {
+        if (generation !== pasteGenerationRef.current) return
         if (nextAttachments.length === 0) return
         setComposerAttachments((prev) => [...prev, ...nextAttachments])
       })
@@ -1062,8 +1104,10 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
       return
     }
 
+    const generation = pasteGenerationRef.current
     void selectNativeFileAttachments()
       .then((nativeAttachments) => {
+        if (generation !== pasteGenerationRef.current) return
         if (nativeAttachments) {
           if (nativeAttachments.length > 0) {
             setComposerAttachments((prev) => [...prev, ...nativeAttachments])
@@ -1193,11 +1237,8 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
         className={
           isHeroComposer
             ? 'mx-auto flex w-full max-w-3xl flex-col'
-          : compact
-              ? 'mx-auto max-w-full'
-              // 900px matches the transcript column above it; at 860 the
-              // composer sat 20px narrower on each side than the messages.
-              : `${isMobileComposer ? 'mx-0 max-w-none' : 'mx-auto max-w-[900px]'}`
+            // Match the transcript even while a side panel tightens padding.
+            : `${isMobileComposer ? 'mx-0 max-w-none' : 'mx-auto max-w-[var(--chat-content-max-width)]'}`
         }
       >
         <div
@@ -1419,7 +1460,10 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
                 rootRef={composerContainerRef}
                 value={input}
                 mentions={mentions}
-                onMentionClick={setReferenceDetail}
+                onMentionClick={mention => {
+                  if (mention.kind === 'session' && mention.id) useTabStore.getState().openTab(mention.id, mention.label)
+                  else setReferenceDetail(mention)
+                }}
                 onChange={handleComposerChange}
                 onKeyDown={handleComposerKeyDown}
                 onPaste={handleComposerPaste}
@@ -1432,7 +1476,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
                 // break-word` does not shrink it. Without this the flex item
                 // refuses to shrink and the whole editor paints past the panel.
                 className="flex-1 min-w-0"
-                editorClassName="max-h-[200px] overflow-y-auto py-2 leading-relaxed text-[var(--color-text-primary)]"
+                editorClassName="chat-reading-text max-h-[200px] overflow-y-auto py-2 leading-relaxed text-[var(--color-text-primary)]"
                 aria={{
                   role: isSlashMenuVisible || isReferenceMenuVisible ? 'combobox' : 'textbox',
                   'aria-autocomplete': isSlashMenuVisible || isReferenceMenuVisible ? 'list' : undefined,
@@ -1450,7 +1494,10 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
               rootRef={composerContainerRef}
               value={input}
               mentions={mentions}
-              onMentionClick={setReferenceDetail}
+              onMentionClick={mention => {
+                  if (mention.kind === 'session' && mention.id) useTabStore.getState().openTab(mention.id, mention.label)
+                  else setReferenceDetail(mention)
+                }}
               onChange={handleComposerChange}
               onKeyDown={handleComposerKeyDown}
               onPaste={handleComposerPaste}
@@ -1458,7 +1505,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
               onCompositionEnd={() => { composingRef.current = false }}
               placeholder={composerPlaceholder}
               disabled={composerDisabled}
-              editorClassName={`max-h-[200px] overflow-y-auto text-sm leading-relaxed text-[var(--color-text-primary)] ${
+              editorClassName={`chat-reading-text max-h-[200px] overflow-y-auto text-sm leading-relaxed text-[var(--color-text-primary)] ${
                 useCompactChrome ? 'py-1.5' : 'py-2'
               }`}
               aria={{
@@ -1546,7 +1593,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
                   </div>
 
                   <div className="shrink-0">
-                    <PermissionModeSelector compact={useCompactControls} />
+                    <PermissionModeSelector sessionId={activeTabId ?? undefined} workDir={resolvedWorkDir} compact={useCompactControls} />
                   </div>
 
                   {showLocationInToolbar && (
@@ -1604,12 +1651,13 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
                 <ModelSelector
                   ref={modelSelectorRef}
                   runtimeKey={activeTabId}
+                  lockedProviderId={sideChat ? runtimeSelection?.providerId ?? null : undefined}
                   disabled={isActive}
                   compact={useCompactControls}
                   fluid
                 />
               )}
-              {!isMemberSession && !isActive && hasRunningSubagents ? (
+              {!isMemberSession && !isActive && (hasRunningSubagents || hasRunningTeam) ? (
                 <Button
                   variant="danger"
                   size="base"

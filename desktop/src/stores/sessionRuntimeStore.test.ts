@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionListItem } from '../types/session'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
+import { registerSideChatSession, unregisterSideChatSession } from '../lib/sideChatSessions'
 
 const EXPECTED_GROK_SELECTION = {
   providerId: 'grok-official',
-  modelId: 'grok-4.6',
+  modelId: 'grok-4.7',
   effortLevel: 'high',
 }
 
@@ -12,6 +13,19 @@ describe('sessionRuntimeStore runtime cleanup', () => {
   beforeEach(() => {
     localStorage.clear()
     useSessionRuntimeStore.setState({ selections: {} })
+  })
+
+  it('keeps side-chat models in memory without changing the stored parent choice, even after close', () => {
+    const store = useSessionRuntimeStore.getState()
+    const parent = { providerId: 'example', modelId: 'parent-model' }
+    store.setSelection('parent', parent)
+    registerSideChatSession('side-runtime-test', 'parent')
+    store.setSelection('side-runtime-test', { providerId: 'example', modelId: 'side-model' })
+    expect(useSessionRuntimeStore.getState().selections['side-runtime-test']?.modelId).toBe('side-model')
+    expect(JSON.parse(localStorage.getItem('ccmax-session-runtime')!)).toEqual({ parent })
+    unregisterSideChatSession('side-runtime-test')
+    store.setSelection('side-runtime-test', { providerId: 'example', modelId: 'late-update' })
+    expect(JSON.parse(localStorage.getItem('ccmax-session-runtime')!)).toEqual({ parent })
   })
 
   it('keeps an explicit model choice through stale, matching, then stale metadata refreshes', () => {
@@ -61,20 +75,23 @@ describe('sessionRuntimeStore runtime cleanup', () => {
     expect(useSessionRuntimeStore.getState().selections[metadata.id]).toEqual({ providerId: 'kimi', modelId: 'k3' })
   })
 
-  it('discards retired Grok selections before persisting them', () => {
-    useSessionRuntimeStore.getState().setSelection('session-grok', {
-      providerId: 'grok-official',
-      modelId: 'grok-build',
-      effortLevel: 'max',
-    })
+  it.each(['grok-build', 'grok-composer-2.5-fast'])(
+    'discards the retired Grok model %s before persisting it',
+    (retiredModelId) => {
+      useSessionRuntimeStore.getState().setSelection('session-grok', {
+        providerId: 'grok-official',
+        modelId: retiredModelId,
+        effortLevel: 'max',
+      })
 
-    expect(useSessionRuntimeStore.getState().selections['session-grok']).toEqual(
-      EXPECTED_GROK_SELECTION,
-    )
-    expect(JSON.parse(localStorage.getItem('ccmax-session-runtime')!)).toEqual({
-      'session-grok': EXPECTED_GROK_SELECTION,
-    })
-  })
+      expect(useSessionRuntimeStore.getState().selections['session-grok']).toEqual(
+        EXPECTED_GROK_SELECTION,
+      )
+      expect(JSON.parse(localStorage.getItem('ccmax-session-runtime')!)).toEqual({
+        'session-grok': EXPECTED_GROK_SELECTION,
+      })
+    },
+  )
 
   it('does not let retired Grok session metadata restore the removed model', () => {
     useSessionRuntimeStore.getState().syncFromSessions([{

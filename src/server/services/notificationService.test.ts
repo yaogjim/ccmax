@@ -141,7 +141,7 @@ describe('notificationService', () => {
       await fs.writeFile(path.join(tmpDir, 'settings.json'), JSON.stringify({
         network: { proxy: { mode, url: manualUrl } },
       }))
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
       const capture = (async (input: string | URL | Request, init?: RequestInit) => {
         seen.push({ url: String(input), proxy: (init as RequestInit & { proxy?: string })?.proxy })
         return fake.impl(input, init)
@@ -163,7 +163,7 @@ describe('notificationService', () => {
   describe('recipient resolution', () => {
     test('never broadcasts to every paired user when no explicit recipients are configured', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111), telegramUser(222)], allowedUsers: [333] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -184,7 +184,7 @@ describe('notificationService', () => {
       // scheduler swallowed the throw into a log line — the run looked
       // successful and no delivery status was ever recorded for it.
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -205,7 +205,7 @@ describe('notificationService', () => {
       // config as a missing recipient would make every desktop-only task report
       // a failed delivery.
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -220,7 +220,7 @@ describe('notificationService', () => {
 
     test('delivers to an explicitly requested user only after the server pairing record verifies it', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111), telegramUser(222)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -237,7 +237,7 @@ describe('notificationService', () => {
 
     test('treats an allowedUsers-only identifier as unpaired instead of a notification source', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [], allowedUsers: [333] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -252,7 +252,7 @@ describe('notificationService', () => {
 
     test('reports an unknown recipient instead of silently sending nothing', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -273,7 +273,7 @@ describe('notificationService', () => {
           pairedUsers: [telegramUser(111, 'Alice'), telegramUser(222, 'Alice')],
         },
       }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -288,7 +288,7 @@ describe('notificationService', () => {
 
     test('rejects an empty recipient reference', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -342,7 +342,7 @@ describe('notificationService', () => {
         attempt += 1
         return attempt < 3
           ? new Response('slow down', { status: 429 })
-          : Response.json({ ok: true })
+          : Response.json({ ok: true, result: { message_id: 123 } })
       })
 
       const report = await sendTaskNotification(
@@ -393,7 +393,7 @@ describe('notificationService', () => {
 
     test('reports missing credentials as a visible failure instead of skipping', async () => {
       rawConfig = { telegram: { pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -410,7 +410,7 @@ describe('notificationService', () => {
       configSpy.mockImplementation(async () => {
         throw new Error('config unreadable')
       })
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -425,7 +425,7 @@ describe('notificationService', () => {
 
     test('is a no-op when notifications are disabled or no IM channel is selected', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       expect((await sendTaskNotification(runFixture(), { enabled: false, channels: ['telegram'] }, options(fake))).ok).toBe(true)
       expect((await sendTaskNotification(runFixture(), { enabled: true, channels: ['desktop'] }, options(fake))).ok).toBe(true)
@@ -436,7 +436,7 @@ describe('notificationService', () => {
   describe('Telegram plain text', () => {
     test('sends without parse_mode so markdown characters cannot break delivery', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const report = await sendTaskNotification(
         runFixture(),
@@ -455,7 +455,7 @@ describe('notificationService', () => {
 
     test('truncates oversized output before sending', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       await sendTaskNotification(
         runFixture({ output: 'x'.repeat(10_000) }),
@@ -555,7 +555,7 @@ describe('notificationService', () => {
       const fake = createFakeFetch((call) =>
         call.body.chat_id === 222
           ? Response.json({ ok: false, description: 'blocked' }, { status: 403 })
-          : Response.json({ ok: true }),
+          : Response.json({ ok: true, result: { message_id: 123 } }),
       )
       const storePath = path.join(tmpDir, 'notification-deliveries.json')
 
@@ -579,7 +579,7 @@ describe('notificationService', () => {
 
     test('fails closed when the pending record cannot be written, and never sends untracked', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
       const failingStore = {
         filePath: path.join(tmpDir, 'unwritable.json'),
         enqueuePending: async () => {
@@ -606,7 +606,7 @@ describe('notificationService', () => {
 
   test('returns a report instead of throwing so callers cannot silently succeed', async () => {
     rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-    const fake = createFakeFetch(() => Response.json({ ok: true }))
+    const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
     const report: NotificationDeliveryReport = await sendTaskNotification(
       runFixture(),
@@ -621,7 +621,7 @@ describe('notificationService', () => {
   test('keeps the two-argument call shape working for the existing scheduler call site', async () => {
     rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
     const notification: TaskNotificationInput = { enabled: true, channels: ['telegram'] }
-    const fake = createFakeFetch(() => Response.json({ ok: true }))
+    const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
     globalThis.fetch = fake.impl
 
     const report = await sendTaskNotification(runFixture(), notification)
@@ -644,7 +644,7 @@ describe('notificationService', () => {
           records: Array<{ outcome: string }>
         }
         outcomeAtSendTime = onDisk.records[0]?.outcome
-        return Response.json({ ok: true })
+        return Response.json({ ok: true, result: { message_id: 123 } })
       })
 
       const report = await sendTaskNotification(
@@ -695,7 +695,7 @@ describe('notificationService', () => {
     test('does not duplicate the log row when the same run is notified twice', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
       const storePath = path.join(tmpDir, 'journal-idempotent.json')
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
       const common = { store: new NotificationDeliveryStore(storePath) }
       const notification: TaskNotificationInput = {
         enabled: true,
@@ -734,7 +734,7 @@ describe('notificationService', () => {
       }])
       resetNotificationRecoveryStateForTests()
 
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
       const report = await sendTaskNotification(
         runFixture(),
         { enabled: true, channels: ['telegram'], recipients: { telegram: [222] } },
@@ -758,7 +758,7 @@ describe('notificationService', () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
       const storePath = path.join(tmpDir, 'journal-once.json')
       const store = new NotificationDeliveryStore(storePath)
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
       const notification: TaskNotificationInput = {
         enabled: true,
         channels: ['telegram'],
@@ -799,7 +799,7 @@ describe('notificationService', () => {
       }])
       resetNotificationRecoveryStateForTests()
 
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
       globalThis.fetch = fake.impl
 
       await startPendingDeliveryRecovery({ store, logger })
@@ -844,7 +844,7 @@ describe('notificationService', () => {
       // A new send after startup opens its own pending row; the already-run
       // recovery pass must not reclassify it as indeterminate.
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(222)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
       await sendTaskNotification(
         runFixture({ id: 'run-new' }),
         { enabled: true, channels: ['telegram'], recipients: { telegram: [222] } },
@@ -918,7 +918,7 @@ describe('notificationService', () => {
     test('delivers plain text to a paired recipient and journals the attempt', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
       const storePath = path.join(tmpDir, 'immediate.json')
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const result = await sendImmediateMessage(
         { channel: 'telegram', recipient: 111, text: 'hello from the tool', runId: 'conv-1' },
@@ -944,7 +944,7 @@ describe('notificationService', () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
       const storePath = path.join(tmpDir, 'immediate-repeated.json')
       const store = new NotificationDeliveryStore(storePath)
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
       const send = (text: string) => sendImmediateMessage(
         { channel: 'telegram', recipient: 111, text },
         options(fake, { store }),
@@ -962,7 +962,7 @@ describe('notificationService', () => {
     test('does not send or settle a second immediate call with the same explicit run id', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
       const store = new NotificationDeliveryStore(path.join(tmpDir, 'immediate-duplicate.json'))
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
       const input = { channel: 'telegram' as const, recipient: 111, text: 'hello', runId: 'same-run' }
       expect((await sendImmediateMessage(input, options(fake, { store }))).ok).toBe(true)
       expect((await sendImmediateMessage(input, options(fake, { store }))).ok).toBe(false)
@@ -973,7 +973,7 @@ describe('notificationService', () => {
     test('refuses an unpaired recipient before any network call', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)], allowedUsers: [999] } }
       const storePath = path.join(tmpDir, 'immediate-unpaired.json')
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const result = await sendImmediateMessage(
         { channel: 'telegram', recipient: 999, text: 'should not send' },
@@ -988,7 +988,7 @@ describe('notificationService', () => {
 
     test('reports missing credentials instead of pretending the message went out', async () => {
       rawConfig = { telegram: { pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const result = await sendImmediateMessage(
         { channel: 'telegram', recipient: 111, text: 'no bot token' },
@@ -1002,7 +1002,7 @@ describe('notificationService', () => {
 
     test('rejects empty content without contacting the platform', async () => {
       rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
-      const fake = createFakeFetch(() => Response.json({ ok: true }))
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
 
       const result = await sendImmediateMessage(
         { channel: 'telegram', recipient: 111, text: '   ' },

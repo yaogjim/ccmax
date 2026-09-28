@@ -34,7 +34,7 @@
    helper 的客户端核验（`ClientAttestation.swift`）要求调用链能被密码学地认定为本应用：**host、sidecar、helper 必须签在同一张证书上**（同 team、同 leaf），且 sidecar 的 identifier 必须精确等于 `com.claude-code-haha.desktop.sidecar`。任何一环对不上，helper 对**所有**命令返回 `unauthorized_client`，表现是设置页权限一直"检测中…"、授权卡片点了没反应。
 
    ```bash
-   APP="desktop/build-artifacts/macos-arm64/Claude Code Haha.app"
+   APP="desktop/build-artifacts/macos-arm64/ccmax.app"
    B="$APP/Contents/Resources/app.asar.unpacked/src-tauri/binaries"
    for P in "$APP" "$B/claude-sidecar-aarch64-apple-darwin" "$B/ccmax-computer-use.app"; do
      codesign -dv "$P" 2>&1 | grep -E "^(Identifier|TeamIdentifier)="
@@ -42,7 +42,7 @@
    ```
 
    期望：三个 `TeamIdentifier` 完全相同，且 identifier 分别是
-   `com.claude-code-haha.desktop` / `com.claude-code-haha.desktop.sidecar` / `dev.cchaha.cu-helper`。
+   `com.ccmax.desktop` / `com.claude-code-haha.desktop.sidecar` / `dev.cchaha.cu-helper`。
 
    ad-hoc 构建（`SIGN_BUILD=0`，或机器上没有签名证书）**没有证书可言，Computer Use 在其上必然不可用** —— 这不是 bug，是 attestation 的固有前提。要测 Computer Use 就必须用签名构建（默认即是）。
 
@@ -143,7 +143,7 @@
 
 | # | 步骤 | 期望 |
 |---|---|---|
-| 5.1 | 让 agent 操控 **Claude Code Haha 自己** | 拒绝：`Computer Use is not allowed to use the app '…' for safety reasons.` |
+| 5.1 | 让 agent 操控 **ccmax 自己** | 拒绝：`Computer Use is not allowed to use the app '…' for safety reasons.` |
 | 5.2 | 操控 Terminal / iTerm / Chrome | 同样拒绝 |
 | 5.3 | 未开 systemKeyCombos 时按 `cmd+q` | 拒绝，提示 `Enable system key combinations in Computer Use settings, then retry.` |
 | 5.4 | 开了之后再按 | 放行 |

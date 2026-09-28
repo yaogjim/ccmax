@@ -10,6 +10,7 @@ import type {
   AnthropicContentBlock,
 } from './types.js'
 import { openaiUsageToAnthropic } from './usage.js'
+import { createUnparsedToolInput } from '../../../utils/unparsedToolInput.js'
 
 /**
  * Convert OpenAI Chat Completions response to Anthropic Messages response.
@@ -99,9 +100,17 @@ function mapFinishReason(reason: string | null): string {
   }
 }
 
-/** Completed tool input must be an object, never a repaired fragment. */
+/** Preserve malformed completed calls for CLI validation, never repair or execute them. */
 export function parseCompleteChatToolArguments(value: unknown): Record<string, unknown> {
-  const parsed: unknown = value == null || value === '' ? {} : typeof value === 'string' ? JSON.parse(value) : value
+  let parsed: unknown = value == null || value === '' ? {} : value
+  if (typeof value === 'string' && value !== '') {
+    try {
+      parsed = JSON.parse(value)
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error
+      return createUnparsedToolInput(value)
+    }
+  }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('OpenAI Chat completed tool arguments must be a JSON object')
   }

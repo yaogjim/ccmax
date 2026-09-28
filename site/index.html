@@ -26,11 +26,14 @@
           var path = window.location.pathname.replace(/\/+$/, '')
           if (path !== base) return
 
+          var languages = navigator.languages && navigator.languages.length
+            ? navigator.languages
+            : [(navigator.languages && navigator.languages[0]) || navigator.language || '']
           var stored = localStorage.getItem('cch-locale')
           var locale = stored === 'en' || stored === 'zh'
             ? stored
-            : ((navigator.languages || [navigator.language || '']).some(function (tag) {
-              return /^zh(?:-|$)/i.test(String(tag).trim())
+            : (languages.some(function (tag) {
+              return /^zh(?:[-_]|$)/i.test(String(tag || '').trim())
             }) ? 'zh' : 'en')
 
           if (locale === 'en') {

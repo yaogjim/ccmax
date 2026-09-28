@@ -51,6 +51,10 @@ export const DESKTOP_PERSISTENCE_KEYS = {
     canonical: 'ccmax-app-zoom',
     legacy: 'cc-haha-app-zoom',
   },
+  chatAppearance: {
+    canonical: 'ccmax-chat-appearance',
+    legacy: 'cc-haha-chat-appearance',
+  },
   sidebarWidth: {
     canonical: 'ccmax-sidebar-width',
     legacy: 'cc-haha-sidebar-width',
@@ -133,6 +137,9 @@ export const LEGACY_LOCALE_STORAGE_KEY = DESKTOP_PERSISTENCE_KEYS.locale.legacy
 export const APP_ZOOM_STORAGE_KEY = DESKTOP_PERSISTENCE_KEYS.appZoom.canonical
 export const LEGACY_APP_ZOOM_STORAGE_KEY = DESKTOP_PERSISTENCE_KEYS.appZoom.legacy
 
+export const CHAT_APPEARANCE_STORAGE_KEY = DESKTOP_PERSISTENCE_KEYS.chatAppearance.canonical
+export const LEGACY_CHAT_APPEARANCE_STORAGE_KEY = DESKTOP_PERSISTENCE_KEYS.chatAppearance.legacy
+
 export const SIDEBAR_WIDTH_STORAGE_KEY = DESKTOP_PERSISTENCE_KEYS.sidebarWidth.canonical
 export const LEGACY_SIDEBAR_WIDTH_STORAGE_KEY = DESKTOP_PERSISTENCE_KEYS.sidebarWidth.legacy
 
@@ -177,6 +184,7 @@ export const STARTUP_COPY_KEY_PAIRS: readonly PersistenceKeyPair[] = [
   DESKTOP_PERSISTENCE_KEYS.locale,
   DESKTOP_PERSISTENCE_KEYS.sidebarWidth,
   DESKTOP_PERSISTENCE_KEYS.activeSettingsTab,
+  DESKTOP_PERSISTENCE_KEYS.chatAppearance,
   DESKTOP_PERSISTENCE_KEYS.sidebarProjectOrder,
   DESKTOP_PERSISTENCE_KEYS.sidebarPinnedProjects,
   DESKTOP_PERSISTENCE_KEYS.sidebarHiddenProjects,

@@ -10,7 +10,7 @@ All anchors confirmed: `CommandRouter.swift:234` awaits the blocking glide befor
 
 # Computer Use 对标 Codex 从底层重设计规格
 
-> 目标:把 "Claude Code Haha" 的 macOS Computer Use 从 **整屏截图 + 像素坐标 + 每步重截 + CGEvent 注入** 这套盲操架构,重写为对齐 Codex 的 **get_app_state(关键窗口 AX 树 + 加速窗口截图,一回合一次)+ AX 语义注入** 架构。接口层与 helper 层全部重设计,不写兼容代码。
+> 目标:把 "ccmax" 的 macOS Computer Use 从 **整屏截图 + 像素坐标 + 每步重截 + CGEvent 注入** 这套盲操架构,重写为对齐 Codex 的 **get_app_state(关键窗口 AX 树 + 加速窗口截图,一回合一次)+ AX 语义注入** 架构。接口层与 helper 层全部重设计,不写兼容代码。
 >
 > **证据纪律**:本规格只采信我在本会话亲自用 `nm`/`strings`/读码/re-parse transcript 复核过的结论。被前几轮证伪/修正的两条结论已剔除并标注(见 §0.1)。每条根因都标了证据强度。
 
@@ -357,7 +357,7 @@ I have verified every load-bearing claim and uncovered substantial gaps. I have 
 
 规格 §0.3 #4 自己标了这条,**正确**。我加强:Codex Service 确实导入 `AXEnhancedUserInterface`/`AXManualAccessibility`/`enableEnhancedUserInterface`【实证】,这是它能读 Chromium/Electron 树的关键。**但**:
 
-- **[未证且规格未量化]** 我方自己的 app("Claude Code Haha")**也是 Electron/WebKit**。规格 §0.3 #5 提到"大型 Electron 树规模"但没意识到一个反身问题:**我们要用 CU 操作的目标里大量是 Electron/网页**(VS Code、Chrome、我们自己),而 `AXEnhancedUserInterface` 开启后 Chromium 暴露的 AX 树**深度极大、节点数千**。规格 §0.3 #5 把它当"决定 token 成本"——实际它先决定**get_app_state 延迟**:若一棵树要遍历几千节点,即便批量 `CopyMultipleAttributeValues`,首次全量也可能 >1s,**直接打脸"快"**。Codex 用 `RefetchableSkyshotAXTree` + diff + render-tree 剪枝来扛【实证符号齐全】,这套**剪枝/diff 算法本身是重活**,规格 §3.2 一句"`UIElementRenderDifference` 等价"轻描淡写。
+- **[未证且规格未量化]** 我方自己的 app("ccmax")**也是 Electron/WebKit**。规格 §0.3 #5 提到"大型 Electron 树规模"但没意识到一个反身问题:**我们要用 CU 操作的目标里大量是 Electron/网页**(VS Code、Chrome、我们自己),而 `AXEnhancedUserInterface` 开启后 Chromium 暴露的 AX 树**深度极大、节点数千**。规格 §0.3 #5 把它当"决定 token 成本"——实际它先决定**get_app_state 延迟**:若一棵树要遍历几千节点,即便批量 `CopyMultipleAttributeValues`,首次全量也可能 >1s,**直接打脸"快"**。Codex 用 `RefetchableSkyshotAXTree` + diff + render-tree 剪枝来扛【实证符号齐全】,这套**剪枝/diff 算法本身是重活**,规格 §3.2 一句"`UIElementRenderDifference` 等价"轻描淡写。
 - **建议**:阶段1第一周不仅验"Electron AXPress 是否命中"(规格已列),还要**实测一棵真实大型 Electron 树的全量遍历耗时 + token 体积**,否则"快"是空头支票。
 
 ### C2. 【可行性,规格 §5.1 已识别但风险不对称】MCP elicitation 能力是阶段1硬门槛,不是阶段2
@@ -423,4 +423,4 @@ I have verified every load-bearing claim and uncovered substantial gaps. I have 
 
 **对规格已做对的肯定**:根因诊断、我方代码锚点(`Capture.swift:334`/`CommandRouter.swift:234,237`/`VirtualCursor.swift:126`/`type` 逐 grapheme `toolCalls.ts:2466-2481`/`screenshotFiltering:'native'` 谎报 `common.ts:67`+`tools.ts:156`/`MOVE_SETTLE_MS=50`/Python 死重)**全部复核通过**;剔除"抢鼠标"和 transcript 基准两条错误结论**正确**;AX-优先注入、窗口锁定截图、光标脱离关键路径、分期不被付费账号阻塞的总体判断**成立**。本审计不是推翻方向,而是补全 Codex 功能面(elicitation/Skysight/RecordReplay/Guardian/多窗口/app指令)+ 纠正两条架构主张(坐标=AX 而非 CGEvent;确认=协议而非纯 prose)+ 揭示三条隐藏前置(elicitation SDK 支持、TurnEnded 跨层协议、大型 Electron 树耗时实测)。
 
-**关键文件锚点**:Codex 证据源 `/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/`(`skills/computer-use/SKILL.md`、`Codex Computer Use.app/Contents/MacOS/SkyComputerUseService`、`.../SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient`、`.../SharedSupport/CUALockScreenGuardian.app`、`.../Resources/Package_ComputerUse.bundle/Contents/Resources/Skysight{Summarizer,MemoryInstructions}.md`);我方待改 `/Users/nanmi/workspace/myself_code/claude-code-haha/.claude/worktrees/quizzical-lehmann-5ab084/` 下 `src/vendor/computer-use-mcp/{tools.ts,toolCalls.ts,executor.ts,mcpServer.ts,common.ts}`、`native/cu-helper/Sources/cu-helper/{Capture,CommandRouter,VirtualCursor,Injection}.swift`、`src/utils/computerUse/{helperBridge,cuHelperBridge,cuHelperDaemon,pythonBridge,common}.ts`、`runtime/{mac_helper,win_helper}.py`。
+**关键文件锚点**:Codex 证据源 `/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/`(`skills/computer-use/SKILL.md`、`Codex Computer Use.app/Contents/MacOS/SkyComputerUseService`、`.../SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient`、`.../SharedSupport/CUALockScreenGuardian.app`、`.../Resources/Package_ComputerUse.bundle/Contents/Resources/Skysight{Summarizer,MemoryInstructions}.md`);我方待改源码位于项目根目录下 `src/vendor/computer-use-mcp/{tools.ts,toolCalls.ts,executor.ts,mcpServer.ts,common.ts}`、`native/cu-helper/Sources/cu-helper/{Capture,CommandRouter,VirtualCursor,Injection}.swift`、`src/utils/computerUse/{helperBridge,cuHelperBridge,cuHelperDaemon,pythonBridge,common}.ts`、`runtime/{mac_helper,win_helper}.py`。

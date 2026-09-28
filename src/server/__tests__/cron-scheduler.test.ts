@@ -15,6 +15,7 @@ import {
   type TaskRun,
 } from '../services/cronScheduler.js'
 import { CronService } from '../services/cronService.js'
+import * as lockfile from '../../utils/lockfile.js'
 import { SettingsService } from '../services/settingsService.js'
 import * as notificationService from '../services/notificationService.js'
 import { resetScheduledRunReadModelForTests } from '../services/localIndex/scheduledRunReadModel.js'
@@ -386,6 +387,29 @@ describe('CronScheduler', () => {
       'db',
       'scheduled-runs-v1.sqlite',
     ))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('keeps both same-second task completions and leaves the task list readable', async () => {
+    const first = await cronService.createTask({ cron: '* * * * *', prompt: 'first', recurring: true })
+    const second = await cronService.createTask({ cron: '* * * * *', prompt: 'second', recurring: true })
+    const now = spyOn(Date, 'now').mockReturnValue(1_790_331_340_000)
+    try {
+      const results = await Promise.all([
+        scheduler.executeTask(first),
+        scheduler.executeTask(second),
+      ])
+      expect(results.map(result => result.status)).toEqual(['completed', 'completed'])
+
+      const runs = await scheduler.getRecentRuns()
+      expect(runs).toHaveLength(2)
+      expect(runs.map(run => run.taskId).sort()).toEqual([first.id, second.id].sort())
+      expect(runs.every(run => run.status === 'completed')).toBe(true)
+      const tasks = await cronService.listTasks()
+      expect(tasks).toHaveLength(2)
+      expect(tasks.every(task => task.lastFiredAt)).toBe(true)
+    } finally {
+      now.mockRestore()
+    }
   })
 
   it('keeps one execution lifecycle canonical and projected writes in its original scope', async () => {
@@ -1525,5 +1549,41 @@ describe('CronScheduler log write serialization', () => {
       renameSpy.mockRestore()
       Date.now = realNow
     }
+  })
+
+  it('does not publish a run while another process holds the log lock', async () => {
+    // `mutateRunsFile` serializes same-process writers in a queue, but the
+    // queue alone cannot exclude a second server process sharing the config
+    // dir — that is the on-disk lock. Hold it from the outside and prove no
+    // write escapes it: a reverted implementation would rename its temp file
+    // into place within a few milliseconds of the task starting.
+    const task = await cronService.createTask({
+      cron: '* * * * *',
+      prompt: 'locked run log',
+      recurring: true,
+    })
+    const logPath = path.join(tmpDir, 'scheduled_tasks_log.json')
+    const release = await lockfile.lock(logPath, { realpath: false })
+    const pending = scheduler.executeTask(task)
+    let publishedWhileLocked = false
+    try {
+      const deadline = Date.now() + 1_000
+      while (Date.now() < deadline && !publishedWhileLocked) {
+        publishedWhileLocked = await fs
+          .access(logPath)
+          .then(() => true, () => false)
+        if (!publishedWhileLocked) await Bun.sleep(25)
+      }
+    } finally {
+      await release()
+    }
+    expect(publishedWhileLocked).toBe(false)
+
+    const run = await pending
+    expect(run.status).toBe('completed')
+    const log = JSON.parse(await fs.readFile(logPath, 'utf-8')) as {
+      runs: TaskRun[]
+    }
+    expect(log.runs.map((entry) => entry.id)).toEqual([run.id])
   })
 })

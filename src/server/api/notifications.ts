@@ -158,6 +158,7 @@ function projectResult(result: ImmediateMessageResult): Record<string, unknown> 
             recipientLabel: result.delivery.recipientLabel,
             outcome: result.delivery.outcome,
             attempts: result.delivery.attempts,
+            ...(result.delivery.messageId !== undefined ? { messageId: result.delivery.messageId } : {}),
             ...(result.delivery.errorCode ? { errorCode: result.delivery.errorCode } : {}),
             ...(result.delivery.error ? { error: result.delivery.error } : {}),
           },

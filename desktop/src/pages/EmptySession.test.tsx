@@ -419,7 +419,7 @@ describe('EmptySession', () => {
     })
     expect(document.querySelector('.composer-mention')).toHaveTextContent('@README.md')
     expect(getComposerText()).toContain('Please review @README.md')
-    expect(mocks.search).toHaveBeenCalledWith('README', '/workspace/project')
+    expect(mocks.search).toHaveBeenCalledWith('README', '/workspace/project', { signal: expect.any(AbortSignal) })
     expect(screen.queryByRole('combobox', { name: 'Search skills, plugins, files…' })).not.toBeInTheDocument()
     expect(mocks.wsSend).not.toHaveBeenCalled()
     expect(mocks.createSession).not.toHaveBeenCalled()
@@ -509,6 +509,18 @@ describe('EmptySession', () => {
     await waitFor(() => {
       expect(mocks.listSkills).toHaveBeenCalledTimes(2)
     })
+  })
+
+  it('finds /clear without recommending it in an empty session', async () => {
+    render(<EmptySession />)
+
+    setComposerText('/', 1)
+    expect(await screen.findByRole('listbox', { name: 'Slash commands' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: '/clear' })).not.toBeInTheDocument()
+
+    setComposerText('/clear', 6)
+    expect(await screen.findByRole('option', { name: '/clear' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: '/goal' })).not.toBeInTheDocument()
   })
 
   it('prioritizes enabled plugin slash commands by command name when filtering', async () => {
@@ -838,7 +850,7 @@ describe('EmptySession', () => {
           sonnet: 'MiniMax-M3',
           opus: 'MiniMax-M3',
         },
-        model1mSupport: { main: enabled, haiku: enabled, sonnet: enabled, opus: enabled },
+        model1mSupport: { main: enabled, fable: enabled, haiku: enabled, sonnet: enabled, opus: enabled },
         toolSearchEnabled: true,
       }],
       activeId: 'provider-minimax',

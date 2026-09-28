@@ -15,6 +15,7 @@ import {
   runDesktopPersistenceMigrations,
 } from './persistenceMigrations'
 import { WORKSPACE_STORAGE_VERSION } from './workspace/storageKey'
+import { CHAT_APPEARANCE_STORAGE_KEY, DEFAULT_CHAT_APPEARANCE, LEGACY_CHAT_APPEARANCE_STORAGE_KEY } from './chatAppearance'
 
 const LEGACY_TAB = DESKTOP_PERSISTENCE_KEYS.openTabs.legacy
 const LEGACY_RUNTIME = DESKTOP_PERSISTENCE_KEYS.sessionRuntime.legacy
@@ -27,6 +28,59 @@ const LEGACY_LOCALE = DESKTOP_PERSISTENCE_KEYS.locale.legacy
 describe('desktop persistence migrations', () => {
   beforeEach(() => {
     window.localStorage.clear()
+  })
+
+  test('upgrades a frozen schema-4 install with reading defaults without changing zoom or theme', () => {
+    localStorage.setItem(DESKTOP_PERSISTENCE_VERSION_KEY, '4')
+    localStorage.setItem('cc-haha-app-zoom', '1.25')
+    localStorage.setItem('cc-haha-theme', 'ink-blue')
+    localStorage.setItem('unrelated-user-key', 'keep')
+    runDesktopPersistenceMigrations()
+    expect(JSON.parse(localStorage.getItem(CHAT_APPEARANCE_STORAGE_KEY)!)).toEqual({ version: 1, ...DEFAULT_CHAT_APPEARANCE })
+    expect(localStorage.getItem('cc-haha-app-zoom')).toBe('1.25')
+    expect(localStorage.getItem('cc-haha-theme')).toBe('ink-blue')
+    expect(localStorage.getItem('unrelated-user-key')).toBe('keep')
+    expect(runDesktopPersistenceMigrations().migratedKeys).not.toContain(CHAT_APPEARANCE_STORAGE_KEY)
+  })
+
+  test('normalizes unversioned reading preferences and preserves a future schema', () => {
+    localStorage.setItem(CHAT_APPEARANCE_STORAGE_KEY, JSON.stringify({ font: 'serif', fontSize: 80, extra: true }))
+    runDesktopPersistenceMigrations()
+    expect(JSON.parse(localStorage.getItem(CHAT_APPEARANCE_STORAGE_KEY)!)).toEqual({ version: 1, font: 'serif', fontSize: 24, width: 'standard', extra: true })
+    const future = '{"version":2,"font":"future","extra":true}'
+    localStorage.setItem(CHAT_APPEARANCE_STORAGE_KEY, future)
+    runDesktopPersistenceMigrations()
+    expect(localStorage.getItem(CHAT_APPEARANCE_STORAGE_KEY)).toBe(future)
+  })
+
+  test('copies a legacy chat-appearance install into the canonical ccmax key and normalizes it', () => {
+    // A cc-haha install carries the legacy key only. Startup must move it to
+    // the ccmax canonical key without dropping the legacy copy.
+    localStorage.setItem(LEGACY_CHAT_APPEARANCE_STORAGE_KEY, JSON.stringify({ font: 'mono', fontSize: 80 }))
+
+    runDesktopPersistenceMigrations()
+
+    expect(JSON.parse(localStorage.getItem(CHAT_APPEARANCE_STORAGE_KEY)!)).toEqual({
+      version: 1,
+      font: 'mono',
+      fontSize: 24,
+      width: 'standard',
+    })
+    expect(localStorage.getItem(LEGACY_CHAT_APPEARANCE_STORAGE_KEY)).not.toBeNull()
+  })
+
+  test('prefers the canonical chat-appearance key when the legacy key also exists', () => {
+    localStorage.setItem(CHAT_APPEARANCE_STORAGE_KEY, JSON.stringify({ version: 1, font: 'serif', fontSize: 16, width: 'wide' }))
+    localStorage.setItem(LEGACY_CHAT_APPEARANCE_STORAGE_KEY, JSON.stringify({ version: 1, font: 'mono', fontSize: 20, width: 'full' }))
+
+    runDesktopPersistenceMigrations()
+
+    expect(JSON.parse(localStorage.getItem(CHAT_APPEARANCE_STORAGE_KEY)!)).toEqual({
+      version: 1,
+      font: 'serif',
+      fontSize: 16,
+      width: 'wide',
+    })
   })
 
   test('old fixture: copies legacy open-tabs into canonical shape without removing legacy', () => {
@@ -50,7 +104,7 @@ describe('desktop persistence migrations', () => {
       { sessionId: 123, title: 'bad' },
     ])
     expect(window.localStorage.getItem(DESKTOP_PERSISTENCE_VERSION_KEY)).toBe(String(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION))
-    expect(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION).toBe(4)
+    expect(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION).toBe(5)
   })
 
   test('does not overwrite an existing canonical key when legacy also exists', () => {
@@ -544,7 +598,7 @@ describe('desktop persistence migrations', () => {
       expect(window.localStorage.getItem(pair.canonical)).toBe(`from-legacy:${pair.canonical}`)
       expect(window.localStorage.getItem(pair.legacy)).toBe(`from-legacy:${pair.canonical}`)
     }
-    expect(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION).toBe(4)
+    expect(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION).toBe(5)
     expect(window.localStorage.getItem(DESKTOP_PERSISTENCE_VERSION_KEY)).toBe(String(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION))
   })
 

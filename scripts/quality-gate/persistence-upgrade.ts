@@ -9,6 +9,14 @@ type Check = {
 const rootDir = process.cwd()
 const checks: Check[] = [
   {
+    title: 'Agent Teams plan sidecar compatibility and approval recovery',
+    command: ['bun', 'test', './src/utils/swarm/teamPlanStore.test.ts', './src/server/services/teamPlanService.test.ts'],
+  },
+  {
+    title: 'Session collaboration state migration and recovery',
+    command: ['bun', 'test', './src/server/services/sessionCollaborationService.test.ts', '--test-name-pattern', 'migrat|recover'],
+  },
+  {
     title: 'Connector installation state migrations',
     command: ['bun', 'test', './src/server/services/connectorsPersistence.test.ts'],
   },
@@ -49,6 +57,11 @@ const checks: Check[] = [
   {
     title: 'Desktop localStorage migrations',
     command: ['bun', 'run', 'test', '--', '--run', 'src/lib/persistenceMigrations.test.ts'],
+    cwd: 'desktop',
+  },
+  {
+    title: 'Electron userData profile migration from legacy app identity',
+    command: ['bun', 'run', 'test', '--', '--run', 'electron/services/userDataProfileMigration.test.ts'],
     cwd: 'desktop',
   },
 ]

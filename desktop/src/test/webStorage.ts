@@ -56,6 +56,21 @@ function installStorage(name: 'localStorage' | 'sessionStorage'): void {
 installStorage('localStorage')
 installStorage('sessionStorage')
 
+/**
+ * Dispatch a `storage` event carrying the polyfilled `Storage`.
+ *
+ * jsdom's `StorageEvent` constructor brand-checks `storageArea` against its own
+ * `Storage` interface and rejects `MemoryStorage`, so building the event and
+ * stamping its fields avoids the constructor entirely. Keep the `storageArea`
+ * value the same object the app reads from `globalThis.localStorage`.
+ */
+export function dispatchStorageEvent(key: string | null, storageArea: Storage | null = null): void {
+  const event = new Event('storage') as StorageEvent
+  Object.defineProperty(event, 'key', { value: key, configurable: true })
+  Object.defineProperty(event, 'storageArea', { value: storageArea, configurable: true })
+  window.dispatchEvent(event)
+}
+
 // Product defaults new installs to Simplified Chinese, while the shared test
 // suite asserts English labels unless a test explicitly selects another locale.
 // Seed the canonical preference before application modules initialize.

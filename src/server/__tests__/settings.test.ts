@@ -945,6 +945,14 @@ describe('Models API', () => {
         context: '1m',
       },
       {
+        id: 'claude-opus-5-5',
+        name: 'Opus 5.5',
+        description: 'Best for complex agentic coding and enterprise work',
+        context: '1m',
+        defaultReasoningEffort: 'medium',
+        supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
         id: 'claude-opus-5',
         name: 'Opus 5',
         description: 'Best for complex agentic coding and enterprise work',
@@ -1206,6 +1214,7 @@ describe('Models API', () => {
     expect(listBody.models.map((model: { id: string }) => model.id)).toEqual([
       'claude-fable-5-1',
       'claude-fable-5',
+      'claude-opus-5-5',
       'claude-opus-5',
       'claude-opus-4-8',
       'claude-sonnet-5',
@@ -1228,8 +1237,9 @@ describe('Models API', () => {
     const body = await response.json()
 
     expect(body.model).toMatchObject({
-      id: 'claude-opus-5',
-      name: 'Opus 5',
+      id: 'claude-opus-5-5',
+      name: 'Opus 5.5',
+      defaultReasoningEffort: 'medium',
     })
   })
 
@@ -1373,6 +1383,9 @@ describe('Models API', () => {
       name: 'ChatGPT Official',
     })
     expect(body.models.map((model) => model.id)).toEqual([
+      'gpt-6-astra',
+      'gpt-6-sol',
+      'gpt-6-luna',
       'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna',
@@ -1380,11 +1393,15 @@ describe('Models API', () => {
       'gpt-5.4',
       'gpt-5.5',
       'gpt-5.4-mini',
-      'gpt-6-astra',
     ])
     expect(body.models[0]).toMatchObject({
-      id: 'gpt-5.6-sol',
+      id: 'gpt-6-astra',
       defaultReasoningEffort: 'low',
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+    })
+    expect(body.models[1]).toMatchObject({
+      id: 'gpt-6-sol',
+      defaultReasoningEffort: 'medium',
       supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
     })
   })
@@ -1485,10 +1502,13 @@ describe('Models API', () => {
     }
     expect(body.provider).toEqual({ id: 'grok-official', name: 'Grok Official' })
     expect(body.models.map((model) => model.id)).toEqual([
+      'grok-4.7',
+      'grok-4.7-build-fast',
       'grok-4.6',
       'grok-4.5',
-      'grok-composer-2.5-fast',
     ])
+    expect(body.models.find((model) => model.id === 'grok-4.7')?.context).toBe('500000')
+    expect(body.models.find((model) => model.id === 'grok-4.7-build-fast')?.context).toBe('500000')
     expect(body.models.find((model) => model.id === 'grok-4.6')?.context).toBe('500000')
     expect(body.models.find((model) => model.id === 'grok-4.5')?.context).toBe('500000')
   })
@@ -1660,6 +1680,8 @@ describe('Model Options', () => {
     const labels = options.map(option => option.label)
 
     expect(values).toContain('gpt-5.3-codex')
+    expect(values).toContain('gpt-6-sol')
+    expect(values).toContain('gpt-6-luna')
     expect(values).toContain('gpt-5.6-sol')
     expect(values).toContain('gpt-5.6-terra')
     expect(values).toContain('gpt-5.6-luna')

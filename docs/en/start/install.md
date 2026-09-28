@@ -9,6 +9,8 @@ order: 1
 
 Install and go. You don't need Node.js, Python, or Claude Code — the CLI engine and the ripgrep binary used for file search are both bundled inside the installer.
 
+The product is now called **ccmax**. Existing packages, installed apps, and system processes may still use the legacy name `Claude Code Haha`; filenames and commands below match those published packages.
+
 ## Pick the right package
 
 Everything lives on [GitHub Releases](https://github.com/yaogjim/ccmax/releases/latest). Choose by operating system and CPU architecture:

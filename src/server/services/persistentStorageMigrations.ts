@@ -7,13 +7,13 @@ import { isOpenAIOfficialProviderId } from './openaiOfficialProvider.js'
 import { isGrokOfficialProviderId } from './grokOfficialProvider.js'
 import {
   BUILT_IN_PROVIDER_IDS,
+  PROVIDER_OFFICIAL_MODEL_SETTINGS_SCHEMA_VERSION,
   PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,
-  PROVIDER_REQUEST_COMPATIBILITY_SCHEMA_VERSION,
 } from '../types/provider.js'
-import { migrateSqliteDatabaseFamilies } from './localIndex/sqliteFamilyMigration.js'
+import { migrateSqliteDatabaseFamilies, exclusivePublish } from './localIndex/sqliteFamilyMigration.js'
 import { normalizeNotificationDeliveryStore } from './notificationDeliveryStore.js'
 
-export const CURRENT_PROVIDER_INDEX_SCHEMA_VERSION = PROVIDER_REQUEST_COMPATIBILITY_SCHEMA_VERSION
+export const CURRENT_PROVIDER_INDEX_SCHEMA_VERSION = PROVIDER_OFFICIAL_MODEL_SETTINGS_SCHEMA_VERSION
 
 type MigrationReport = {
   migratedEntries: string[]
@@ -67,6 +67,17 @@ function isSavedProvider(value: unknown): value is JsonObject {
     typeof value.baseUrl === 'string' &&
     isProviderModels(value.models)
   )
+}
+
+function normalizeOfficialProviderModels(value: unknown): JsonObject {
+  if (!isRecord(value)) return {}
+  const normalized: JsonObject = { ...value }
+  for (const id of BUILT_IN_PROVIDER_IDS) {
+    if (!isProviderModels(value[id])) {
+      delete normalized[id]
+    }
+  }
+  return normalized
 }
 
 function isLegacyProviderModel(value: unknown): value is LegacyProviderModel {
@@ -166,12 +177,14 @@ function migrateProvidersIndex(value: unknown): JsonObject {
       activeId: null,
       providers: [],
       providerOrder: [...BUILT_IN_PROVIDER_IDS],
+      officialProviderModels: {},
     }
   }
 
   const {
     activeProviderId: _legacyActiveProviderId,
     providerOrder: rawProviderOrder,
+    officialProviderModels: rawOfficialProviderModels,
     ...rest
   } = value
   const sourceSchemaVersion = typeof value.schemaVersion === 'number' ? value.schemaVersion : 1
@@ -203,6 +216,7 @@ function migrateProvidersIndex(value: unknown): JsonObject {
     activeId,
     providers,
     providerOrder: normalizeProviderOrder(rawProviderOrder, providers),
+    officialProviderModels: normalizeOfficialProviderModels(rawOfficialProviderModels),
   }
 }
 
@@ -451,6 +465,92 @@ async function maybeCopyLegacyForkDirToPrimary(
   }
 }
 
+export type SessionCollaborationStateMigrationOptions = {
+  /**
+   * Atomically publish a temp regular file to its final path. Defaults to
+   * `exclusivePublish` (same-directory hard link), which fails with EEXIST
+   * rather than replacing a file another writer created in the meantime.
+   * Injected only for tests that need to simulate that race.
+   */
+  commitFile?: (tempPath: string, finalPath: string) => Promise<void>
+}
+
+/** A failed inbox copy is recorded in `report.failures` under this path. */
+export const SESSION_COLLABORATION_STATE_FAILURE_PREFIX =
+  'cc-haha/session-collaboration/state.json'
+
+const SESSION_COLLABORATION_STATE_ENTRY =
+  `${SESSION_COLLABORATION_STATE_FAILURE_PREFIX} -> ccmax/session-collaboration/state.json`
+
+/**
+ * The collaboration inbox is a raw store, not a schema-migrated JSON. Copy it
+ * verbatim so every version/unknown field survives byte-for-byte, then publish
+ * it with an exclusive same-directory hard link: if another writer creates the
+ * canonical file between the existence check and the publish, `link` fails with
+ * EEXIST and that file wins. The legacy file is never rewritten or deleted.
+ */
+export async function migrateLegacySessionCollaborationState(
+  configDir: string,
+  report: MigrationReport,
+  options?: SessionCollaborationStateMigrationOptions,
+): Promise<void> {
+  const commitFile = options?.commitFile ?? exclusivePublish
+  const primary = path.join(configDir, 'ccmax', 'session-collaboration', 'state.json')
+  const legacy = path.join(configDir, 'cc-haha', 'session-collaboration', 'state.json')
+
+  if (await pathExists(primary)) return
+  if (!(await pathExists(legacy))) return
+
+  const tmpPath = `${primary}.migrating-${Date.now()}-${randomBytes(3).toString('hex')}`
+  try {
+    await fs.mkdir(path.dirname(primary), { recursive: true })
+    await fs.copyFile(legacy, tmpPath)
+    // `copyFile` does not carry the source mode; session-collaboration content
+    // is user text, so match the 0o600 the service writes its own state with.
+    await fs.chmod(tmpPath, 0o600)
+    await commitFile(tmpPath, primary)
+    report.migratedEntries.push(SESSION_COLLABORATION_STATE_ENTRY)
+  } catch (error) {
+    // EEXIST means a concurrent writer published the canonical file first.
+    // Keeping theirs is the correct outcome, not a migration failure.
+    if (errnoCode(error) !== 'EEXIST') {
+      report.failures.push(
+        `${SESSION_COLLABORATION_STATE_FAILURE_PREFIX}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  } finally {
+    // `exclusivePublish` already unlinked it; this also cleans up a failed or
+    // losing publish so no `.migrating-` sibling is ever left behind.
+    await fs.rm(tmpPath, { force: true }).catch(() => {})
+  }
+}
+
+/**
+ * The collaboration inbox is raw user data, not a schema-migrated JSON, so a
+ * failed forward copy cannot be healed by reading it through the service: a
+ * missing canonical file loads as an empty store, and the next write would
+ * publish that empty store and leave the legacy inbox invisible. Returns the
+ * legacy path only when it still exists, the canonical file is still missing,
+ * and this migration reported the failure — an unrelated failures entry (for
+ * example a provider index) never blocks the host. The legacy file is left
+ * untouched, so a later retry can still complete the copy.
+ */
+export async function findUnmigratedLegacySessionCollaborationState(
+  report: { failures: readonly string[] },
+  configDir = getConfigDir(),
+): Promise<string | undefined> {
+  const failed = report.failures.some((failure) =>
+    failure.startsWith(`${SESSION_COLLABORATION_STATE_FAILURE_PREFIX}:`),
+  )
+  if (!failed) return undefined
+
+  const primary = path.join(configDir, 'ccmax', 'session-collaboration', 'state.json')
+  if (await pathExists(primary)) return undefined
+
+  const legacy = path.join(configDir, 'cc-haha', 'session-collaboration', 'state.json')
+  return (await pathExists(legacy)) ? legacy : undefined
+}
+
 async function migrateForkOwnedJsonDir(
   dir: string,
   entryPrefix: string,
@@ -490,6 +590,11 @@ async function runPersistentStorageMigrations(configDir: string): Promise<Migrat
   // root providers.json still lands in the legacy dir, then gets copied.
   await migrateLegacyRootProviders(configDir, ccHahaDir, report)
   await maybeCopyLegacyForkDirToPrimary(configDir, report)
+
+  // A primary dir that already exists (providers, settings, …) skips the
+  // directory copy above, so the collaboration inbox needs its own forward
+  // migration into the canonical directory.
+  await migrateLegacySessionCollaborationState(configDir, report)
 
   // Dual-run schema migrations: primary first (resolveForkOwnedDir prefers it),
   // then legacy so old-path fixtures stay upgraded without deleting legacy data.

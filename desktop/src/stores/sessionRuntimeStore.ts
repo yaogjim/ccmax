@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { isSideChatSession } from '../lib/sideChatSessions'
 import type { RuntimeSelection } from '../types/runtime'
 import type { SessionListItem } from '../types/session'
 import {
@@ -23,6 +24,9 @@ const RETIRED_GROK_MODEL_IDS = new Set([
   'grok-4.3',
   'grok-4.20-reasoning',
   'grok-4.20-non-reasoning',
+  // Dropped from the live /v1/models feed, so a session still pinned to it
+  // would send an ID the gateway no longer serves.
+  'grok-composer-2.5-fast',
 ])
 
 export const DRAFT_RUNTIME_SELECTION_KEY = '__draft__'
@@ -72,6 +76,10 @@ function normalizeSelections(
   let changed = false
   const normalized: Record<string, RuntimeSelection> = {}
   for (const [key, selection] of Object.entries(selections)) {
+    if (isSideChatSession(key)) {
+      changed = true
+      continue
+    }
     const next = normalizeSelection(selection)
     if (!next) {
       changed = true
@@ -103,7 +111,9 @@ function persistSelections(selections: Record<string, RuntimeSelection>) {
   writeCanonical(
     globalThis.localStorage,
     DESKTOP_PERSISTENCE_KEYS.sessionRuntime,
-    JSON.stringify(selections),
+    JSON.stringify(Object.fromEntries(
+      Object.entries(selections).filter(([key]) => !isSideChatSession(key)),
+    )),
   )
 }
 

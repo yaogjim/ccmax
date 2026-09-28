@@ -36,7 +36,9 @@ import type {
 // 4: usage copied into a fork is excluded from the fork's activity projection.
 // 5: protocol-lock metadata was projected into session summaries.
 // 6: protocol enforcement was removed; rebuild v5 summaries without protocol restrictions.
-export const SESSION_SUMMARY_PARSER_VERSION = 6
+// 7: independent desktop team workers remain addressable but leave sidebar listings.
+// 8: complete runtime selections clear the previous effort when no override is saved.
+export const SESSION_SUMMARY_PARSER_VERSION = 8
 
 export type SessionSourceCandidate = {
   path: string
@@ -642,8 +644,8 @@ export function createSessionProjector(options: SessionProjectorOptions): Sessio
           transcript_path, session_id, project_path, title, created_at,
           modified_at, modified_at_ms, message_count, work_dir, repository_json,
           worktree_session_json, permission_mode, runtime_provider_id,
-          runtime_provider_present, runtime_model_id, effort_level
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          runtime_provider_present, runtime_model_id, effort_level, is_team_worker
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(transcript_path) DO UPDATE SET
           session_id = excluded.session_id,
           project_path = excluded.project_path,
@@ -659,7 +661,8 @@ export function createSessionProjector(options: SessionProjectorOptions): Sessio
           runtime_provider_id = excluded.runtime_provider_id,
           runtime_provider_present = excluded.runtime_provider_present,
           runtime_model_id = excluded.runtime_model_id,
-          effort_level = excluded.effort_level
+          effort_level = excluded.effort_level,
+          is_team_worker = excluded.is_team_worker
       `,
       bundle.candidate.path,
       bundle.candidate.sessionId,
@@ -678,7 +681,8 @@ export function createSessionProjector(options: SessionProjectorOptions): Sessio
       summary.runtimeProviderId ?? null,
       runtimeProviderPresent,
       summary.runtimeModelId ?? null,
-      summary.effortLevel ?? null)
+      summary.effortLevel ?? null,
+      summary.isTeamWorker ? 1 : 0)
 
       writeBackfillState(
         writer,

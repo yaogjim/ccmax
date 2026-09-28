@@ -202,6 +202,7 @@ async function writeSitemap(records) {
 /** 2026-07 信息架构重组前的老路径，发一份骨架出去让前端接管重定向，别在 CDN 层就 404。 */
 const legacyRoutes = [
   '/agent', '/agent/01-usage-guide', '/agent/02-implementation', '/agent/03-agent-framework',
+  '/agents/project', '/agents/upstream-removals',
   '/channel', '/channel/01-channel-system', '/channel/02-im-gateway-proposal',
   '/desktop/01-quick-start', '/desktop/02-architecture', '/desktop/03-features',
   '/desktop/04-installation', '/desktop/05-FAQ', '/desktop/06-h5-access',
@@ -246,9 +247,9 @@ async function main() {
 
   await createRouteEntry('/en', shell, {
     alternate: '/',
-    description: 'A local-first desktop client for Claude Code. Sessions, diffs, agents and scheduled runs all sit in the open.',
+    description: 'Write code, work across apps, and review every change. Give ccmax a goal and put your ideas in motion.',
     path: '/en',
-    title: 'ccmax — a local-first desktop client for Claude Code'
+    title: 'ccmax — Less busywork. More room for life.'
   })
 
   for (const legacy of legacyRoutes) {

@@ -68,6 +68,7 @@ export type NotificationDeliveryFailureCode =
   | 'invalid_recipient'
   | 'http_error'
   | 'business_error'
+  | 'invalid_receipt'
   | 'network_error'
   | 'timeout'
   | 'delivery_record_failed'
@@ -86,6 +87,7 @@ export type NotificationRecipientDelivery = {
   attempts: number
   error?: string
   errorCode?: NotificationDeliveryFailureCode
+  messageId?: number
 }
 
 export type NotificationDeliveryReport = {
@@ -629,6 +631,7 @@ async function deliverWithRecord(
     const settled = await deps.store.settle(deliveryId, {
       outcome: entry.outcome === 'delivered' ? 'delivered' : entry.outcome === 'indeterminate' ? 'indeterminate' : 'failed',
       attempts: entry.attempts,
+      ...(entry.messageId !== undefined ? { messageId: entry.messageId } : {}),
       ...(entry.error !== undefined ? { error: deps.redact(entry.error) } : {}),
       ...(entry.errorCode !== undefined ? { errorCode: entry.errorCode } : {}),
     })
@@ -690,7 +693,15 @@ async function deliverTelegram(
     return deliveryEntry('telegram', recipient, 'failed', attempts, 'business_error', deps.redact(String(payload.description ?? 'Telegram reported ok:false')))
   }
 
-  return deliveryEntry('telegram', recipient, 'delivered', attempts)
+  const receipt = payload?.result
+  const messageId = receipt && typeof receipt === 'object' && !Array.isArray(receipt)
+    ? (receipt as Record<string, unknown>).message_id
+    : undefined
+  if (payload?.ok !== true || typeof messageId !== 'number' || !Number.isSafeInteger(messageId) || messageId <= 0) {
+    return deliveryEntry('telegram', recipient, 'indeterminate', attempts, 'invalid_receipt', 'Telegram 未返回可验证的消息回执，禁止据此认定送达')
+  }
+
+  return { ...deliveryEntry('telegram', recipient, 'delivered', attempts), messageId }
 }
 
 // ─── Feishu ───────────────────────────────────────────────────────────────────

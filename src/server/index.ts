@@ -1,3 +1,6 @@
+import { configureSessionCollaborationHost, getSessionCollaborationService } from './services/sessionCollaborationHost.js'
+import { authenticateCollaborationCaller, collaborationToolAction } from './sessionCollaborationAuth.js'
+import { handleSessionCollaborationApi } from './api/sessionCollaboration.js'
 /**
  * Claude Code Desktop App — HTTP + WebSocket Server
  *
@@ -26,10 +29,12 @@ import { OPENAI_CODEX_REDIRECT_PATH } from '../services/openaiAuth/client.js'
 import { ensureDesktopCliLauncherInstalled } from './services/desktopCliLauncherService.js'
 import { enableConfigs } from '../utils/config.js'
 import { diagnosticsService } from './services/diagnosticsService.js'
+import { apiPerformanceMonitor } from './services/apiPerformanceMonitor.js'
 import { ensurePersistentStorageUpgraded } from './services/persistentStorageMigrations.js'
 import { handleStaticH5Request } from './staticH5.js'
 import {
   classifyH5Request,
+  resolveTrustedRendererOrigin,
   isH5AccessControlPath,
   isLocalCredentialOnlyPath,
   requiresLocalAccessCredential,
@@ -213,6 +218,21 @@ function isH5AccessControlRequest(
     return false
   }
 
+  // Chromium omits Authorization from preflight. Let only the configured dev
+  // renderer's local H5 control-plane preflight reach CORS; the real request
+  // still passes the process-credential check below. Other credential-only
+  // endpoints keep their existing policy.
+  if (
+    isH5AccessControlPath(url.pathname) &&
+    req.method === 'OPTIONS' &&
+    context.trustedRendererOrigin &&
+    req.headers.get('Origin') === context.trustedRendererOrigin &&
+    req.headers.has('Access-Control-Request-Method') &&
+    classifyH5Request(req, url, context) === 'local-trusted'
+  ) {
+    return false
+  }
+
   if (requiresLocalAccessCredential(url.pathname, context)) {
     return true
   }
@@ -234,6 +254,7 @@ function originFromUrl(value: string | null): string | null {
 
 export function startServer(port = PORT, host = HOST) {
   enableConfigs()
+  const trustedRendererOrigin = resolveTrustedRendererOrigin(process.env.CC_HAHA_TRUSTED_RENDERER_ORIGIN)
   // Warm the synchronous disconnect-grace cache from managed settings so the
   // first client disconnect honors the configured value (issue #764).
   void refreshDisconnectGraceMs()
@@ -322,6 +343,12 @@ export function startServer(port = PORT, host = HOST) {
 
         await localIndexCoordinator.start().catch(() => undefined)
         await ensurePersistentStorageUpgraded()
+        const collaborationAction = collaborationToolAction(url.pathname)
+        if (collaborationAction) {
+          const caller = authenticateCollaborationCaller(req, (id, token) => conversationService.authorizeSdkConnection(id, token))
+          if (!caller) return Response.json({ error: 'Invalid session credential' }, { status: 401 })
+          return handleSessionCollaborationApi(req, collaborationAction, caller, await getSessionCollaborationService())
+        }
         const origin = req.headers.get('Origin')
         const clientAddress = server.requestIP(req)?.address ?? null
         const localTokenOverride = url.searchParams.get('localToken') ?? url.searchParams.get('token')
@@ -364,6 +391,7 @@ export function startServer(port = PORT, host = HOST) {
         const sdkToken = url.searchParams.get('token')
         const h5RequestContext = {
           clientAddress,
+          trustedRendererOrigin,
           localAccessTokenConfigured:
             hasConfiguredLocalAccessToken() || hasConfiguredPetAccessToken(),
           localAccessAuthorized:
@@ -395,6 +423,8 @@ export function startServer(port = PORT, host = HOST) {
         })
         const h5AccessControlBlocked = isH5AccessControlRequest(req, url, h5RequestContext)
 
+        // The configured dev renderer's preflight is classified as local-trusted.
+        // All other browser origins still pass through these capability gates.
         if (h5AccessControlBlocked) {
           return isLocalCredentialOnlyPath(url.pathname)
             ? localCredentialRejectedResponse()
@@ -639,14 +669,18 @@ export function startServer(port = PORT, host = HOST) {
 
       websocket: handleWebSocket,
     })
+    const disposeCollaboration = configureSessionCollaborationHost(localConnectHost, server.port)
     const stop = server.stop.bind(server)
     server.stop = (closeActiveConnections?: boolean) => {
+      apiPerformanceMonitor.stop()
+      disposeCollaboration()
       publicAccess.disable()
       publicAccessServers.delete(publicAccess)
       return stop(closeActiveConnections)
     }
     serverPort = server.port
     ProviderService.setServerPort(serverPort)
+    apiPerformanceMonitor.start()
   } catch (error) {
     publicAccess.disable()
     publicAccessServers.delete(publicAccess)

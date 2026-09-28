@@ -1,3 +1,4 @@
+import { MODEL_SLOTS, type ModelSlot } from '@/lib/providerModelContext'
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -22,8 +23,8 @@ import { useMobileViewport } from '../../hooks/useMobileViewport'
 import { isDesktopRuntime } from '../../lib/desktopRuntime'
 import {
   normalizeRuntimeSelection,
+  reconcileRuntimeSelection,
   resolveDefaultRuntimeSelection,
-  resolveProviderRuntimeModelId,
   resolveProviderSlotModelId,
 } from '../../lib/runtimeSelection'
 import { useHahaOAuthStore } from '../../stores/hahaOAuthStore'
@@ -67,6 +68,7 @@ type Props = {
   runtimeSelection?: RuntimeSelection
   onRuntimeSelectionChange?: (selection: RuntimeSelection) => void
   runtimeKey?: string
+  lockedProviderId?: string | null
   disabled?: boolean
   compact?: boolean
   fluid?: boolean
@@ -137,14 +139,12 @@ function mergeOfficialModels(availableModels: ModelInfo[]): ModelInfo[] {
 
 function buildProviderModels(
   provider: SavedProvider,
-  labels: Record<'main' | 'haiku' | 'sonnet' | 'opus', string>,
+  labels: Record<ModelSlot, string>,
 ): ModelInfo[] {
-  const entries: Array<{ id: string; label: string }> = [
-    { id: resolveProviderSlotModelId(provider, 'main'), label: labels.main },
-    { id: resolveProviderSlotModelId(provider, 'haiku'), label: labels.haiku },
-    { id: resolveProviderSlotModelId(provider, 'sonnet'), label: labels.sonnet },
-    { id: resolveProviderSlotModelId(provider, 'opus'), label: labels.opus },
-  ]
+  const entries = MODEL_SLOTS.map(slot => ({
+    id: resolveProviderSlotModelId(provider, slot),
+    label: labels[slot],
+  }))
 
   const byId = new Map<string, { id: string; labels: string[] }>()
   for (const entry of entries) {
@@ -186,7 +186,7 @@ function buildProviderChoices(
   officialName: string,
   openAIOfficialName: string,
   grokOfficialName: string,
-  labels: Record<'main' | 'haiku' | 'sonnet' | 'opus', string>,
+  labels: Record<ModelSlot, string>,
   claudeOfficialLoggedIn: boolean,
   openAIOfficialLoggedIn: boolean,
   grokOfficialLoggedIn: boolean,
@@ -249,6 +249,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   runtimeSelection: controlledRuntimeSelection,
   onRuntimeSelectionChange,
   runtimeKey,
+  lockedProviderId,
   disabled = false,
   compact = false,
   fluid = false,
@@ -395,6 +396,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   const roleLabels = useMemo(
     () => ({
       main: t('settings.providers.mainModel'),
+      fable: t('settings.providers.fableModel'),
       haiku: t('settings.providers.haikuModel'),
       sonnet: t('settings.providers.sonnetModel'),
       opus: t('settings.providers.opusModel'),
@@ -420,16 +422,17 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   const normalizedSearchQuery = searchQuery.trim().toLocaleLowerCase()
   const selectableModels = isControlled && models ? models : availableModels
   const filteredProviderChoices = useMemo(() => {
-    if (!normalizedSearchQuery) return providerChoices
+    const choices = lockedProviderId === undefined ? providerChoices : providerChoices.filter(choice => choice.providerId === lockedProviderId)
+    if (!normalizedSearchQuery) return choices
 
-    return providerChoices.flatMap((choice) => {
+    return choices.flatMap((choice) => {
       const providerMatches = choice.providerName.toLocaleLowerCase().includes(normalizedSearchQuery)
       const models = providerMatches
         ? choice.models
         : choice.models.filter(model => modelMatchesSearch(model, normalizedSearchQuery))
       return models.length > 0 ? [{ ...choice, models }] : []
     })
-  }, [normalizedSearchQuery, providerChoices])
+  }, [normalizedSearchQuery, providerChoices, lockedProviderId])
   const filteredAvailableModels = useMemo(
     () => normalizedSearchQuery
       ? selectableModels.filter(model => modelMatchesSearch(model, normalizedSearchQuery))
@@ -449,25 +452,29 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
       storeModel?.id,
     )
     : null
-  const requestedRuntimeProvider = providers.find(
-    (provider) => provider.id === requestedRuntimeSelection?.providerId,
-  )
-  const activeRuntimeSelection = requestedRuntimeSelection && providerChoices.some(
-    (choice) => choice.providerId === requestedRuntimeSelection.providerId,
-  )
-    ? {
-      ...requestedRuntimeSelection,
-      modelId: requestedRuntimeProvider
-        ? resolveProviderRuntimeModelId(
-          requestedRuntimeProvider,
-          requestedRuntimeSelection.modelId,
-        )
-        : requestedRuntimeSelection.modelId,
-    }
+  const resolvedRuntimeSelection = requestedRuntimeSelection
+    ? reconcileRuntimeSelection(requestedRuntimeSelection, {
+      providers, activeId, hasLoadedProviders: hasLoadedProviders && lockedProviderId === undefined,
+      currentModelId: storeModel?.id,
+      defaultEffortLevel: effortLevel,
+    })
     : null
+  // OAuth catalogs are loaded lazily. Their absence must not erase an already
+  // selected model, even while another provider is the global default.
+  const activeRuntimeSelection = resolvedRuntimeSelection && (
+    controlledRuntimeSelection || runtimeSelection ||
+    providerChoices.some((choice) => choice.providerId === resolvedRuntimeSelection.providerId)
+  ) ? resolvedRuntimeSelection : null
 
   const selectedProviderChoice = activeRuntimeSelection
-    ? providerChoices.find((choice) => choice.providerId === activeRuntimeSelection.providerId) ?? null
+    ? providerChoices.find((choice) => choice.providerId === activeRuntimeSelection.providerId)
+      ?? (activeRuntimeSelection.providerId === null
+        ? officialChoices(null, mergeOfficialModels(activeId === null ? availableModels : []), activeId === null, t('settings.providers.officialName'))
+        : activeRuntimeSelection.providerId === OPENAI_OFFICIAL_PROVIDER_ID
+          ? officialChoices(OPENAI_OFFICIAL_PROVIDER_ID, activeId === OPENAI_OFFICIAL_PROVIDER_ID && availableModels.length ? availableModels : OPENAI_OFFICIAL_MODELS, activeId === OPENAI_OFFICIAL_PROVIDER_ID, t('settings.providers.openaiOfficialName'))
+          : activeRuntimeSelection.providerId === GROK_OFFICIAL_PROVIDER_ID
+            ? officialChoices(GROK_OFFICIAL_PROVIDER_ID, activeId === GROK_OFFICIAL_PROVIDER_ID && availableModels.length ? availableModels : GROK_OFFICIAL_MODELS, activeId === GROK_OFFICIAL_PROVIDER_ID, t('settings.providers.grokOfficialName'))
+            : null)
     : null
 
   const selectedRuntimeModel = activeRuntimeSelection
@@ -488,7 +495,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
     (selectedRuntimeProvider.apiFormat ?? 'anthropic') === 'anthropic' &&
     !isOpenAIReasoningModel(selectedRuntimeModel?.id ?? '')
 
-  const needsProviderConfiguration = isRuntimeScoped && providerChoices.length === 0
+  const needsProviderConfiguration = isRuntimeScoped && !activeRuntimeSelection && providerChoices.length === 0
   const buttonModelLabel = isRuntimeScoped
     ? selectedRuntimeModel?.name
       ?? (needsProviderConfiguration ? t('model.configureProvider') : t('model.selectModel'))
@@ -584,12 +591,14 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   }), [openSelector])
 
   const handleRuntimeSelect = (selection: RuntimeSelection) => {
+    if (lockedProviderId !== undefined && selection.providerId !== lockedProviderId) return
     const provider = providers.find((entry) => entry.id === selection.providerId)
     const normalizedSelection = normalizeRuntimeSelection(
       selection,
       provider?.apiFormat,
       provider ? getBundledPresetReasoningProviderKind(provider.presetId) : undefined,
     )
+    if (lockedProviderId !== undefined) normalizedSelection.effortLevel = activeRuntimeSelection?.effortLevel
     onRuntimeSelectionChange?.(normalizedSelection)
     if (runtimeKey) {
       useSessionRuntimeStore.getState().setSelection(runtimeKey, normalizedSelection)
@@ -601,7 +610,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   }
 
   const handleRuntimeEffortSelect = (level: ReasoningEffortLevel) => {
-    if (!activeRuntimeSelection) return
+    if (!activeRuntimeSelection || lockedProviderId !== undefined) return
     handleRuntimeSelect({
       ...activeRuntimeSelection,
       effortLevel: level,
@@ -889,7 +898,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
           <button
             ref={effortButtonRef}
             type="button"
-            disabled={disabled}
+            disabled={disabled || lockedProviderId !== undefined}
             aria-label={`${t('model.effort')}: ${effortLabels[selectedRuntimeEffort]}`}
             aria-expanded={effortOpen}
             onClick={() => {

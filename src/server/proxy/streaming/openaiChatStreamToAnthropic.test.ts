@@ -52,13 +52,23 @@ describe('Chat stream protocol boundaries', () => {
     expect(events.some(e => e.type === 'message_stop')).toBe(false)
   })
 
-  for (const broken of [tool(0, { id: '' }), tool(0, { function: { name: '', arguments: '{}' } }), tool(0, { function: { name: 'Read', arguments: '{"path":' } }), tool(0, { function: { name: 'Read', arguments: '[]' } })]) {
+  for (const broken of [tool(0, { id: '' }), tool(0, { function: { name: '', arguments: '{}' } }), tool(0, { function: { name: 'Read', arguments: '[]' } })]) {
     test(`rejects completed invalid tool ${JSON.stringify(broken)}`, async () => {
       const events = await collect(chunk({ tool_calls: [broken] }) + chunk({}, 'tool_calls'))
       expect(events.at(-1).type).toBe('error')
       expect(events.some(e => e.type === 'message_stop')).toBe(false)
     })
   }
+
+  test('completed malformed arguments reach CLI validation unchanged', async () => {
+    const raw = '{"path":'
+    const events = await collect(chunk({ tool_calls: [tool(0, { function: { name: 'Read', arguments: raw } })] }) + chunk({}, 'tool_calls'))
+    expect(events.at(-1).type).toBe('message_stop')
+    expect(events.find(e => e.type === 'message_delta').delta.stop_reason).toBe('tool_use')
+    expect(events.find(e => e.content_block?.type === 'tool_use').content_block.id).toBe('call_0')
+    expect(events.filter(e => e.delta?.partial_json).map(e => e.delta.partial_json).join('')).toBe(raw)
+    expect(events.some(e => e.type === 'error')).toBe(false)
+  })
 
   test('length retains truncation cause without synthesizing tool success', async () => {
     const events = await collect(chunk({ tool_calls: [tool(0, { function: { name: 'Read', arguments: '{"path":' } })] }) + chunk({}, 'length'))
@@ -133,4 +143,11 @@ describe('Chat stream protocol boundaries', () => {
     await reader.cancel()
     expect(cancelled).toBe(true)
   })
+})
+
+test('nested prompt cache survives zero direct cache creation in streaming usage (#1327)', async () => {
+  const usage = { prompt_tokens: 149293, completion_tokens: 551, cache_creation_input_tokens: 0, prompt_tokens_details: { cached_tokens: 147840 } }
+  const events = await collect(chunk({ content: 'Done' }) + chunk({}, 'stop')
+    + `data: ${JSON.stringify({ choices: [], usage })}\n\ndata: [DONE]\n\n`)
+  expect(events.find(e => e.type === 'message_delta').usage).toMatchObject({ input_tokens: 1453, output_tokens: 551, cache_read_input_tokens: 147840 })
 })

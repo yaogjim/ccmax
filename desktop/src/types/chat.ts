@@ -8,7 +8,7 @@ import type { RuntimeSelection } from './runtime'
 export type ClientMessage =
   | { type: 'prewarm_session' }
   | { type: 'sync_state' }
-  | { type: 'user_message'; content: string; attachments?: AttachmentRef[] }
+  | { type: 'user_message'; content: string; attachments?: AttachmentRef[]; sessionReferences?: Array<{ sessionId: string }> }
   | {
       type: 'permission_response'
       requestId: string
@@ -28,6 +28,7 @@ export type ClientMessage =
   | { type: 'set_permission_mode'; mode: PermissionMode }
   | ({ type: 'set_runtime_config' } & RuntimeSelection)
   | { type: 'stop_generation' }
+  | { type: 'ask_user_question_activity'; requestId: string }
   | { type: 'stop_background_task'; taskId: string }
   | { type: 'ping' }
 
@@ -43,6 +44,7 @@ export type AttachmentRef = {
   diffSide?: 'old' | 'new'
   hunkId?: string
   note?: string
+  referenceKind?: 'chat-selection'
   quote?: string
   selectionNumber?: number
 }
@@ -77,6 +79,7 @@ export type UIAttachment = {
   diffSide?: 'old' | 'new'
   hunkId?: string
   note?: string
+  referenceKind?: 'chat-selection'
   quote?: string
   selectionNumber?: number
 }
@@ -128,7 +131,7 @@ export type ServerMessage =
       computerUseRequestIds: string[]
       turnActive: boolean
     }
-  | { type: 'user_message_replay'; content: string }
+  | { type: 'user_message_replay'; content: string; sessionReferences?: Array<{ sessionId: string }>; collaboration?: { sourceSessionId: string; messageId?: string } }
   | { type: 'message_complete'; usage: TokenUsage; timing?: TurnTiming }
   /** `complete` marks a whole thinking block; without it `text` is a stream fragment. */
   | { type: 'thinking'; text: string; complete?: boolean }
@@ -138,6 +141,7 @@ export type ServerMessage =
       providerId: string | null
       modelId: string
       effortLevel?: string
+      requestedConfig?: { providerId: string | null; modelId: string; effortLevel?: string }
     }
   // CLI 回传的权限模式变化（如 ExitPlanMode 退出 plan 后恢复、Shift+Tab）。
   // 桌面端据此把选择器校正回 CLI 的真实权限，避免本地影子值漂移。
@@ -158,6 +162,7 @@ export type ServerMessage =
   | { type: 'system_notification'; subtype: string; message?: string; data?: unknown }
   | { type: 'pong' }
   | { type: 'team_update'; teamName: string; members: TeamMemberStatus[]; incarnationId?: string; leadSessionId?: string; createdAt?: number }
+  | { type: 'team_plan_updated'; teamName: string; sessionId: string; planId: string; revision: number; state: string; incarnationId: string }
   | { type: 'team_created'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'team_workbench_updated'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'team_deleted'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
@@ -345,7 +350,7 @@ export type UIMessage =
    * the user's own prompt render identically, which is what flattened the
    * member transcript.
    */
-  | { id: string; type: 'user_text'; content: string; modelContent?: string; transcriptMessageId?: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean; optimisticQueued?: boolean; teammateFrom?: string }
+  | { id: string; type: 'user_text'; content: string; sessionReferences?: Array<{ sessionId: string }>; collaboration?: { sourceSessionId: string; messageId?: string }; modelContent?: string; transcriptMessageId?: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean; optimisticQueued?: boolean; awaitingReplay?: boolean; teammateFrom?: string }
   | { id: string; type: 'assistant_text'; content: string; transcriptMessageId?: string; timestamp: number; model?: string }
   | { id: string; type: 'thinking'; content: string; timestamp: number }
   | {
@@ -363,7 +368,7 @@ export type UIMessage =
     }
   | { id: string; type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; timestamp: number; parentToolUseId?: string }
   | { id: string; type: 'background_task'; task: BackgroundAgentTask; timestamp: number }
-  | { id: string; type: 'system'; content: string; timestamp: number }
+  | { id: string; type: 'system'; content: string; generationStopped?: boolean; transcriptMessageId?: string; timestamp: number }
   | {
       id: string
       type: 'compact_summary'

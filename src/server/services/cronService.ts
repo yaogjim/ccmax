@@ -351,6 +351,47 @@ async function withTasksFileLock<T>(
   }
 }
 
+/**
+ * 每个任务文件一条互斥队列（模块级，跨实例共享）。
+ * 调度器会在同一分钟并发启动多个任务（各自调用 updateLastFired），
+ * API 的增删改也可能与调度器写入交错；无互斥时后完成的写回会覆盖
+ * 先完成的修改（执行时间丢失、创建不落盘、已删除任务复活）。
+ * 注意 API 层（scheduled-tasks.ts）与调度器（cronScheduler.ts）持有
+ * 不同的 CronService 实例，因此队列必须按文件路径共享而非挂在实例上。
+ */
+const mutationQueues = new Map<string, Promise<unknown>>()
+
+/** 在指定文件的互斥队列中执行变更操作，保留其原始结果/错误。 */
+function runExclusive<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
+  const previous = mutationQueues.get(filePath) ?? Promise.resolve()
+  const result = previous.then(operation)
+  mutationQueues.set(
+    filePath,
+    result.then(
+      () => undefined,
+      () => undefined,
+    ),
+  )
+  return result
+}
+
+/**
+ * Serialize a task-file read-modify-write for both layers:
+ *  - `runExclusive` orders same-process callers (the API handler and the
+ *    scheduler hold different `CronService` instances but share this
+ *    module-level queue, keyed by file path);
+ *  - `withTasksFileLock` excludes another server process pointed at the same
+ *    config dir.
+ * Queue first, then lock, so same-process writers never spin on the on-disk
+ * lock and the lock is held only for the mutation itself.
+ */
+function withTasksFileMutation<T>(
+  filePath: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  return runExclusive(filePath, () => withTasksFileLock(filePath, run))
+}
+
 export class CronService {
   /** 任务文件路径 */
   private getTasksFilePath(): string {
@@ -398,7 +439,7 @@ export class CronService {
 
     const notification = await this.resolveNotification(task.notification)
 
-    return withTasksFileLock(this.getTasksFilePath(), async () => {
+    return withTasksFileMutation(this.getTasksFilePath(), async () => {
       const data = await this.readTasksFile()
       const { notification: _rawNotification, ...rest } = task
       const newTask: CronTask = {
@@ -427,7 +468,7 @@ export class CronService {
       ? await this.resolveNotification(requestedNotification)
       : undefined
 
-    return withTasksFileLock(this.getTasksFilePath(), async () => {
+    return withTasksFileMutation(this.getTasksFilePath(), async () => {
       const data = await this.readTasksFile()
       const index = data.tasks.findIndex((t) => t.id === id)
       if (index === -1) {
@@ -457,7 +498,7 @@ export class CronService {
 
   /** 删除任务 */
   async deleteTask(id: string): Promise<void> {
-    await withTasksFileLock(this.getTasksFilePath(), async () => {
+    await withTasksFileMutation(this.getTasksFilePath(), async () => {
       const data = await this.readTasksFile()
       const index = data.tasks.findIndex((t) => t.id === id)
       if (index === -1) {
@@ -470,7 +511,7 @@ export class CronService {
 
   /** 更新任务的最后执行时间 */
   async updateLastFired(taskId: string, timestamp: string): Promise<void> {
-    await withTasksFileLock(this.getTasksFilePath(), async () => {
+    await withTasksFileMutation(this.getTasksFilePath(), async () => {
       const data = await this.readTasksFile()
       const index = data.tasks.findIndex((t) => t.id === taskId)
       if (index === -1) {
@@ -524,10 +565,11 @@ export class CronService {
         lastError = err as Error
         await fs.unlink(tmpFile).catch(() => {})
 
-        if (
-          (err as NodeJS.ErrnoException).code !== 'ENOENT' ||
-          attempt === TASKS_FILE_WRITE_ATTEMPTS - 1
-        ) {
+        // EPERM: Windows 上与其他进程同时 rename 到同一目标可能瞬时失败，
+        // 与 ENOENT 一样属于可重试的瞬时错误。
+        const code = (err as NodeJS.ErrnoException).code
+        const retryable = code === 'ENOENT' || code === 'EPERM'
+        if (!retryable || attempt === TASKS_FILE_WRITE_ATTEMPTS - 1) {
           break
         }
       }

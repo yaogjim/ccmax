@@ -38,7 +38,7 @@ You can also list, inspect, update, enable, disable, delete, or immediately run 
 
 ## Every field in the form
 
-![The New scheduled task dialog: name, description, prompt, frequency, notifications](../../images/app/en/schedule-create.webp)
+![The New scheduled task dialog: name, description, prompt, frequency, notifications (Chinese interface)](../../images/app/en/schedule-create.webp)
 
 - **Name** (required) — the identifier in the list. A hyphenated form like `daily-code-review` reads well.
 - **Description** (required) — one line about what it does, so you recognize it later.

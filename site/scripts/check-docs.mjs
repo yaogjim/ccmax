@@ -240,8 +240,7 @@ async function checkAppScreenshotFiles() {
 
 /**
  * 语言分流的判定规则在两处各有一份：src/lib/locale.js（可测的模块）和 index.html 里的内联
- * 副本（首帧就要跳，等不到模块加载）。两处漂移不会报错，只会让首页悄悄按旧规则分流，所以
- * 在这里钉死：storage key 和中文判定正则必须逐字一致，且内联脚本必须只在根路径动手。
+ * 副本（首帧就要跳，等不到模块加载）。锁住 storage key、浏览器语言读取及根路径边界。
  */
 async function checkLocaleRedirect() {
   const problems = []
@@ -249,10 +248,10 @@ async function checkLocaleRedirect() {
   const shellSource = await fs.readFile(path.join(paths.siteDir, 'index.html'), 'utf8')
 
   const storageKey = moduleSource.match(/LOCALE_STORAGE_KEY\s*=\s*'([^']+)'/)?.[1]
-  const chineseTag = moduleSource.match(/const CHINESE_TAG\s*=\s*(\/.+\/i)/)?.[1]
+  const defaultLocale = moduleSource.match(/DEFAULT_LOCALE\s*=\s*'([^']+)'/)?.[1]
 
-  if (!storageKey || !chineseTag) {
-    problems.push('src/lib/locale.js: 读不出 LOCALE_STORAGE_KEY 或 CHINESE_TAG，防漂移校验失效')
+  if (!storageKey || !defaultLocale) {
+    problems.push('src/lib/locale.js: 读不出 LOCALE_STORAGE_KEY 或 DEFAULT_LOCALE，防漂移校验失效')
     return problems
   }
 
@@ -260,8 +259,12 @@ async function checkLocaleRedirect() {
     problems.push(`index.html: 内联语言脚本没有用 '${storageKey}'，与 src/lib/locale.js 不一致`)
   }
 
-  if (!shellSource.includes(chineseTag)) {
-    problems.push(`index.html: 内联语言脚本的中文判定与 src/lib/locale.js 的 ${chineseTag} 不一致`)
+  if (!shellSource.includes('navigator.languages && navigator.languages[0]') || !shellSource.includes('navigator.language')) {
+    problems.push('index.html: 内联语言脚本缺少浏览器首选语言读取')
+  }
+
+  if (!shellSource.includes(`? 'zh' : '${defaultLocale}'`)) {
+    problems.push(`index.html: 内联语言脚本的非中文默认语言与 src/lib/locale.js 的 ${defaultLocale} 不一致`)
   }
 
   if (!moduleSource.includes("from './site.js'")) {
@@ -435,6 +438,14 @@ async function main() {
   ])
   const problems = [...await checkLocaleRedirect()]
   problems.push(...await checkReadmeImages(readmes))
+
+  // docs/agents/ 是内部项目材料，不发布。generator 的 excludedDirectoryNames 掉了 agents
+  // 时这里就会红，别只靠注释挡下一次合并。
+  for (const record of records) {
+    if (record.section === 'agents') {
+      problems.push(`${record.sourcePath}: docs/agents must stay out of the published manifest`)
+    }
+  }
   problems.push(...checkAppScreenshotReferences([
     ...readmes,
     ...records.map((record) => ({

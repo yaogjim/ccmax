@@ -63,6 +63,42 @@ beforeEach(() => {
 })
 
 describe('ModelSelector', () => {
+  it('shows the configured default for an opened session whose saved provider was removed', () => {
+    useSettingsStore.setState({ locale: 'en', effortLevel: 'high' })
+    useProviderStore.setState({
+      activeId: 'replacement', hasLoadedProviders: true, isLoading: false,
+      providers: [{
+        id: 'replacement', presetId: 'custom', name: 'Replacement',
+        apiFormat: 'anthropic', apiKey: 'fixture', baseUrl: 'http://127.0.0.1:1',
+        models: { main: 'current-model', haiku: '', sonnet: '', opus: '' },
+      }],
+    })
+    useSessionRuntimeStore.getState().setSelection('restored-session', {
+      providerId: 'deleted-provider', modelId: 'old-model', effortLevel: 'max',
+    })
+
+    render(<ModelSelector runtimeKey="restored-session" />)
+
+    expect(screen.getByRole('button', { name: 'current-model, Replacement' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Select model' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /High/ })).toBeInTheDocument()
+  })
+
+  it('keeps a restored official model visible before lazy OAuth status is fetched', () => {
+    useSettingsStore.setState({ locale: 'en' })
+    useProviderStore.setState({ hasLoadedProviders: true, providers: [], activeId: null })
+    useSessionRuntimeStore.getState().setSelection('official-restored', {
+      providerId: null, modelId: 'claude-opus-4-8', effortLevel: 'high',
+    })
+    const fetchStatus = vi.fn(async () => {})
+    useHahaOAuthStore.setState({ status: null, fetchStatus })
+
+    render(<ModelSelector runtimeKey="official-restored" />)
+
+    expect(screen.getByRole('button', { name: 'Opus 4.8, Claude Official' })).toBeInTheDocument()
+    expect(fetchStatus).not.toHaveBeenCalled()
+  })
+
   it('keeps a long model label shrinkable in a fluid desktop toolbar', () => {
     useSettingsStore.setState({ locale: 'en', availableModels: MODELS, currentModel: MODELS[0] })
     render(<ModelSelector value="alpha" onChange={vi.fn()} fluid />)
@@ -78,13 +114,13 @@ describe('ModelSelector', () => {
       providers: [{
         id: 'provider-1m', presetId: 'custom', name: 'Provider 1M',
         apiFormat: 'anthropic', apiKey: 'fixture', baseUrl: 'http://127.0.0.1:9999',
-        models: { main: 'main-model', haiku: 'haiku-model', sonnet: 'sonnet-model', opus: 'opus-model' },
-        model1mSupport: { main: enabled, haiku: enabled, sonnet: enabled, opus: enabled },
+        models: { main: 'main-model', fable: 'fable-model', haiku: 'haiku-model', sonnet: 'sonnet-model', opus: 'opus-model' },
+        model1mSupport: { main: enabled, fable: enabled, haiku: enabled, sonnet: enabled, opus: enabled },
       }],
     })
     const runtimeChange = vi.fn()
     render(<ModelSelector runtimeKey="__draft__" onRuntimeSelectionChange={runtimeChange} />)
-    for (const slot of ['main', 'haiku', 'sonnet', 'opus']) {
+    for (const slot of ['main', 'fable', 'haiku', 'sonnet', 'opus']) {
       await clickByRole(/, Provider 1M$/)
       fireEvent.click(within(screen.getByTestId('model-selector-dropdown')).getByRole('button', { name: new RegExp(`^${slot}-model`) }))
       expect(runtimeChange).toHaveBeenLastCalledWith({
@@ -92,6 +128,34 @@ describe('ModelSelector', () => {
       })
       expect(screen.getByRole('button', { name: /High/ })).toBeInTheDocument()
     }
+  })
+
+  it('finds a separately configured Fable model by provider, role and model ID', async () => {
+    useSettingsStore.setState({ locale: 'en' })
+    useProviderStore.setState({
+      activeId: 'relay', hasLoadedProviders: true, isLoading: false,
+      providers: [{
+        id: 'relay', presetId: 'custom', name: 'AruHub',
+        apiFormat: 'anthropic', apiKey: 'fixture', baseUrl: 'http://127.0.0.1:9999',
+        models: {
+          main: 'claude-opus-5-5', fable: 'claude-fable-5-1',
+          haiku: 'claude-opus-5-5', sonnet: 'claude-opus-5-5', opus: 'claude-opus-5-5',
+        },
+      }],
+    })
+    const runtimeChange = vi.fn()
+    render(<ModelSelector runtimeKey="__draft__" onRuntimeSelectionChange={runtimeChange} />)
+    await clickByRole(/, AruHub$/)
+    const dropdown = within(screen.getByTestId('model-selector-dropdown'))
+    const search = dropdown.getByRole('searchbox', { name: 'Search models' })
+    for (const query of ['Aru', 'Fable Model', 'claude-fable-5-1']) {
+      fireEvent.change(search, { target: { value: query } })
+      expect(dropdown.getByRole('button', { name: /claude-fable-5-1/ })).toBeInTheDocument()
+    }
+    fireEvent.click(dropdown.getByRole('button', { name: /claude-fable-5-1/ }))
+    expect(runtimeChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      providerId: 'relay', modelId: 'claude-fable-5-1',
+    }))
   })
 
   it.each(['unknown', 'mixed', 'anthropic'] as const)(
@@ -164,13 +228,14 @@ describe('ModelSelector', () => {
     await clickByRole(/Opus 4\.7/i)
 
     expect(screen.getByRole('button', { name: /Fable 5\.1/ })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Opus 5/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Opus 5\.5/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Opus 5 / })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Opus 4\.8/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Sonnet 5/ })).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: /Opus 4\.7/ }).length).toBeGreaterThan(0)
-    await clickByRole(/Opus 5/)
+    await clickByRole(/Opus 5\.5/)
     expect(onRuntimeChange).toHaveBeenCalledWith(expect.objectContaining({
-      providerId: null, modelId: 'claude-opus-5',
+      providerId: null, modelId: 'claude-opus-5-5',
     }))
   })
 
@@ -602,7 +667,7 @@ describe('ModelSelector', () => {
     })
   })
 
-  it('defaults blank provider-scoped runtime selections to the active provider main model', async () => {
+  it('defaults blank runtime selections to the model selected in settings', async () => {
     useSettingsStore.setState({
       locale: 'en',
       availableModels: [
@@ -634,17 +699,17 @@ describe('ModelSelector', () => {
 
     render(<ModelSelector runtimeKey="blank-session" />)
 
-    const trigger = screen.getByRole('button', { name: /deepseek-v4-flash/i })
+    const trigger = screen.getByRole('button', { name: /deepseek-v4-pro/i })
     await act(async () => {
       fireEvent.click(trigger)
       await Promise.resolve()
     })
 
-    const flashOption = screen
-      .getAllByRole('button', { name: /deepseek-v4-flash/i })
-      .find((button) => button.textContent?.includes('Main Model'))
-    expect(flashOption).toBeDefined()
-    expect(flashOption?.className).toContain('border-[var(--color-model-option-selected-border)]')
+    const configuredOption = screen
+      .getAllByRole('button', { name: /deepseek-v4-pro/i })
+      .find((button) => button.textContent?.includes('Sonnet Model'))
+    expect(configuredOption).toBeDefined()
+    expect(configuredOption?.className).toContain('border-[var(--color-model-option-selected-border)]')
   })
 
   it('closes the focus ring on both halves of the segmented control', () => {
@@ -1240,8 +1305,8 @@ describe('ModelSelector', () => {
 
   it('replaces a stale Grok runtime model with the current official default', async () => {
     const grokModels: ModelInfo[] = [{
-      id: 'grok-4.6',
-      name: 'Grok 4.6',
+      id: 'grok-4.7',
+      name: 'Grok 4.7',
       description: "SpaceXAI's latest frontier model",
       context: '500000',
       defaultReasoningEffort: 'high',
@@ -1272,14 +1337,29 @@ describe('ModelSelector', () => {
     render(<ModelSelector runtimeKey="session-stale-grok" />)
 
     expect(screen.queryByText('grok-build')).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Grok 4.6, Grok Official' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Grok 4.7, Grok Official' })).toBeInTheDocument()
     await waitFor(() => {
       expect(useSessionRuntimeStore.getState().selections['session-stale-grok']).toEqual({
         providerId: 'grok-official',
-        modelId: 'grok-4.6',
+        modelId: 'grok-4.7',
         effortLevel: 'high',
       })
     })
+  })
+
+  it('keeps temporary side chat model choices within its inherited provider', async () => {
+    useProviderStore.setState({ providers: ['a', 'b'].map(id => ({ id, presetId: 'custom', name: `Provider ${id}`, apiKey: 'fixture', baseUrl: 'https://fixture.invalid', apiFormat: 'anthropic' as const, models: { main: `model-${id}`, sonnet: `alternate-${id}`, haiku: '', opus: '' } })), activeId: 'a', hasLoadedProviders: true })
+    useSessionRuntimeStore.getState().setSelection('side-model', { providerId: 'a', modelId: 'model-a', effortLevel: 'high' })
+    render(<ModelSelector runtimeKey="side-model" lockedProviderId="a" />)
+    await clickByRole(/model-a/i)
+    const dropdown = screen.getByTestId('model-selector-dropdown')
+    expect(dropdown.textContent).toContain('alternate-a')
+    expect(dropdown.textContent).not.toContain('Provider b')
+    expect(dropdown.textContent).not.toContain('Claude Official')
+    await clickByRole(/alternate-a/i)
+    expect(useSessionRuntimeStore.getState().selections['side-model']?.effortLevel).toBe('high')
+    const effort = screen.queryByRole('button', { name: /effort:/i })
+    if (effort) expect(effort).toBeDisabled()
   })
 
   it('hides official provider sections when OAuth is not logged in', async () => {

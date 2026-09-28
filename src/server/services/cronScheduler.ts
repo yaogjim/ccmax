@@ -255,6 +255,43 @@ type RunsFileMutationTarget = {
   projectionTarget: ScheduledRunReadModelTarget
 }
 
+// Two tasks can finish in the same second. Serialize the whole read/modify/write
+// cycle per log file so neither completion can replace the other's record.
+//
+// Two layers, both required:
+//  - this module-level queue orders callers *inside one process* (the API
+//    service and the scheduler each hold their own pieces of state, and a
+//    same-millisecond completion would otherwise rename over the other's
+//    record);
+//  - `withRunsFileLock` below takes the shared on-disk lock, which is what
+//    excludes a second server process pointed at the same config dir.
+// Queue first, then lock, so same-process writers never spin on the lock and
+// the lock is held only for the mutation itself.
+const runLogMutationQueues = new Map<string, Promise<void>>()
+
+function mutateRunsFile(
+  target: RunsFileMutationTarget,
+  mutation: (data: RunsFile) => void,
+): Promise<void> {
+  const previous = runLogMutationQueues.get(target.sourcePath) ?? Promise.resolve()
+  const result = previous.then(() =>
+    withRunsFileLock(target.sourcePath, async () => {
+      const data = await readRunsFile(target.sourcePath)
+      mutation(data)
+      trimRuns(data)
+      await writeRunsFile(data, target)
+    }),
+  )
+  const settled = result.catch(() => {})
+  runLogMutationQueues.set(target.sourcePath, settled)
+  void settled.then(() => {
+    if (runLogMutationQueues.get(target.sourcePath) === settled) {
+      runLogMutationQueues.delete(target.sourcePath)
+    }
+  })
+  return result
+}
+
 function getLogFilePath(): string {
   const configDir =
     process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
@@ -409,12 +446,13 @@ async function compareScheduledRunPageInShadow(
 }
 
 /**
- * Serialize a read-modify-write against the runs log. `appendRun`/`updateRun`
- * read the whole file, mutate it, and rename a temp file over it; two tasks
- * finishing at the same time (or two server processes sharing a config dir)
- * would otherwise interleave those steps and silently drop a run. Uses the
- * same on-disk `proper-lockfile` lock as `CronService`; `realpath: false`
- * because the log may not exist yet, and the directory is created first.
+ * Cross-process half of the runs-log serialization: the shared on-disk lock
+ * that a second server process sharing a config dir also takes. `CronService`
+ * uses the same lock for the task file. `realpath: false` because the log may
+ * not exist yet, and the directory is created first.
+ *
+ * `mutateRunsFile` takes this lock inside its in-process queue; callers that do
+ * not go through the queue (the startup stale-run cleanup) call it directly.
  */
 async function withRunsFileLock<T>(
   filePath: string,
@@ -442,12 +480,7 @@ async function appendRun(
   run: TaskRun,
   target = captureRunsFileMutationTarget(),
 ): Promise<void> {
-  await withRunsFileLock(target.sourcePath, async () => {
-    const data = await readRunsFile(target.sourcePath)
-    data.runs.push(run)
-    trimRuns(data)
-    await writeRunsFile(data, target)
-  })
+  await mutateRunsFile(target, data => { data.runs.push(run) })
 }
 
 /** Update an existing run in the log (matched by run.id). */
@@ -455,16 +488,10 @@ async function updateRun(
   run: TaskRun,
   target = captureRunsFileMutationTarget(),
 ): Promise<void> {
-  await withRunsFileLock(target.sourcePath, async () => {
-    const data = await readRunsFile(target.sourcePath)
+  await mutateRunsFile(target, data => {
     const idx = data.runs.findIndex((r) => r.id === run.id)
-    if (idx !== -1) {
-      data.runs[idx] = run
-    } else {
-      data.runs.push(run)
-    }
-    trimRuns(data)
-    await writeRunsFile(data, target)
+    if (idx !== -1) data.runs[idx] = run
+    else data.runs.push(run)
   })
 }
 

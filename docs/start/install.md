@@ -9,6 +9,8 @@ order: 1
 
 装完就能用，不需要另外安装 Node.js、Python 或 Claude Code——CLI 内核和文件搜索用的 ripgrep 都已经打进安装包里了。
 
+产品名称统一为 **ccmax**。现有安装包、已安装的应用和系统进程可能仍显示旧名称 `Claude Code Haha`；下面的文件名和命令按实际发布包保留。
+
 ## 挑对安装包
 
 所有安装包都在 [GitHub Releases](https://github.com/yaogjim/ccmax/releases/latest)，按系统和 CPU 架构选一个：

@@ -63,6 +63,7 @@ function docsManifestPlugin() {
 
 export default defineConfig({
   base: SITE_BASE_PATH,
+  resolve: { alias: { '@': path.resolve(import.meta.dirname, 'src') } },
   plugins: [docsManifestPlugin()],
   build: {
     outDir: 'dist',

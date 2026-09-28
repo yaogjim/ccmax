@@ -12,6 +12,7 @@ import { ProviderSettings } from './ProviderSettings'
 vi.mock('../../components/settings/ClaudeOfficialLogin', () => ({ ClaudeOfficialLogin: () => null }))
 vi.mock('../../components/settings/ChatGPTOfficialLogin', () => ({ ChatGPTOfficialLogin: () => null }))
 vi.mock('../../components/settings/GrokOfficialLogin', () => ({ GrokOfficialLogin: () => null }))
+vi.mock('../../components/settings/OfficialProviderModelSettings', () => ({ OfficialProviderModelSettings: () => null }))
 
 const savedProviders: SavedProvider[] = ([
   ['xuanshuapi', '玄枢API', 'https://www.xuanshuapi.com', 'claude-sonnet-5'],
@@ -61,9 +62,11 @@ describe('ApiSmart sponsor provider', () => {
     expect(dialog.getByDisplayValue('https://direct.aruhub.com:8443')).toBeInTheDocument()
     expect(dialog.getAllByDisplayValue('claude-opus-5')).toHaveLength(2)
     expect(dialog.getAllByDisplayValue('claude-sonnet-5')).toHaveLength(2)
-    expect(dialog.getByText(/注册即送 1 美元全模型通用额度/)).toBeInTheDocument()
-    fireEvent.click(dialog.getByRole('button', { name: /Get API Key/ }))
+    const offer = dialog.getByRole('button', { name: /注册即送 1 美元全模型通用额度/ })
+    fireEvent.click(offer)
     expect(open).toHaveBeenCalledWith('https://aruhub.com/sign-up?aff=Z54g')
+    fireEvent.click(dialog.getByRole('button', { name: /Get API Key/ }))
+    expect(open).toHaveBeenCalledTimes(2)
     fireEvent.change(dialog.getAllByPlaceholderText('sk-...')[0]!, { target: { value: 'fake-aruhub-key' } })
     expect(dialog.getByText(/注册即送 1 美元全模型通用额度/)).toBeInTheDocument()
     fireEvent.change(dialog.getByDisplayValue('https://direct.aruhub.com:8443'), { target: { value: 'https://other.invalid' } })
@@ -78,6 +81,47 @@ describe('ApiSmart sponsor provider', () => {
       apiKey: 'fake-aruhub-key',
       models: { main: 'claude-opus-5', haiku: 'claude-sonnet-5', sonnet: 'claude-sonnet-5', opus: 'claude-opus-5' },
     })))
+  })
+
+  it('lets a preset switch protocol while the preset endpoint stays put', async () => {
+    const create = vi.spyOn(providersApi, 'create').mockImplementation(async (input) => ({
+      provider: { ...input, id: 'saved-aruhub', apiFormat: input.apiFormat ?? 'anthropic' },
+    }))
+    render(<ProviderSettings />)
+    fireEvent.click(await screen.findByRole('button', { name: /Add Model/ }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByRole('button', { name: 'AruHub' }))
+
+    // AruHub is an Anthropic-endpoint preset that also serves OpenAI, so the
+    // protocol starts on the preset's own value and is the user's to change.
+    const formatTrigger = dialog.getByRole('button', { name: /Anthropic Messages \(native\)/ })
+    expect(dialog.queryByText(/point the base URL at an endpoint that serves it/)).not.toBeInTheDocument()
+
+    fireEvent.click(formatTrigger)
+    fireEvent.click(await screen.findByRole('option', { name: /OpenAI Chat Completions/ }))
+
+    expect(dialog.getByText(/point the base URL at an endpoint that serves it/)).toBeInTheDocument()
+    // The address is the user's to replace, so switching must not rewrite it.
+    expect(dialog.getByDisplayValue('https://direct.aruhub.com:8443')).toBeInTheDocument()
+
+    fireEvent.change(dialog.getAllByPlaceholderText('sk-...')[0]!, { target: { value: 'fake-aruhub-key' } })
+    fireEvent.click(dialog.getByRole('button', { name: 'Add' }))
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      presetId: 'aruhub',
+      baseUrl: 'https://direct.aruhub.com:8443',
+      apiFormat: 'openai_chat',
+      apiKey: 'fake-aruhub-key',
+    })))
+  })
+
+  it('does not warn about the endpoint while a preset keeps its own protocol', async () => {
+    render(<ProviderSettings />)
+    fireEvent.click(await screen.findByRole('button', { name: /Add Model/ }))
+    const dialog = within(screen.getByRole('dialog'))
+    fireEvent.click(dialog.getByRole('button', { name: 'ApiSmart' }))
+
+    expect(dialog.getByRole('button', { name: /OpenAI Chat Completions \(proxy\)/ })).toBeInTheDocument()
+    expect(dialog.queryByText(/point the base URL at an endpoint that serves it/)).not.toBeInTheDocument()
   })
 
   it('prefills the sponsor connection, opens its landing page, and saves the selected models', async () => {
@@ -302,10 +346,26 @@ describe('provider request compatibility', () => {
     expect(dialog.queryByRole('combobox', { name: 'Output token field' })).not.toBeInTheDocument()
     expect(dialog.getByRole('combobox', { name: 'Reasoning parameters' })).toBeInTheDocument()
   })
-  it('keeps compatibility controls hidden for Anthropic providers', async () => {
+  it('shows the reply output budget for Anthropic providers and saves it budget-only', async () => {
+    // The fixture carries OpenAI-compat knobs (sampling, futureOption) that do
+    // not apply to a native Anthropic endpoint. For Anthropic the editor keeps
+    // the budget visible and editable, hides the advanced controls, and strips
+    // any stale compat options on save so they cannot leak into the provider.
     vi.mocked(providersApi.list).mockResolvedValue({ providers: [{ ...provider, apiFormat: 'anthropic' }], activeId: null })
     const dialog = await open()
-    expect(dialog.queryByRole('textbox', { name: 'Reply output budget' })).not.toBeInTheDocument()
+    const budget = dialog.getByRole('textbox', { name: 'Reply output budget' })
+    expect(budget).toHaveValue('64000')
+    expect(dialog.queryByRole('button', { name: 'Advanced compatibility' })).not.toBeInTheDocument()
+    fireEvent.change(budget, { target: { value: '4096' } })
+    fireEvent.click(dialog.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledWith('compat-provider', expect.objectContaining({
+      apiFormat: 'anthropic',
+      // Exact object match: sampling/futureOption must be gone, not just omitted from the assertion.
+      requestCompatibility: { maxOutputTokens: 4096 },
+    })))
+    const settings = vi.mocked(providersApi.updateSettings).mock.calls.at(-1)?.[0]
+    expect(settings).not.toHaveProperty('requestCompatibility')
+    expect(settings).toMatchObject({ env: { CUSTOM_ENV: 'keep', CLAUDE_CODE_PROVIDER_MAX_OUTPUT_TOKENS: '4096' } })
   })
 })
 

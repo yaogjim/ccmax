@@ -7,7 +7,7 @@ import aruhubLogo from '../../../../docs/images/sponsors/aruhub-logo.png'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useProviderStore } from '../../stores/providerStore'
 import { useUIStore } from '../../stores/uiStore'
-import { useTranslation } from '../../i18n'
+import { useTranslation, type TranslationKey } from '../../i18n'
 import { Modal } from '@/components/ui/Modal'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { Input } from '@/components/ui/Input'
@@ -27,10 +27,11 @@ import { defaultAddProviderPreset, normalizeProviderBaseUrl, presetMatchesBaseUr
 import { ClaudeOfficialLogin } from '../../components/settings/ClaudeOfficialLogin'
 import { ChatGPTOfficialLogin } from '../../components/settings/ChatGPTOfficialLogin'
 import { GrokOfficialLogin } from '../../components/settings/GrokOfficialLogin'
+import { OfficialProviderModelSettings } from '../../components/settings/OfficialProviderModelSettings'
 import { CcSwitchImportModal } from '../../components/settings/CcSwitchImportModal'
 import { ModelIdCombobox } from '../../components/settings/ModelIdCombobox'
 import { ProviderRequestCompatibilityFields } from '@/components/settings/ProviderRequestCompatibilityFields'
-import { compatibilityForm, invalidCompatibilityNumber, parseCompatibilityForm, readCompatibilityEditorJson, writeCompatibilityJson, type RequestCompatibilityForm } from '../../lib/providerRequestCompatibility'
+import { compatibilityForm, invalidCompatibilityNumber, parseCompatibilityForm, parseAnthropicBudgetForm, pickOutputBudget, readCompatibilityEditorJson, writeCompatibilityJson, type RequestCompatibilityForm } from '../../lib/providerRequestCompatibility'
 import { ProviderImageGenerationFields, type ImageGenerationFormValue } from '../../components/settings/ProviderImageGenerationFields'
 import { BUILT_IN_PROVIDER_IDS, CLAUDE_OFFICIAL_PROVIDER_ID, OPENAI_OFFICIAL_PROVIDER_ID } from '../../constants/openaiOfficialProvider'
 import { GROK_OFFICIAL_PROVIDER_ID } from '../../constants/grokOfficialProvider'
@@ -58,6 +59,15 @@ type ProviderListItem =
   | { id: typeof OPENAI_OFFICIAL_PROVIDER_ID; kind: 'openai-official' }
   | { id: typeof GROK_OFFICIAL_PROVIDER_ID; kind: 'grok-official' }
   | { id: string; kind: 'saved'; provider: SavedProvider }
+
+/** Row labels for the model-mapping form, in `MODEL_SLOTS` order. */
+const MODEL_SLOT_LABEL_KEYS: Record<ModelSlot, TranslationKey> = {
+  main: 'settings.providers.mainModel',
+  fable: 'settings.providers.fableModel',
+  haiku: 'settings.providers.haikuModel',
+  sonnet: 'settings.providers.sonnetModel',
+  opus: 'settings.providers.opusModel',
+}
 
 function defaultProviderOrder(providers: SavedProvider[]): string[] {
   return [
@@ -286,6 +296,7 @@ export function ProviderSettings({ browserMode = false }: { browserMode?: boolea
                     details={!browserMode && isClaudeOfficialActive ? (
                       <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
                         <ClaudeOfficialLogin />
+                        <OfficialProviderModelSettings providerId={CLAUDE_OFFICIAL_PROVIDER_ID} />
                       </div>
                     ) : null}
                   />
@@ -309,6 +320,7 @@ export function ProviderSettings({ browserMode = false }: { browserMode?: boolea
                     details={!browserMode && isOpenAIOfficialActive ? (
                       <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
                         <ChatGPTOfficialLogin />
+                        <OfficialProviderModelSettings providerId={OPENAI_OFFICIAL_PROVIDER_ID} />
                       </div>
                     ) : null}
                   />
@@ -332,6 +344,7 @@ export function ProviderSettings({ browserMode = false }: { browserMode?: boolea
                     details={!browserMode && isGrokOfficialActive ? (
                       <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
                         <GrokOfficialLogin />
+                        <OfficialProviderModelSettings providerId={GROK_OFFICIAL_PROVIDER_ID} />
                       </div>
                     ) : null}
                   />
@@ -562,6 +575,7 @@ const MODEL_CONTEXT_WINDOWS_ENV_KEY = 'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS'
 const DISABLE_EXPERIMENTAL_BETAS_ENV_KEY = 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS'
 const DEFAULT_MODEL_1M_SUPPORT: Model1mSupport = {
   main: false,
+  fable: false,
   haiku: false,
   sonnet: false,
   opus: false,
@@ -699,6 +713,7 @@ function getInitialModel1mSupport(
 ): Model1mSupport {
   return {
     main: provider?.model1mSupport?.main === true || hasModel1mMarker(models.main),
+    fable: provider?.model1mSupport?.fable === true || (models.fable ? hasModel1mMarker(models.fable) : false),
     haiku: provider?.model1mSupport?.haiku === true || hasModel1mMarker(models.haiku),
     sonnet: provider?.model1mSupport?.sonnet === true || hasModel1mMarker(models.sonnet),
     opus: provider?.model1mSupport?.opus === true || hasModel1mMarker(models.opus),
@@ -716,7 +731,7 @@ function applyModel1mSupportMapping(
 ): ModelMapping {
   return {
     main: applyModel1mSupport(models.main, model1mSupport.main),
-    ...(models.fable ? { fable: stripModel1mMarker(models.fable) } : {}),
+    ...(models.fable ? { fable: applyModel1mSupport(models.fable, model1mSupport.fable) } : {}),
     haiku: applyModel1mSupport(models.haiku, model1mSupport.haiku),
     sonnet: applyModel1mSupport(models.sonnet, model1mSupport.sonnet),
     opus: applyModel1mSupport(models.opus, model1mSupport.opus),
@@ -1151,12 +1166,18 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
         }
         applyToolSearchEnv(mergedEnv, apiFormat, toolSearchEnabled)
         applyDisableExperimentalBetasEnv(mergedEnv, disableExperimentalBetas)
-        const merged = {
+        const merged: Record<string, unknown> = {
           ...settings,
           skipWebFetchPreflight: settings.skipWebFetchPreflight ?? true,
           env: mergedEnv,
         }
-        setSettingsJson(JSON.stringify(writeCompatibilityJson(merged, apiFormat === 'anthropic' ? undefined : parseCompatibilityForm(compatibility)), null, 2))
+        // `model` / `modelContext` are the session's selected default, written by
+        // the model picker. They are not part of the provider being added, so
+        // showing them here makes a new provider look like it inherits Grok 4.7
+        // (or whatever was last selected) and saving would write that back.
+        delete merged.model
+        delete merged.modelContext
+        setSettingsJson(JSON.stringify(writeCompatibilityJson(merged, apiFormat === 'anthropic' ? parseAnthropicBudgetForm(compatibility) : parseCompatibilityForm(compatibility)), null, 2))
       }).catch(() => {
         if (!cancelled && !settingsJsonUserEditedRef.current) {
           setSettingsJson((current) => current.trim() ? current : JSON.stringify({}, null, 2))
@@ -1215,11 +1236,11 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
     setTestResult(null)
   }
 
-  const isCustom = selectedPreset.id === 'custom'
   const requiresApiKey = selectedPreset.needsApiKey !== false
   const autoCompactWindowErrorKey = getAutoCompactWindowErrorKey(autoCompactWindow)
   const modelContextWindowErrorSlots = MODEL_SLOTS.filter((slot) => getModelContextWindowErrorKey(modelContextInputs[slot]))
-  const compatibilityInvalid = apiFormat !== 'anthropic' && (invalidCompatibilityNumber(compatibility.maxOutputTokens) || invalidCompatibilityNumber(compatibility.outputTokenLimit))
+  const compatibilityInvalid = invalidCompatibilityNumber(compatibility.maxOutputTokens)
+    || (apiFormat !== 'anthropic' && invalidCompatibilityNumber(compatibility.outputTokenLimit))
   const canSubmit = !compatibilityInvalid && name.trim() && baseUrl.trim() && (mode === 'edit' || !requiresApiKey || apiKey.trim()) && models.main.trim() && (!imageGeneration.enabled || imageGeneration.model.trim()) && !settingsJsonError && !autoCompactWindowErrorKey && modelContextWindowErrorSlots.length === 0
   const normalizedBaseUrl = normalizeProviderBaseUrl(baseUrl)
   const isPresetDefaultEndpoint = normalizedBaseUrl === normalizeProviderBaseUrl(selectedPreset.baseUrl)
@@ -1337,10 +1358,10 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
   }
   const handleCompatibilityChange = (value: RequestCompatibilityForm) => {
     setCompatibility(value)
-    if (invalidCompatibilityNumber(value.maxOutputTokens) || invalidCompatibilityNumber(value.outputTokenLimit)) return
+    if (invalidCompatibilityNumber(value.maxOutputTokens) || (apiFormat !== 'anthropic' && invalidCompatibilityNumber(value.outputTokenLimit))) return
     setSettingsJson((current) => {
       try {
-        return JSON.stringify(writeCompatibilityJson(JSON.parse(current || '{}'), parseCompatibilityForm(value)), null, 2)
+        return JSON.stringify(writeCompatibilityJson(JSON.parse(current || '{}'), apiFormat === 'anthropic' ? parseAnthropicBudgetForm(value) : parseCompatibilityForm(value)), null, 2)
       } catch {
         return current
       }
@@ -1351,7 +1372,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
     setSettingsJson((current) => {
       const connected = updateSettingsJsonProviderConnection(current, value, authStrategy, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas, supportsNestedToolResultMedia)
       try {
-        return JSON.stringify(writeCompatibilityJson(JSON.parse(connected), value === 'anthropic' ? undefined : parseCompatibilityForm(compatibility)), null, 2)
+        return JSON.stringify(writeCompatibilityJson(JSON.parse(connected), value === 'anthropic' ? parseAnthropicBudgetForm(compatibility) : parseCompatibilityForm(compatibility)), null, 2)
       } catch {
         return connected
       }
@@ -1544,7 +1565,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
 
   const handleSubmit = async () => {
     if (!canSubmit || isSubmitting) return
-    const storedCompatibility = apiFormat === 'anthropic' ? undefined : parseCompatibilityForm(compatibility)
+    const storedCompatibility = apiFormat === 'anthropic' ? parseAnthropicBudgetForm(compatibility) : parseCompatibilityForm(compatibility)
     const normalizedModels = normalizeModelMapping(models)
     const parsedAutoCompactWindow = parseAutoCompactWindowInput(autoCompactWindow)
     const parsedModelContextWindows = buildModelContextWindows(models, modelContextInputs)
@@ -1570,6 +1591,11 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           const { providersApi } = await import('../../api/providers')
           const settings = writeCompatibilityJson(parsed, storedCompatibility)
           delete settings.requestCompatibility
+          // The editor never owns the session default model. updateSettings merges
+          // by replacing the whole object, so omitting these keys keeps the
+          // model picker's selection instead of clearing it.
+          delete settings.model
+          delete settings.modelContext
           await providersApi.updateSettings(settings)
         } catch {
           // JSON validation already prevents this
@@ -1636,6 +1662,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
 
   const handleTest = async () => {
     if (!baseUrl.trim() || !models.main.trim() || compatibilityInvalid) return
+    const formCompatibility = apiFormat === 'anthropic' ? parseAnthropicBudgetForm(compatibility) : parseCompatibilityForm(compatibility)
     setIsTesting(true)
     setTestResult(null)
     try {
@@ -1645,7 +1672,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
         apiFormat === provider.apiFormat &&
         authStrategy === provider.authStrategy &&
         supportsNestedToolResultMedia === (provider.supportsNestedToolResultMedia ?? true) &&
-        JSON.stringify(parseCompatibilityForm(compatibility)) === JSON.stringify(provider.requestCompatibility)
+        JSON.stringify(formCompatibility) === JSON.stringify(provider.requestCompatibility)
       if (savedConfigUnchanged && provider) {
         result = await useProviderStore.getState().testProvider(provider.id, {
           modelId: models.main.trim(),
@@ -1660,7 +1687,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           apiFormat,
           supportsNestedToolResultMedia,
           presetId: selectedPreset.id,
-          ...(apiFormat !== 'anthropic' ? { requestCompatibility: parseCompatibilityForm(compatibility) } : {}),
+          ...(formCompatibility ? { requestCompatibility: formCompatibility } : {}),
         })
       }
       setTestResult(result)
@@ -1790,7 +1817,20 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
                 <span className="material-symbols-outlined text-[9px] opacity-60 transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5">arrow_outward</span>
               </button>
             )}
-            {promoText && <span className="text-[11px] leading-5 text-[var(--color-text-tertiary)]">{promoText}</span>}
+            {promoText && (
+              apiKeyUrl ? (
+                <button
+                  type="button"
+                  onClick={() => openExternalUrl(apiKeyUrl)}
+                  className="group inline-flex min-w-0 cursor-pointer items-start gap-1 text-left text-[11px] leading-5 text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-brand)] focus:outline-none focus:shadow-[var(--shadow-focus-ring)]"
+                >
+                  <span>{promoText}</span>
+                  <span aria-hidden="true" className="material-symbols-outlined mt-1 shrink-0 text-[10px] opacity-50 transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5">arrow_outward</span>
+                </button>
+              ) : (
+                <span className="text-[11px] leading-5 text-[var(--color-text-tertiary)]">{promoText}</span>
+              )
+            )}
           </div>
         )}
 
@@ -1833,23 +1873,26 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
           )}
           <div className={browserMode ? "grid grid-cols-1 sm:grid-cols-2 gap-2" : "grid grid-cols-2 gap-2"}>
             {MODEL_SLOTS.map((slot) => {
-              const labelKey = slot === 'main'
-                ? 'settings.providers.mainModel'
-                : slot === 'haiku'
-                  ? 'settings.providers.haikuModel'
-                  : slot === 'sonnet'
-                    ? 'settings.providers.sonnetModel'
-                    : 'settings.providers.opusModel'
-              const label = t(labelKey)
+              const label = t(MODEL_SLOT_LABEL_KEYS[slot])
               const pickLabel = t('settings.providers.fetchModelsPick', { label })
               return (
                 <div key={slot} className="min-w-0">
                   <ModelIdCombobox
                     label={label}
                     required={slot === 'main'}
-                    value={models[slot]}
+                    value={models[slot] ?? ''}
                     onChange={(value) => handleModelChange(slot, value)}
-                    placeholder={slot === 'main' ? t('settings.providers.modelIdPlaceholder') : t('settings.providers.sameAsMain')}
+                    placeholder={
+                      // Fable is the one slot that does not fall back to the
+                      // main model: an empty value leaves the choice to the
+                      // runtime, which resolves it to the provider's Opus-tier
+                      // model (third-party) or a real Fable model (official).
+                      slot === 'main'
+                        ? t('settings.providers.modelIdPlaceholder')
+                        : slot === 'fable'
+                          ? t('settings.providers.fableModelPlaceholder')
+                          : t('settings.providers.sameAsMain')
+                    }
                     groups={modelPickerGroups}
                     pickerLabel={pickLabel}
                     noMatchesLabel={t('model.noMatches')}
@@ -1878,8 +1921,9 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
 
         <Input label={t('settings.providers.notes')} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder={t('settings.providers.notesPlaceholder')} />
 
-        {/* API Format */}
-        {(isCustom || mode === 'edit') && !presetDrivesApiFormat ? (
+        {/* API Format — a preset only owns this field when it routes per model;
+            every other preset starts on its own format but stays switchable. */}
+        {!presetDrivesApiFormat ? (
           <div>
             <label className="text-sm font-medium text-[var(--color-text-primary)] mb-1 block">{t('settings.providers.apiFormat')}</label>
             <Dropdown<ApiFormat>
@@ -1898,18 +1942,21 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
             {apiFormat !== 'anthropic' && (
               <p className="text-[11px] text-[var(--color-text-tertiary)] mt-1">{t('settings.providers.proxyHint')}</p>
             )}
+            {/* The preset's own endpoint is still in the field above; a custom
+                preset brings none, so there is nothing to warn about. */}
+            {apiFormat !== selectedPreset.apiFormat && Boolean(selectedPreset.baseUrl) && (
+              <p className="text-[11px] text-[var(--color-text-tertiary)] mt-1">{t('settings.providers.apiFormatOverrideHint')}</p>
+            )}
           </div>
-        ) : (presetDrivesApiFormat || apiFormat !== 'anthropic') ? (
+        ) : (
           <div>
             <label className="text-sm font-medium text-[var(--color-text-primary)] mb-1 block">{t('settings.providers.apiFormat')}</label>
             <div className="text-xs text-[var(--color-text-tertiary)] px-3 py-2 rounded-[var(--radius-md)] bg-[var(--color-surface-container-low)] border border-[var(--color-border)]">
               {selectedApiFormatLabel}
             </div>
-            {presetDrivesApiFormat && (
-              <p className="text-[11px] text-[var(--color-text-tertiary)] mt-1">{t('settings.providers.apiFormatPerModelHint')}</p>
-            )}
+            <p className="text-[11px] text-[var(--color-text-tertiary)] mt-1">{t('settings.providers.apiFormatPerModelHint')}</p>
           </div>
-        ) : null}
+        )}
 
         <ProviderRequestCompatibilityFields value={compatibility} apiFormat={apiFormat} onChange={handleCompatibilityChange} />
 
@@ -2084,7 +2131,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
                 const parsed = restoreSettingsJsonSecrets(JSON.parse(raw), settingsJson, apiKey)
                 const nextCompatibility = readCompatibilityEditorJson(parsed, settingsJson)
                 setCompatibility(compatibilityForm(nextCompatibility))
-                const synchronized = writeCompatibilityJson(parsed, apiFormat === 'anthropic' ? undefined : nextCompatibility)
+                const synchronized = writeCompatibilityJson(parsed, apiFormat === 'anthropic' ? pickOutputBudget(nextCompatibility) : nextCompatibility)
                 setSettingsJson(JSON.stringify(synchronized, null, 2))
                 setSettingsJsonError(null)
                 // Auto-fill form fields from parsed JSON env
@@ -2140,6 +2187,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets, browserMode
                       const mergedModels = { ...prev, ...newModels }
                       const nextModel1mSupport = {
                         main: hasModel1mMarker(mergedModels.main),
+                        fable: mergedModels.fable ? hasModel1mMarker(mergedModels.fable) : false,
                         haiku: hasModel1mMarker(mergedModels.haiku),
                         sonnet: hasModel1mMarker(mergedModels.sonnet),
                         opus: hasModel1mMarker(mergedModels.opus),

@@ -20,6 +20,8 @@ import * as path from 'node:path'
 import { handleNotificationsApi } from '../api/notifications.js'
 import { handleApiRequest } from '../router.js'
 import { LOCAL_ACCESS_TOKEN_ENV } from '../localAccessAuth.js'
+import { NotificationDeliveryStore } from '../services/notificationDeliveryStore.js'
+import { resetNotificationRecoveryStateForTests } from '../services/notificationService.js'
 
 const ANTHROPIC_API_KEY_ENV = 'ANTHROPIC_API_KEY'
 const FIXTURE_TOKEN = 'fixture-local-desktop-token'
@@ -33,7 +35,7 @@ let originalAnthropicKey: string | undefined
 let originalFetch: typeof globalThis.fetch
 let calls: FetchCall[]
 
-function stubFetch(handler: (call: FetchCall) => Response = () => Response.json({ ok: true })): void {
+function stubFetch(handler: (call: FetchCall) => Response = () => Response.json({ ok: true, result: { message_id: 123 } })): void {
   globalThis.fetch = (async (input: string | URL | Request) => {
     const call = { url: String(input) }
     calls.push(call)
@@ -99,6 +101,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   globalThis.fetch = originalFetch
+  resetNotificationRecoveryStateForTests()
   restoreEnv('CLAUDE_CONFIG_DIR', originalConfigDir)
   restoreEnv(LOCAL_ACCESS_TOKEN_ENV, originalToken)
   restoreEnv(ANTHROPIC_API_KEY_ENV, originalAnthropicKey)
@@ -111,6 +114,61 @@ function restoreEnv(key: string, value: string | undefined): void {
 }
 
 describe('POST /api/notifications/send', () => {
+  test('Telegram 缺少消息回执时保持不确定，不能声称送达', async () => {
+    stubFetch(() => Response.json({ ok: true }))
+    const resp = await callSend({ channel: 'telegram', recipient: 111, text: 'hello' })
+    expect(await resp.json()).toMatchObject({
+      ok: false,
+      delivery: { outcome: 'indeterminate', errorCode: 'invalid_receipt', attempts: 1 },
+    })
+    expect(calls).toHaveLength(1)
+  })
+
+  test.each([
+    { result: { message_id: 123 } },
+    { ok: 'true', result: { message_id: 123 } },
+    { ok: true, result: { message_id: '123' } },
+    { ok: true, result: { message_id: 0 } },
+    { ok: true, result: { message_id: -1 } },
+    { ok: true, result: { message_id: 1.5 } },
+    { ok: true, result: { message_id: Number.MAX_SAFE_INTEGER + 1 } },
+    { ok: true, result: [] },
+  ])('Telegram 无效成功回执保持不确定 %#', async (payload) => {
+    stubFetch(() => Response.json(payload))
+    const resp = await callSend({ channel: 'telegram', recipient: 111, text: 'hello' })
+    expect(await resp.json()).toMatchObject({
+      ok: false,
+      delivery: { outcome: 'indeterminate', errorCode: 'invalid_receipt' },
+    })
+    expect(calls).toHaveLength(1)
+  })
+
+  test('Telegram 不可解析的响应只记不确定，重启后同一运行不重发', async () => {
+    stubFetch(() => new Response('not-json'))
+    const input = { channel: 'telegram', recipient: 111, text: 'hello', runId: 'uncertain-run' }
+    expect(await (await callSend(input)).json()).toMatchObject({ ok: false, delivery: { outcome: 'indeterminate' } })
+    resetNotificationRecoveryStateForTests()
+    expect(await (await callSend(input)).json()).toMatchObject({ ok: false })
+    expect(calls).toHaveLength(1)
+    const reopened = new NotificationDeliveryStore(path.join(tmpDir, 'ccmax', 'notification-deliveries.json'))
+    expect(await reopened.list({ runId: 'uncertain-run' })).toMatchObject([
+      { outcome: 'indeterminate', errorCode: 'invalid_receipt', attempts: 1 },
+    ])
+  })
+
+  test('Telegram 有效回执透传并可由重新打开的存储查询', async () => {
+    stubFetch(() => Response.json({ ok: true, result: { message_id: 271828 } }))
+    const resp = await callSend({ channel: 'telegram', recipient: 111, text: 'hello', runId: 'receipt-run' })
+    expect(await resp.json()).toMatchObject({
+      ok: true,
+      delivery: { outcome: 'delivered', messageId: 271828 },
+    })
+    const reopened = new NotificationDeliveryStore(path.join(tmpDir, 'ccmax', 'notification-deliveries.json'))
+    expect(await reopened.list({ runId: 'receipt-run' })).toMatchObject([
+      { outcome: 'delivered', messageId: 271828, attempts: 1 },
+    ])
+  })
+
   test('sends through the shared sender to a paired recipient', async () => {
     const resp = await callSend({ channel: 'telegram', recipient: 111, text: 'hello' })
 

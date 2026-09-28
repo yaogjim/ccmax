@@ -8,7 +8,6 @@ import { BrandSeal } from '@/components/composite/BrandSeal'
 import { Button } from '@/components/ui/Button'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { EmptyState } from '@/components/ui/EmptyState'
-import { ErrorState } from '@/components/ui/ErrorState'
 import { IconButton } from '@/components/ui/IconButton'
 import { Spinner } from '@/components/ui/Spinner'
 import { useDismissable } from '@/hooks/useDismissable'
@@ -16,6 +15,7 @@ import { GlobalSearchModal } from '../search/GlobalSearchModal'
 import { FindInPageModal } from '../search/FindInPageModal'
 import { ProjectEditorModal, type ProjectEditorSubmission } from './ProjectEditorModal'
 import { SidebarTaskList } from './SidebarTaskList'
+import { SIDEBAR_PROJECT_SESSION_PREVIEW_LIMIT } from '../../lib/sessionListPagination'
 import { ProjectSessionList, notifyProjectHistoryAtSidebarBottom } from '@/components/layout/ProjectSessionList'
 import {
   buildSidebarTaskGroups,
@@ -57,7 +57,7 @@ const isWindows = typeof navigator !== 'undefined' && /Win/.test(navigator.platf
 const SESSION_LIST_AUTO_REFRESH_MS = 30_000
 const SESSION_LIST_BUILDING_REFRESH_MS = 1_500
 const SESSION_LIST_FOCUS_REFRESH_MIN_MS = 5_000
-const PROJECT_GROUP_VISIBLE_COUNT = 6
+const PROJECT_GROUP_VISIBLE_COUNT = SIDEBAR_PROJECT_SESSION_PREVIEW_LIMIT
 
 type SidebarProjectOrganization = 'project' | 'recentProject' | 'time'
 type SidebarProjectSortBy = 'createdAt' | 'updatedAt'
@@ -117,8 +117,8 @@ export function Sidebar({
   const t = useTranslation()
   const sessions = useSessionStore((s) => s.sessions)
   const projectHistory = useSessionStore((s) => s.projectHistory)
+  const projectSessionTotals = useSessionStore((s) => s.projectSessionTotals)
   const isLoading = useSessionStore((s) => s.isLoading)
-  const error = useSessionStore((s) => s.error)
   const indexStatus = useSessionStore((s) => s.indexStatus)
   const indexBuilding = indexStatus?.mode === 'on' && indexStatus.state === 'building'
   const fetchSessions = useSessionStore((s) => s.fetchSessions)
@@ -275,12 +275,11 @@ export function Sidebar({
   const isTaskView = projectOrganization === 'time'
   const showInitialLoading = isLoading && sessions.length === 0
   const showRefreshLoading = showInitialLoading
-  // Index building/ready/off are implementation details of how the list is
-  // loaded, not something the user acts on, so they stay silent in both the
-  // visible sidebar and the live region. Only `degraded` is announced: there
-  // the list really is served a different way, which the user can perceive.
-  const showIndexDegraded = indexStatus?.state === 'degraded'
-  const indexAnnouncement = showIndexDegraded ? t('sidebar.indexDegraded') : ''
+  // Every index state is an implementation detail of how the list is loaded,
+  // not something the user acts on. Even `degraded` only changes the source
+  // the list is read from — the rows, their order, and search results stay
+  // identical — so it stays silent in both the visible sidebar and the live
+  // region instead of taking a row to explain itself.
   const filteredSessionIds = useMemo(() => filteredSessions.map((session) => session.id), [filteredSessions])
   const selectedCount = selectedSessionIds.size
   const sessionsById = useMemo(
@@ -1157,40 +1156,17 @@ export function Sidebar({
                 </div>
               </div>
             )}
-            <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
-              {indexAnnouncement}
-            </div>
-            {showIndexDegraded && (
-              <div
-                data-testid="sidebar-index-degraded"
-                aria-hidden="true"
-                className="mx-4 mb-1 flex-none text-[11px] leading-5 text-[var(--color-text-tertiary)]"
-              >
-                {t('sidebar.indexDegraded')}
-              </div>
-            )}
             <div
               ref={sessionScrollAreaRef}
               onScroll={(event) => notifyProjectHistoryAtSidebarBottom(event.currentTarget)}
               data-testid="sidebar-session-scroll-area"
               className="sidebar-scroll-area min-h-0 flex-1 overflow-y-auto px-3 pb-20"
             >
-              {error && (
-                <ErrorState
-                  className="mx-1 mt-2 break-words"
-                  size="sm"
-                  tone="strong"
-                  title={t('sidebar.sessionListFailed')}
-                  detail={error}
-                  onRetry={() => fetchSessions()}
-                  retryLabel={t('common.retry')}
-                />
-              )}
               {showInitialLoading ? (
                 <div className="px-3 py-4 text-center text-xs text-[var(--color-text-tertiary)]">
                   {t('common.loading')}
                 </div>
-              ) : !error && filteredSessions.length === 0 && (
+              ) : filteredSessions.length === 0 && (
                 <div className="px-3 py-2">
                   <EmptyState variant="inline" title={t('sidebar.noSessions')} />
                 </div>
@@ -1232,7 +1208,12 @@ export function Sidebar({
                   ? []
                   : getVisibleProjectSessions(project.sessions, sessionsExpanded, activeTabId)
                 const hiddenCount = project.sessions.length - visibleItems.length
-                const showSessionFoldControl = project.sessions.length > PROJECT_GROUP_VISIBLE_COUNT
+                const projectSessionTotal = projectSessionTotals[project.key]
+                const hasUnloadedSessions = projectSessionTotal === undefined
+                  ? false
+                  : projectSessionTotal > project.sessions.length
+                const showSessionFoldControl = project.sessions.length > PROJECT_GROUP_VISIBLE_COUNT ||
+                  (projectSessionTotal ?? 0) > PROJECT_GROUP_VISIBLE_COUNT
                 const groupIds = project.sessions.map((session) => session.id)
                 const groupSelectedCount = groupIds.filter((id) => selectedSessionIds.has(id)).length
                 const history = projectHistory[project.key]
@@ -1356,11 +1337,11 @@ export function Sidebar({
                           outerScrollRef={sessionScrollAreaRef}
                           testId={`sidebar-project-session-list-${domSafeProjectKey(project.key)}`}
                           expanded={sessionsExpanded}
-                          hasHiddenSessions={hiddenCount > 0}
+                          hasHiddenSessions={hiddenCount > 0 || hasUnloadedSessions}
                           itemCount={visibleItems.length}
                           nextCursor={history?.nextCursor}
                           isLoading={history?.isLoading ?? false}
-                          hasMore={history?.hasMore ?? true}
+                          hasMore={history?.hasMore ?? (projectSessionTotal === undefined || hasUnloadedSessions)}
                           error={history?.error}
                           onExpand={() => setExpandedProjectKeys((current) => new Set([...current, project.key]))}
                           onLoadMore={() => useSessionStore.getState().loadMoreProjectSessions(project.key)}

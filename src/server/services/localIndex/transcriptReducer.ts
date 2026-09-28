@@ -72,6 +72,7 @@ type ReducerEntry = {
 }
 
 type ReducerState = {
+  isTeamWorker: boolean
   fallbackCreatedAt: string
   fallbackModifiedAt: string
   fallbackWorkDir: string | null
@@ -134,6 +135,25 @@ const VALID_SESSION_PERMISSION_MODES = new Set([
   'auto',
 ])
 const VALID_SESSION_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+
+export function resolveSessionEffortLevel(
+  record: Record<string, unknown>,
+  previous: string | undefined,
+): string | undefined {
+  if (typeof record.effortLevel === 'string' && VALID_SESSION_EFFORT_LEVELS.has(record.effortLevel)) {
+    return record.effortLevel
+  }
+  // A complete runtime selection replaces the previous selection, including
+  // its effort override. Historical partial metadata remains a patch.
+  if (
+    (record.runtimeProviderId === null || typeof record.runtimeProviderId === 'string') &&
+    typeof record.runtimeModelId === 'string' && record.runtimeModelId.length > 0
+  ) {
+    return undefined
+  }
+  return previous
+}
+
 const ACTIVITY_TRANSCRIPT_MESSAGE_TYPES = new Set([
   'user',
   'assistant',
@@ -249,6 +269,7 @@ function createInitialState(
     runtimeProviderId: undefined,
     runtimeModelId: undefined,
     effortLevel: undefined,
+    isTeamWorker: false,
     repository: undefined,
     worktreeSession: undefined,
     nextOrdinal: 0,
@@ -507,6 +528,7 @@ function applyActivityEntry(state: ReducerState, entry: ReducerEntry): void {
 }
 
 function applyEntry(state: ReducerState, entry: ReducerEntry): void {
+  if (entry.entrypoint === 'claude-desktop-team-worker') state.isTeamWorker = true
   applyActivityEntry(state, entry)
   if (!state.hasCreatedAt && entry.timestamp) {
     state.createdAt = entry.timestamp
@@ -543,12 +565,7 @@ function applyEntry(state: ReducerState, entry: ReducerEntry): void {
     if (typeof record.runtimeModelId === 'string') {
       state.runtimeModelId = record.runtimeModelId
     }
-    if (
-      typeof record.effortLevel === 'string' &&
-      VALID_SESSION_EFFORT_LEVELS.has(record.effortLevel)
-    ) {
-      state.effortLevel = record.effortLevel
-    }
+    state.effortLevel = resolveSessionEffortLevel(record, state.effortLevel)
   }
 
   if (typeof entry.cwd === 'string' && entry.cwd.trim()) {
@@ -613,6 +630,7 @@ function summaryFromState(state: ReducerState): SessionListSummary {
       : {}),
     ...(state.runtimeModelId ? { runtimeModelId: state.runtimeModelId } : {}),
     ...(state.effortLevel ? { effortLevel: state.effortLevel } : {}),
+    ...(state.isTeamWorker ? { isTeamWorker: true } : {}),
     ...(state.repository ? { repository: { ...state.repository } } : {}),
     ...(state.worktreeSession !== undefined
       ? {

@@ -76,5 +76,9 @@ describe('AboutSettings product identity', () => {
     expect(screen.queryByText('Report an Issue')).not.toBeInTheDocument()
     expect(screen.queryByText('If this project helps you, consider giving it a Star')).not.toBeInTheDocument()
     expect(screen.queryByText('Open a GitHub Issue for bugs or usage questions')).not.toBeInTheDocument()
+    // The upstream cc-haha WeCom group entry is part of the removed social
+    // section and must not come back with a later upstream merge.
+    expect(screen.queryByText('Join the cc-haha group')).not.toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: 'cc-haha WeCom user group QR code' })).not.toBeInTheDocument()
   })
 })

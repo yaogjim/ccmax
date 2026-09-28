@@ -7,11 +7,20 @@ function response(tool: Record<string, unknown>, reason = 'tool_calls'): OpenAIC
 }
 
 describe('Chat non-streaming response integrity', () => {
-  for (const args of ['{"path":', '[]', 'null', '42']) {
+  for (const args of ['[]', 'null', '42']) {
     test(`completed malformed/non-object arguments reject: ${args}`, () => {
       expect(() => openaiChatToAnthropic(response({ id: 'call', function: { name: 'Read', arguments: args } }), 'fixture')).toThrow()
     })
   }
+  test('completed malformed arguments retain identity and a bounded non-executable marker', () => {
+    const raw = '{"path":"' + 'x'.repeat(3000)
+    const result = openaiChatToAnthropic(response({ id: 'call', function: { name: 'Read', arguments: raw } }), 'fixture')
+    expect(result.stop_reason).toBe('tool_use')
+    expect(result.content[0]).toEqual({
+      type: 'tool_use', id: 'call', name: 'Read',
+      input: { __unparsedToolInput: { raw: raw.slice(0, 2048), len: raw.length } },
+    })
+  })
   test('error envelope rejects rather than returning empty success', () => {
     expect(() => openaiChatToAnthropic({ error: { message: 'Fixture failure' } } as unknown as OpenAIChatResponse, 'fixture')).toThrow('Fixture failure')
   })
@@ -28,3 +37,13 @@ describe('Chat non-streaming response integrity', () => {
     expect(result.content.some(block => block.type === 'tool_use')).toBe(false)
   })
 })
+
+// Issue #1327: zero-valued compatibility cache fields must not hide OpenAI usage.
+for (const direct of [{ cache_creation_input_tokens: 0 }, { cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }]) {
+  test(`nested prompt cache survives zero direct fields ${JSON.stringify(direct)}`, () => {
+    const upstream = response({}, 'stop')
+    upstream.choices[0].message.tool_calls = undefined
+    upstream.usage = { prompt_tokens: 149293, completion_tokens: 551, prompt_tokens_details: { cached_tokens: 147840 }, ...direct }
+    expect(openaiChatToAnthropic(upstream, 'fixture').usage).toEqual({ input_tokens: 1453, output_tokens: 551, cache_read_input_tokens: 147840 })
+  })
+}

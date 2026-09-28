@@ -78,6 +78,8 @@ describe('notificationDeliveryStore migration', () => {
     expect(first.deliveryId).toBe('legacy-1')
     expect(first.channel).toBe('telegram')
     expect(first.outcome).toBe('delivered')
+    // 旧记录没有平台回执，迁移不得凭空补造。
+    expect(first.messageId).toBeUndefined()
     // A legacy record predates the retry counter; default it instead of dropping the record.
     expect(first.attempts).toBe(1)
     // Unknown fields survive a forward migration.

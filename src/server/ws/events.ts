@@ -19,7 +19,7 @@ export type PermissionMode =
 export type ClientMessage =
   | { type: 'prewarm_session' }
   | { type: 'sync_state' }
-  | { type: 'user_message'; content: string; attachments?: AttachmentRef[] }
+  | { type: 'user_message'; content: string; attachments?: AttachmentRef[]; sessionReferences?: { sessionId: string }[] }
   | {
       type: 'permission_response'
       requestId: string
@@ -43,6 +43,7 @@ export type ClientMessage =
   | { type: 'set_permission_mode'; mode: PermissionMode }
   | { type: 'set_runtime_config'; providerId: string | null; modelId: string; effortLevel?: string }
   | { type: 'stop_generation' }
+  | { type: 'ask_user_question_activity'; requestId: string }
   | { type: 'stop_background_task'; taskId: string }
   | { type: 'ping' }
 
@@ -106,7 +107,7 @@ export type ServerMessage =
       computerUseRequestIds: string[]
       turnActive: boolean
     }
-  | { type: 'user_message_replay'; content: string }
+  | { type: 'user_message_replay'; content: string; sessionReferences?: { sessionId: string }[] }
   | { type: 'message_complete'; usage: TokenUsage; timing?: TurnTiming }
   /**
    * `text` is a fragment when the CLI streams `thinking_delta`, and a whole block when
@@ -118,6 +119,7 @@ export type ServerMessage =
   | { type: 'status'; state: ChatState; verb?: string; attemptStart?: boolean }
   | {
       type: typeof RUNTIME_CONFIG_APPLIED_EVENT
+      requestedConfig?: { providerId: string | null; modelId: string; effortLevel?: string }
       providerId: string | null
       modelId: string
       effortLevel?: string
@@ -143,6 +145,7 @@ export type ServerMessage =
   | { type: 'system_notification'; subtype: string; message?: string; data?: unknown }
   | { type: 'pong' }
   | { type: 'team_update'; teamName: string; members: TeamMemberStatus[]; incarnationId?: string; leadSessionId?: string; createdAt?: number }
+  | { type: 'team_plan_updated'; teamName: string; sessionId: string; planId: string; incarnationId: string; revision: number; state: string }
   | { type: 'team_created'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'team_workbench_updated'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'team_deleted'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }

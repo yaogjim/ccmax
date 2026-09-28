@@ -1,6 +1,7 @@
 import { OFFICIAL_DEFAULT_MODEL_ID } from '../constants/modelCatalog'
 import {
   OPENAI_OFFICIAL_DEFAULT_MODEL_ID,
+  OPENAI_OFFICIAL_MODELS,
   OPENAI_OFFICIAL_PROVIDER_ID,
 } from '../constants/openaiOfficialProvider'
 import type { SavedProvider } from '../types/provider'
@@ -17,6 +18,7 @@ import {
   type ModelReasoningApiFormat,
   type ModelReasoningProviderKind,
 } from '../../../src/shared/modelReasoning'
+import { getBundledPresetReasoningProviderKind } from '../config/providerPresets'
 
 const PROVIDER_MODEL_SLOTS = ['main', 'haiku', 'sonnet', 'opus', 'fable'] as const
 
@@ -29,7 +31,7 @@ export function resolveProviderSlotModelId(
   slot: keyof SavedProvider['models'],
 ): string {
   const modelId = provider.models[slot]?.trim() ?? ''
-  const enabled = slot === 'fable' ? undefined : provider.model1mSupport?.[slot]
+  const enabled = provider.model1mSupport?.[slot]
   // Missing flags are legacy configuration: preserve explicit model suffixes.
   if (!modelId || enabled === undefined) return modelId
   const baseModelId = baseProviderModelId(modelId)
@@ -61,10 +63,14 @@ export function resolveActiveProviderRuntimeSelection(
   if (!inferredProviderId) return null
 
   const providerMainModelId = activeProvider ? resolveProviderSlotModelId(activeProvider, 'main') : undefined
+  const configuredModelId = activeProvider && currentModelId && PROVIDER_MODEL_SLOTS.some(
+    (slot) => activeProvider.models[slot]?.trim() &&
+      baseProviderModelId(activeProvider.models[slot]!) === baseProviderModelId(currentModelId),
+  ) ? resolveProviderRuntimeModelId(activeProvider, currentModelId) : undefined
 
   return {
     providerId: inferredProviderId,
-    modelId: providerMainModelId || currentModelId || (
+    modelId: configuredModelId || providerMainModelId || currentModelId || (
       inferredProviderId === OPENAI_OFFICIAL_PROVIDER_ID
         ? OPENAI_OFFICIAL_DEFAULT_MODEL_ID
         : inferredProviderId === GROK_OFFICIAL_PROVIDER_ID
@@ -91,6 +97,42 @@ export function resolveDefaultRuntimeSelection(
   }
 }
 
+/** Resolve restored choices only after the saved-provider list is authoritative. */
+export function reconcileRuntimeSelection(
+  selection: RuntimeSelection,
+  context: {
+    providers: SavedProvider[]
+    hasLoadedProviders: boolean
+    activeId: string | null
+    currentModelId?: string
+    defaultEffortLevel?: RuntimeSelection['effortLevel']
+  },
+): RuntimeSelection {
+  const provider = context.providers.find((entry) => entry.id === selection.providerId)
+  const isOfficial = selection.providerId === null ||
+    selection.providerId === OPENAI_OFFICIAL_PROVIDER_ID ||
+    selection.providerId === GROK_OFFICIAL_PROVIDER_ID
+  if (!provider && !isOfficial && context.hasLoadedProviders) {
+    // Deleted/recreated providers must not carry their old model or effort into
+    // the default provider. Use the same choice for rendering and transport.
+    const fallback = resolveDefaultRuntimeSelection(
+      context.activeId, null, context.providers, context.currentModelId,
+    )
+    const fallbackProvider = context.providers.find((entry) => entry.id === fallback.providerId)
+    return normalizeRuntimeSelection(
+      { ...fallback, ...(context.defaultEffortLevel ? { effortLevel: context.defaultEffortLevel } : {}) },
+      fallbackProvider?.apiFormat,
+      fallbackProvider ? getBundledPresetReasoningProviderKind(fallbackProvider.presetId) : undefined,
+    )
+  }
+  const modelId = provider ? resolveProviderRuntimeModelId(provider, selection.modelId) : selection.modelId
+  return normalizeRuntimeSelection(
+    modelId === selection.modelId ? selection : { ...selection, modelId },
+    provider?.apiFormat,
+    provider ? getBundledPresetReasoningProviderKind(provider.presetId) : undefined,
+  )
+}
+
 export function normalizeRuntimeSelection(
   selection: RuntimeSelection,
   apiFormat?: ModelReasoningApiFormat,
@@ -98,14 +140,14 @@ export function normalizeRuntimeSelection(
 ): RuntimeSelection {
   if (
     selection.effortLevel === undefined ||
-    selection.providerId === null ||
-    selection.providerId === OPENAI_OFFICIAL_PROVIDER_ID
+    selection.providerId === null
   ) {
     return selection
   }
 
-  if (selection.providerId === GROK_OFFICIAL_PROVIDER_ID) {
-    const model = GROK_OFFICIAL_MODELS.find((entry) => entry.id === selection.modelId)
+  if (selection.providerId === GROK_OFFICIAL_PROVIDER_ID || selection.providerId === OPENAI_OFFICIAL_PROVIDER_ID) {
+    const models = selection.providerId === GROK_OFFICIAL_PROVIDER_ID ? GROK_OFFICIAL_MODELS : OPENAI_OFFICIAL_MODELS
+    const model = models.find((entry) => entry.id === selection.modelId)
     // Models only known from the live catalog (e.g. grok-4.6) are absent from
     // the bundled desktop list. Keep their effort untouched and let the server
     // validate it against the live catalog instead of silently dropping it.
@@ -113,6 +155,7 @@ export function normalizeRuntimeSelection(
     const effortLevel = model.supportedReasoningEfforts?.includes(selection.effortLevel)
       ? selection.effortLevel
       : model.defaultReasoningEffort ?? model.supportedReasoningEfforts?.[0]
+    if (effortLevel === selection.effortLevel) return selection
     const { effortLevel: _unsupportedEffort, ...runtime } = selection
     return effortLevel ? { ...runtime, effortLevel } : runtime
   }

@@ -149,6 +149,12 @@ const persistencePrefixes = [
   'src/server/services/desktopUiPreferencesService',
   'src/server/__tests__/desktop-ui-preferences',
   'desktop/src/lib/persistenceMigrations',
+  // `check:persistence-upgrade` runs `electron/services/userDataProfileMigration.test.ts`
+  // from `desktop/`. `desktop/electron/` already selects the native lane, but nothing
+  // selected the persistence lane, so a migration-only change skipped the lane that
+  // proves the legacy-profile fixtures still upgrade. Base name (not the full file)
+  // so both the source and its test are covered.
+  'desktop/electron/services/userDataProfileMigration',
   'scripts/quality-gate/persistence-upgrade',
 ]
 

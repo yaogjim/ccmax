@@ -45,6 +45,7 @@ export type NotificationDeliveryRecord = {
   attempts: number
   error?: string
   errorCode?: string
+  messageId?: number
   createdAt: string
   [key: string]: unknown
 }
@@ -67,6 +68,7 @@ export type DeliverySettlement = {
   attempts: number
   error?: string
   errorCode?: string
+  messageId?: number
 }
 
 export type EnqueueResult = {
@@ -330,6 +332,7 @@ export class NotificationDeliveryStore {
           ...record,
           outcome: settlement.outcome,
           attempts: normalizeAttempts(settlement.attempts),
+          ...(settlement.messageId !== undefined ? { messageId: settlement.messageId } : {}),
           ...(settlement.errorCode !== undefined ? { errorCode: settlement.errorCode } : {}),
           ...(settlement.error !== undefined ? { error: settlement.error } : {}),
         }) as NotificationDeliveryRecord

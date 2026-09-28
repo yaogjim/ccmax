@@ -140,6 +140,37 @@ describe('evaluateChangePolicy', () => {
     expect(result.checks.persistence).toBe(true)
   })
 
+  test('routes the Electron userData profile migration to the persistence and native checks', () => {
+    // `check:persistence-upgrade` runs `electron/services/userDataProfileMigration.test.ts`
+    // from `desktop/`. Changing the migration alone used to select only the native lane, so
+    // the lane that proves legacy-profile fixture compatibility never ran.
+    const sourceOnly = evaluateChangePolicy(['desktop/electron/services/userDataProfileMigration.ts'])
+
+    expect(sourceOnly.checks.persistence).toBe(true)
+    expect(sourceOnly.checks.desktopNative).toBe(true)
+    // Electron is compiled outside `desktop/tsconfig.json`, so the renderer lane stays off.
+    expect(sourceOnly.checks.desktop).toBe(false)
+
+    const testOnly = evaluateChangePolicy(['desktop/electron/services/userDataProfileMigration.test.ts'])
+
+    expect(testOnly.checks.persistence).toBe(true)
+    expect(testOnly.checks.desktopNative).toBe(true)
+    expect(testOnly.missingTestSignals).toEqual([])
+    expect(testOnly.blocked).toBe(false)
+  })
+
+  test('keeps sibling Electron services off the persistence check', () => {
+    // The prefix is the migration file's base name, so an unrelated service under the same
+    // directory still routes to the native lane without pulling in the persistence lane.
+    const result = evaluateChangePolicy([
+      'desktop/electron/services/sidecarManager.ts',
+      'desktop/electron/services/publicAccess.ts',
+    ])
+
+    expect(result.checks.desktopNative).toBe(true)
+    expect(result.checks.persistence).toBe(false)
+  })
+
   test('routes every source root the dead-import check owns to the policy lane', () => {
     // scripts/pr/dead-imports.test.ts reads these roots rather than importing them,
     // so the import graph cannot pull the policy lane in. Without the prefixes the
