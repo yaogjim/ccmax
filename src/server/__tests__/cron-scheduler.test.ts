@@ -337,6 +337,56 @@ describe('CronScheduler', () => {
     scheduler.stop()
   })
 
+  it('settles a recently started abandoned run on the first scheduler tick', async () => {
+    const startedAt = new Date(Date.now() - 30_000).toISOString()
+    const logPath = path.join(tmpDir, 'scheduled_tasks_log.json')
+    await fs.writeFile(logPath, JSON.stringify({ runs: [{
+      id: 'interrupted-run',
+      taskId: 'interrupted-task',
+      taskName: 'Interrupted task',
+      prompt: 'fixture',
+      startedAt,
+      status: 'running',
+    }] }))
+
+    scheduler.start()
+    await scheduler.tick()
+
+    const runs = await scheduler.getTaskRuns('interrupted-task')
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({
+      id: 'interrupted-run',
+      status: 'failed',
+      error: 'Process terminated before task could complete',
+    })
+    expect(runs[0].completedAt).toBeDefined()
+  })
+
+  it('preserves a running record while another scheduler holds its task lock', async () => {
+    const taskId = 'active-task'
+    const logPath = path.join(tmpDir, 'scheduled_tasks_log.json')
+    await fs.writeFile(logPath, JSON.stringify({ runs: [{
+      id: 'active-run',
+      taskId,
+      taskName: 'Active task',
+      prompt: 'fixture',
+      startedAt: new Date(Date.now() - 12 * 60_000).toISOString(),
+      status: 'running',
+    }] }))
+    const lockPath = path.join(tmpDir, 'scheduled_task_locks', `${taskId}.lock`)
+    await fs.mkdir(path.dirname(lockPath), { recursive: true })
+    const release = await lockfile.lock(lockPath, { realpath: false })
+    try {
+      scheduler.start()
+      await scheduler.tick()
+      expect((await scheduler.getTaskRuns(taskId))[0].status).toBe('running')
+    } finally {
+      await release()
+    }
+    await scheduler.tick()
+    expect((await scheduler.getTaskRuns(taskId))[0].status).toBe('failed')
+  })
+
   it('should return empty runs when no tasks have executed', async () => {
     const runs = await scheduler.getRecentRuns()
     expect(runs).toEqual([])

@@ -727,12 +727,8 @@ export class CronScheduler {
   start(): void {
     if (this.intervalId) return // already running
     console.log('[CronScheduler] Starting — checking every 60 s')
-    // Clean up stale "running" entries left by previously crashed processes
-    this.cleanupStaleRuns().catch((err) =>
-      console.error('[CronScheduler] Error cleaning up stale runs:', err),
-    )
     this.intervalId = setInterval(() => this.tick(), 60_000)
-    // Immediate first check
+    // The first tick also reconciles runs abandoned by earlier processes.
     this.tick()
   }
 
@@ -758,6 +754,11 @@ export class CronScheduler {
 
   /** One tick of the scheduler — evaluate all tasks against the current time. */
   async tick(): Promise<void> {
+    // Recheck on every tick: a crashed process's lock can still look fresh at
+    // startup, and a run skipped then must not stay "running" indefinitely.
+    await this.cleanupStaleRuns().catch((err) =>
+      console.error('[CronScheduler] Error cleaning up stale runs:', err),
+    )
     try {
       const tasks = await this.cronService.listTasks()
       const now = new Date()
@@ -1303,9 +1304,9 @@ export class CronScheduler {
   // ─── Cleanup ───────────────────────────────────────────────────────────────
 
   /**
-   * Mark stale "running" entries as "failed" on startup.
-   * These are leftover from previous process instances that crashed or were
-   * killed before they could update the run log.
+   * Settle abandoned runs after restart and on each tick. The execution lock
+   * is held until a live runner has written its terminal record, even when
+   * that runner is in a different server process sharing this config dir.
    */
   private async cleanupStaleRuns(): Promise<void> {
     const target = captureRunsFileMutationTarget()
@@ -1313,23 +1314,23 @@ export class CronScheduler {
       const data = await readRunsFile(target.sourcePath)
       let changed = false
       const now = Date.now()
-      const taskTimeoutMs = resolveCronTaskTimeoutMs()
 
       for (const run of data.runs) {
         if (run.status !== 'running') continue
-        const startedAt = new Date(run.startedAt).getTime()
-        // If "running" for longer than the task timeout + 1-minute buffer,
-        // the owning process is certainly dead.
-        if (now - startedAt > taskTimeoutMs + 60_000) {
-          run.status = 'failed'
-          run.error = 'Process terminated before task could complete'
-          run.completedAt = new Date().toISOString()
-          run.durationMs = now - startedAt
-          changed = true
-          console.log(
-            `[CronScheduler] Cleaned up stale run ${run.id} for task ${run.taskId}`,
-          )
+        if (await lockfile.check(getTaskExecutionLockPath(run.taskId), { realpath: false })) {
+          continue
         }
+        const startedAt = new Date(run.startedAt).getTime()
+        run.status = 'failed'
+        run.error = 'Process terminated before task could complete'
+        run.completedAt = new Date(now).toISOString()
+        run.durationMs = Number.isFinite(startedAt) && startedAt <= now
+          ? now - startedAt
+          : 0
+        changed = true
+        console.log(
+          `[CronScheduler] Cleaned up abandoned run ${run.id} for task ${run.taskId}`,
+        )
       }
 
       if (changed) {
