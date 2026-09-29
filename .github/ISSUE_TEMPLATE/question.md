@@ -1,9 +1,10 @@
 ---
 name: 使用问题咨询
 about: 咨询桌面端或 CLI 使用过程中遇到的问题
-title: '[问题] '
+title: "[问题] "
 labels: question
 assignees: ''
+
 ---
 
 ## 提交前确认
@@ -59,5 +60,3 @@ assignees: ''
 
 
 ---
-
-

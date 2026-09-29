@@ -1,9 +1,10 @@
 ---
 name: Bug 反馈
 about: 提交桌面端或 CLI 的 Bug 报告
-title: '[BUG] '
+title: "[BUG] "
 labels: bug
 assignees: ''
+
 ---
 
 ## 提交前确认
