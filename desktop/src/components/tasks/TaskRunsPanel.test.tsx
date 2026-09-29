@@ -10,6 +10,32 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { useTaskStore } from '../../stores/taskStore'
 import type { NotificationDeliveryRecord, TaskRun } from '../../types/task'
 
+describe('TaskRunsPanel run controls', () => {
+  it('stops a running run, then confirms clearing its terminal record', async () => {
+    useSettingsStore.setState({ locale: 'en' })
+    const running = { ...terminalRun, status: 'running' as const, output: undefined }
+    let records: TaskRun[] = [running]
+    const fetchTaskRuns = vi.fn(async () => records)
+    const stop = vi.spyOn(tasksApi, 'stopRun').mockImplementation(async () => {
+      records = [{ ...running, status: 'failed', error: 'Stopped by user' }]
+      return { run: records[0]! }
+    })
+    const clear = vi.spyOn(tasksApi, 'deleteRun').mockImplementation(async () => {
+      records = []
+      return { ok: true }
+    })
+    useTaskStore.setState({ fetchTaskRuns } as Partial<ReturnType<typeof useTaskStore.getState>>)
+    render(<TaskRunsPanel taskId="task-1" onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop run' }))
+    await waitFor(() => expect(stop).toHaveBeenCalledWith('task-1', 'run-1'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear record' }))
+    expect(clear).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm clear' }))
+    await waitFor(() => expect(clear).toHaveBeenCalledWith('task-1', 'run-1'))
+    await waitFor(() => expect(screen.getByText(translate('en', 'tasks.noLogs'))).toBeInTheDocument())
+  })
+})
+
 beforeEach(() => {
   // The deliveries endpoint is the backend contract this panel is built
   // against; every test stubs it so none reaches the network.

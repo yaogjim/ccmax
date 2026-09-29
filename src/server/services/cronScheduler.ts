@@ -12,6 +12,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
+import { ApiError } from '../middleware/errorHandler.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { parseCronExpression } from '../../utils/cron.js'
 import { CronService, type CronTask } from './cronService.js'
@@ -707,6 +708,7 @@ export class CronScheduler {
     string,
     { proc: ReturnType<typeof Bun.spawn>; startedAt: number; runId: string }
   >()
+  private stoppedRunIds = new Set<string>()
   /** Track which minute each task last fired (prevents same-process duplicate within a minute). */
   private lastFiredMinuteKey = new Map<string, string>()
   private cronService: CronService
@@ -742,6 +744,7 @@ export class CronScheduler {
       this.intervalId = null
     }
     for (const [taskId, entry] of this.runningTasks) {
+      this.stoppedRunIds.add(entry.runId)
       try {
         entry.proc.kill()
       } catch {
@@ -750,6 +753,74 @@ export class CronScheduler {
       this.runningTasks.delete(taskId)
     }
     console.log('[CronScheduler] Stopped')
+  }
+
+  /** Exclude a new start across scheduler instances while a task is removed. */
+  async withTaskIdle<T>(taskId: string, action: () => Promise<T>): Promise<T> {
+    if (!claimTaskExecution(taskId)) throw ApiError.conflict('Task is still finishing; retry shortly')
+    let release: (() => Promise<void>) | null = null
+    try {
+      release = await acquireTaskExecutionLock(taskId)
+      if (!release) throw ApiError.conflict('Task is running in another server process')
+      return await action()
+    } finally {
+      await release?.().catch(() => {})
+      releaseTaskExecutionClaim(taskId)
+    }
+  }
+
+  /** Stop precisely this run; never kill a newer run after a stale UI click. */
+  async stopRun(taskId: string, runId: string): Promise<TaskRun> {
+    const active = this.runningTasks.get(taskId)
+    if (active?.runId === runId) {
+      this.stoppedRunIds.add(runId)
+      try {
+        active.proc.kill()
+      } catch {
+        // It may have exited between reading the map and killing it.
+      }
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const run = (await readRunsFile()).runs.find((item) => item.id === runId && item.taskId === taskId)
+        if (run && run.status !== 'running') return run
+        await Bun.sleep(50)
+      }
+      throw ApiError.conflict('Task process has not stopped yet; retry shortly')
+    }
+
+    const run = (await readRunsFile()).runs.find((item) => item.id === runId && item.taskId === taskId)
+    if (!run) throw ApiError.notFound(`Run ${runId} not found for task ${taskId}`)
+    if (run.status !== 'running') return run
+    if (await lockfile.check(getTaskExecutionLockPath(taskId), { realpath: false })) {
+      throw ApiError.conflict('Task is running in another server process; stop it there first')
+    }
+    await this.cleanupStaleRuns()
+    const settled = (await readRunsFile()).runs.find((item) => item.id === runId && item.taskId === taskId)
+    if (!settled || settled.status === 'running') throw ApiError.conflict('Run is still active')
+    return settled
+  }
+
+  /** Delete one terminal run without touching the task or its other runs. */
+  async deleteRun(taskId: string, runId: string): Promise<void> {
+    const target = captureRunsFileMutationTarget()
+    await this.cleanupStaleRuns()
+    await mutateRunsFile(target, (data) => {
+      const index = data.runs.findIndex((run) => run.id === runId && run.taskId === taskId)
+      if (index < 0) throw ApiError.notFound(`Run ${runId} not found for task ${taskId}`)
+      if (data.runs[index]!.status === 'running') throw ApiError.conflict('Stop the run before clearing it')
+      data.runs.splice(index, 1)
+    })
+  }
+
+  /** Remove the history after the task itself has been deleted. */
+  async deleteTaskRuns(taskId: string): Promise<void> {
+    const target = captureRunsFileMutationTarget()
+    await this.cleanupStaleRuns()
+    await mutateRunsFile(target, (data) => {
+      if (data.runs.some((run) => run.taskId === taskId && run.status === 'running')) {
+        throw ApiError.conflict('Stop the task before deleting its history')
+      }
+      data.runs = data.runs.filter((run) => run.taskId !== taskId)
+    })
   }
 
   /** One tick of the scheduler — evaluate all tasks against the current time. */
@@ -943,6 +1014,7 @@ export class CronScheduler {
 
     const taskTimeoutMs = resolveCronTaskTimeoutMs()
     let timeoutId: Timer | undefined
+    let timedOut = false
 
     let settled: TaskRun
     try {
@@ -964,7 +1036,8 @@ export class CronScheduler {
 
       // Set up a timeout
       timeoutId = setTimeout(() => {
-        if (this.runningTasks.has(task.id)) {
+        if (this.runningTasks.get(task.id)?.runId === runId) {
+          timedOut = true
           try {
             proc.kill()
           } catch {
@@ -973,10 +1046,19 @@ export class CronScheduler {
         }
       }, taskTimeoutMs)
 
-      // Collect stdout
+      // Drain both pipes while the child is alive. Waiting for exit before
+      // reading stderr can block a child whose diagnostic output fills its pipe.
+      const stderrResult = proc.stderr
+        ? new Response(proc.stderr).text().catch(() => '')
+        : Promise.resolve('')
+
+      // Read stdout concurrently with process exit. A CLI may spawn a helper
+      // that inherits its pipe: waiting for EOF *before* proc.exited then
+      // holds the task at running until that helper exits (or forever).
       const stdoutChunks: string[] = []
-      if (proc.stdout) {
-        const reader = proc.stdout.getReader()
+      const reader = proc.stdout?.getReader()
+      const readStdout = (async () => {
+        if (!reader) return
         const decoder = new TextDecoder()
         try {
           while (true) {
@@ -987,18 +1069,22 @@ export class CronScheduler {
         } catch {
           // stream may be interrupted on kill
         }
-      }
+      })()
 
-      // Wait for exit
       const exitCode = await proc.exited
+      // Give the pipes a short chance to flush after exit, but never hold the
+      // execution lock indefinitely for a descendant retaining the write end.
+      const drain = <T>(result: Promise<T>, fallback: T) => Promise.race([
+        result,
+        Bun.sleep(750).then(() => fallback),
+      ])
+      const stdoutDrained = await drain(readStdout.then(() => true), false)
+      if (!stdoutDrained) void reader?.cancel().catch(() => {})
 
       const completedAt = new Date().toISOString()
       const rawOutput = stdoutChunks.join('')
       const durationMs =
         new Date(completedAt).getTime() - new Date(startedAt).getTime()
-
-      // Determine if this was a timeout
-      const wasTimeout = durationMs >= taskTimeoutMs
 
       // Extract only meaningful AI text responses from raw NDJSON output.
       // The raw stream contains system/init messages, tool_use blocks, and
@@ -1006,24 +1092,20 @@ export class CronScheduler {
       // AI answer appears. A naive .slice(0, 10_000) would lose the answer.
       const output = extractAssistantText(rawOutput)
 
+      const wasStopped = this.stoppedRunIds.has(runId)
       const completedRun: TaskRun = {
         ...run,
         completedAt,
-        status: wasTimeout ? 'timeout' : exitCode === 0 ? 'completed' : 'failed',
+        status: wasStopped ? 'failed' : timedOut ? 'timeout' : exitCode === 0 ? 'completed' : 'failed',
         output: output.slice(0, 50_000), // cap after extraction
         exitCode,
         durationMs,
       }
 
-      // Collect stderr for error field
-      if (exitCode !== 0 && proc.stderr) {
-        try {
-          const stderrText = await new Response(proc.stderr).text()
-          completedRun.error = stderrText.slice(0, 5_000)
-        } catch {
-          // ignore
-        }
-      }
+      const stderrText = await drain(stderrResult, '')
+      if (wasStopped) completedRun.error = 'Stopped by user'
+      else if (timedOut) completedRun.error = `Task timed out after ${taskTimeoutMs} ms`
+      else if (exitCode !== 0) completedRun.error = stderrText.slice(0, 5_000) || `Process exited with code ${exitCode}`
 
       settled = completedRun
     } catch (err) {
@@ -1036,7 +1118,9 @@ export class CronScheduler {
         ...run,
         completedAt,
         status: 'failed',
-        error: err instanceof Error ? err.message : String(err),
+        error: this.stoppedRunIds.has(runId)
+          ? 'Stopped by user'
+          : err instanceof Error ? err.message : String(err),
         durationMs:
           new Date(completedAt).getTime() - new Date(startedAt).getTime(),
       }
@@ -1051,6 +1135,7 @@ export class CronScheduler {
     await this.persistScheduledSessionPermission(sessionId, workDir)
     await updateRun(settled, runLogTarget)
     await this.finalizeTaskRun(task, settled, runLogTarget)
+    this.stoppedRunIds.delete(runId)
 
     return settled
   }

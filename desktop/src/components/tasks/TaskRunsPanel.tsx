@@ -263,6 +263,9 @@ export function TaskRunsPanel({ taskId, onClose, refreshKey }: Props) {
   const openTab = useTabStore((s) => s.openTab)
   const [runs, setRuns] = useState<TaskRun[]>([])
   const [loading, setLoading] = useState(true)
+  const [actionRunId, setActionRunId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [confirmClearId, setConfirmClearId] = useState<string | null>(null)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [detailState, setDetailState] = useState<{
     runId: string
@@ -473,6 +476,25 @@ export function TaskRunsPanel({ taskId, onClose, refreshKey }: Props) {
     setExpandedId(null)
   }, [cancelDeliveriesRequest, cancelDetailRequest, taskId])
 
+  const manageRun = async (run: TaskRun, action: 'stop' | 'clear') => {
+    if (actionRunId) return
+    setActionRunId(run.id)
+    setActionError(null)
+    try {
+      if (action === 'stop') await tasksApi.stopRun(taskId, run.id)
+      else {
+        await tasksApi.deleteRun(taskId, run.id)
+        setConfirmClearId(null)
+        if (expandedId === run.id) setExpandedId(null)
+      }
+      refresh()
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setActionRunId(null)
+    }
+  }
+
   // Load the run's notification deliveries once it is terminal. A running run
   // has nothing queued yet; the poll flips it to terminal and this effect then
   // fetches, so the status never claims a result that has not settled.
@@ -555,6 +577,7 @@ export function TaskRunsPanel({ taskId, onClose, refreshKey }: Props) {
 
       {/* Content */}
       <div className="max-h-64 overflow-y-auto px-5 pb-4">
+        {actionError && <ErrorState size="sm" title={t('common.error')} detail={actionError} />}
         {loading ? (
           // Same 16px brand spinner in the same `py-6` box; the label goes from
           // an `aria-label` on the SVG to an `aria-live` region, so the wait is
@@ -597,6 +620,25 @@ export function TaskRunsPanel({ taskId, onClose, refreshKey }: Props) {
                     )}
 
                     <div className="ml-auto flex items-center gap-2">
+                      {run.status === 'running' ? (
+                        <Button variant="ghost" size="sm" disabled={actionRunId !== null}
+                          onClick={() => { void manageRun(run, 'stop') }}>
+                          {t('tasks.stopRun')}
+                        </Button>
+                      ) : confirmClearId === run.id ? (
+                        <>
+                          <Button variant="ghost" size="sm" disabled={actionRunId !== null}
+                            onClick={() => { void manageRun(run, 'clear') }}>
+                            {t('tasks.confirmClearRun')}
+                          </Button>
+                          <Button variant="ghost" size="sm" onClick={() => setConfirmClearId(null)}>{t('common.cancel')}</Button>
+                        </>
+                      ) : (
+                        <Button variant="ghost" size="sm" disabled={actionRunId !== null}
+                          onClick={() => setConfirmClearId(run.id)}>
+                          {t('tasks.clearRun')}
+                        </Button>
+                      )}
                       {/* Open session — only after run completes (session is empty while running) */}
                       {run.sessionId && run.status !== 'running' && (
                         <Button

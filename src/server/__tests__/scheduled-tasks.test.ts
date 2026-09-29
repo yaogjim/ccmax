@@ -1366,6 +1366,70 @@ describe('Scheduled Tasks API manual run', () => {
       await Bun.sleep(10)
     }
   })
+  it('does not claim a manual run started if its record cannot be written', async () => {
+    const task = await new CronService().createTask({
+      cron: '0 9 * * *', prompt: 'start fails', recurring: true, folderPath: tmpDir,
+    })
+    const spy = spyOn(CronService.prototype, 'updateLastFired').mockRejectedValue(new Error('write denied'))
+    try {
+      const req = new Request(`http://localhost/api/scheduled-tasks/${task.id}/run`, { method: 'POST' })
+      const response = await handleScheduledTasksApi(req, new URL(req.url), ['api', 'scheduled-tasks', task.id, 'run'])
+      expect(response.status).toBe(500)
+      expect(await fs.stat(path.join(tmpDir, 'scheduled_tasks_log.json')).then(() => true).catch(() => false)).toBe(false)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('deletes a running task and its history without leaving an orphaned run', async () => {
+    const ready = path.join(tmpDir, 'delete-run-ready')
+    const cli = path.join(tmpDir, 'delete-blocked-cli.ts')
+    await fs.writeFile(cli, `import { writeFileSync } from 'node:fs'\nwriteFileSync(${JSON.stringify(ready)}, 'ready')\nwhile (true) await Bun.sleep(20)\n`)
+    process.env.CLAUDE_CLI_PATH = cli
+    const task = await new CronService().createTask({ cron: '0 9 * * *', prompt: 'delete in flight', recurring: true, folderPath: tmpDir })
+    const request = (method: string, suffix: string) => {
+      const req = new Request(`http://localhost/api/scheduled-tasks/${task.id}${suffix}`, { method })
+      return handleScheduledTasksApi(req, new URL(req.url), ['api', 'scheduled-tasks', task.id, ...suffix.split('/').filter(Boolean)])
+    }
+    expect((await request('POST', '/run')).status).toBe(200)
+    for (let i = 0; i < 200 && !await fs.stat(ready).then(() => true).catch(() => false); i++) await Bun.sleep(5)
+    expect((await request('DELETE', '')).status).toBe(200)
+    expect((await new CronService().listTasks()).find((item) => item.id === task.id)).toBeUndefined()
+    expect((await (await request('GET', '/runs')).json() as { runs: unknown[] }).runs).toEqual([])
+  })
+
+  it('exposes stop and clear for a live run, then allows another manual start', async () => {
+    const ready = path.join(tmpDir, 'api-run-ready')
+    const release = path.join(tmpDir, 'api-run-release')
+    const cli = path.join(tmpDir, 'api-blocking-cli.ts')
+    await fs.writeFile(cli, `import { existsSync, writeFileSync } from 'node:fs'\nwriteFileSync(${JSON.stringify(ready)}, 'ready')\nwhile (!existsSync(${JSON.stringify(release)})) await Bun.sleep(5)\nconsole.log(JSON.stringify({ type: 'result', result: 'done' }))\n`)
+    process.env.CLAUDE_CLI_PATH = cli
+    const task = await new CronService().createTask({ cron: '0 9 * * *', prompt: 'API cancellation', recurring: true, folderPath: tmpDir })
+    const request = (method: string, suffix: string) => {
+      const req = new Request(`http://localhost/api/scheduled-tasks/${task.id}${suffix}`, { method })
+      return handleScheduledTasksApi(req, new URL(req.url), ['api', 'scheduled-tasks', task.id, ...suffix.split('/').filter(Boolean)])
+    }
+    try {
+      expect((await request('POST', '/run')).status).toBe(200)
+      for (let i = 0; i < 200 && !await fs.stat(ready).then(() => true).catch(() => false); i++) await Bun.sleep(5)
+      const run = (await (await request('GET', '/runs')).json() as { runs: Array<{ id: string }> }).runs[0]!
+      expect((await request('POST', '/run')).status).toBe(409)
+      expect((await request('DELETE', `/runs/${run.id}`)).status).toBe(409)
+      expect((await request('POST', `/runs/${run.id}/stop`)).status).toBe(200)
+      expect((await request('DELETE', `/runs/${run.id}`)).status).toBe(200)
+      await fs.writeFile(release, 'release')
+      expect((await request('POST', '/run')).status).toBe(200)
+      for (let i = 0; i < 200; i++) {
+        const runs = (await (await request('GET', '/runs')).json() as { runs: Array<{ status: string }> }).runs
+        if (runs.length === 1 && runs[0]!.status === 'completed') break
+        await Bun.sleep(10)
+      }
+      expect((await request('DELETE', '')).status).toBe(200)
+      expect((await (await request('GET', '/runs')).json() as { runs: unknown[] }).runs).toEqual([])
+    } finally {
+      await fs.writeFile(release, 'release').catch(() => {})
+    }
+  })
 })
 
 // ─── Scheduled Tasks API: run delivery records ──────────────────────────────

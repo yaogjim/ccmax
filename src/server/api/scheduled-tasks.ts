@@ -45,6 +45,17 @@ export async function handleScheduledTasksApi(
     const subResource = segments[3] // /api/scheduled-tasks/:id/runs
     const subSubResource = segments[4] // /api/scheduled-tasks/runs/:runId/deliveries
 
+    // ── POST /api/scheduled-tasks/:id/runs/:runId/stop ────────────────
+    const runAction = segments[5]
+    if (method === 'POST' && taskId && subResource === 'runs' && subSubResource && runAction === 'stop') {
+      const run = await cronScheduler.stopRun(taskId, subSubResource)
+      return Response.json({ run })
+    }
+    if (method === 'DELETE' && taskId && subResource === 'runs' && subSubResource && !runAction) {
+      await cronScheduler.deleteRun(taskId, subSubResource)
+      return Response.json({ ok: true })
+    }
+
     // ── GET /api/scheduled-tasks/runs/:runId/deliveries ──────────────────
     // The delivery journal for one run: which destinations were attempted and
     // how each attempt ended. Unknown runs are a 404 so a caller cannot mistake
@@ -158,26 +169,28 @@ export async function handleScheduledTasksApi(
       if (!task) throw ApiError.notFound(`Task ${taskId} not found`)
 
       let markStarted: () => void = () => {}
-      const started = new Promise<void>((resolve) => {
-        markStarted = resolve
+      const started = new Promise<'started'>((resolve) => {
+        markStarted = () => resolve('started')
       })
-      cronScheduler
-        .executeTask(task, {
-          createSession: true,
-          onRunStarted: () => markStarted(),
-        })
-        .catch((err) => {
-          console.error(`[ScheduledTasks] Manual run failed for task ${taskId}:`, err)
-        })
-        .finally(() => markStarted())
-
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, MANUAL_RUN_START_TIMEOUT_MS)
-        started.then(() => {
-          clearTimeout(timer)
-          resolve()
-        })
+      const execution = cronScheduler.executeTask(task, {
+        createSession: true,
+        onRunStarted: markStarted,
       })
+      void execution.catch((err) => {
+        console.error(`[ScheduledTasks] Manual run failed for task ${taskId}:`, err)
+      })
+      let startTimer: ReturnType<typeof setTimeout> | undefined
+      const outcome = await Promise.race([
+        started,
+        execution.then((run) => run.status === 'running' ? 'busy' : 'finished', () => 'failed'),
+        new Promise<'timeout'>((resolve) => {
+          startTimer = setTimeout(() => resolve('timeout'), MANUAL_RUN_START_TIMEOUT_MS)
+        }),
+      ])
+      if (startTimer) clearTimeout(startTimer)
+      if (outcome === 'busy') throw ApiError.conflict('Task is already running')
+      if (outcome === 'failed') throw ApiError.internal('Task could not start')
+      if (outcome === 'timeout') throw new ApiError(503, 'Task start has not been confirmed; check runs before retrying', 'START_TIMEOUT')
       return Response.json({ ok: true })
     }
 
@@ -190,7 +203,15 @@ export async function handleScheduledTasksApi(
 
     // ── DELETE /api/scheduled-tasks/:id ───────────────────────────────────
     if (method === 'DELETE' && taskId && !subResource) {
-      await cronService.deleteTask(taskId)
+      // A live runner must be settled before its task is removed; otherwise it
+      // can write a fresh running record after deletion and strand the UI.
+      for (const run of await cronScheduler.getTaskRuns(taskId)) {
+        if (run.status === 'running') await cronScheduler.stopRun(taskId, run.id)
+      }
+      await cronScheduler.withTaskIdle(taskId, async () => {
+        await cronService.deleteTask(taskId)
+        await cronScheduler.deleteTaskRuns(taskId)
+      })
       return Response.json({ ok: true })
     }
 

@@ -57,6 +57,14 @@ export const tasksApi = {
     return api.post<{ ok: true }>(`/api/scheduled-tasks/${id}/run`, {})
   },
 
+  stopRun(taskId: string, runId: string) {
+    return api.post<{ run: TaskRun }>(`/api/scheduled-tasks/${taskId}/runs/${runId}/stop`, {})
+  },
+
+  deleteRun(taskId: string, runId: string) {
+    return api.delete<{ ok: true }>(`/api/scheduled-tasks/${taskId}/runs/${runId}`)
+  },
+
   getRecentRuns(limit = 50, options: Omit<RunsOptions, 'limit'> = {}) {
     return api.get<RunsResponse>(`/api/scheduled-tasks/runs${runsQuery({ ...options, limit })}`)
   },

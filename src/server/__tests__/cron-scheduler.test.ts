@@ -965,6 +965,85 @@ describe('CronScheduler failure terminal state', () => {
       .then((raw) => JSON.parse(raw) as { runs: TaskRun[] })
   }
 
+  it('settles a child that writes more stderr than a pipe can buffer', async () => {
+    const cliPath = path.join(tmpDir, 'stderr-heavy-cli.ts')
+    await fs.writeFile(cliPath, "process.stderr.write('x'.repeat(1024 * 1024)); console.log(JSON.stringify({ type: 'result', result: 'done' }))\n")
+    process.env.CLAUDE_CLI_PATH = cliPath
+    const task = await cronService.createTask({ cron: '0 9 * * *', prompt: 'stderr fixture', recurring: true, folderPath: tmpDir })
+    const execution = scheduler.executeTask(task)
+    try {
+      const result = await Promise.race([execution, Bun.sleep(1500).then(() => null)])
+      expect(result?.status).toBe('completed')
+      expect((await scheduler.getTaskRuns(task.id))[0]?.status).toBe('completed')
+    } finally {
+      scheduler.stop()
+      await execution.catch(() => {})
+    }
+  })
+
+  it('finishes when a departed CLI leaves its stdout pipe open in a descendant', async () => {
+    const cli = path.join(tmpDir, 'inherited-stdout-cli.ts')
+    await fs.writeFile(cli, "const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', 'setTimeout(() => {}, 2000)'], { detached: true, stdio: ['ignore', process.stdout, 'ignore'] }).unref(); console.log(JSON.stringify({ type: 'result', result: 'done' }))\n")
+    process.env.CLAUDE_CLI_PATH = cli
+    const task = await cronService.createTask({ cron: '0 9 * * *', prompt: 'inherited pipe fixture', recurring: true, folderPath: tmpDir })
+    const execution = scheduler.executeTask(task)
+    const outcome = await Promise.race([execution, Bun.sleep(1500).then(() => null)])
+    expect(outcome?.status).toBe('completed')
+    await execution
+  })
+
+  it('marks a killed over-time run as timeout and releases its execution lock', async () => {
+    const blocked = await createBlockingFakeCronCli(tmpDir)
+    process.env.CLAUDE_CLI_PATH = blocked.cliPath
+    const previousTimeout = process.env.CC_HAHA_TASK_TIMEOUT_MS
+    process.env.CC_HAHA_TASK_TIMEOUT_MS = '100'
+    const task = await cronService.createTask({ cron: '0 9 * * *', prompt: 'timeout fixture', recurring: true, folderPath: tmpDir })
+    try {
+      const timedOut = await scheduler.executeTask(task)
+      expect(timedOut.status).toBe('timeout')
+      expect(timedOut.error).toContain('timed out')
+      await fs.writeFile(blocked.releasePath, 'release')
+      expect((await scheduler.executeTask(task)).status).toBe('completed')
+    } finally {
+      if (previousTimeout === undefined) delete process.env.CC_HAHA_TASK_TIMEOUT_MS
+      else process.env.CC_HAHA_TASK_TIMEOUT_MS = previousTimeout
+      await fs.writeFile(blocked.releasePath, 'release').catch(() => {})
+    }
+  })
+
+  it('stops a live run and allows a new run after cancellation', async () => {
+    const blocking = await createBlockingFakeCronCli(tmpDir)
+    process.env.CLAUDE_CLI_PATH = blocking.cliPath
+    const task = await cronService.createTask({ cron: '0 9 * * *', prompt: 'cancel fixture', recurring: true })
+    const execution = scheduler.executeTask(task)
+    try {
+      await waitForFile(blocking.readyPath)
+      const [running] = await scheduler.getTaskRuns(task.id)
+      expect(running?.status).toBe('running')
+      const stopped = await scheduler.stopRun(task.id, running!.id)
+      expect(stopped.status).toBe('failed')
+      expect(stopped.error).toContain('Stopped')
+      expect((await execution).status).toBe('failed')
+      await fs.writeFile(blocking.releasePath, 'release')
+      expect((await scheduler.executeTask(task)).status).toBe('completed')
+    } finally {
+      scheduler.stop()
+      await fs.writeFile(blocking.releasePath, 'release').catch(() => {})
+      await execution.catch(() => {})
+    }
+  })
+
+  it('settles an abandoned run and removes only the requested terminal record', async () => {
+    const task = await cronService.createTask({ cron: '0 9 * * *', prompt: 'cleanup fixture', recurring: true })
+    const logPath = path.join(tmpDir, 'scheduled_tasks_log.json')
+    const stale = { id: 'stale', taskId: task.id, taskName: 'test', prompt: 'test', status: 'running', startedAt: new Date().toISOString() }
+    await fs.writeFile(logPath, JSON.stringify({ runs: [stale, { ...stale, id: 'keep', status: 'completed' }] }))
+    const stopped = await scheduler.stopRun(task.id, 'stale')
+    expect(stopped.status).toBe('failed')
+    await scheduler.deleteRun(task.id, 'stale')
+    expect((await scheduler.getTaskRuns(task.id)).map((run) => run.id)).toEqual(['keep'])
+  })
+
   it('records a failed terminal run when Bun.spawn throws', async () => {
     const task = await cronService.createTask({
       cron: '* * * * *',
