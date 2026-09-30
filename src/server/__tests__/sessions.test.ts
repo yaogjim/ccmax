@@ -505,6 +505,18 @@ describe('SessionService', () => {
     expect((await service.getSessionMessages(workerId)).length).toBeGreaterThan(0)
   })
 
+  it('hides desktop pinned agent worker transcripts from the sidebar and keeps direct reads', async () => {
+    const workerId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    const siblingId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-pinned-sidebar', workerId, [{ ...makeUserEntry('pinned task'), entrypoint: 'claude-desktop-pinned-agent' }])
+    await writeSessionFile('-tmp-pinned-sidebar', siblingId, [{ ...makeUserEntry('ordinary sidebar task'), entrypoint: 'claude-desktop' }])
+    const result = await service.listSessions({ project: '-tmp-pinned-sidebar', limit: 20 })
+    expect(result.sessions.map(item => item.id)).toEqual([siblingId])
+    expect(result.total).toBe(1)
+    expect(await service.findSessionFile(workerId)).not.toBeNull()
+    expect((await service.getSessionMessages(workerId)).length).toBeGreaterThan(0)
+  })
+
   beforeEach(async () => {
     await setupTmpConfigDir()
     service = new SessionService()

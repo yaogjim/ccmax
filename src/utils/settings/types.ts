@@ -831,6 +831,29 @@ export const SettingsSchema = lazySchema(() =>
             'agentType as spawned (e.g. "Explore"), case-sensitive. Other ' +
             'built-in fields stay read-only.',
         ),
+      agentRuntimeBindings: z
+        .record(
+          z.string(),
+          z
+            .object({
+              // Stable provider id (or `claude-official`). Never a display
+              // name, and never a credential.
+              providerId: z.string().trim().min(1).optional().catch(undefined),
+              modelId: z.string().trim().min(1).optional().catch(undefined),
+            })
+            // Room for future per-binding fields; an entry that is not an
+            // object degrades to an empty (ignored) binding.
+            .passthrough()
+            .catch({}),
+        )
+        .optional()
+        // One malformed value must not invalidate the whole settings file.
+        .catch(undefined)
+        .describe(
+          'Pins an agent to a specific provider and model when it runs. Keys ' +
+            'are the agentType, case-sensitive. Only honoured from user and ' +
+            'managed settings.',
+        ),
       companyAnnouncements: z
         .array(z.string())
         .optional()

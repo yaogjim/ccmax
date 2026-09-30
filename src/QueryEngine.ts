@@ -1,4 +1,5 @@
 import { consumeSessionMessage, isPendingSessionMessage } from './utils/sessionMessageInbox.js'
+import { isPinnedAgentWorkerProcess } from './shared/workerSession.js'
 import { feature } from 'bun:bundle'
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { randomUUID } from 'crypto'
@@ -466,7 +467,9 @@ export class QueryEngine {
       messages: this.mutableMessages,
       uuid: options?.uuid,
       isMeta: options?.isMeta,
-      skipSlashCommands: isPendingSessionMessage(options?.uuid),
+      // A pinned agent's task is content: slash commands in it must not be able
+      // to swap the model the agent is pinned to.
+      skipSlashCommands: isPendingSessionMessage(options?.uuid) || isPinnedAgentWorkerProcess(),
       skipAttachments: isPendingSessionMessage(options?.uuid),
       querySource: 'sdk',
     })

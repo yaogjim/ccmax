@@ -1,7 +1,7 @@
 import { z } from 'zod/v4'
 import { snapshotTeamPlanPresetSource } from '../../utils/swarm/teamPlanPresetSource.js'
 import type { ToolUseContext } from '../../Tool.js'
-import type { TeamPlanMember, TeamPlanRecord, TeamPlanRuntime, TeamPlanTask } from '../../shared/teamPlan.js'
+import type { TeamPlanAgentSnapshot, TeamPlanMember, TeamPlanRecord, TeamPlanRuntime, TeamPlanTask } from '../../shared/teamPlan.js'
 import { getTeamLeaderRuntime } from '../../utils/swarm/teamPlanPolicy.js'
 import { listTasks, getCanonicalTeamTaskListId } from '../../utils/tasks.js'
 import { resolveTeammateModel } from '../../utils/swarm/resolveTeammateModel.js'
@@ -33,11 +33,18 @@ export const proposedTeamPlanSchema = z.object({
 
 export type ProposedTeamPlan = z.infer<typeof proposedTeamPlanSchema>
 
-export function snapshotTeamAgents(context: ToolUseContext) {
-  return Object.fromEntries(context.options.agentDefinitions.activeAgents.map(agent => [agent.agentType, {
+type SnapshotSourceAgent = ToolUseContext['options']['agentDefinitions']['activeAgents'][number]
+
+/**
+ * Frozen, serializable copy of one Agent preset. Shared by Team plans and
+ * pinned agents so both hand a server-started worker the same definition shape.
+ * `sourceIdentity` is left to callers: Team plans verify the preset file, a
+ * pinned run executes the definition the tool call just resolved.
+ */
+export function snapshotAgentPreset(agent: SnapshotSourceAgent, context: ToolUseContext): Omit<TeamPlanAgentSnapshot, 'sourceIdentity'> & { systemPrompt: string } {
+  return {
     agentType: agent.agentType,
     source: agent.source,
-    sourceIdentity: snapshotTeamPlanPresetSource(agent),
     description: agent.whenToUse,
     systemPrompt: agent.rawSystemPrompt ?? agent.getSystemPrompt({ toolUseContext: context }),
     ...(agent.tools ? { tools: [...agent.tools] } : {}),
@@ -50,11 +57,19 @@ export function snapshotTeamAgents(context: ToolUseContext) {
     ...(agent.memory ? { memory: agent.memory } : {}),
     ...(agent.hooks ? { hooks: structuredClone(agent.hooks) } : {}),
     ...(agent.mcpServers ? { mcpServers: agent.mcpServers.filter(spec => typeof spec === 'string') } : {}),
-    ...(agent.mcpServers?.some(spec => typeof spec !== 'string') ? { configurationError: 'Inline MCP server configurations are not supported in team plans. Configure the server separately and reference its name in the Agent preset.' } : {}),
+    ...(agent.mcpServers?.some(spec => typeof spec !== 'string') ? { configurationError: 'Inline MCP server configurations are not supported in team plans or pinned agents. Configure the server separately and reference its name in the Agent preset.' } : {}),
     ...(agent.initialPrompt ? { initialPrompt: agent.initialPrompt } : {}),
     ...(agent.maxTurns !== undefined ? { maxTurns: agent.maxTurns } : {}),
     ...(agent.omitClaudeMd !== undefined ? { omitClaudeMd: agent.omitClaudeMd } : {}),
-  }]))
+  }
+}
+
+export function snapshotTeamAgents(context: ToolUseContext) {
+  return Object.fromEntries(context.options.agentDefinitions.activeAgents.map(agent => {
+    const { agentType, source, ...rest } = snapshotAgentPreset(agent, context)
+    // Key order is part of the persisted plan shape; keep sourceIdentity where it always was.
+    return [agent.agentType, { agentType, source, sourceIdentity: snapshotTeamPlanPresetSource(agent), ...rest }]
+  }))
 }
 
 export function resolveProposedTeamPlan(plan: ProposedTeamPlan, context: ToolUseContext) {

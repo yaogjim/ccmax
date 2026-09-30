@@ -1058,3 +1058,18 @@ it('excludes desktop team workers from sidebar pages while retaining indexed tra
     expect(index.getSession?.('worker-session')?.id).toBe('worker-session')
   } finally { database.close() }
 })
+
+it('excludes pinned agent workers from sidebar pages while retaining indexed transcript lookup', async () => {
+  const root = await createTempDir('pinned-agent-sidebar')
+  const database = openLocalIndexDatabase({ path: join(root, 'index.sqlite') })
+  const index = createSessionIndex(database)
+  try {
+    const projector = createSessionProjector({ database, index, scope: root })
+    const worker = await createCandidate({ root, projectPath: '-repo', sessionId: 'pinned-worker', content: line({ ...user('pinned work', '2026-01-03T00:00:00Z'), entrypoint: 'claude-desktop-pinned-agent' }) })
+    const ordinary = await createCandidate({ root, projectPath: '-repo', sessionId: 'ordinary-session', content: line({ ...user('ordinary', '2026-01-02T00:00:00Z'), entrypoint: 'claude-desktop' }) })
+    for (const candidate of [worker, ordinary]) await projector.projectSource(candidate)
+    expect(index.listSessions().sessions.map(item => item.id)).toEqual(['ordinary-session'])
+    expect(index.listSessions().total).toBe(1)
+    expect(index.findSessionFiles('pinned-worker')).toHaveLength(1)
+  } finally { database.close() }
+})

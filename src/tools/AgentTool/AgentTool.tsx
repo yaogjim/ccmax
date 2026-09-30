@@ -54,6 +54,8 @@ import type { AgentDefinition } from './loadAgentsDir.js';
 import { filterAgentsByMcpRequirements, hasRequiredMcpServers, isBuiltInAgent } from './loadAgentsDir.js';
 import { getPrompt } from './prompt.js';
 import { runAgent } from './runAgent.js';
+import { buildPinnedLaunchInfo, buildPinnedRuntimeInfo, continuePinnedRun, waitForPinnedStart, pinnedAgentPreflightError, pinnedModelIgnoredWarning, type PinnedRunState, resolvePinnedRuntime, runPinnedAgent } from './runPinnedAgent.js';
+import { snapshotAgentPreset } from '../TeamPlanTool/context.js';
 import { renderGroupedAgentToolUse, renderToolResultMessage, renderToolUseErrorMessage, renderToolUseMessage, renderToolUseProgressMessage, renderToolUseRejectedMessage, renderToolUseTag, userFacingName, userFacingNameBackgroundColor } from './UI.js';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -138,11 +140,34 @@ type AgentToolInput = z.infer<ReturnType<typeof baseInputSchema>> & {
   cwd?: string;
 };
 
+// Where a pinned agent ran. Built from the desktop server's events, so the
+// provider and model shown to the user are the ones actually used.
+const pinnedRuntimeOutputSchema = lazySchema(() => z.object({
+  mode: z.literal('pinned'),
+  providerId: z.string(),
+  providerName: z.string(),
+  requestedModel: z.string(),
+  status: z.literal('completed'),
+  warnings: z.array(z.string())
+}));
+
+// A background launch: the provider name is only there once the worker has
+// reported in, but the agent is known to be pinned from the start.
+const pinnedLaunchOutputSchema = lazySchema(() => z.object({
+  mode: z.literal('pinned'),
+  providerId: z.string(),
+  providerName: z.string().optional(),
+  requestedModel: z.string(),
+  status: z.literal('running'),
+  warnings: z.array(z.string())
+}));
+
 // Output schema - multi-agent spawned schema added dynamically at runtime when enabled
 export const outputSchema = lazySchema(() => {
   const syncOutputSchema = agentToolResultSchema().extend({
     status: z.literal('completed'),
-    prompt: z.string()
+    prompt: z.string(),
+    runtime: pinnedRuntimeOutputSchema().optional()
   });
   const asyncOutputSchema = z.object({
     status: z.literal('async_launched'),
@@ -150,7 +175,8 @@ export const outputSchema = lazySchema(() => {
     description: z.string().describe('The description of the task'),
     prompt: z.string().describe('The prompt for the agent'),
     outputFile: z.string().describe('Path to the output file for checking agent progress'),
-    canReadOutputFile: z.boolean().optional().describe('Whether the calling agent has Read/Bash tools to check progress')
+    canReadOutputFile: z.boolean().optional().describe('Whether the calling agent has Read/Bash tools to check progress'),
+    runtime: pinnedLaunchOutputSchema().optional()
   });
   return z.union([syncOutputSchema, asyncOutputSchema]);
 });
@@ -567,6 +593,26 @@ export const AgentTool = buildTool({
     // below (registerAsyncAgentTask + notifyOnCompletion).
     const assistantForceAsync = feature('KAIROS') ? appState.kairosEnabled : false;
     const shouldRunAsync = (run_in_background === true || selectedAgent.background === true || isCoordinator || forceAsync || assistantForceAsync || (proactiveModule?.isProactiveActive() ?? false)) && !isBackgroundTasksDisabled;
+    // An agent the user pinned to a provider runs in a server-started worker
+    // instead of in this process. Refuse anything that path cannot honour
+    // before any side effect (worktree, task registration) happens: falling
+    // back to this session's own provider would send the task somewhere the
+    // user chose not to.
+    const pinnedBinding = resolvePinnedRuntime(selectedAgent.agentType);
+    const pinnedWarnings: string[] = [];
+    if (pinnedBinding) {
+      const preflightError = pinnedAgentPreflightError({
+        agentType: selectedAgent.agentType,
+        isForkPath,
+        isolation: effectiveIsolation,
+        cwd
+      });
+      if (preflightError) throw new Error(preflightError);
+      if (modelParam) pinnedWarnings.push(pinnedModelIgnoredWarning(selectedAgent.agentType, modelParam));
+    }
+    const pinnedState: PinnedRunState = {};
+    // Frozen once, so the foreground and background paths send the same definition.
+    const pinnedDefinition = pinnedBinding ? snapshotAgentPreset(selectedAgent, toolUseContext) : undefined;
     // Assemble the worker's tool pool independently of the parent's.
     // Workers always get their tools from assembleToolPool with their own
     // permission mode, so they aren't affected by the parent's tool
@@ -580,6 +626,31 @@ export const AgentTool = buildTool({
 
     // Create a stable agent ID early so it can be used for worktree slug
     const earlyAgentId = createAgentId();
+
+    if (pinnedBinding) {
+      // Marks the agent as pinned on disk before its worker reports in, so a
+      // SendMessage or resume racing the start is refused instead of queued to
+      // a run that has no way to receive it. The worker's `started` event
+      // replaces this with the provider and model it actually used.
+      await writeAgentMetadata(asAgentId(earlyAgentId), {
+        agentType: selectedAgent.agentType,
+        description,
+        ...(toolUseContext.toolUseId && {
+          toolUseId: toolUseContext.toolUseId
+        }),
+        ...(toolUseContext.agentId && {
+          ownerAgentId: toolUseContext.agentId
+        }),
+        runtime: {
+          mode: 'pinned',
+          providerId: pinnedBinding.providerId,
+          providerName: pinnedBinding.providerId,
+          requestedModel: pinnedBinding.modelId,
+          model: pinnedBinding.modelId,
+          workerSessionId: ''
+        }
+      }).catch(err => logForDebugging(`Failed to write pinned agent metadata: ${err}`));
+    }
 
     // Set up worktree isolation if requested
     let worktreeInfo: {
@@ -753,7 +824,19 @@ export const AgentTool = buildTool({
       void runWithAgentContext(asyncAgentContext, () => wrapWithCwd(() => runAsyncAgentLifecycle({
         taskId: agentBackgroundTask.agentId,
         abortController: agentBackgroundTask.abortController!,
-        makeStream: onCacheSafeParams => runAgent({
+        // A pinned agent's worker runs in the desktop server; killing the task
+        // aborts this signal, which closes the stream and stops the worker.
+        makeStream: onCacheSafeParams => pinnedBinding ? runPinnedAgent({
+          agentType: selectedAgent.agentType,
+          definition: pinnedDefinition!,
+          prompt,
+          description,
+          toolUseId: toolUseContext.toolUseId,
+          agentId: agentBackgroundTask.agentId,
+          ownerAgentId: toolUseContext.agentId,
+          signal: agentBackgroundTask.abortController!.signal,
+          state: pinnedState
+        }) : runAgent({
           ...runAgentParams,
           override: {
             ...runAgentParams.override,
@@ -774,6 +857,10 @@ export const AgentTool = buildTool({
         ownerAgentId: toolUseContext.agentId
       })));
       const canReadOutputFile = toolUseContext.options.tools.some(t => toolMatchesName(t, FILE_READ_TOOL_NAME) || toolMatchesName(t, BASH_TOOL_NAME));
+      // The launch result is what the desktop card shows, so give the worker a
+      // moment to report which provider it started on.
+      if (pinnedBinding) await waitForPinnedStart(pinnedState);
+      const launchedRuntime = pinnedBinding ? buildPinnedLaunchInfo(pinnedState, pinnedBinding, pinnedWarnings) : undefined;
       return {
         data: {
           isAsync: true as const,
@@ -783,6 +870,9 @@ export const AgentTool = buildTool({
           prompt: prompt,
           outputFile: getTaskOutputPath(agentBackgroundTask.agentId),
           canReadOutputFile,
+          ...(launchedRuntime ? {
+            runtime: launchedRuntime
+          } : {}),
           ...(worktreeIsolationSkipped ? {
             worktreeIsolationSkipped
           } : {})
@@ -869,8 +959,34 @@ export const AgentTool = buildTool({
         // const capture for sound type narrowing inside the callback below
         const summaryTaskId = foregroundTaskId;
 
+        // A pinned run's cancellation is re-targeted when it moves to the
+        // background: while in the foreground it follows this turn's abort
+        // signal, afterwards only the background task's own controller (ESC on
+        // the main thread must not kill a background agent).
+        const pinnedAbort = pinnedBinding ? new AbortController() : undefined;
+        const followSignal = (source: AbortSignal) => {
+          if (!pinnedAbort) return () => {};
+          const forward = () => pinnedAbort.abort();
+          if (source.aborted) forward();
+          else source.addEventListener('abort', forward, {
+            once: true
+          });
+          return () => source.removeEventListener('abort', forward);
+        };
+        let stopFollowingForeground = followSignal(toolUseContext.abortController.signal);
+
         // Get async iterator for the agent
-        const agentIterator = runAgent({
+        const agentIterator = (pinnedBinding ? runPinnedAgent({
+          agentType: selectedAgent.agentType,
+          definition: pinnedDefinition!,
+          prompt,
+          description,
+          toolUseId: toolUseContext.toolUseId,
+          agentId: syncAgentId,
+          ownerAgentId: toolUseContext.agentId,
+          signal: pinnedAbort!.signal,
+          state: pinnedState
+        }) : runAgent({
           ...runAgentParams,
           override: {
             ...runAgentParams.override,
@@ -882,7 +998,7 @@ export const AgentTool = buildTool({
             } = startAgentSummarization(summaryTaskId, syncAgentId, params, rootSetAppState);
             stopForegroundSummarization = stop;
           } : undefined
-        })[Symbol.asyncIterator]();
+        }))[Symbol.asyncIterator]();
 
         // Track if an error occurred during iteration
         let syncAgentError: Error | undefined;
@@ -928,6 +1044,10 @@ export const AgentTool = buildTool({
                 // Capture the taskId for use in the async callback
                 const backgroundedTaskId = foregroundTaskId;
                 wasBackgrounded = true;
+                if (pinnedBinding) {
+                  stopFollowingForeground();
+                  stopFollowingForeground = followSignal(task.abortController!.signal);
+                }
                 // Stop foreground summarization; the backgrounded closure
                 // below owns its own independent stop function.
                 stopForegroundSummarization?.();
@@ -942,14 +1062,18 @@ export const AgentTool = buildTool({
                     // (releases MCP connections, session hooks, prompt cache tracking, etc.)
                     // Timeout prevents blocking if MCP server cleanup hangs.
                     // .catch() prevents unhandled rejection if timeout wins the race.
-                    await Promise.race([agentIterator.return(undefined).catch(() => {}), sleep(1000)]);
+                    // A pinned run is the exception: its worker cannot be restarted,
+                    // so the same iterator is carried on below.
+                    if (!pinnedBinding) {
+                      await Promise.race([agentIterator.return(undefined).catch(() => {}), sleep(1000)]);
+                    }
                     // Initialize progress tracking from existing messages
                     const tracker = createProgressTracker();
                     const resolveActivity2 = createActivityDescriptionResolver(toolUseContext.options.tools);
                     for (const existingMsg of agentMessages) {
                       updateProgressFromMessage(tracker, existingMsg, resolveActivity2, toolUseContext.options.tools);
                     }
-                    for await (const msg of runAgent({
+                    for await (const msg of pinnedBinding ? continuePinnedRun(agentIterator, nextMessagePromise) : runAgent({
                       ...runAgentParams,
                       isAsync: true,
                       // Agent is now running in background
@@ -1067,6 +1191,7 @@ export const AgentTool = buildTool({
 
                 // Return async_launched result immediately
                 const canReadOutputFile = toolUseContext.options.tools.some(t => toolMatchesName(t, FILE_READ_TOOL_NAME) || toolMatchesName(t, BASH_TOOL_NAME));
+                const launchedRuntime = pinnedBinding ? buildPinnedLaunchInfo(pinnedState, pinnedBinding, pinnedWarnings) : undefined;
                 return {
                   data: {
                     isAsync: true as const,
@@ -1076,6 +1201,9 @@ export const AgentTool = buildTool({
                     prompt: prompt,
                     outputFile: getTaskOutputPath(backgroundedTaskId),
                     canReadOutputFile,
+                    ...(launchedRuntime ? {
+                      runtime: launchedRuntime
+                    } : {}),
                     ...(worktreeIsolationSkipped ? {
                       worktreeIsolationSkipped
                     } : {})
@@ -1185,6 +1313,15 @@ export const AgentTool = buildTool({
             toolUseContext.setToolJSX(null);
           }
 
+          // If the loop ended early (an error in a consumer, not just a
+          // finished stream), close the pinned stream so the server stops its
+          // worker instead of leaving it running unobserved.
+          // (A backgrounded run keeps its worker; the background stream owns the iterator.)
+          if (pinnedBinding && !wasBackgrounded) {
+            stopFollowingForeground();
+            await Promise.race([agentIterator.return(undefined).catch(() => {}), sleep(1000)]);
+          }
+
           // Stop foreground summarization. Idempotent — if already stopped at
           // the backgrounding transition, this is a no-op. The backgrounded
           // closure owns a separate stop function (stopBackgroundedSummarization).
@@ -1254,6 +1391,10 @@ export const AgentTool = buildTool({
         // whatever messages we have. If we have no assistant messages,
         // re-throw the error so it's properly handled by the tool framework.
         if (syncAgentError) {
+          // A pinned agent's failure must reach the caller as a failure. The
+          // partial-result recovery below would present the last progress
+          // message as if the agent had finished.
+          if (pinnedBinding) throw syncAgentError;
           // Check if we have any assistant messages to return
           const hasAssistantMessages = agentMessages.some(msg => msg.type === 'assistant');
           if (!hasAssistantMessages) {
@@ -1283,11 +1424,15 @@ export const AgentTool = buildTool({
             }, ...agentResult.content];
           }
         }
+        const pinnedRuntime = pinnedBinding ? buildPinnedRuntimeInfo(pinnedState, pinnedWarnings) : undefined;
         return {
           data: {
             status: 'completed' as const,
             prompt,
             ...agentResult,
+            ...(pinnedRuntime ? {
+              runtime: pinnedRuntime
+            } : {}),
             ...worktreeResult,
             ...(worktreeIsolationSkipped ? {
               worktreeIsolationSkipped
@@ -1361,7 +1506,11 @@ The agent is now running and will receive instructions via mailbox.`
       };
     }
     if (data.status === 'async_launched') {
-      const prefix = `Async agent launched successfully.\nagentId: ${data.agentId} (internal ID - do not mention to user. Use SendMessage with to: '${data.agentId}' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes.`;
+      // A pinned agent is refused by SendMessage, so it is never offered as continuable.
+      const launchedRuntime = data.runtime;
+      const continueHint = launchedRuntime ? `pinned agents cannot be continued with SendMessage; start a new Agent call instead` : `Use SendMessage with to: '${data.agentId}' to continue this agent.`;
+      const launchedRuntimeText = launchedRuntime ? `\nran on: ${launchedRuntime.providerName ?? 'its pinned provider'} · ${launchedRuntime.requestedModel} (pinned)${launchedRuntime.warnings.map(warning => `\nwarning: ${warning}`).join('')}` : '';
+      const prefix = `Async agent launched successfully.\nagentId: ${data.agentId} (internal ID - do not mention to user. ${continueHint})${launchedRuntimeText}\nThe agent is working in the background. You will be notified automatically when it completes.`;
       const stopGuidance = `Do not stop this agent just because you have enough partial output. Stop it only if the user asks to cancel it, or if it is clearly runaway, harmful, duplicative, or no longer useful.`;
       const instructions = data.canReadOutputFile ? `Do not duplicate this agent's work — avoid working with the same files or topics it is using. Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.\n${stopGuidance}\noutput_file: ${data.outputFile}\nIf asked, you can check progress before completion by using ${FILE_READ_TOOL_NAME} or ${BASH_TOOL_NAME} tail on the output file.` : `Briefly tell the user what you launched and end your response. Do not generate any other text — agent results will arrive in a subsequent message.\n${stopGuidance}`;
       const skipped = (data as Record<string, unknown>).worktreeIsolationSkipped;
@@ -1395,7 +1544,9 @@ The agent is now running and will receive instructions via mailbox.`
       // 34M Explore runs/week ≈ 1-2 Gtok/week). Telemetry doesn't parse this
       // block (it uses logEvent in finalizeAgentTool), so dropping is safe.
       // agentType is optional for resume compat — missing means show trailer.
-      if (data.agentType && ONE_SHOT_BUILTIN_AGENT_TYPES.has(data.agentType) && !worktreeInfoText) {
+      const runtimeInfo = data.runtime;
+      const runtimeText = runtimeInfo ? `\nran on: ${runtimeInfo.providerName} · ${runtimeInfo.requestedModel} (pinned)${runtimeInfo.warnings.map(warning => `\nwarning: ${warning}`).join('')}` : '';
+      if (data.agentType && ONE_SHOT_BUILTIN_AGENT_TYPES.has(data.agentType) && !worktreeInfoText && !runtimeText) {
         return {
           tool_use_id: toolUseID,
           type: 'tool_result',
@@ -1407,7 +1558,7 @@ The agent is now running and will receive instructions via mailbox.`
         type: 'tool_result',
         content: [...contentOrMarker, {
           type: 'text',
-          text: `agentId: ${data.agentId} (use SendMessage with to: '${data.agentId}' to continue this agent)${worktreeInfoText}
+          text: `agentId: ${data.agentId} (${runtimeInfo ? 'pinned agents cannot be continued with SendMessage; start a new Agent call instead' : `use SendMessage with to: '${data.agentId}' to continue this agent`})${worktreeInfoText}${runtimeText}
 <usage>total_tokens: ${data.totalTokens}
 tool_uses: ${data.totalToolUseCount}
 duration_ms: ${data.totalDurationMs}</usage>`

@@ -1,5 +1,6 @@
 import { isInlineImagePath } from '@/lib/attachmentImages'
 import { isSideChatSession } from '@/lib/sideChatSessions'
+import { agentRuntimeField } from '../lib/agentRuntimeBadge'
 import { CHAT_HISTORY_CACHE_BYTES, historyCacheBytes } from '../lib/chatHistoryCache'
 import { normalizeSessionReferences, splitSessionReferenceContext } from '@/lib/sessionReferences'
 import { create } from 'zustand'
@@ -5247,6 +5248,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             id: nextId(), type: 'tool_result', toolUseId: msg.toolUseId,
             originalToolUseId: msg.originalToolUseId,
             content: msg.content, isError: msg.isError, timestamp: now, parentToolUseId,
+            ...(msg.agentRuntime ? { agentRuntime: msg.agentRuntime } : {}),
           }]
           let backgroundAgentTasks = s.backgroundAgentTasks ?? {}
           const stoppedTask = msg.isError
@@ -7976,6 +7978,7 @@ export function mapHistoryMessagesToUiMessages(
           isError: !!block.is_error,
           timestamp,
           parentToolUseId: msg.parentToolUseId,
+          ...agentRuntimeField(msg.toolUseResult),
         })
       }
       applyImageMetadataSourcePaths(attachments, imageSourcePaths)

@@ -3,6 +3,13 @@ import type { RuntimeSelection } from './runtime'
 
 // Source: src/server/ws/events.ts
 
+/** Where a pinned Agent actually ran (mirrors `PinnedAgentRuntimeBadge` in src/shared/pinnedAgent.ts). */
+export type AgentRuntimeBadge = {
+  providerId: string
+  providerName: string
+  requestedModel: string
+}
+
 // ─── Client → Server ──────────────────────────────────────────────
 
 export type ClientMessage =
@@ -104,7 +111,7 @@ export type ServerMessage =
   | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; originalToolUseId?: string; parentToolUseId?: string }
   | { type: 'content_delta'; text?: string; toolInput?: string }
   | { type: 'tool_use_complete'; toolName: string; toolUseId: string; originalToolUseId?: string; input: unknown; parentToolUseId?: string }
-  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string }
+  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string; agentRuntime?: AgentRuntimeBadge }
   | {
       type: 'permission_request'
       requestId: string
@@ -366,7 +373,7 @@ export type UIMessage =
       status?: 'stopped'
       partialInput?: string
     }
-  | { id: string; type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; timestamp: number; parentToolUseId?: string }
+  | { id: string; type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; timestamp: number; parentToolUseId?: string; agentRuntime?: AgentRuntimeBadge }
   | { id: string; type: 'background_task'; task: BackgroundAgentTask; timestamp: number }
   | { id: string; type: 'system'; content: string; generationStopped?: boolean; transcriptMessageId?: string; timestamp: number }
   | {

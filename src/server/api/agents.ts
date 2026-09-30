@@ -7,6 +7,7 @@
  * POST   /api/agents/reload — 重载当前 CLI 会话中的 Agent 定义
  * PUT    /api/agents/:name  — 更新 Agent
  * DELETE /api/agents/:name  — 删除 Agent
+ * PUT|DELETE /api/agents/:name/runtime — 设置/清除 Agent 的供应商与模型绑定
  *
  * GET    /api/tasks         — 获取后台任务列表
  * GET    /api/tasks/:id     — 获取任务详情
@@ -23,6 +24,14 @@ import {
   type AgentScope,
 } from '../services/agentService.js'
 import { SettingsService } from '../services/settingsService.js'
+import { ProviderService } from '../services/providerService.js'
+import {
+  AgentRuntimeModelError,
+  describeAgentRuntime,
+  resolveAgentRuntimeModel,
+  type AgentRuntimeStatus,
+} from '../services/agentRuntimeModel.js'
+import { resolveAgentRuntimeBindings } from '../../tools/AgentTool/agentRuntimeBindings.js'
 import { taskService } from '../services/taskService.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
 import { resetTaskList } from '../../utils/tasks.js'
@@ -55,6 +64,7 @@ import { filterToolsForAgent } from '../../tools/AgentTool/agentToolUtils.js'
 
 const agentService = new AgentService()
 const settingsService = new SettingsService()
+const providerService = new ProviderService()
 
 export async function handleAgentsApi(
   req: Request,
@@ -177,6 +187,66 @@ async function handleAgents(
     throw new ApiError(
       405,
       `Method ${method} not allowed on /api/agents/${agentName}/override`,
+      'METHOD_NOT_ALLOWED',
+    )
+  }
+
+  // ── PUT|DELETE /api/agents/:name/runtime ─────────────────────────────
+  // Pins any agent (built-in, custom or plugin) to a provider and model. It is
+  // a user-level setting like /override, so there is no `scope` field.
+  if (segments[3] === 'runtime' && agentName) {
+    if (method === 'PUT') {
+      const body = await parseJsonBody(req)
+      assertAllowedFields(body, AGENT_RUNTIME_FIELDS)
+      const cwd = typeof body.cwd === 'string' ? body.cwd : getCwd()
+      const providerId = requireNonEmptyString(body.providerId, 'providerId')
+      const modelId = requireNonEmptyString(body.modelId, 'modelId')
+      assertAgentRuntimeWritable(agentName)
+      await assertExistingAgent(agentName, cwd)
+      try {
+        await resolveAgentRuntimeModel(
+          providerService,
+          { providerId, modelId },
+          `agent ${agentName}`,
+        )
+      } catch (error) {
+        if (error instanceof AgentRuntimeModelError) {
+          throw new ApiError(
+            400,
+            error.message,
+            error.code === 'provider_missing'
+              ? 'PROVIDER_NOT_FOUND'
+              : 'MODEL_UNRESOLVABLE',
+          )
+        }
+        throw error
+      }
+      // The saved modelId is what the user chose (possibly an alias such as
+      // "sonnet"); it is resolved again against the provider at launch time.
+      await settingsService.updateAgentRuntimeBinding(agentName, {
+        providerId,
+        modelId,
+      })
+      return Response.json({
+        agent: await loadAgentAfterRuntimeChange(agentName, cwd),
+      })
+    }
+
+    if (method === 'DELETE') {
+      const cwd = url.searchParams.get('cwd') || getCwd()
+      assertAgentRuntimeWritable(agentName)
+      // Idempotent, and deliberately not gated on the agent still existing: a
+      // binding left behind by a deleted agent must stay clearable.
+      await settingsService.updateAgentRuntimeBinding(agentName, null)
+      return Response.json({
+        ok: true,
+        agent: await loadAgentAfterRuntimeChange(agentName, cwd),
+      })
+    }
+
+    throw new ApiError(
+      405,
+      `Method ${method} not allowed on /api/agents/${agentName}/runtime`,
       'METHOD_NOT_ALLOWED',
     )
   }
@@ -335,6 +405,15 @@ type ApiAgentDefinition = {
     effort?: SharedAgentDefinition['effort']
     source: SettingSource
   }
+  /** The provider/model this agent is pinned to, if any (any agent source). */
+  runtime?: {
+    providerId: string
+    modelId: string
+    providerName?: string
+    source: SettingSource
+  }
+  /** Whether `runtime` could launch right now. Present only with `runtime`. */
+  runtimeStatus?: AgentRuntimeStatus
 }
 
 type ApiResolvedAgentDefinition = ApiAgentDefinition & {
@@ -433,6 +512,68 @@ const UPDATE_AGENT_FIELDS = new Set([...CREATE_AGENT_FIELDS, 'target'])
 // No `scope`: built-in overrides are user-level by definition. Accepting and
 // ignoring one would silently write somewhere the caller did not ask for.
 const BUILT_IN_OVERRIDE_FIELDS = new Set(['model', 'effort', 'cwd'])
+
+// Same reasoning as above: bindings are user-level, so no `scope`.
+const AGENT_RUNTIME_FIELDS = new Set(['providerId', 'modelId', 'cwd'])
+
+/**
+ * Refuse to write a binding the user could not actually change: agent
+ * customization locked to plugins, or a managed (policy) binding that outranks
+ * anything written to the user file.
+ */
+function assertAgentRuntimeWritable(name: string): void {
+  if (isRestrictedToPluginOnly('agents')) {
+    throw new ApiError(
+      403,
+      'Agent customization is restricted to plugins by managed settings',
+      'AGENT_CUSTOMIZATION_LOCKED',
+    )
+  }
+  if (resolveAgentRuntimeBindings().get(name)?.source === 'policySettings') {
+    throw new ApiError(
+      403,
+      `Agent runtime is managed by policy: ${name}`,
+      'AGENT_RUNTIME_MANAGED',
+    )
+  }
+}
+
+async function assertExistingAgent(name: string, cwd: string): Promise<void> {
+  const { allAgents } = await getAgentDefinitionsWithOverrides(cwd)
+  if (!allAgents.some(agent => agent.agentType === name)) {
+    throw ApiError.notFound(`Agent not found: ${name}`)
+  }
+}
+
+/** Re-read an agent after its binding changed; null if it no longer exists. */
+async function loadAgentAfterRuntimeChange(
+  name: string,
+  cwd: string,
+): Promise<ApiAgentDefinition | null> {
+  const { activeAgents, allAgents } = await getAgentDefinitionsWithOverrides(cwd)
+  const agent =
+    activeAgents.find(candidate => candidate.agentType === name) ??
+    allAgents.find(candidate => candidate.agentType === name)
+  if (!agent) return null
+  return serializeAgentForRequest(agent, activeAgents.includes(agent), cwd)
+}
+
+async function serializeAgentRuntime(
+  agentType: string,
+): Promise<Partial<ApiAgentDefinition>> {
+  const binding = resolveAgentRuntimeBindings().get(agentType)
+  if (!binding) return {}
+  const described = await describeAgentRuntime(providerService, binding)
+  return {
+    runtime: {
+      providerId: binding.providerId,
+      modelId: binding.modelId,
+      ...(described.providerName ? { providerName: described.providerName } : {}),
+      source: binding.source,
+    },
+    runtimeStatus: described.status,
+  }
+}
 
 /**
  * Only the model and effort of an agent that is genuinely built-in right now.
@@ -765,12 +906,15 @@ async function serializeAgentForRequest(
   cwd: string,
 ): Promise<ApiAgentDefinition> {
   const editable = await resolveEditableAgent(agent, cwd)
-  return serializeActiveAgent(
-    agent,
-    isActive,
-    editable !== null,
-    editable?.target,
-  )
+  return {
+    ...serializeActiveAgent(
+      agent,
+      isActive,
+      editable !== null,
+      editable?.target,
+    ),
+    ...(await serializeAgentRuntime(agent.agentType)),
+  }
 }
 
 async function resolveEditableAgent(

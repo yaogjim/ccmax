@@ -41,6 +41,7 @@ import {
   writeToMailbox,
 } from '../../utils/teammateMailbox.js'
 import { resumeAgentBackground } from '../AgentTool/resumeAgent.js'
+import { pinnedAgentContinuationError } from '../AgentTool/runPinnedAgent.js'
 import { SEND_MESSAGE_TOOL_NAME } from './constants.js'
 import { DESCRIPTION, getPrompt } from './prompt.js'
 import { renderToolResultMessage, renderToolUseMessage } from './UI.js'
@@ -817,6 +818,12 @@ export const SendMessageTool: Tool<InputSchema, SendMessageToolOutput> =
         const registered = appState.agentNameRegistry.get(input.to)
         const agentId = registered ?? toAgentId(input.to)
         if (agentId) {
+          // A pinned agent's worker has finished (or is out of reach): queuing to
+          // it or resuming it here would run its work on this session's provider.
+          const pinnedError = await pinnedAgentContinuationError(agentId)
+          if (pinnedError) {
+            return { data: { success: false, message: pinnedError } }
+          }
           const task = appState.tasks[agentId]
           if (isLocalAgentTask(task) && !isMainSessionTask(task)) {
             if (task.status === 'running') {

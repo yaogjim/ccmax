@@ -1,6 +1,7 @@
 import { configureSessionCollaborationHost, getSessionCollaborationService } from './services/sessionCollaborationHost.js'
 import { authenticateCollaborationCaller, collaborationToolAction } from './sessionCollaborationAuth.js'
 import { handleSessionCollaborationApi } from './api/sessionCollaboration.js'
+import { handlePinnedAgentApi, isPinnedAgentRunPath } from './api/pinnedAgent.js'
 /**
  * Claude Code Desktop App — HTTP + WebSocket Server
  *
@@ -348,6 +349,13 @@ export function startServer(port = PORT, host = HOST) {
           const caller = authenticateCollaborationCaller(req, (id, token) => conversationService.authorizeSdkConnection(id, token))
           if (!caller) return Response.json({ error: 'Invalid session credential' }, { status: 401 })
           return handleSessionCollaborationApi(req, collaborationAction, caller, await getSessionCollaborationService())
+        }
+        if (isPinnedAgentRunPath(url.pathname)) {
+          // Same credential as the collaboration tools: only a running CLI
+          // session holding its own SDK token may start a pinned worker.
+          const caller = authenticateCollaborationCaller(req, (id, token) => conversationService.authorizeSdkConnection(id, token))
+          if (!caller) return Response.json({ error: 'Invalid session credential' }, { status: 401 })
+          return handlePinnedAgentApi(req, caller)
         }
         const origin = req.headers.get('Origin')
         const clientAddress = server.requestIP(req)?.address ?? null

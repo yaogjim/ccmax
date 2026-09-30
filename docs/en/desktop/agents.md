@@ -74,6 +74,32 @@ Agent configuration stores a model ID, not a provider. The picker lists models f
 
 If you create a user agent with the same name (a hand-written file with `name: Explore`, say), it shadows the built-in one completely — changing the built-in's model then has no effect, and the dialog says so.
 
+## Pinning an Agent's Runtime
+
+By default a subagent uses the current session's provider and model. If you want a particular agent to always run on a different provider — say the main session on Claude, while repetitive execution work goes to a cheaper DeepSeek — you can pin its runtime.
+
+In the agent's detail page, use **Pin runtime** in the Runtime section, pick a provider and model (or type a model ID), and save. From then on every time the main session delegates to this agent it runs on the provider you chose, and the main session itself is unaffected. To go back to following the session, click **Clear**.
+
+The pin is written to `agentRuntimeBindings` in `~/.claude/settings.json`. Only user settings and enterprise-managed settings are read; a settings file inside a project cannot declare one, so a cloned repository cannot quietly change where your tasks are sent.
+
+:::warning
+Once pinned, the task the agent receives — its prompt and the contents of files it reads — goes to the provider you selected, not the current session's provider. Make sure you trust that provider first.
+:::
+
+Things to know before relying on it:
+
+- **Desktop app sessions only.** Calling a pinned agent from a plain CLI session fails with an error; it never silently falls back to the session's provider.
+- **A stale pin fails instead of downgrading.** If the provider was removed or the model can't be resolved, the list shows "Provider no longer exists" or "Model cannot be resolved" and running the agent fails. Pick again or clear it.
+- **A per-call `model` is ignored**, and the result carries a note saying so.
+- **Not supported:** worktree isolation (`isolation`), a different working directory, use as a fork, or being started from another pinned agent or a team worker. Each of these fails with a clear error.
+- **No follow-ups.** After a pinned agent finishes, continuing or resuming it with `SendMessage` is refused; dispatch it again with the full task instead.
+- **Background runs work**, and a foreground run can be moved to the background midway; stopping the background task also stops the remote worker. The launch card of a background run carries the provider badge too (if the worker takes longer than about 3 seconds to start, the card has no badge for now, though the run is still pinned to the chosen provider); the completion notice that arrives later is a separate message and does not repeat it.
+- **At most 3 pinned agents at once per session.** More fail immediately rather than queueing.
+- Its cost and usage are billed to the selected provider and are not added to the main session's usage.
+- It shares the main session's working directory, so keep an eye on conflicts if several agents write the same files.
+
+While it runs, the subagent's card in the conversation shows a "provider · model" badge saying where it actually ran.
+
 ## Writing your own
 
 ![The Create Agent dialog: scope, model, effort, tools, system prompt (Chinese interface)](../../images/app/en/agent-create.webp)
