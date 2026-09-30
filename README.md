@@ -9,11 +9,7 @@
 
 <div align="center">
 
-[![GitHub Stars](https://img.shields.io/github/stars/yaogjim/ccmax?style=social)](https://github.com/yaogjim/ccmax/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/yaogjim/ccmax?style=social)](https://github.com/yaogjim/ccmax/network/members)
-[![GitHub Issues](https://img.shields.io/github/issues/yaogjim/ccmax)](https://github.com/yaogjim/ccmax/issues)
-[![GitHub Pull Requests](https://img.shields.io/github/issues-pr/yaogjim/ccmax)](https://github.com/yaogjim/ccmax/pulls)
-[![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/yaogjim/ccmax/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 [![English](https://img.shields.io/badge/🇺🇸_English-Current-blue)](README.md)
 [![中文](https://img.shields.io/badge/🇨🇳_简体中文-Available-green)](README.zh-CN.md)
 [![Docs](https://img.shields.io/badge/📖_Documentation-Visit-FF7A00)](https://yaogjim.github.io/ccmax)
@@ -22,102 +18,85 @@
 
 </div>
 
-ccmax is a **desktop Claude Code workspace** for macOS, Windows, and Linux: multi-session workspaces, global search, branch / Worktree launch, diff review, built-in browser preview, GUI permission approval, any model — Claude, ChatGPT, Grok, presets, or local endpoints — image generation, visual MCP & SubAgent managers, an Agent Teams workbench, dynamic Workflow orchestration, model trace, Computer Use, skill marketplace, colour themes, desktop pets, H5 remote access, IM integration, and scheduled tasks, all in one app.
+ccmax is a **desktop AI coding workbench** built on Claude Code: it brings projects and multi-session work, code review, model providers, multi-agent collaboration, and local automation into one Electron app, with a CLI and a local server alongside. The source supports macOS, Windows, and Linux.
+
+> **Source vs. release.** This page describes what the current source tree can do. The most recent published build is **v0.6.8**, which ships a macOS Apple Silicon installer only; pinning a dedicated provider and model to an individual agent has landed in the current source but is not part of that release. Installation scope and signing are covered below.
 
 <p align="center">
-  <a href="#desktop-preview">Desktop Preview</a> · <a href="#install-the-desktop-app">Install</a> · <a href="#desktop-highlights">Highlights</a> · <a href="#more-documentation">More Docs</a> · <a href="#sponsorship--partnership">Sponsorship</a> · <a href="#user-group">User Group</a>
+  <a href="#desktop-preview">Desktop Preview</a> · <a href="#install-the-desktop-app">Install</a> · <a href="#desktop-highlights">Desktop Highlights</a> · <a href="#more-documentation">More Documentation</a>
 </p>
 
 ---
 
 ## Desktop Preview
 
-<p align="center">
-  <a href="https://github.com/yaogjim/ccmax/releases"><img src="https://img.shields.io/badge/⬇_Download_Desktop-macOS_%7C_Windows_%7C_Linux-FF7A00?style=for-the-badge" alt="Download Desktop"></a>
-</p>
-
-The top row covers **getting started and daily work**: sessions, permissions, changes, and Computer Use. The second shows **extensions**: models, skills, scheduled tasks, and IM. These screenshots show the real project in the Chinese interface. Click a thumbnail to see the full screen.
+These screenshots come from a production build of the current source frontend, using an isolated demo project and configuration — no real account or real model execution is shown. The Chinese and English READMEs each show the interface in their own language, and clicking an image opens the full 2000-pixel-wide capture.
 
 <table>
   <tr>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/en/session-new.webp"><img src="docs/images/readme-features/en/session-new.webp" width="100%" alt="New session with project, permission, and model choices"></a><br><b>01 · Start a session</b><br>Pick a project and permissions</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/en/permission-modes.webp"><img src="docs/images/readme-features/en/permission-modes.webp" width="100%" alt="Choose one of five permission modes in a real project session"></a><br><b>02 · Set permissions</b><br>Control what each task can do</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/en/workspace-diff.webp"><img src="docs/images/readme-features/en/workspace-diff.webp" width="100%" alt="Review a code diff file by file in the workspace"></a><br><b>03 · Review changes</b><br>Inspect each file's diff</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/en/settings-computer-use.webp"><img src="docs/images/readme-features/en/computer-use.webp" width="100%" alt="macOS Computer Use settings with enabled status and Accessibility and Screen Recording permissions"></a><br><b>04 · Computer Use</b><br>Keep your Mac mouse and keyboard free</td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/en/readme-session-new.webp"><img src="docs/images/app/en/readme-session-new.webp" width="100%" alt="Session workbench: demo project, session tabs, permission and run location, and model selection"></a>
+      <br><b>01 · Session workbench</b><br>Project, permissions, and model in one place.
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/en/readme-permission-modes.webp"><img src="docs/images/app/en/readme-permission-modes.webp" width="100%" alt="Five-mode permission menu in the session composer"></a>
+      <br><b>02 · Choose permissions</b><br>Pick the execution permissions for the task.
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/en/readme-models.webp"><img src="docs/images/app/en/readme-models.webp" width="100%" alt="Model management page: a custom demo provider plus Claude, ChatGPT, and Grok official account entries"></a>
+      <br><b>03 · Manage models</b><br>Official accounts, custom APIs, and local endpoints.
+    </td>
   </tr>
   <tr>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/en/settings-provider-add.webp"><img src="docs/images/readme-features/en/settings-provider-add.webp" width="100%" alt="Add a model provider using a preset and endpoint URL"></a><br><b>05 · Connect models</b><br>Use presets or local endpoints</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/en/skill-market.webp"><img src="docs/images/readme-features/en/skill-market.webp" width="100%" alt="Browse skills and inspect their sources"></a><br><b>06 · Add skills</b><br>Install what a task needs</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/en/schedule-create.webp"><img src="docs/images/readme-features/en/schedule-create.webp" width="100%" alt="Create a scheduled task in its own session"></a><br><b>07 · Schedule tasks</b><br>Automate recurring work</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/en/settings-im.webp"><img src="docs/images/readme-features/en/settings-im.webp" width="100%" alt="Configure Slack in the IM access settings"></a><br><b>08 · Work remotely</b><br>Continue through IM</td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/en/readme-team-plan.webp"><img src="docs/images/app/en/readme-team-plan.webp" width="100%" alt="Pre-run team confirmation: members, providers, models, task assignment, and dependencies"></a>
+      <br><b>04 · Confirm the team plan</b><br>Check members and tasks, then start the run.
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/en/readme-side-chat.webp"><img src="docs/images/app/en/readme-side-chat.webp" width="100%" alt="Temporary side chat panel opened beside the main session"></a>
+      <br><b>05 · Ask on the side</b><br>Inherits the context; a follow-up that does not interrupt the main task.
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/en/readme-agent-runtime.webp"><img src="docs/images/app/en/readme-agent-runtime.webp" width="100%" alt="Agent detail runtime environment: a pinned provider and model with availability status"></a>
+      <br><b>06 · Agent-specific model</b><br>An optional pinned runtime, available in the current source.
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/en/readme-scheduled-tasks.webp"><img src="docs/images/app/en/readme-scheduled-tasks.webp" width="100%" alt="New local scheduled-task form with a prompt, a schedule, and a notification target"></a>
+      <br><b>07 · Local scheduled tasks</b><br>Scheduled runs, run history, and notifications.
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/en/readme-mcp.webp"><img src="docs/images/app/en/readme-mcp.webp" width="100%" alt="Add MCP server form with scope and transport fields"></a>
+      <br><b>08 · Manage MCP servers</b><br>Configure external tool servers in the GUI.
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/en/readme-system.webp"><img src="docs/images/app/en/readme-system.webp" width="100%" alt="System settings page: visibility switches for optional entries plus a skill-marketplace address field"></a>
+      <br><b>09 · System settings</b><br>Show entries on demand and set a custom marketplace URL.
+    </td>
   </tr>
 </table>
 
-Start here: [install the app](docs/en/start/install.md) → [connect a model](docs/en/start/models.md) → [run your first session](docs/en/start/first-session.md) → [explore settings](docs/en/desktop/settings.md) → [try real workflows](docs/en/cases/index.md). For hands-free cross-app work on macOS, follow the [Computer Use guide](docs/en/desktop/computer-use.md).
-
----
-
-## Sponsorship & Partnership
-
-This project is maintained in the author's spare time. Corporate or individual sponsorships are welcome to support ongoing development. Custom features, integrations, and business partnerships are also open for discussion.
-
-<table>
-  <thead>
-    <tr>
-      <th width="220">Sponsor</th>
-      <th align="left">Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td align="center" valign="middle">
-        <a href="https://aruhub.com/sign-up?aff=Z54g">
-          <img src="docs/images/sponsors/aruhub-logo.png" width="180" alt="AruHub">
-        </a>
-      </td>
-      <td valign="middle">
-        Thanks to <a href="https://aruhub.com/sign-up?aff=Z54g">AruHub</a> for sponsoring this project! AruHub focuses on providing developers with a stable, long-term primary API upstream service. Built for high-frequency AI coding workflows such as Codex and Claude Code, it offers official GPT API access through enterprise groups and stable Claude enterprise groups for sustained use, with support for leading models including GPT and Claude. Image 2 / 2.5 is available around the clock, starting at CNY 0.04 per image. Pay-as-you-go billing supports high-volume enterprise usage, invoicing, and refunds. Register through the <a href="https://aruhub.com/sign-up?aff=Z54g">exclusive link</a> to receive US$1 in credit usable across all models, with no model restrictions.
-      </td>
-    </tr>
-    <tr>
-      <td align="center" valign="middle">
-        <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=ccmax">
-          <img src="docs/images/sponsors/atlascloud-logo-black.png#gh-light-mode-only" width="180" alt="Atlas Cloud">
-          <img src="docs/images/sponsors/atlascloud-logo-white.png#gh-dark-mode-only" width="180" alt="Atlas Cloud">
-        </a>
-      </td>
-      <td valign="middle">
-        Thanks to <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=ccmax">Atlas Cloud</a> for sponsoring this project. Atlas Cloud is a full-modal AI inference platform that gives developers a single AI API to access video generation, image generation, and LLM APIs. Instead of managing multiple vendor integrations, you connect once and get unified access to 300+ curated models across all modalities. Atlas Cloud is already built into the ccmax provider list, so you can pick it in settings and start using it with just an API key. Check out Atlas Cloud's new <a href="https://www.atlascloud.ai/console/coding-plan">coding plan promotion</a> for more budget-friendly API access.
-      </td>
-    </tr>
-    <tr>
-      <td align="center" valign="middle">
-        <a href="https://www.apismart.ai">
-          <img src="docs/images/sponsors/apismart-logo.png" width="180" alt="ApiSmart">
-        </a>
-      </td>
-      <td valign="middle">
-        Thanks to <a href="https://www.apismart.ai">ApiSmart</a> for sponsoring this project. ApiSmart provides unified access to leading AI models through a single API. Use one API key to connect with LLM, image, and video models through an OpenAI-compatible interface. Easily switch between models, simplify billing, and improve reliability with intelligent routing and automatic failover.
-      </td>
-    </tr>
-  </tbody>
-</table>
-
-📧 **Contact**: relakkes@gmail.com
+Start here: [install the app](docs/en/start/install.md) → [connect a model](docs/en/start/models.md) → [run your first session](docs/en/start/first-session.md) → [explore settings](docs/en/desktop/settings.md) → [try real workflows](docs/en/cases/index.md). For cross-app work, follow the [Computer Use guide](docs/en/desktop/computer-use.md).
 
 ---
 
 ## Install the Desktop App
 
-1. Download the macOS / Windows / Linux desktop installer from [Releases](https://github.com/yaogjim/ccmax/releases).
-2. On first launch, configure your model provider, API key, and default model in Settings.
-3. Public macOS releases require signing and notarization. Draft or unsigned temporary builds may still need one-time manual approval. Unsigned Windows installers may show SmartScreen; click "More info" -> "Run anyway". See the [desktop installation guide](docs/en/start/install.md).
+The latest release, **v0.6.8**, ships a **macOS Apple Silicon (ARM64)** installer only, requiring macOS 12.0 or later. There is no Windows, Linux, or Intel Mac build for this release; for other platforms, build from source as described in the [contributing guide](docs/en/internals/contributing.md).
 
-Release trust and privacy: [Code signing policy](docs/en/start/code-signing.md) · [Privacy and network access](docs/en/start/privacy.md)
+1. Download `ccmax-0.6.8-mac-arm64.dmg` and `install-macos-unsigned.sh` from the Assets of the v0.6.8 [release](https://github.com/yaogjim/ccmax/releases).
+2. Put the script in the same folder as the DMG and run `bash install-macos-unsigned.sh`. It installs the app, removes the quarantine attribute, and launches it.
+3. Manual alternative: install the DMG as usual, then run `xattr -dr com.apple.quarantine /Applications/ccmax.app` before opening the app.
+4. On first launch, sign in to an official account under Settings → Models, or configure a provider, API key, and default model.
+
+**About signing.** The v0.6.8 build of this branch uses a local self-signed certificate. It is not signed with an Apple Developer ID and is not notarized, so the first launch may be blocked with a "damaged" or "cannot verify developer" warning. Only after confirming that the installer and script come from a trusted source should you clear the quarantine attribute as above.
+
+Release notes: [v0.6.8](release-notes/v0.6.8.md) · [Code signing policy](docs/en/start/code-signing.md) · [Privacy and network access](docs/en/start/privacy.md)
 
 ## Run the CLI from Source
 
-For users who want to debug the underlying CLI, server, or local development flow:
+For debugging the underlying CLI, server, or local development flow:
 
 ```bash
 bun install
@@ -125,68 +104,44 @@ cp .env.example .env
 ./bin/ccmax
 ```
 
-See [environment variables](docs/en/cli/env.md) and [CLI setup](docs/en/cli/index.md) for more configuration options.
-
----
-
-## User Group
-
-Scan the QR code below to join the ccmax user group on WeCom (WeChat Work) — the conversation there is mostly in Chinese. For questions and bug reports in English, [Issues](https://github.com/yaogjim/ccmax/issues) is the better place. For enterprise deployment, customization, or Agent development needs, contact the author [yaogjim](https://github.com/yaogjim).
-
-<p align="center">
-  <img src="docs/images/community/wechat-group-qr.png" width="300" alt="ccmax WeCom user group QR code">
-</p>
-
----
-
-## ☕ Buy Me a Coffee
-
-If this project helps you, consider buying me a coffee — every bit of support keeps this project going ❤️
-
-<table>
-<tr>
-<td align="center" width="33%">
-<img src="docs/images/donate/wechat_pay.jpeg" width="250" alt="WeChat Pay"><br>
-<b>WeChat Pay</b>
-</td>
-<td align="center" width="33%">
-<img src="docs/images/donate/zfb_pay.png" width="250" alt="Alipay"><br>
-<b>Alipay</b>
-</td>
-<td align="center" width="33%">
-<a href="https://buymeacoffee.com/relakkes" target="_blank">
-<img src="docs/images/donate/bmc_button.png" width="250" alt="Buy Me a Coffee">
-</a><br>
-<b>Buy Me a Coffee</b>
-</td>
-</tr>
-</table>
+See [environment variables](docs/en/cli/env.md), [CLI setup](docs/en/cli/index.md), and [contributing](docs/en/internals/contributing.md) for more configuration options.
 
 ---
 
 ## Desktop Highlights
 
-- **Multi-session workspace**: tabs, project switching, terminal entry, and session history in one place, with a resizable sidebar.
-- **Global search**: press Cmd+K to search across every session and jump to the match.
-- **Branch / Worktree launch**: choose a repository branch and decide whether to use the current working tree or an isolated Worktree.
-- **Review edits file by file**: the workspace lists this turn's changes; open any file for a syntax-highlighted diff, or undo the whole turn.
-- **Built-in browser preview**: the page your agent just edited renders right inside the app, cookies and login state included.
-- **Five permission modes**: from "ask every time" to "skip permissions" — risky commands, tool calls, and follow-up questions are all approved in the GUI.
-- **Bring your own model**: sign in to Claude, ChatGPT, or Grok; use presets for DeepSeek, Kimi, Zhipu GLM and others; or point it at LM Studio and Ollama running locally.
-- **Image generation**: generate and edit images right in the chat — sign in with ChatGPT or Grok for instant use, or plug in any OpenAI-compatible Images API.
-- **Visual MCP manager**: add and edit MCP servers in a GUI — STDIO / Streamable HTTP / SSE, with project, shared, or global scope.
-- **Six colour themes**: white, paper, warm classic, celadon, ink night, and ink blue — optionally following your system's light/dark setting.
-- **Skill marketplace**: discover, preview, and install third-party skills from ClawHub / SkillHub, with source and safety status shown up front.
-- **Session activity panel**: track task progress, background tasks, SubAgents, and sources in one side panel.
-- **Visual SubAgent manager**: create and tune SubAgents in a GUI — model, tools, and permission mode.
-- **Agent Teams workbench**: visualize multi-agent collaboration in the GUI — members, tasks, a communication feed, and a dependency-lane canvas.
-- **Dynamic Workflow orchestration**: the model writes and runs orchestration scripts on the fly, driving subagents concurrently or in pipelines, with phase views, interrupts, and resume.
-- **Model trace**: every model request is logged locally with status and timing — search and filter to diagnose stuck or failed calls.
-- **Computer Use**: let the agent take screenshots, click, type, and control desktop apps after authorization; the native macOS runtime does not take over your physical mouse or keyboard.
-- **Desktop pets**: Dada, Huhu, Bubu, and Huihui change what they do with the task at hand — or raise one of your own (off by default).
-- **H5 remote access**: scan a QR code to continue the session in your phone browser; locking the screen won't kill a running task.
-- **IM integration**: chat, switch projects, and approve actions through Telegram / Feishu / WeChat / DingTalk / WhatsApp / WeCom / QQ / Slack.
-- **Scheduled tasks and usage stats**: run planned tasks in their own sessions and track local token usage trends.
+### Daily workspace
+
+- **Multi-session and project management** — tabs, project switching, a terminal entry, and session history in one window, with a resizable sidebar. See [sessions, permissions, and review](docs/en/desktop/sessions.md).
+- **Global search** — press Cmd+K to search across sessions and jump straight to the match.
+- **Branch / Worktree launch** — start a session on a repository branch, on the current working tree or in an isolated Git worktree.
+- **Review changes file by file** — the workspace lists this turn's changes, with syntax-highlighted diffs, line comments, and a whole-turn undo. See [workspace](docs/en/desktop/workspace.md).
+- **Built-in browser preview** — view the page you are building inside the app, using the cookies and login state of a separate browser.
+- **Five permission modes** — pick permissions per task; tool calls, risky operations, and pending questions are handled in the GUI.
+
+### Collaboration and automation
+
+- **Agent Teams team plan** — before a run starts, the app shows members, agent presets, providers, models, task ownership, and dependencies; you can adjust them individually or in bulk and the team starts only after you confirm. The workbench shows members, tasks, and communication, and can stop the whole team. See [agents](docs/en/desktop/agents.md).
+- **Cross-session references and collaboration** — reference an earlier session with `@` as context, and let agents dispatch work, read results from other sessions, and exchange messages. Messages between agents never count as user authorization.
+- **Side chats** — type `/btw <question>`, or select text and ask in the side chat. The temporary thread inherits the parent session's context and model, runs independently, and does not interrupt the main task; it is cleared when you close that tab or quit the app.
+- **Visual agent management** — browse, create, and edit subagents, configuring the system prompt, tools, model, and reasoning effort, and adjust the model of built-in agents. See [subagents and task splitting](docs/en/desktop/agents.md).
+- **Agent-specific provider and model (current source)** — you can pin a runtime to an individual agent without affecting the main session. If the pinned runtime becomes unavailable it fails with an explicit error instead of switching providers. This applies to desktop app sessions only; one parent session runs at most three pinned agents at a time, they share a single working directory, and pinned agents do not support resuming the conversation or an isolated Worktree. Task content is sent to the provider you choose, so confirm you trust it before configuring. This feature is not part of the v0.6.8 release.
+- **Local scheduled tasks** — create and manage tasks from the UI or in natural language, view run history, stop a running execution, and clear finished records after confirmation; notifications can go to the desktop or to an authorized Telegram / Feishu target. Tasks trigger only while the desktop app keeps running. See [scheduled tasks](docs/en/desktop/schedule.md).
+- **Dynamic Workflow orchestration** — the model writes and runs orchestration scripts, driving subagents concurrently or in pipelines, with phase views, interrupts, and resume.
+- **Computer Use** — after authorization, let the agent take screenshots, click, type, and control desktop apps; on macOS the native runtime does not occupy your real mouse and keyboard. See [Computer Use](docs/en/desktop/computer-use.md).
+
+### Models, extensions and preferences
+
+- **Bring your own model** — sign in to Claude / ChatGPT / Grok official accounts, use third-party API presets, add a custom endpoint, or point at local LM Studio / Ollama. See [connect a model provider](docs/en/start/models.md).
+- **Image generation and editing** — use a configured image service in chat, through an official account or a compatible Images API.
+- **MCP management in the GUI** — manage external tool servers over STDIO / Streamable HTTP / SSE, scoped to a project, shared, or global.
+- **Skills and plugins** — browse, preview, and install extensions with their source and safety status shown; the marketplace entry and address are adjustable in System settings.
+- **Request trace and usage stats** — inspect the status, duration, and token-usage trends of local model requests to diagnose failing calls.
+- **System settings** — centrally control the Terminal, IM access, Pets, Trace, Diagnostics, About, H5 access, and sidebar skill-marketplace entries; these optional entries are hidden by default and enabled as needed.
+- **Six themes and chat appearance** — white, paper, warm classic, celadon, ink night, and ink blue, optionally following the system light/dark setting; chat font, font size, and conversation width are adjusted separately.
+- **Optional timed auto-answer** — when enabled, questions waiting on a user answer past the configured duration can be decided by the session's small model based on context; you can still handle them manually at any time. See [settings](docs/en/desktop/settings.md).
+- **Desktop pets** — built-in pets change their actions with the task state, and you can create your own; off by default. See [desktop pets](docs/en/desktop/pets.md).
+- **Phone and IM relay** — H5 access from a phone browser, plus remote chat, project switching, and permission approval through Telegram / Feishu / WeChat / DingTalk / WhatsApp / WeCom / QQ / Slack. See [remote access](docs/en/desktop/remote.md) and [IM integrations](docs/en/im/index.md).
 
 ---
 
@@ -194,44 +149,28 @@ If this project helps you, consider buying me a coffee — every bit of support 
 
 Full documentation site: <https://yaogjim.github.io/ccmax>
 
-| Section | Documents |
-|------|------|
-| **Getting started** | [What this is](docs/en/start/index.md) · [Download and install](docs/en/start/install.md) · [Connect a model provider](docs/en/start/models.md) · [Your first session](docs/en/start/first-session.md) · [Troubleshooting](docs/en/start/troubleshooting.md) |
-| **Desktop features** | [Feature overview](docs/en/desktop/index.md) · [Computer Use](docs/en/desktop/computer-use.md) · [Desktop pets](docs/en/desktop/pets.md) · [Phone H5 and IM relay](docs/en/desktop/remote.md) |
-| **IM integrations** | [Overview and pairing](docs/en/im/index.md) · [Feishu](docs/en/im/feishu.md) · [Telegram](docs/en/im/telegram.md) · [WeChat](docs/en/im/wechat.md) · [DingTalk](docs/en/im/dingtalk.md) · [WhatsApp](docs/en/im/whatsapp.md) · [WeCom](docs/en/im/wecom.md) · [QQ](docs/en/im/qq.md) · [Slack](docs/en/im/slack.md) |
-| **CLI** | [Install and run](docs/en/cli/index.md) · [Command reference](docs/en/cli/reference.md) · [Environment variables](docs/en/cli/env.md) |
-| **Internals** | [Desktop architecture](docs/en/internals/desktop.md) · [Multi-agent system](docs/en/internals/agent.md) · [Skills system](docs/en/internals/skills.md) · [Memory system](docs/en/internals/memory.md) · [Computer Use architecture](docs/en/internals/computer-use.md) · [Local server and API](docs/en/internals/server.md) · [Channel system](docs/en/internals/channel.md) · [Project structure](docs/en/internals/structure.md) · [Contributing and quality gates](docs/en/internals/contributing.md) |
+- **Getting started** — [What ccmax is](docs/en/start/index.md) · [Download and install](docs/en/start/install.md) · [Connect a model provider](docs/en/start/models.md) · [Your first session](docs/en/start/first-session.md) · [Troubleshooting](docs/en/start/troubleshooting.md)
+- **Desktop features** — [Feature overview](docs/en/desktop/index.md) · [Sessions and permissions](docs/en/desktop/sessions.md) · [Workspace](docs/en/desktop/workspace.md) · [Agents](docs/en/desktop/agents.md) · [Scheduled tasks](docs/en/desktop/schedule.md) · [Settings](docs/en/desktop/settings.md) · [Computer Use](docs/en/desktop/computer-use.md) · [Desktop pets](docs/en/desktop/pets.md) · [Phone H5 and IM relay](docs/en/desktop/remote.md)
+- **Real workflows** — [Case library](docs/en/cases/index.md) · [Fix a bug](docs/en/cases/fix-bug.md) · [Ship a feature](docs/en/cases/ship-feature.md) · [Daily review](docs/en/cases/daily-review.md) · [Explore a project](docs/en/cases/explore-project.md) · [Hand off to your phone](docs/en/cases/phone-handoff.md)
+- **IM integrations** — [Overview and pairing](docs/en/im/index.md) · [Feishu](docs/en/im/feishu.md) · [Telegram](docs/en/im/telegram.md) · [WeChat](docs/en/im/wechat.md) · [DingTalk](docs/en/im/dingtalk.md) · [WhatsApp](docs/en/im/whatsapp.md) · [WeCom](docs/en/im/wecom.md) · [QQ](docs/en/im/qq.md) · [Slack](docs/en/im/slack.md)
+- **CLI** — [Install and run](docs/en/cli/index.md) · [Command reference](docs/en/cli/reference.md) · [Environment variables](docs/en/cli/env.md)
+- **Internals** — [Desktop architecture](docs/en/internals/desktop.md) · [Multi-agent system](docs/en/internals/agent.md) · [Skills system](docs/en/internals/skills.md) · [Memory system](docs/en/internals/memory.md) · [Computer Use architecture](docs/en/internals/computer-use.md) · [Local server and API](docs/en/internals/server.md) · [Channel system](docs/en/internals/channel.md) · [Project structure](docs/en/internals/structure.md) · [Contributing and quality gates](docs/en/internals/contributing.md)
 
 ---
 
 ## Tech Stack
 
-| Category | Technology |
-|------|------|
-| Language | TypeScript |
-| Desktop app | Electron |
-| Desktop UI | React + Vite |
-| Local runtime | [Bun](https://bun.sh) |
-| Terminal UI | React + [Ink](https://github.com/vadimdemedes/ink) |
-| CLI parsing | Commander.js |
-| API | Anthropic SDK |
-| Protocols | MCP, LSP |
-
-## Acknowledgements
-
-Thanks to the following open-source projects and community practices for reference and inspiration:
-
-- [React](https://github.com/facebook/react): frontend engineering and component-based UI ecosystem.
-- [Electron](https://github.com/electron/electron): cross-platform desktop app capabilities and engineering practices.
-- [cc-switch](https://github.com/farion1231/cc-switch): reference for model provider configuration.
-- [LINUX DO](https://linux.do/): a new ideal developer community.
+- **Language** — TypeScript
+- **Desktop app** — Electron
+- **Desktop UI** — React + Vite
+- **Local runtime** — [Bun](https://bun.sh)
+- **Terminal UI** — React + [Ink](https://github.com/vadimdemedes/ink)
+- **CLI parsing** — Commander.js
+- **API** — Anthropic SDK
+- **Protocols** — MCP, LSP
 
 ---
 
-## ⭐ Star History
+## License
 
-If this project helps you, please support it with a ⭐ Star so more people can discover ccmax.
-
-<a href="https://www.repostars.dev/?repos=yaogjim%2Fccmax&theme=ocean">
-  <img alt="Star History Chart" src="https://www.repostars.dev/api/embed?repo=yaogjim%2Fccmax&theme=ocean" />
-</a>
+Released under the [MIT License](LICENSE).

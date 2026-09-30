@@ -9,11 +9,7 @@
 
 <div align="center">
 
-[![GitHub Stars](https://img.shields.io/github/stars/yaogjim/ccmax?style=social)](https://github.com/yaogjim/ccmax/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/yaogjim/ccmax?style=social)](https://github.com/yaogjim/ccmax/network/members)
-[![GitHub Issues](https://img.shields.io/github/issues/yaogjim/ccmax)](https://github.com/yaogjim/ccmax/issues)
-[![GitHub Pull Requests](https://img.shields.io/github/issues-pr/yaogjim/ccmax)](https://github.com/yaogjim/ccmax/pulls)
-[![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/yaogjim/ccmax/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 [![中文](https://img.shields.io/badge/🇨🇳_简体中文-当前-blue)](README.zh-CN.md)
 [![English](https://img.shields.io/badge/🇺🇸_English-Available-green)](README.md)
 [![Docs](https://img.shields.io/badge/📖_文档站点-Visit-FF7A00)](https://yaogjim.github.io/ccmax)
@@ -22,102 +18,85 @@
 
 </div>
 
-ccmax 是一个**桌面端 Claude Code 工作台**：多会话与全局搜索、分支 / Worktree 启动、Diff 审阅、内置浏览器预览、图形化权限审批、模型自选（Claude / ChatGPT / Grok / 预设 / 本地端点）、图片生成、MCP 与 SubAgent 可视化管理、Agent Teams 协作工作台、动态 Workflow 编排、模型请求追踪、Computer Use、技能市场、多主题、桌面宠物、H5 远程访问、IM 接入和定时任务，集中在一个 macOS / Windows / Linux APP 里。
+ccmax 是一个**桌面端 AI 编程工作台**，基于 Claude Code，把项目与多会话、代码审阅、模型接入、多 Agent 协作和本地自动化集中在一个 Electron 应用中，同时提供 CLI 和本地服务。源码支持 macOS、Windows 与 Linux。
+
+> **源码与发布包**：本文介绍当前源码的功能。最近发布的 **v0.6.8** 仅提供 macOS Apple Silicon 安装包；为单个 Agent 绑定专属供应商与模型的能力已进入当前源码，尚未包含在该发布包中。安装范围和签名情况见下方说明。
 
 <p align="center">
-  <a href="#桌面端预览">桌面端预览</a> · <a href="#安装桌面端">安装桌面端</a> · <a href="#桌面端亮点">桌面端亮点</a> · <a href="#更多文档">更多文档</a> · <a href="#赞助与合作">赞助与合作</a> · <a href="#用户交流群">用户交流群</a>
+  <a href="#桌面端预览">桌面端预览</a> · <a href="#安装桌面端">安装桌面端</a> · <a href="#桌面端亮点">桌面端亮点</a> · <a href="#更多文档">更多文档</a>
 </p>
 
 ---
 
 ## 桌面端预览
 
-<p align="center">
-  <a href="https://github.com/yaogjim/ccmax/releases"><img src="https://img.shields.io/badge/⬇_下载桌面端-macOS_%7C_Windows_%7C_Linux-FF7A00?style=for-the-badge" alt="下载桌面端"></a>
-</p>
-
-上排看**上手与日常工作**：新建、权限、改动与 Computer Use；下排看**扩展能力**：模型、技能、定时任务与 IM。截图来自真实项目，保留项目与会话列表。点击缩略图可查看完整界面。
+以下截图来自当前源码的前端生产构建，使用隔离的演示项目与配置，不展示真实账号或真实模型执行结果。中文、英文 README 分别展示对应语言的界面，点击图片可查看 2000 像素宽的完整截图。
 
 <table>
   <tr>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/zh-CN/session-new.webp"><img src="docs/images/readme-features/zh-CN/session-new.webp" width="100%" alt="新建会话：选择项目、权限和模型"></a><br><b>01 · 新建会话</b><br>从项目与权限开始</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/zh-CN/permission-modes.webp"><img src="docs/images/readme-features/zh-CN/permission-modes.webp" width="100%" alt="真实项目会话中的五档执行权限菜单"></a><br><b>02 · 选择权限</b><br>按任务控制操作范围</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/zh-CN/workspace-diff.webp"><img src="docs/images/readme-features/zh-CN/workspace-diff.webp" width="100%" alt="在工作区逐文件查看代码 Diff"></a><br><b>03 · 审阅改动</b><br>逐文件检查 Diff</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/zh-CN/settings-computer-use.webp"><img src="docs/images/readme-features/zh-CN/computer-use.webp" width="100%" alt="macOS Computer Use 设置：启用状态、辅助功能与屏幕录制权限"></a><br><b>04 · Computer Use</b><br>Mac 上不占用真实鼠标键盘</td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/zh-CN/readme-session-new.webp"><img src="docs/images/app/zh-CN/readme-session-new.webp" width="100%" alt="会话工作台：演示项目、会话标签与权限、运行位置和模型选择"></a>
+      <br><b>01 · 会话工作台</b><br>项目、权限和模型集中选择
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/zh-CN/readme-permission-modes.webp"><img src="docs/images/app/zh-CN/readme-permission-modes.webp" width="100%" alt="会话输入框中的五档权限模式菜单"></a>
+      <br><b>02 · 选择权限</b><br>按任务选择执行权限
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/zh-CN/readme-models.webp"><img src="docs/images/app/zh-CN/readme-models.webp" width="100%" alt="模型管理页：自定义演示供应商与 Claude、ChatGPT、Grok 官方账号入口"></a>
+      <br><b>03 · 模型管理</b><br>官方账号、自定义 API 与本地端点
+    </td>
   </tr>
   <tr>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/zh-CN/settings-provider-add.webp"><img src="docs/images/readme-features/zh-CN/settings-provider-add.webp" width="100%" alt="添加模型服务商时选择预设并填写接口地址"></a><br><b>05 · 接入模型</b><br>预设、本地端点都能用</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/zh-CN/skill-market.webp"><img src="docs/images/readme-features/zh-CN/skill-market.webp" width="100%" alt="浏览技能市场并查看技能来源"></a><br><b>06 · 扩展技能</b><br>按任务安装所需能力</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/zh-CN/schedule-create.webp"><img src="docs/images/readme-features/zh-CN/schedule-create.webp" width="100%" alt="创建独立执行的定时任务"></a><br><b>07 · 定时执行</b><br>让重复任务自动跑</td>
-    <td align="center" valign="top" width="25%"><a href="docs/images/app/zh-CN/settings-im.webp"><img src="docs/images/readme-features/zh-CN/settings-im.webp" width="100%" alt="IM 接入页的 Slack 配置表单"></a><br><b>08 · 远程接力</b><br>在 IM 中继续会话</td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/zh-CN/readme-team-plan.webp"><img src="docs/images/app/zh-CN/readme-team-plan.webp" width="100%" alt="团队执行前确认界面：成员、供应商、模型、任务分配与依赖"></a>
+      <br><b>04 · 确认团队计划</b><br>先检查成员和任务，再启动执行
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/zh-CN/readme-side-chat.webp"><img src="docs/images/app/zh-CN/readme-side-chat.webp" width="100%" alt="主会话旁打开的临时侧边聊天面板"></a>
+      <br><b>05 · 侧边问答</b><br>继承上下文，追问不打断主任务
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/zh-CN/readme-agent-runtime.webp"><img src="docs/images/app/zh-CN/readme-agent-runtime.webp" width="100%" alt="Agent 详情中的运行环境：绑定独立供应商与模型，并显示可用状态"></a>
+      <br><b>06 · Agent 专属模型</b><br>可选固定运行环境，当前源码可用
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/zh-CN/readme-scheduled-tasks.webp"><img src="docs/images/app/zh-CN/readme-scheduled-tasks.webp" width="100%" alt="新建本地定时任务表单：任务提示词、执行计划与通知配置"></a>
+      <br><b>07 · 本地定时任务</b><br>计划执行、运行记录与通知
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/zh-CN/readme-mcp.webp"><img src="docs/images/app/zh-CN/readme-mcp.webp" width="100%" alt="添加 MCP 服务表单：服务名称、配置作用域与传输方式"></a>
+      <br><b>08 · MCP 管理</b><br>图形化配置外部工具服务
+    </td>
+    <td align="center" valign="top" width="33%">
+      <a href="docs/images/app/zh-CN/readme-system.webp"><img src="docs/images/app/zh-CN/readme-system.webp" width="100%" alt="系统设置页：可选设置入口的显示开关与技能市场地址配置"></a>
+      <br><b>09 · 系统设置</b><br>按需显示入口，自定义技能市场地址
+    </td>
   </tr>
 </table>
 
-从 0 开始：[下载安装](docs/start/install.md) → [连接模型](docs/start/models.md) → [跑通第一条会话](docs/start/first-session.md) → [设置指南](docs/desktop/settings.md) → [实战案例](docs/cases/index.md)。想体验不抢鼠标的跨应用操作，接着看 [Computer Use 指南](docs/desktop/computer-use.md)。
-
----
-
-## 赞助与合作
-
-本项目由个人利用业余时间维护，欢迎企业或个人赞助支持持续开发，也可洽谈定制、集成或商务合作。
-
-<table>
-  <thead>
-    <tr>
-      <th width="220">赞助商</th>
-      <th align="left">介绍</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td align="center" valign="middle">
-        <a href="https://aruhub.com/sign-up?aff=Z54g">
-          <img src="docs/images/sponsors/aruhub-logo.png" width="180" alt="AruHub">
-        </a>
-      </td>
-      <td valign="middle">
-        感谢 <a href="https://aruhub.com/sign-up?aff=Z54g">AruHub</a> 对本项目的赞助！AruHub 专注为开发者提供长期稳定的主力 API 上游服务。面向 Codex / Claude Code 等高频 AI Coding 场景，提供 GPT 企业分组官方接口、Claude 稳定企业分组，适合长时间持续调用；同时覆盖 GPT、Claude 等主流模型。Image 2 / 2.5 全天稳定供应，低至 0.04 元/张。按量付费，支持企业大用量、开发票及退款。通过 <a href="https://aruhub.com/sign-up?aff=Z54g">专属链接</a>注册即送 1 美元全模型通用额度，不限制模型使用。
-      </td>
-    </tr>
-    <tr>
-      <td align="center" valign="middle">
-        <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=ccmax">
-          <img src="docs/images/sponsors/atlascloud-logo-black.png#gh-light-mode-only" width="180" alt="Atlas Cloud">
-          <img src="docs/images/sponsors/atlascloud-logo-white.png#gh-dark-mode-only" width="180" alt="Atlas Cloud">
-        </a>
-      </td>
-      <td valign="middle">
-        感谢 <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=ccmax">Atlas Cloud</a> 赞助本项目！Atlas Cloud 是一个全模态 AI 推理平台，让开发者通过统一的 AI API 访问视频生成、图像生成和 LLM API，无需分别维护多个厂商集成，即可调用 300+ 精选模型。ccmax 已内置 Atlas Cloud 供应商预设，在设置里选择后填入 API Key 即可直接使用。Atlas Cloud 最新推出 <a href="https://www.atlascloud.ai/console/coding-plan">coding plan 优惠</a>，为开发者提供更具性价比的 API 访问预算。
-      </td>
-    </tr>
-    <tr>
-      <td align="center" valign="middle">
-        <a href="https://www.apismart.ai">
-          <img src="docs/images/sponsors/apismart-logo.png" width="180" alt="ApiSmart">
-        </a>
-      </td>
-      <td valign="middle">
-        感谢 <a href="https://www.apismart.ai">ApiSmart</a> 赞助本项目！ApiSmart 通过单一 API 提供对主流 AI 模型的统一访问。只需一个 API Key，即可通过兼容 OpenAI 的接口连接大语言模型、图像模型和视频模型。轻松切换模型、简化账单管理，并通过智能路由和自动故障转移提升可靠性。
-      </td>
-    </tr>
-  </tbody>
-</table>
-
-📧 **联系邮箱**：relakkes@gmail.com
+从 0 开始：[下载安装](docs/start/install.md) → [连接模型](docs/start/models.md) → [跑通第一条会话](docs/start/first-session.md) → [设置指南](docs/desktop/settings.md) → [实战案例](docs/cases/index.md)。跨应用操作见 [Computer Use 指南](docs/desktop/computer-use.md)。
 
 ---
 
 ## 安装桌面端
 
-1. 前往 [Releases](https://github.com/yaogjim/ccmax/releases) 下载 macOS / Windows / Linux 桌面端安装包。
-2. 首次启动后，在桌面端设置里配置模型提供商、API Key 和默认模型。
-3. 正式 macOS Release 需要经过签名和公证；如果安装的是 draft/unsigned 临时包，首次打开可能仍需手动放行。Windows 未签名安装包可能出现 SmartScreen 提示，点「更多信息」→「仍要运行」即可。详见 [桌面端安装指南](docs/start/install.md)。
+最近发布的 **v0.6.8** 仅提供 **macOS Apple Silicon（ARM64）** 安装包，要求 macOS 12.0 及以上。该版本没有 Windows、Linux 或 Intel Mac 安装包；其他平台可参考[贡献指南](docs/internals/contributing.md)从源码构建。
 
-发布可信度与隐私：[Code signing policy](docs/start/code-signing.md) · [隐私与联网说明](docs/start/privacy.md)
+1. 前往 [Releases](https://github.com/yaogjim/ccmax/releases)，从 v0.6.8 的 Assets 下载 `ccmax-0.6.8-mac-arm64.dmg` 和 `install-macos-unsigned.sh`。
+2. 将脚本与 DMG 放在同一个目录，执行 `bash install-macos-unsigned.sh`。脚本会安装应用、移除隔离标记并启动。
+3. 手动安装方式：正常安装 DMG 后，执行 `xattr -dr com.apple.quarantine /Applications/ccmax.app`，再打开应用。
+4. 首次启动后，在「设置 → 模型配置」登录官方账号，或配置供应商、API Key 与默认模型。
+
+**签名说明**：该分支的 v0.6.8 使用本地自签名证书，未经 Apple Developer ID 签名和公证，首次打开可能出现「已损坏」或「无法验证开发者」提示。仅在确认安装包与脚本来源可信后，使用上述方式解除隔离标记。
+
+发布说明：[v0.6.8](release-notes/v0.6.8.md) · [签名策略](docs/start/code-signing.md) · [隐私与联网说明](docs/start/privacy.md)
 
 ## 从源码启动 CLI
 
-适合想调试底层 CLI、服务端或自行开发的用户：
+适合调试底层 CLI、服务端或自行开发的用户：
 
 ```bash
 bun install
@@ -125,68 +104,44 @@ cp .env.example .env
 ./bin/ccmax
 ```
 
-更多配置见 [环境变量](docs/cli/env.md) 和 [命令行安装与启动](docs/cli/index.md)。
-
----
-
-## 用户交流群
-
-使用过程中有问题、想反馈 Bug，或者想看看别人怎么用，欢迎扫码加入 ccmax 企业微信用户群。也可以直接来 [Issues](https://github.com/yaogjim/ccmax/issues) 提问。企业定制 / 私有化部署 / Agent 定制需求，请联系作者 [yaogjim](https://github.com/yaogjim)。
-
-<p align="center">
-  <img src="docs/images/community/wechat-group-qr.png" width="300" alt="ccmax 企业微信用户群二维码">
-</p>
-
----
-
-## ☕ 请作者喝杯咖啡
-
-如果这个项目对您有帮助，欢迎打赏支持，您的每一份支持都是我持续更新的动力 ❤️
-
-<table>
-<tr>
-<td align="center" width="33%">
-<img src="docs/images/donate/wechat_pay.jpeg" width="250" alt="微信赞赏"><br>
-<b>微信赞赏</b>
-</td>
-<td align="center" width="33%">
-<img src="docs/images/donate/zfb_pay.png" width="250" alt="支付宝"><br>
-<b>支付宝</b>
-</td>
-<td align="center" width="33%">
-<a href="https://buymeacoffee.com/relakkes" target="_blank">
-<img src="docs/images/donate/bmc_button.png" width="250" alt="Buy Me a Coffee">
-</a><br>
-<b>Buy Me a Coffee</b>
-</td>
-</tr>
-</table>
+更多配置见 [环境变量](docs/cli/env.md)、[命令行安装与启动](docs/cli/index.md)和[参与贡献](docs/internals/contributing.md)。
 
 ---
 
 ## 桌面端亮点
 
-- **多会话工作台**：标签页、项目切换、终端入口和会话历史集中管理，侧边栏宽度可拖拽。
-- **全局搜索**：按 Cmd+K 跨所有会话全文搜索，一键跳到命中位置。
-- **分支 / Worktree 启动**：新会话可以选择仓库分支，并决定用当前工作树还是隔离 Worktree。
-- **改动逐个文件审阅**：右侧工作区列出本轮改动，点开就是带语法高亮的 Diff，整轮可撤销。
-- **内置浏览器预览**：Agent 刚改完的页面直接在应用内渲染，登录态和 Cookie 真实可用。
-- **五档权限模式**：从「询问权限」到「跳过权限」，危险命令、工具调用和 AI 反问都在桌面端审批。
-- **模型自选**：Claude / ChatGPT / Grok 官方账号可直接登录；DeepSeek、Kimi、智谱 GLM 等第三方 API 有现成预设；LM Studio、Ollama 的本地模型也接得上。
-- **图片生成**：聊天中直接生成和编辑图片——ChatGPT / Grok 授权登录即可使用，也支持接入任意 OpenAI 兼容的 Images API。
-- **MCP 图形化管理**：界面化增删改 MCP Server，支持 STDIO / Streamable HTTP / SSE 三种传输方式与项目私有、共享、全局三种作用域。
-- **六套配色主题**：纯白、纸墨、经典暖色、青瓷、墨夜、墨夜蓝，可跟随系统深浅色自动切换。
-- **技能市场**：发现、预览、安装 ClawHub / SkillHub 的第三方技能，来源和安全状态摆在明处。
-- **会话活动面板**：集中查看任务进度、后台任务、SubAgent 与来源。
-- **可视化 SubAgent 管理**：图形界面创建和调校子代理，选择模型、工具与权限模式。
-- **Agent Teams 协作工作台**：桌面端可视化多 Agent 协作团队——成员、任务、通信流和依赖泳道一目了然。
-- **动态 Workflow 编排**：模型当场编写并运行编排脚本，并发或流水线调度多个子代理，支持阶段视图、中断与断点续跑。
-- **模型请求追踪**：本地记录每轮模型请求的状态与耗时，可搜索筛选，快速定位卡死或失败调用。
-- **Computer Use**：让 Agent 在授权后截图、点击、输入并控制桌面应用；macOS 原生运行时不占用你的真实鼠标和键盘。
-- **桌面宠物**：搭搭、弧弧、补补、回回随任务状态换动作，也能自己做一只（默认关闭）。
-- **H5 远程访问**：扫码用手机浏览器接入当前会话，锁屏切后台都不打断正在跑的任务。
-- **IM 接入**：通过 Telegram / 飞书 / 微信 / 钉钉 / WhatsApp / 企业微信 / QQ / Slack 远程对话、切换项目和审批权限。
-- **定时任务与用量统计**：创建计划任务在独立会话执行，并查看本机 Token 使用趋势。
+### 日常工作区
+
+- **多会话与项目管理**：标签页、项目切换、终端入口和会话历史集中管理，侧边栏宽度可拖拽。详见[会话、权限与审阅](docs/desktop/sessions.md)。
+- **全局搜索**：按 Cmd+K 跨会话全文搜索，直接跳到命中位置。
+- **分支 / Worktree 启动**：新会话可选择仓库分支，在当前工作树或隔离的 Git 工作树中运行。
+- **逐文件审阅改动**：工作区列出本轮修改，支持语法高亮 Diff、行级评论与整轮撤销。详见[工作区](docs/desktop/workspace.md)。
+- **内置浏览器预览**：在应用内查看正在开发的页面，使用独立浏览器的 Cookie 与登录状态。
+- **五档权限模式**：按任务选择权限，工具调用、危险操作和待回答问题在图形界面中处理。
+
+### 协作与自动化
+
+- **Agent Teams 团队计划**：执行前展示成员、Agent 预设、供应商、模型、任务归属与依赖，可逐个调整或批量设置，确认后才启动；工作台展示成员、任务和通信，支持整组停止。
+- **跨会话引用与协作**：用 `@` 引用历史会话作为上下文，也可让 Agent 分派工作、读取其他会话结果并互通消息。Agent 之间的消息不构成用户授权。
+- **侧边问答**：输入 `/btw 问题`，或选中文字后在侧边聊天提问。临时对话继承父会话的上下文与模型，独立运行，不打断主任务；关闭对应标签或退出应用后清空。
+- **可视化 Agent 管理**：浏览、创建和编辑子 Agent，配置系统提示词、工具、模型与思考强度，也可调整内置 Agent 的模型。详见[子 Agent 与任务拆分](docs/desktop/agents.md)。
+- **Agent 专属供应商与模型（当前源码）**：可为单个 Agent 固定运行环境，主会话不受影响；失效时明确报错，不自动切换供应商。仅在桌面应用会话生效，同一父会话最多同时运行 3 个固定 Agent，共用工作目录，暂不支持续聊或独立 Worktree。任务内容会发送给所选供应商，配置前请确认信任关系。此功能尚未包含在 v0.6.8 发布包中。
+- **本地定时任务**：通过界面或自然语言创建、管理任务，查看运行记录，停止运行中的执行、确认后清除已结束记录；可选择桌面通知或已授权配对的 Telegram / 飞书通知目标。任务仅在桌面应用持续运行时触发。详见[定时任务](docs/desktop/schedule.md)。
+- **动态 Workflow 编排**：模型编写并运行编排脚本，并发或流水线调度子 Agent，支持阶段视图、中断与恢复。
+- **Computer Use**：授权后让 Agent 截图、点击、输入并操作桌面应用；macOS 原生运行时不占用真实鼠标和键盘。详见[Computer Use](docs/desktop/computer-use.md)。
+
+### 模型、扩展与偏好
+
+- **模型自选**：支持 Claude / ChatGPT / Grok 官方账号登录、第三方 API 预设、自定义接口及 LM Studio / Ollama 本地端点。详见[连接模型服务](docs/start/models.md)。
+- **图片生成与编辑**：在聊天中使用已配置的图片生成服务，支持官方账号与兼容的 Images API。
+- **MCP 图形化管理**：管理 STDIO / Streamable HTTP / SSE 外部工具服务，支持项目私有、共享与全局作用域。
+- **技能与插件**：浏览、预览和安装扩展，查看来源与安全状态；技能市场入口及地址可在系统设置中调整。
+- **请求追踪与用量统计**：查看本地模型请求的状态、耗时与 Token 使用趋势，辅助定位失败调用。
+- **系统设置**：统一控制终端、IM 接入、宠物、Trace 请求追踪、诊断、关于、H5 访问和侧栏技能市场入口，默认隐藏这些可选入口，按需开启。
+- **六套主题与聊天外观**：纯白、纸墨、经典暖色、青瓷、墨夜、墨夜蓝，可跟随系统深浅色；聊天字体、字号和对话宽度单独调整。
+- **可选超时自动回答**：开启后，等待用户回答的问题超过设定时长，可由会话的小模型基于上下文决策；仍可随时人工处理。详见[设置指南](docs/desktop/settings.md)。
+- **桌面宠物**：内置宠物随任务状态切换动作，也支持自定义形象，默认关闭。详见[桌面宠物](docs/desktop/pets.md)。
+- **手机与 IM 接力**：H5 手机浏览器访问，以及 Telegram / 飞书 / 微信 / 钉钉 / WhatsApp / 企业微信 / QQ / Slack 远程对话、项目切换和权限审批。详见[远程访问](docs/desktop/remote.md)与 [IM 接入](docs/im/index.md)。
 
 ---
 
@@ -194,44 +149,28 @@ cp .env.example .env
 
 完整文档站：<https://yaogjim.github.io/ccmax>
 
-| 分区 | 文档 |
-|------|------|
-| **开始使用** | [这是什么](docs/start/index.md) · [下载与安装](docs/start/install.md) · [连接模型服务](docs/start/models.md) · [跑通第一条会话](docs/start/first-session.md) · [故障排查](docs/start/troubleshooting.md) |
-| **桌面端功能** | [功能总览](docs/desktop/index.md) · [Computer Use](docs/desktop/computer-use.md) · [桌面宠物](docs/desktop/pets.md) · [手机 H5 与 IM 接力](docs/desktop/remote.md) |
-| **IM 接入** | [总览与配对流程](docs/im/index.md) · [飞书](docs/im/feishu.md) · [Telegram](docs/im/telegram.md) · [微信](docs/im/wechat.md) · [钉钉](docs/im/dingtalk.md) · [WhatsApp](docs/im/whatsapp.md) · [企业微信](docs/im/wecom.md) · [QQ](docs/im/qq.md) · [Slack](docs/im/slack.md) |
-| **命令行** | [安装与启动](docs/cli/index.md) · [命令参考](docs/cli/reference.md) · [环境变量](docs/cli/env.md) |
-| **深入原理** | [桌面端架构](docs/internals/desktop.md) · [多 Agent 系统](docs/internals/agent.md) · [Skills 系统](docs/internals/skills.md) · [记忆系统](docs/internals/memory.md) · [Computer Use 架构](docs/internals/computer-use.md) · [本地 Server 与 API](docs/internals/server.md) · [Channel 系统](docs/internals/channel.md) · [项目结构](docs/internals/structure.md) · [参与贡献与质量门禁](docs/internals/contributing.md) |
+- **开始使用**：[这是什么](docs/start/index.md) · [下载与安装](docs/start/install.md) · [连接模型服务](docs/start/models.md) · [跑通第一条会话](docs/start/first-session.md) · [故障排查](docs/start/troubleshooting.md)
+- **桌面端功能**：[功能总览](docs/desktop/index.md) · [会话与权限](docs/desktop/sessions.md) · [工作区](docs/desktop/workspace.md) · [子 Agent](docs/desktop/agents.md) · [定时任务](docs/desktop/schedule.md) · [设置](docs/desktop/settings.md) · [Computer Use](docs/desktop/computer-use.md) · [桌面宠物](docs/desktop/pets.md) · [手机 H5 与 IM 接力](docs/desktop/remote.md)
+- **实战案例**：[案例总览](docs/cases/index.md) · [修复 Bug](docs/cases/fix-bug.md) · [实现功能](docs/cases/ship-feature.md) · [每日审阅](docs/cases/daily-review.md) · [探索项目](docs/cases/explore-project.md) · [手机接力](docs/cases/phone-handoff.md)
+- **IM 接入**：[总览与配对](docs/im/index.md) · [飞书](docs/im/feishu.md) · [Telegram](docs/im/telegram.md) · [微信](docs/im/wechat.md) · [钉钉](docs/im/dingtalk.md) · [WhatsApp](docs/im/whatsapp.md) · [企业微信](docs/im/wecom.md) · [QQ](docs/im/qq.md) · [Slack](docs/im/slack.md)
+- **命令行**：[安装与启动](docs/cli/index.md) · [命令参考](docs/cli/reference.md) · [环境变量](docs/cli/env.md)
+- **深入原理**：[桌面端架构](docs/internals/desktop.md) · [多 Agent 系统](docs/internals/agent.md) · [技能系统](docs/internals/skills.md) · [记忆系统](docs/internals/memory.md) · [Computer Use 架构](docs/internals/computer-use.md) · [本地 Server 与 API](docs/internals/server.md) · [Channel 系统](docs/internals/channel.md) · [项目结构](docs/internals/structure.md) · [参与贡献与质量门禁](docs/internals/contributing.md)
 
 ---
 
 ## 技术栈
 
-| 类别 | 技术 |
-|------|------|
-| 语言 | TypeScript |
-| 桌面 APP | Electron |
-| 桌面 UI | React + Vite |
-| 本地运行时 | [Bun](https://bun.sh) |
-| 终端 UI | React + [Ink](https://github.com/vadimdemedes/ink) |
-| CLI 解析 | Commander.js |
-| API | Anthropic SDK |
-| 协议 | MCP, LSP |
-
-## 致谢
-
-感谢以下开源项目和社区实践为本项目提供参考与启发：
-
-- [React](https://github.com/facebook/react)：前端工程与组件化 UI 生态。
-- [Electron](https://github.com/electron/electron)：跨端桌面应用能力与工程实践。
-- [cc-switch](https://github.com/farion1231/cc-switch)：模型供应商配置能力参考。
-- [LINUX DO](https://linux.do/)：新的理想型开发者社区。
+- **语言**：TypeScript
+- **桌面应用**：Electron
+- **桌面 UI**：React + Vite
+- **本地运行时**：[Bun](https://bun.sh)
+- **终端 UI**：React + [Ink](https://github.com/vadimdemedes/ink)
+- **CLI 解析**：Commander.js
+- **API**：Anthropic SDK
+- **协议**：MCP、LSP
 
 ---
 
-## ⭐ Star History
+## 许可证
 
-如果这个项目对你有帮助，欢迎点一个 ⭐ Star，让更多人发现 ccmax。
-
-<a href="https://www.repostars.dev/?repos=yaogjim%2Fccmax&theme=ocean">
-  <img alt="Star History Chart" src="https://www.repostars.dev/api/embed?repo=yaogjim%2Fccmax&theme=ocean" />
-</a>
+本项目采用 [MIT 许可证](LICENSE)。
