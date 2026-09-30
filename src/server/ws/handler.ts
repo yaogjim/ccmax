@@ -105,6 +105,7 @@ import {
   scopedToolUseId,
   extractAssistantText,
   normalizeAskUserQuestionToolResult,
+  pinnedRuntimeField,
   classifyRuntimeErrorCode,
   toApiRetryServerMessage,
   toStreamingFallbackServerMessage,
@@ -3535,6 +3536,8 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
               content: normalizeAskUserQuestionToolResult(block.content, cliMsg.toolUseResult),
               isError: !!block.is_error,
               parentToolUseId,
+              // The CLI emits the structured result as tool_use_result; older paths used camelCase.
+              ...pinnedRuntimeField(cliMsg.tool_use_result ?? cliMsg.toolUseResult),
             })
           }
         }

@@ -44,7 +44,7 @@ import {
   type ConversationNavigationItem,
   type ConversationNavigationMode,
 } from './ConversationNavigator'
-import type { AgentTaskNotification, BackgroundAgentTask, UIMessage } from '../../types/chat'
+import type { AgentRuntimeBadge, AgentTaskNotification, BackgroundAgentTask, UIMessage } from '../../types/chat'
 import type { TeamDetail, TeamWorkbenchSnapshot } from '../../types/team'
 import { formatTokenCount } from '../../lib/formatTokenCount'
 import { formatDurationMs, hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks } from '../../lib/backgroundTasks'
@@ -3300,10 +3300,14 @@ export function MessageList({
   }, [branchableMessageTargets, branchingMessageId, handleBranchMessage, t])
 
   const toolResultByToolUseId = useMemo(() => {
-    if (toolResultMap.size === 0) return new Map<string, { content: unknown; isError: boolean }>()
-    const result = new Map<string, { content: unknown; isError: boolean }>()
+    if (toolResultMap.size === 0) return new Map<string, { content: unknown; isError: boolean; agentRuntime?: AgentRuntimeBadge }>()
+    const result = new Map<string, { content: unknown; isError: boolean; agentRuntime?: AgentRuntimeBadge }>()
     for (const [toolUseId, toolResult] of toolResultMap) {
-      result.set(toolUseId, { content: toolResult.content, isError: toolResult.isError })
+      result.set(toolUseId, {
+        content: toolResult.content,
+        isError: toolResult.isError,
+        ...(toolResult.agentRuntime ? { agentRuntime: toolResult.agentRuntime } : {}),
+      })
     }
     return result
   }, [toolResultMap])

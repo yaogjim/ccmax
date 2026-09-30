@@ -12,7 +12,8 @@ import type { TranslationKey } from '../../i18n'
 import { InlineImageGallery } from './InlineImageGallery'
 import { ImageGenerationBlock } from './ImageGenerationBlock'
 import { isImageGenerationToolName } from './imageGenerationTools'
-import type { AgentTaskNotification } from '../../types/chat'
+import type { AgentRuntimeBadge, AgentTaskNotification } from '../../types/chat'
+import { formatAgentRuntimeBadge } from '../../lib/agentRuntimeBadge'
 import {
   PlanPreviewCard,
   extractPlanPreview,
@@ -31,7 +32,7 @@ export type ToolCallChrome = 'card' | 'row'
 type Props = {
   toolName: string
   input: unknown
-  result?: { content: unknown; isError: boolean } | null
+  result?: { content: unknown; isError: boolean; agentRuntime?: AgentRuntimeBadge } | null
   agentTaskNotification?: AgentTaskNotification
   compact?: boolean
   chrome?: ToolCallChrome
@@ -301,6 +302,15 @@ export const ToolCallBlock = memo(function ToolCallBlock({ toolName, input, resu
         ) : (
           <span className="flex-1" />
         )}
+        {result?.agentRuntime ? (
+          <span
+            data-testid="agent-runtime-badge"
+            title={t('chat.agentRuntime.title')}
+            className="inline-flex min-w-0 max-w-[40%] shrink items-center rounded-full border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-2 py-0.5 font-mono text-[11px] text-[var(--color-text-secondary)]"
+          >
+            <span className="truncate">{formatAgentRuntimeBadge(result.agentRuntime)}</span>
+          </span>
+        ) : null}
         {pendingSummary ? (
           <span
             className="inline-flex min-w-0 max-w-[58%] shrink-0 items-center gap-1 text-[12.5px] text-[var(--color-text-tertiary)]"

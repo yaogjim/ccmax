@@ -50,6 +50,7 @@ import { SearchField } from '@/components/ui/SearchField'
 import { SelectField } from '@/components/ui/SelectField'
 import { SettingsPageHeader } from '@/components/settings/SettingsSection'
 import { ModelSelector } from '@/components/controls/ModelSelector'
+import { AgentRuntimeModal, AgentRuntimeSection, formatAgentRuntime } from './AgentRuntimePanel'
 
 const AGENT_COLORS: Record<string, string> = {
   red: '#ef4444',
@@ -132,6 +133,10 @@ export function AgentManager() {
   const [formState, setFormState] = useState<{ mode: 'create' | 'edit'; agent?: AgentDefinition } | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<AgentDefinition | null>(null)
   const [overrideTarget, setOverrideTarget] = useState<AgentDefinition | null>(null)
+  const [runtimeTarget, setRuntimeTarget] = useState<AgentDefinition | null>(null)
+  const [runtimeClearError, setRuntimeClearError] = useState<string | null>(null)
+  const clearAgentRuntime = useAgentStore((state) => state.clearAgentRuntime)
+  const isMutating = useAgentStore((state) => state.isMutating)
 
   const activeSession = sessions.find((session) => session.id === activeSessionId)
   const currentWorkDir = getSessionBrowsablePath(activeSession)
@@ -156,6 +161,15 @@ export function AgentManager() {
     }
     return groups
   }, [allAgents])
+
+  const handleClearRuntime = async (agent: AgentDefinition) => {
+    setRuntimeClearError(null)
+    try {
+      await clearAgentRuntime(agent, agentContextPath, contextSessionId)
+    } catch {
+      setRuntimeClearError(t('settings.agents.runtime.clearError'))
+    }
+  }
 
   const sourceCount = AGENT_SOURCE_ORDER.filter((source) => (groupedAgents[source] ?? []).length > 0).length
   const handleAgentBack = () => {
@@ -199,6 +213,18 @@ export function AgentManager() {
           onEdit={() => setFormState({ mode: 'edit', agent: selectedAgent })}
           onDelete={() => setDeleteTarget(selectedAgent)}
           onOverride={() => setOverrideTarget(selectedAgent)}
+          runtimeSection={(
+            <AgentRuntimeSection
+              agent={selectedAgent}
+              onEdit={() => {
+                setRuntimeClearError(null)
+                setRuntimeTarget(selectedAgent)
+              }}
+              onClear={() => void handleClearRuntime(selectedAgent)}
+              clearing={isMutating}
+              error={runtimeClearError}
+            />
+          )}
         />
       ) : (
         <>
@@ -293,6 +319,16 @@ export function AgentManager() {
                                   <span className="break-all font-mono text-[13px] font-semibold text-[var(--color-text-primary)]">{agent.agentType}</span>
                                   {agent.modelDisplay && <MetaPill>{agent.modelDisplay}</MetaPill>}
                                   {agent.effort !== undefined && <MetaPill>{agent.effort}</MetaPill>}
+                                  {agent.runtime && (
+                                    <Badge
+                                      tone={agent.runtimeStatus === 'valid' ? 'brand' : 'warning'}
+                                      size="md"
+                                      bordered
+                                      title={t('settings.agents.runtime.title')}
+                                    >
+                                      {formatAgentRuntime(agent.runtime)}
+                                    </Badge>
+                                  )}
                                   <MetaPill>{sourceLabel}</MetaPill>
                                   <Badge
                                     tone={agent.isActive ? 'success' : 'neutral'}
@@ -354,6 +390,14 @@ export function AgentManager() {
         sessionId={contextSessionId}
         onClose={() => setDeleteTarget(null)}
       />
+      {runtimeTarget && (
+        <AgentRuntimeModal
+          agent={runtimeTarget}
+          cwd={agentContextPath}
+          sessionId={contextSessionId}
+          onClose={() => setRuntimeTarget(null)}
+        />
+      )}
       {overrideTarget && (
         <BuiltInAgentOverrideModal
           agent={overrideTarget}
@@ -372,12 +416,14 @@ function AgentDetailView({
   onEdit,
   onDelete,
   onOverride,
+  runtimeSection,
 }: {
   agent: AgentDefinition
   onBack: () => void
   onEdit: () => void
   onDelete: () => void
   onOverride: () => void
+  runtimeSection: ReactNode
 }) {
   const t = useTranslation()
   const sourceLabel = t(`settings.agents.source.${agent.source}`)
@@ -448,6 +494,8 @@ function AgentDetailView({
           </div>
         </div>
       </section>
+
+      {runtimeSection}
 
       {agent.tools && agent.tools.length > 0 && (
         <section className="rounded-[var(--radius-2xl)] border border-[var(--color-border)] bg-[var(--color-surface)] px-5 py-4">

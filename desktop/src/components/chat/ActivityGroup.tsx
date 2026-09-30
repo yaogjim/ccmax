@@ -192,7 +192,7 @@ function ActivityToolRow({
         chrome="row"
         toolName={toolCall.toolName}
         input={toolCall.input}
-        result={result ? { content: result.content, isError: result.isError } : null}
+        result={result ? { content: result.content, isError: result.isError, agentRuntime: result.agentRuntime } : null}
         isPending={toolCall.isPending}
         status={toolCall.status}
         partialInput={toolCall.partialInput}

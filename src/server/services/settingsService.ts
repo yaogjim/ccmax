@@ -327,6 +327,46 @@ export class SettingsService {
     })
   }
 
+  /**
+   * 写入或清除单个 Agent 的运行绑定（agentRuntimeBindings）。
+   *
+   * `binding` 为 null 时只清除本 API 拥有的 providerId/modelId，保留条目里
+   * 其他（未来版本写入的）字段；条目清空后删除条目，整个 key 变空时删除 key。
+   * 与 updateBuiltInAgentOverride 同理，读改写必须在写锁内完成。
+   */
+  async updateAgentRuntimeBinding(
+    agentType: string,
+    binding: { providerId: string; modelId: string } | null,
+  ): Promise<void> {
+    const filePath = this.getUserSettingsPath()
+    await this.withWriteLock(filePath, async () => {
+      const current = await this.readJsonFile(filePath)
+      const bindings = { ...(normalizeJsonObject(current.agentRuntimeBindings) ?? {}) }
+
+      const entry = { ...(normalizeJsonObject(bindings[agentType]) ?? {}) }
+      if (binding === null) {
+        delete entry.providerId
+        delete entry.modelId
+      } else {
+        entry.providerId = binding.providerId
+        entry.modelId = binding.modelId
+      }
+      if (Object.keys(entry).length === 0) {
+        delete bindings[agentType]
+      } else {
+        bindings[agentType] = entry
+      }
+
+      const merged = Object.assign({}, current)
+      if (Object.keys(bindings).length === 0) {
+        delete merged.agentRuntimeBindings
+      } else {
+        merged.agentRuntimeBindings = bindings
+      }
+      await this.writeJsonFile(filePath, merged)
+    })
+  }
+
   // ---------------------------------------------------------------------------
   // 权限模式
   // ---------------------------------------------------------------------------

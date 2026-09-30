@@ -1,3 +1,4 @@
+import { isHiddenWorkerEntrypoint } from '../../../shared/workerSession.js'
 import { cleanSessionTitleSource } from '../../../utils/sessionTitleText.js'
 import { SYNTHETIC_MODEL } from '../../../utils/messages.js'
 import { extractShotCountFromAssistantContent } from '../../../utils/shotStats.js'
@@ -528,7 +529,7 @@ function applyActivityEntry(state: ReducerState, entry: ReducerEntry): void {
 }
 
 function applyEntry(state: ReducerState, entry: ReducerEntry): void {
-  if (entry.entrypoint === 'claude-desktop-team-worker') state.isTeamWorker = true
+  if (isHiddenWorkerEntrypoint(entry.entrypoint)) state.isTeamWorker = true
   applyActivityEntry(state, entry)
   if (!state.hasCreatedAt && entry.timestamp) {
     state.createdAt = entry.timestamp

@@ -7,6 +7,8 @@ const apiDeleteMock = vi.hoisted(() => vi.fn())
 const apiReloadMock = vi.hoisted(() => vi.fn())
 const apiSetOverrideMock = vi.hoisted(() => vi.fn())
 const apiClearOverrideMock = vi.hoisted(() => vi.fn())
+const apiSetRuntimeMock = vi.hoisted(() => vi.fn())
+const apiClearRuntimeMock = vi.hoisted(() => vi.fn())
 
 vi.mock('../api/agents', () => ({
   agentsApi: {
@@ -17,6 +19,8 @@ vi.mock('../api/agents', () => ({
     reload: apiReloadMock,
     setOverride: apiSetOverrideMock,
     clearOverride: apiClearOverrideMock,
+    setRuntime: apiSetRuntimeMock,
+    clearRuntime: apiClearRuntimeMock,
   },
 }))
 
@@ -1010,6 +1014,92 @@ describe('agentStore', () => {
       selectedAgent,
       isMutating: false,
       mutationError: 'Agent customization is restricted',
+    })
+  })
+
+  describe('agent runtime pin', () => {
+    const binding = {
+      providerId: 'provider-a',
+      providerName: 'Provider A',
+      modelId: 'model-a',
+      source: 'userSettings' as const,
+    }
+
+    it('pins a custom agent and keeps it selected', async () => {
+      const before = makeAgent()
+      const after = makeAgent({ runtime: binding, runtimeStatus: 'valid' })
+      useAgentStore.setState({ selectedAgent: before, allAgents: [before], activeAgents: [before] })
+      apiSetRuntimeMock.mockResolvedValue({ agent: after })
+      apiListMock.mockResolvedValue({ activeAgents: [after], allAgents: [after] })
+
+      await expect(
+        useAgentStore.getState().setAgentRuntime(
+          before,
+          { cwd: '/workspace/current', providerId: 'provider-a', modelId: 'model-a' },
+        ),
+      ).resolves.toBe(after)
+
+      expect(apiSetRuntimeMock).toHaveBeenCalledWith('reviewer', {
+        cwd: '/workspace/current',
+        providerId: 'provider-a',
+        modelId: 'model-a',
+      })
+      expect(useAgentStore.getState()).toMatchObject({
+        selectedAgent: after,
+        allAgents: [after],
+        isMutating: false,
+        mutationError: null,
+      })
+    })
+
+    it('pins a built-in agent, which has no scope or target to match on', async () => {
+      const before = makeBuiltInAgent()
+      const after = makeBuiltInAgent({ runtime: binding, runtimeStatus: 'valid' })
+      useAgentStore.setState({ selectedAgent: before, allAgents: [before], activeAgents: [before] })
+      apiSetRuntimeMock.mockResolvedValue({ agent: after })
+      apiListMock.mockResolvedValue({ activeAgents: [after], allAgents: [after] })
+
+      await useAgentStore.getState().setAgentRuntime(
+        before,
+        { providerId: 'provider-a', modelId: 'model-a' },
+      )
+
+      expect(useAgentStore.getState().selectedAgent?.runtime).toEqual(binding)
+    })
+
+    it('clears the pin from the server result', async () => {
+      const pinned = makeAgent({ runtime: binding, runtimeStatus: 'valid' })
+      const cleared = makeAgent()
+      useAgentStore.setState({ selectedAgent: pinned, allAgents: [pinned], activeAgents: [pinned] })
+      apiClearRuntimeMock.mockResolvedValue({ agent: cleared })
+      apiListMock.mockResolvedValue({ activeAgents: [cleared], allAgents: [cleared] })
+
+      await expect(
+        useAgentStore.getState().clearAgentRuntime(pinned, '/workspace/current'),
+      ).resolves.toBe(cleared)
+
+      expect(apiClearRuntimeMock).toHaveBeenCalledWith('reviewer', '/workspace/current')
+      expect(useAgentStore.getState().selectedAgent?.runtime).toBeUndefined()
+    })
+
+    it('surfaces the server message when the pin is rejected, keeping the selection', async () => {
+      const selectedAgent = makeAgent()
+      useAgentStore.setState({ selectedAgent })
+      apiSetRuntimeMock.mockRejectedValue(new Error('Provider "provider-a" is not configured'))
+
+      await expect(
+        useAgentStore.getState().setAgentRuntime(
+          selectedAgent,
+          { providerId: 'provider-a', modelId: 'model-a' },
+        ),
+      ).rejects.toThrow('Provider "provider-a" is not configured')
+
+      expect(useAgentStore.getState()).toMatchObject({
+        selectedAgent,
+        isMutating: false,
+        mutationError: 'Provider "provider-a" is not configured',
+      })
+      expect(apiListMock).not.toHaveBeenCalled()
     })
   })
 

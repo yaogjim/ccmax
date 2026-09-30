@@ -34,6 +34,31 @@ export type AgentDefinition = {
   defaults?: { model?: string; effort?: string | number }
   /** Built-in agents only: the override currently in effect, if any. */
   override?: { model?: string; effort?: string | number; source: AgentSource }
+  /**
+   * The provider and model this agent is pinned to, for any agent source. The
+   * agent's own `model` field is unrelated: it names a model on whichever
+   * provider the session already uses.
+   */
+  runtime?: AgentRuntimeBinding
+  /** Whether `runtime` could launch right now. Present only with `runtime`. */
+  runtimeStatus?: AgentRuntimeStatus
+}
+
+export type AgentRuntimeBinding = {
+  providerId: string
+  modelId: string
+  /** Absent when the provider no longer exists. */
+  providerName?: string
+  /** Which settings file supplied the binding; only `userSettings` is editable here. */
+  source: AgentSource
+}
+
+export type AgentRuntimeStatus = 'valid' | 'provider_missing' | 'model_unresolvable'
+
+export type AgentRuntimeInput = {
+  cwd?: string
+  providerId: string
+  modelId: string
 }
 
 /** `null` clears that field; an omitted field is left unchanged. */
@@ -110,6 +135,19 @@ export const agentsApi = {
     const suffix = query.toString() ? `?${query.toString()}` : ''
     return api.delete<AgentMutationResponse>(
       `/api/agents/${encodeURIComponent(name)}/override${suffix}`,
+    )
+  },
+  setRuntime: (name: string, input: AgentRuntimeInput) =>
+    api.put<AgentMutationResponse>(
+      `/api/agents/${encodeURIComponent(name)}/runtime`,
+      input,
+    ),
+  clearRuntime: (name: string, cwd?: string) => {
+    const query = new URLSearchParams()
+    if (cwd) query.set('cwd', cwd)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return api.delete<AgentMutationResponse>(
+      `/api/agents/${encodeURIComponent(name)}/runtime${suffix}`,
     )
   },
   reload: (sessionId: string) =>

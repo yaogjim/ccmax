@@ -1,3 +1,4 @@
+import { isHiddenWorkerEntrypoint } from '../../shared/workerSession.js'
 import { getSideChat, isSideChatId, sideChatSummary } from './sideChatRegistry.js'
 import { splitSessionReferenceContext } from './sessionReferenceContext.js'
 import { parseSessionCollaborationEnvelope } from '../../utils/sessionCollaborationEnvelope.js'
@@ -1284,7 +1285,7 @@ export class SessionService {
         state.launchCount += this.countTranscriptMessages([entry])
         if (typeof entry.cwd === 'string' && entry.cwd.trim()) state.cwd = normalizeDriveRootPathForPlatform(entry.cwd)
         const record = entry as Record<string, unknown>
-        if (record.entrypoint === 'claude-desktop-team-worker') state.isTeamWorker = true
+        if (isHiddenWorkerEntrypoint(record.entrypoint)) state.isTeamWorker = true
         if (entry.type === 'session-meta') {
           if (typeof record.workDir === 'string') state.workDir = normalizeDriveRootPathForPlatform(record.workDir)
           state.permissionMode = this.resolvePermissionModeFromEntries([entry]) ?? state.permissionMode

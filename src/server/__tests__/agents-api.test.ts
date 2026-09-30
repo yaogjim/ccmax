@@ -9,6 +9,7 @@ import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
 import { findGitRoot } from '../../utils/git.js'
 import { refreshActivePlugins } from '../../utils/plugins/refresh.js'
 import { AgentService } from '../services/agentService.js'
+import { ProviderService } from '../services/providerService.js'
 import { conversationService } from '../services/conversationService.js'
 import {
   __resetWebSocketHandlerStateForTests,
@@ -1876,6 +1877,271 @@ describe('Agents API built-in overrides', () => {
       { subtype: 'reload_plugins' },
       { subtype: 'reload_plugins' },
     ])
+  })
+})
+
+describe('Agents API runtime bindings', () => {
+  async function readUserSettings(): Promise<Record<string, any>> {
+    try {
+      return JSON.parse(
+        await fs.readFile(path.join(configDir, 'settings.json'), 'utf-8'),
+      )
+    } catch {
+      return {}
+    }
+  }
+
+  async function writeUserSettings(settings: unknown): Promise<void> {
+    await fs.writeFile(
+      path.join(configDir, 'settings.json'),
+      JSON.stringify(settings),
+    )
+    resetSettingsCache()
+    clearAgentDefinitionsCache()
+  }
+
+  async function addProvider(
+    models: Record<string, string> = {
+      main: 'vendor-main',
+      sonnet: 'vendor-sonnet',
+      opus: 'vendor-opus',
+      haiku: 'vendor-haiku',
+    },
+  ) {
+    return new ProviderService().addProvider({
+      presetId: 'custom',
+      name: 'Vendor B',
+      baseUrl: 'http://127.0.0.1:32111',
+      apiKey: 'fake-key',
+      models,
+    } as any)
+  }
+
+  async function getAgent(name: string) {
+    const list = await api(
+      'GET',
+      `/api/agents?cwd=${encodeURIComponent(projectCwd)}`,
+    )
+    return list.data.allAgents.find((agent: any) => agent.agentType === name)
+  }
+
+  it('pins any agent, lists the binding with a valid status, and keeps unknown fields', async () => {
+    const provider = await addProvider()
+    await writeUserSettings({
+      model: 'opus',
+      futureKey: { keep: true },
+      agentRuntimeBindings: {
+        other: { providerId: 'p', modelId: 'm', futureField: 1 },
+      },
+    })
+
+    const pinned = await api('PUT', '/api/agents/general-purpose/runtime', {
+      cwd: projectCwd,
+      providerId: provider.id,
+      modelId: 'vendor/precise',
+    })
+    expect(pinned.status).toBe(200)
+    expect(pinned.data.agent.runtime).toEqual({
+      providerId: provider.id,
+      modelId: 'vendor/precise',
+      providerName: 'Vendor B',
+      source: 'userSettings',
+    })
+    expect(pinned.data.agent.runtimeStatus).toBe('valid')
+
+    const listed = await getAgent('general-purpose')
+    expect(listed.runtime.providerId).toBe(provider.id)
+    expect(listed.runtimeStatus).toBe('valid')
+    // An unbound agent carries neither field.
+    const unbound = await getAgent('Explore')
+    expect('runtime' in unbound).toBe(false)
+    expect('runtimeStatus' in unbound).toBe(false)
+
+    const settings = await readUserSettings()
+    expect(settings.model).toBe('opus')
+    expect(settings.futureKey).toEqual({ keep: true })
+    expect(settings.agentRuntimeBindings.other).toEqual({
+      providerId: 'p',
+      modelId: 'm',
+      futureField: 1,
+    })
+    expect(settings.agentRuntimeBindings['general-purpose']).toEqual({
+      providerId: provider.id,
+      modelId: 'vendor/precise',
+    })
+  })
+
+  it('accepts a provider alias that the provider maps, and claude-official', async () => {
+    const provider = await addProvider()
+
+    expect(
+      (
+        await api('PUT', '/api/agents/general-purpose/runtime', {
+          cwd: projectCwd,
+          providerId: provider.id,
+          modelId: 'sonnet',
+        })
+      ).status,
+    ).toBe(200)
+    expect(
+      (
+        await api('PUT', '/api/agents/general-purpose/runtime', {
+          cwd: projectCwd,
+          providerId: 'claude-official',
+          modelId: 'claude-sonnet-4-5',
+        })
+      ).status,
+    ).toBe(200)
+  })
+
+  it('rejects a missing provider, an unmapped alias and an invalid model id without writing', async () => {
+    const provider = await addProvider({
+      main: 'vendor-main',
+      haiku: '',
+      sonnet: '',
+      opus: '',
+    })
+    await writeUserSettings({ model: 'opus' })
+
+    const missing = await api('PUT', '/api/agents/general-purpose/runtime', {
+      cwd: projectCwd,
+      providerId: 'no-such-provider',
+      modelId: 'x',
+    })
+    expect(missing.status).toBe(400)
+    expect(missing.data.error).toBe('PROVIDER_NOT_FOUND')
+
+    const unmapped = await api('PUT', '/api/agents/general-purpose/runtime', {
+      cwd: projectCwd,
+      providerId: provider.id,
+      modelId: 'fable',
+    })
+    expect(unmapped.status).toBe(400)
+    expect(unmapped.data.error).toBe('MODEL_UNRESOLVABLE')
+
+    for (const modelId of ['inherit', 'has space', 'tab\tid']) {
+      const bad = await api('PUT', '/api/agents/general-purpose/runtime', {
+        cwd: projectCwd,
+        providerId: provider.id,
+        modelId,
+      })
+      expect(bad.status).toBe(400)
+      expect(bad.data.error).toBe('MODEL_UNRESOLVABLE')
+    }
+
+    for (const body of [
+      { providerId: provider.id },
+      { modelId: 'x' },
+      { providerId: '', modelId: 'x' },
+      { providerId: provider.id, modelId: 'x', scope: 'project' },
+    ]) {
+      const invalid = await api('PUT', '/api/agents/general-purpose/runtime', {
+        cwd: projectCwd,
+        ...body,
+      })
+      expect(invalid.status).toBe(400)
+    }
+
+    expect('agentRuntimeBindings' in (await readUserSettings())).toBe(false)
+  })
+
+  it('404s an unknown agent on PUT', async () => {
+    const provider = await addProvider()
+    const response = await api('PUT', '/api/agents/no-such-agent/runtime', {
+      cwd: projectCwd,
+      providerId: provider.id,
+      modelId: 'x',
+    })
+    expect(response.status).toBe(404)
+  })
+
+  it('clears idempotently and removes the key once the last binding is gone', async () => {
+    const provider = await addProvider()
+    await writeUserSettings({ model: 'opus' })
+    await api('PUT', '/api/agents/general-purpose/runtime', {
+      cwd: projectCwd,
+      providerId: provider.id,
+      modelId: 'x',
+    })
+
+    const cleared = await api(
+      'DELETE',
+      `/api/agents/general-purpose/runtime?cwd=${encodeURIComponent(projectCwd)}`,
+    )
+    expect(cleared.status).toBe(200)
+    expect(cleared.data.agent.runtime).toBeUndefined()
+    const settings = await readUserSettings()
+    expect(settings.model).toBe('opus')
+    expect('agentRuntimeBindings' in settings).toBe(false)
+
+    const again = await api(
+      'DELETE',
+      `/api/agents/general-purpose/runtime?cwd=${encodeURIComponent(projectCwd)}`,
+    )
+    expect(again.status).toBe(200)
+    // Even for an agent that no longer exists: a stale binding stays clearable.
+    const ghost = await api('DELETE', '/api/agents/deleted-agent/runtime')
+    expect(ghost.status).toBe(200)
+    expect(ghost.data.agent).toBeNull()
+  })
+
+  it('only removes the fields it owns when clearing', async () => {
+    await writeUserSettings({
+      agentRuntimeBindings: {
+        'general-purpose': { providerId: 'p', modelId: 'm', futureField: 'keep' },
+      },
+    })
+    await api(
+      'DELETE',
+      `/api/agents/general-purpose/runtime?cwd=${encodeURIComponent(projectCwd)}`,
+    )
+    expect(
+      (await readUserSettings()).agentRuntimeBindings['general-purpose'],
+    ).toEqual({ futureField: 'keep' })
+  })
+
+  it('reports provider_missing and model_unresolvable for a binding that went stale', async () => {
+    const provider = await addProvider({
+      main: 'vendor-main',
+      haiku: '',
+      sonnet: '',
+      opus: '',
+    })
+    await writeUserSettings({
+      agentRuntimeBindings: {
+        'general-purpose': { providerId: 'deleted-provider', modelId: 'x' },
+        Explore: { providerId: provider.id, modelId: 'fable' },
+      },
+    })
+
+    expect((await getAgent('general-purpose')).runtimeStatus).toBe(
+      'provider_missing',
+    )
+    expect((await getAgent('Explore')).runtimeStatus).toBe(
+      'model_unresolvable',
+    )
+    // Still reported, so the UI can ask the user to reselect.
+    expect((await getAgent('Explore')).runtime.modelId).toBe('fable')
+  })
+
+  it('does not touch a project-level settings file', async () => {
+    const provider = await addProvider()
+    await api('PUT', '/api/agents/general-purpose/runtime', {
+      cwd: projectCwd,
+      providerId: provider.id,
+      modelId: 'x',
+    })
+    await expect(
+      fs.stat(path.join(projectRoot, '.claude', 'settings.json')),
+    ).rejects.toThrow()
+  })
+
+  it('rejects unsupported methods', async () => {
+    const response = await api('GET', '/api/agents/general-purpose/runtime')
+    // GET falls through to the agent lookup, never to a write.
+    expect(response.status).not.toBe(500)
+    const post = await api('POST', '/api/agents/general-purpose/runtime', {})
+    expect(post.status).toBe(405)
   })
 })
 

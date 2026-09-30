@@ -4,6 +4,7 @@ import {
   type AgentDefinition,
   type AgentMutationInput,
   type AgentOverrideInput,
+  type AgentRuntimeInput,
   type AgentScope,
   type AgentSource,
 } from '../api/agents'
@@ -47,6 +48,20 @@ type AgentStore = {
   ) => Promise<AgentDefinition>
   clearAgentOverride: (
     name: string,
+    cwd?: string,
+    sessionId?: string,
+  ) => Promise<AgentDefinition>
+  /**
+   * Pin an agent (of any source) to a provider and model. `agent` identifies
+   * the entry to re-select afterwards; the binding itself is keyed by name.
+   */
+  setAgentRuntime: (
+    agent: AgentDefinition,
+    input: AgentRuntimeInput,
+    sessionId?: string,
+  ) => Promise<AgentDefinition>
+  clearAgentRuntime: (
+    agent: AgentDefinition,
     cwd?: string,
     sessionId?: string,
   ) => Promise<AgentDefinition>
@@ -211,6 +226,33 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
         'Failed to refresh agents after resetting the built-in agent override',
       missingAfterRefreshMessage:
         'Reset agent was not returned by the refreshed list',
+      set,
+    }),
+
+  setAgentRuntime: async (agent, input, sessionId) =>
+    runAgentMutation({
+      mutate: async () => (await agentsApi.setRuntime(agent.agentType, input)).agent,
+      locate: (agents) => findMatchingAgent(agents, agent) ?? undefined,
+      cwd: input.cwd,
+      sessionId,
+      mutationErrorFallback: 'Failed to save the agent runtime',
+      refreshErrorFallback: 'Failed to refresh agents after saving the agent runtime',
+      missingAfterRefreshMessage:
+        'Pinned agent was not returned by the refreshed list',
+      set,
+    }),
+
+  clearAgentRuntime: async (agent, cwd, sessionId) =>
+    runAgentMutation({
+      // Idempotent on the server, so clearing an already-cleared pin succeeds.
+      mutate: async () => (await agentsApi.clearRuntime(agent.agentType, cwd)).agent,
+      locate: (agents) => findMatchingAgent(agents, agent) ?? undefined,
+      cwd,
+      sessionId,
+      mutationErrorFallback: 'Failed to clear the agent runtime',
+      refreshErrorFallback: 'Failed to refresh agents after clearing the agent runtime',
+      missingAfterRefreshMessage:
+        'Unpinned agent was not returned by the refreshed list',
       set,
     }),
 

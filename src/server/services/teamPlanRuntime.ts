@@ -4,7 +4,8 @@ import { isValidTeamMemberName, type TeamPlanRecord, type TeamPlanMember } from 
 import { conversationService } from './conversationService.js'
 import { ProviderService } from './providerService.js'
 import { CLAUDE_OFFICIAL_PROVIDER_ID } from '../types/provider.js'
-import { normalizeExplicitClaudeOfficialModelId } from './claudeOfficialRuntime.js'
+import { resolveAgentRuntimeModel } from './agentRuntimeModel.js'
+import { validateAgentPresetSnapshot } from './agentPresetValidation.js'
 import { getModelReasoningCapabilityOverride, isModelReasoningEffort, normalizeModelReasoningEffort } from '../../shared/modelReasoning.js'
 import { getPresetDefaultEnv, getPresetReasoningProviderKind } from './providerRuntimeEnv.js'
 import { validateTeamPlanPresetSource } from '../../utils/swarm/teamPlanPresetSource.js'
@@ -29,21 +30,8 @@ export async function validateTeamPlanRuntime(plan: TeamPlanRecord): Promise<Tea
     const snapshot = plan.agentCatalog?.[member.agentType]
     if (!snapshot || !snapshot.systemPrompt.trim()) throw new Error(`Agent preset is unavailable: ${member.agentType}`)
     validateTeamPlanPresetSource(snapshot)
-    if (snapshot.configurationError) throw new Error(`Agent preset ${member.agentType}: ${snapshot.configurationError}`)
-    if (snapshot.permissionMode && snapshot.permissionMode !== 'default' && snapshot.permissionMode !== conversationService.getSessionPermissionMode(plan.sessionId)) throw new Error(`Agent preset ${member.agentType} requires permission mode ${snapshot.permissionMode}; adjust the preset or leader permission mode and submit a new plan`)
-    const unsupported = [
-      ...(snapshot.isolation ? ['isolation'] : []),
-    ]
-    if (unsupported.length) throw new Error(`Agent preset ${member.agentType} uses unsupported team worker settings: ${unsupported.join(', ')}`)
-    if (snapshot.maxTurns !== undefined && (!Number.isInteger(snapshot.maxTurns) || snapshot.maxTurns < 1)) throw new Error(`Agent preset ${member.agentType} has invalid maxTurns`)
-    const provider = member.runtime.providerId === CLAUDE_OFFICIAL_PROVIDER_ID ? null : await providerService.getProvider(member.runtime.providerId)
-    const requestedModel = member.runtime.modelId.trim()
-    const aliases = provider?.models as Record<string, string> | undefined
-    if (provider && ['default', 'main', 'fable', 'sonnet', 'opus', 'haiku'].includes(requestedModel) && !aliases?.[requestedModel === 'default' ? 'main' : requestedModel]) throw new Error(`Provider has no mapping for ${requestedModel}`)
-    const modelId = provider
-      ? (aliases?.[requestedModel === 'default' ? 'main' : requestedModel] || requestedModel)
-      : normalizeExplicitClaudeOfficialModelId(requestedModel)
-    if (!modelId || !/^[^\s\x00-\x1f]+$/.test(modelId) || modelId === 'inherit') throw new Error(`Choose a concrete model for ${member.name}`)
+    validateAgentPresetSnapshot(snapshot, member.agentType, { parentPermissionMode: conversationService.getSessionPermissionMode(plan.sessionId), workerLabel: 'team worker', permissionHint: 'adjust the preset or leader permission mode and submit a new plan' })
+    const { provider, modelId } = await resolveAgentRuntimeModel(providerService, member.runtime, member.name)
     const requestedEffort = member.runtime.effortLevel
     if (requestedEffort !== undefined && (!isModelReasoningEffort(requestedEffort) || !normalizeModelReasoningEffort(modelId, requestedEffort, provider?.apiFormat ?? 'anthropic', provider ? getModelReasoningCapabilityOverride(modelId, provider.models, getPresetDefaultEnv(provider.presetId)) : undefined, provider ? getPresetReasoningProviderKind(provider.presetId) : undefined))) throw new Error(`Unsupported reasoning effort for ${member.name}`)
     const runtime = { ...member.runtime, modelId }

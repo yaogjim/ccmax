@@ -4,6 +4,8 @@
  * 定义客户端与服务器之间 WebSocket 通信的消息类型。
  */
 
+import type { PinnedAgentRuntimeBadge } from '../../shared/pinnedAgent.js'
+
 // ============================================================================
 // Client → Server
 // ============================================================================
@@ -80,7 +82,7 @@ export type ServerMessage =
   | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; originalToolUseId?: string; parentToolUseId?: string }
   | { type: 'content_delta'; text?: string; toolInput?: string }
   | { type: 'tool_use_complete'; toolName: string; toolUseId: string; originalToolUseId?: string; input: unknown; parentToolUseId?: string }
-  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string }
+  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string; agentRuntime?: PinnedAgentRuntimeBadge }
   | {
       type: 'permission_request'
       requestId: string

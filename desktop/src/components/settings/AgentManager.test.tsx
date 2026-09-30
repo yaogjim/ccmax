@@ -9,6 +9,8 @@ const apiDeleteMock = vi.hoisted(() => vi.fn())
 const apiReloadMock = vi.hoisted(() => vi.fn())
 const apiSetOverrideMock = vi.hoisted(() => vi.fn())
 const apiClearOverrideMock = vi.hoisted(() => vi.fn())
+const apiSetRuntimeMock = vi.hoisted(() => vi.fn())
+const apiClearRuntimeMock = vi.hoisted(() => vi.fn())
 const recentProjectsMock = vi.hoisted(() => vi.fn())
 
 vi.mock('../../api/agents', async (importOriginal) => {
@@ -23,6 +25,8 @@ vi.mock('../../api/agents', async (importOriginal) => {
       reload: apiReloadMock,
       setOverride: apiSetOverrideMock,
       clearOverride: apiClearOverrideMock,
+      setRuntime: apiSetRuntimeMock,
+      clearRuntime: apiClearRuntimeMock,
     },
   }
 })
@@ -46,6 +50,7 @@ import type { AgentDefinition, AgentListResponse } from '../../api/agents'
 import { useAgentStore } from '../../stores/agentStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useSettingsStore } from '../../stores/settingsStore'
+import { useProviderStore } from '../../stores/providerStore'
 import { AgentManager } from './AgentManager'
 
 const EMPTY_RESPONSE = { activeAgents: [], allAgents: [] }
@@ -981,5 +986,153 @@ describe('AgentManager', () => {
 
     expect(await screen.findByText('加载 Agent 失败')).toBeInTheDocument()
     expect(screen.queryByText(/internal agent path leaked/)).not.toBeInTheDocument()
+  })
+
+  describe('runtime pin', () => {
+    const binding = {
+      providerId: 'provider-a',
+      providerName: 'Provider A',
+      modelId: 'model-a',
+      source: 'userSettings' as const,
+    }
+
+    beforeEach(() => {
+      // The picker only asks for providers when none have been loaded.
+      useProviderStore.setState({ providers: [], activeId: null, hasLoadedProviders: true })
+    })
+
+    function openDetail(agent: AgentDefinition) {
+      useAgentStore.setState({
+        activeAgents: [agent],
+        allAgents: [agent],
+        selectedAgent: agent,
+        selectedAgentReturnTab: 'agents',
+      })
+      apiListMock.mockResolvedValue({ activeAgents: [agent], allAgents: [agent] })
+      render(<AgentManager />)
+    }
+
+    it('offers to pin an unpinned agent, built-ins included', async () => {
+      openDetail(makeBuiltInAgent())
+
+      const section = await screen.findByRole('region', { name: 'Runtime' })
+      expect(within(section).getByText(/Not pinned/)).toBeInTheDocument()
+      expect(within(section).getByRole('button', { name: 'Pin runtime' })).toBeInTheDocument()
+      expect(within(section).queryByRole('button', { name: 'Clear' })).not.toBeInTheDocument()
+    })
+
+    it('shows the pinned provider and model with a usable status', async () => {
+      openDetail(makeAgent({ runtime: binding, runtimeStatus: 'valid' }))
+
+      const section = await screen.findByRole('region', { name: 'Runtime' })
+      expect(within(section).getByTestId('agent-runtime-value').textContent).toBe('Provider A · model-a')
+      expect(within(section).getByText('Available')).toBeInTheDocument()
+      expect(within(section).queryByRole('alert')).not.toBeInTheDocument()
+    })
+
+    it.each([
+      ['provider_missing', 'Provider no longer exists'],
+      ['model_unresolvable', 'Model cannot be resolved'],
+    ] as const)('warns that a %s pin will fail instead of falling back', async (status, label) => {
+      openDetail(makeAgent({ runtime: binding, runtimeStatus: status }))
+
+      const section = await screen.findByRole('region', { name: 'Runtime' })
+      expect(within(section).getByText(label)).toBeInTheDocument()
+      expect(within(section).getByRole('alert')).toHaveTextContent('will not fall back to another provider')
+    })
+
+    it('shows only the model once the provider no longer exists', async () => {
+      const { providerName: _gone, ...unnamed } = binding
+      openDetail(makeAgent({ runtime: unnamed, runtimeStatus: 'provider_missing' }))
+
+      const section = await screen.findByRole('region', { name: 'Runtime' })
+      expect(within(section).getByTestId('agent-runtime-value').textContent).toBe('model-a')
+      expect(within(section).queryByText(/provider-a/)).not.toBeInTheDocument()
+    })
+
+    it('leaves a policy-managed pin read-only', async () => {
+      openDetail(makeAgent({
+        runtime: { ...binding, source: 'policySettings' },
+        runtimeStatus: 'valid',
+      }))
+
+      const section = await screen.findByRole('region', { name: 'Runtime' })
+      expect(within(section).getByText(/managed by Managed settings/)).toBeInTheDocument()
+      expect(within(section).queryByRole('button')).not.toBeInTheDocument()
+    })
+
+    it('saves the picked provider and model together with the project', async () => {
+      const agent = makeAgent()
+      openDetail(agent)
+      const pinned = { ...agent, runtime: binding, runtimeStatus: 'valid' as const }
+      apiSetRuntimeMock.mockResolvedValue({ agent: pinned })
+      apiListMock.mockResolvedValue({ activeAgents: [pinned], allAgents: [pinned] })
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Pin runtime' }))
+      const dialog = screen.getByRole('dialog', { name: 'Pin agent runtime' })
+      expect(within(dialog).getByText(/sent to the selected provider/)).toBeInTheDocument()
+      fireEvent.change(within(dialog).getByLabelText('Model ID (optional)'), {
+        target: { value: 'typed-model' },
+      })
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+
+      await waitFor(() => expect(apiSetRuntimeMock).toHaveBeenCalledTimes(1))
+      // No provider is configured, so the picker's default is the official one;
+      // the typed model id replaces only the model.
+      expect(apiSetRuntimeMock).toHaveBeenCalledWith('code_reviewer', {
+        cwd: '/workspace/project',
+        providerId: 'claude-official',
+        modelId: 'typed-model',
+      })
+      await waitFor(() =>
+        expect(screen.queryByRole('dialog', { name: 'Pin agent runtime' })).not.toBeInTheDocument(),
+      )
+      expect(screen.getByTestId('agent-runtime-value').textContent).toBe('Provider A · model-a')
+    })
+
+    it('keeps the dialog open with a localized error when saving fails', async () => {
+      openDetail(makeAgent())
+      apiSetRuntimeMock.mockRejectedValue(new Error('Provider "x" leaked /home/secret/path'))
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Pin runtime' }))
+      fireEvent.click(within(screen.getByRole('dialog', { name: 'Pin agent runtime' })).getByRole('button', { name: 'Save' }))
+
+      const alert = await screen.findByRole('alert')
+      expect(alert).toHaveTextContent('Failed to save the agent runtime')
+      expect(alert).not.toHaveTextContent('/home/secret/path')
+      expect(screen.getByRole('dialog', { name: 'Pin agent runtime' })).toBeInTheDocument()
+    })
+
+    it('clears the pin', async () => {
+      const agent = makeAgent({ runtime: binding, runtimeStatus: 'valid' })
+      openDetail(agent)
+      const cleared = makeAgent()
+      apiClearRuntimeMock.mockResolvedValue({ agent: cleared })
+      apiListMock.mockResolvedValue({ activeAgents: [cleared], allAgents: [cleared] })
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Clear' }))
+
+      await waitFor(() =>
+        expect(apiClearRuntimeMock).toHaveBeenCalledWith('code_reviewer', '/workspace/project'),
+      )
+      expect(await screen.findByText(/Not pinned/)).toBeInTheDocument()
+    })
+
+    it('reports a failed clear without dropping the pin', async () => {
+      openDetail(makeAgent({ runtime: binding, runtimeStatus: 'valid' }))
+      apiClearRuntimeMock.mockRejectedValue(new Error('boom'))
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Clear' }))
+
+      expect(await screen.findByText('Failed to clear the agent runtime')).toBeInTheDocument()
+      expect(screen.getByTestId('agent-runtime-value').textContent).toBe('Provider A · model-a')
+    })
+
+    it('marks pinned agents in the list', async () => {
+      const agent = makeAgent({ runtime: binding, runtimeStatus: 'valid' })
+      await renderManager({ activeAgents: [agent], allAgents: [agent] })
+
+      expect(await screen.findByText('Provider A · model-a')).toBeInTheDocument()
+    })
   })
 })

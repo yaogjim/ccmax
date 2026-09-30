@@ -38,6 +38,7 @@ import { FORK_AGENT, isForkSubagentEnabled } from './forkSubagent.js'
 import type { AgentDefinition } from './loadAgentsDir.js'
 import { isBuiltInAgent } from './loadAgentsDir.js'
 import { resolvePersistedAgentType, runAgent } from './runAgent.js'
+import { isPinnedAgentMetadata, pinnedAgentContinuationMessage } from './runPinnedAgent.js'
 
 export type ResumeAgentResult = {
   agentId: string
@@ -89,6 +90,11 @@ export async function resumeAgentBackground({
   ])
   if (!transcript) {
     throw new Error(`No transcript found for agent ID: ${agentId}`)
+  }
+  // Resuming re-runs the transcript in this process, i.e. on the session's own
+  // provider. That would defeat the pin, so it is refused.
+  if (isPinnedAgentMetadata(meta)) {
+    throw new Error(pinnedAgentContinuationMessage(meta!.agentType))
   }
   const resumedMessages = filterWhitespaceOnlyAssistantMessages(
     filterOrphanedThinkingOnlyMessages(

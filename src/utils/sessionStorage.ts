@@ -268,6 +268,18 @@ export type AgentMetadata = {
   ownerAgentId?: string
   /** Per-invocation Agent tool model override. Retained across follow-ups. */
   model?: ModelAlias
+  /**
+   * Set when the agent ran in a server-started worker pinned to a provider and
+   * model, so a reopened session can still say where the work happened.
+   */
+  runtime?: {
+    mode: 'pinned'
+    providerId: string
+    providerName: string
+    requestedModel: string
+    model: string
+    workerSessionId: string
+  }
   /** Worktree path if the agent was spawned with isolation: "worktree" */
   worktreePath?: string
   /** Original task description from the AgentTool input. Persisted so a

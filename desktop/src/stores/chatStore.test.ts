@@ -16283,3 +16283,82 @@ describe('chatStore inactive complete-page retention', () => {
     }
   })
 })
+
+describe('chatStore pinned agent runtime badge', () => {
+  const runtime = { providerId: 'provider-a', providerName: 'Provider A', requestedModel: 'model-a' }
+
+  beforeEach(() => {
+    sendMock.mockReset()
+    localStorage.clear()
+    useSettingsStore.setState({ locale: 'en' })
+    useChatStore.setState({
+      ...initialState,
+      sessions: { [TEST_SESSION_ID]: makeSession() },
+    })
+  })
+
+  it('keeps the runtime of a live Agent tool result', () => {
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'tool_result',
+      toolUseId: 'agent-1',
+      content: 'done',
+      isError: false,
+      agentRuntime: runtime,
+    })
+
+    const result = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .find((message) => message.type === 'tool_result')
+    expect(result).toMatchObject({ toolUseId: 'agent-1', agentRuntime: runtime })
+  })
+
+  it('does not add a runtime to an unpinned tool result', () => {
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'tool_result',
+      toolUseId: 'read-1',
+      content: 'ok',
+      isError: false,
+    })
+
+    const result = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .find((message) => message.type === 'tool_result')
+    expect(result).toBeTruthy()
+    expect(result).not.toHaveProperty('agentRuntime')
+  })
+
+  it('restores the runtime from the persisted tool result and copies only the display fields', () => {
+    const messages: MessageEntry[] = [{
+      id: 'user-1',
+      type: 'tool_result',
+      timestamp: '2026-04-06T00:00:00.000Z',
+      content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'done', is_error: false }],
+      toolUseResult: {
+        status: 'completed',
+        runtime: {
+          mode: 'pinned',
+          ...runtime,
+          status: 'ok',
+          warnings: ['secret worker note'],
+          workerSessionId: 'worker-1',
+        },
+      },
+    }]
+
+    const mapped = mapHistoryMessagesToUiMessages(messages)
+
+    expect(mapped[0]).toMatchObject({ type: 'tool_result', agentRuntime: runtime })
+    expect(JSON.stringify(mapped[0])).not.toContain('worker-1')
+    expect(JSON.stringify(mapped[0])).not.toContain('secret worker note')
+  })
+
+  it('ignores a malformed persisted runtime', () => {
+    const messages: MessageEntry[] = [{
+      id: 'user-1',
+      type: 'tool_result',
+      timestamp: '2026-04-06T00:00:00.000Z',
+      content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'done', is_error: false }],
+      toolUseResult: { runtime: { mode: 'pinned', providerId: 42 } },
+    }]
+
+    expect(mapHistoryMessagesToUiMessages(messages)[0]).not.toHaveProperty('agentRuntime')
+  })
+})

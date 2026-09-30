@@ -797,7 +797,7 @@ function ToolCallTree({
       <ToolCallBlock
         toolName={toolCall.toolName}
         input={toolCall.input}
-        result={result ? { content: result.content, isError: result.isError } : null}
+        result={result ? { content: result.content, isError: result.isError, agentRuntime: result.agentRuntime } : null}
         compact={compact}
         chrome={chrome}
         isPending={toolCall.isPending}

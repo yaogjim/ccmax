@@ -8,6 +8,7 @@
  * shows up as a missing or malformed message in the desktop, H5, and IM clients
  * alike.
  */
+import type { PinnedAgentRuntimeBadge } from '../../shared/pinnedAgent.js'
 
 import type { ServerMessage, StreamingFallbackCause } from './events.js'
 import type { SessionTaskNotification } from '../services/sessionService.js'
@@ -101,6 +102,26 @@ export function normalizeAskUserQuestionToolResult(content: unknown, toolUseResu
     answers,
     ...(result.selectionSource === 'automatic' ? { selectionSource: 'automatic' } : {}),
   }
+}
+
+/**
+ * The pinned-runtime badge from an Agent tool's structured result, or
+ * undefined for any other tool or an incomplete `runtime`. Fields are copied
+ * one by one: the badge is shown to the user, so nothing else in the result may
+ * ride along.
+ */
+export function readPinnedAgentRuntime(toolUseResult: unknown): PinnedAgentRuntimeBadge | undefined {
+  const runtime = readObject(readObject(toolUseResult)?.runtime)
+  if (!runtime || runtime.mode !== 'pinned') return undefined
+  const { providerId, providerName, requestedModel } = runtime
+  if (typeof providerId !== 'string' || typeof providerName !== 'string' || typeof requestedModel !== 'string') return undefined
+  return { providerId, providerName, requestedModel }
+}
+
+/** Spread into a `tool_result` server message. */
+export function pinnedRuntimeField(toolUseResult: unknown): { agentRuntime?: PinnedAgentRuntimeBadge } {
+  const agentRuntime = readPinnedAgentRuntime(toolUseResult)
+  return agentRuntime ? { agentRuntime } : {}
 }
 
 export function classifyRuntimeErrorCode(message: string, fallbackCode: string): string {

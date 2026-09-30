@@ -1071,4 +1071,30 @@ describe('chat blocks', () => {
 
     expect(screen.getByText('Allow researcher to run this command?')).toBeTruthy()
   })
+
+  it('shows where a pinned agent ran on its card, and nothing on an unpinned one', () => {
+    const { rerender } = render(
+      <ToolCallBlock
+        toolName="Agent"
+        input={{ description: 'Review', prompt: 'Review it', subagent_type: 'reviewer' }}
+        result={{
+          content: 'done',
+          isError: false,
+          agentRuntime: { providerId: 'provider-a', providerName: 'Provider A', requestedModel: 'model-a' },
+        }}
+      />,
+    )
+
+    expect(screen.getByTestId('agent-runtime-badge').textContent).toBe('Provider A · model-a')
+
+    rerender(
+      <ToolCallBlock
+        toolName="Agent"
+        input={{ description: 'Review', prompt: 'Review it', subagent_type: 'reviewer' }}
+        result={{ content: 'done', isError: false }}
+      />,
+    )
+
+    expect(screen.queryByTestId('agent-runtime-badge')).toBeNull()
+  })
 })

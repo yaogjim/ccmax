@@ -387,8 +387,25 @@ function auditTeamWorker(phase: 'boot' | 'release') {
   void appendFile(path, JSON.stringify({ phase, sessionId, model: getArg('--model'), baseUrl: process.env.ANTHROPIC_BASE_URL }) + '\n')
 }
 
+/**
+ * Records where every session (not only team workers) was told to send its
+ * requests, so a test can prove which provider a pinned worker and its parent
+ * each got, without a real model.
+ */
+function auditProvider() {
+  const path = process.env.MOCK_SDK_PROVIDER_AUDIT
+  if (!path) return
+  void appendFile(path, JSON.stringify({
+    sessionId,
+    pinnedWorker: process.env.CC_HAHA_PINNED_AGENT_WORKER === '1',
+    model: getArg('--model'),
+    baseUrl: process.env.ANTHROPIC_BASE_URL,
+  }) + '\n')
+}
+
 ws.addEventListener('open', () => {
   auditTeamWorker('boot')
+  auditProvider()
   if (initMode !== 'on_first_user') {
     if (initDelayMs > 0) {
       setTimeout(sendInit, initDelayMs)
