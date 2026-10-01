@@ -35,6 +35,9 @@ describe('setMode permission updates', () => {
   })
 
   it('runs the plan-exit transition when an approval leaves plan mode', () => {
+    // Importing PermissionUpdate before permissionSetup also reproduces the
+    // circular-import regression: resolving permissionSetup at module load
+    // captured an incomplete export and threw instead of applying this update.
     // The desktop's plan dialog approves ExitPlanMode with
     // `[{ setMode: bypassPermissions }]`. That write used to skip the
     // bookkeeping the CLI does on its own switches (handleSetPermissionMode),
@@ -71,6 +74,21 @@ describe('setMode permission updates', () => {
     expect(next.mode).toBe('acceptEdits')
     expect(next.prePlanMode).toBeUndefined()
     expect(hasExitedPlanModeInSession()).toBe(true)
+  })
+
+  it('can enter and leave plan mode through consecutive host updates', () => {
+    // Both transitions must resolve the fully initialized module, including
+    // when PermissionUpdate is the first module imported by the host.
+    const original = permissionContext({ mode: 'acceptEdits' })
+    const planning = applyPermissionUpdate(original, setMode('plan'))
+    expect(planning.mode).toBe('plan')
+    expect(hasExitedPlanModeInSession()).toBe(false)
+    const resumed = applyPermissionUpdate(planning, setMode('acceptEdits'))
+    expect(resumed.mode).toBe('acceptEdits')
+    expect(resumed.prePlanMode).toBeUndefined()
+    expect(hasExitedPlanModeInSession()).toBe(true)
+    expect(needsPlanModeExitAttachment()).toBe(true)
+    expect(original.mode).toBe('acceptEdits')
   })
 
   it('refuses bypassPermissions when the session cannot use it', () => {

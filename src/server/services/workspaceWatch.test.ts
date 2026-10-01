@@ -120,6 +120,27 @@ describe('workspace watch coalescing contract', () => {
     }
   })
 
+  it('retains a rename destination supplied by the native event alongside the source', async () => {
+    const control = controlledWatchCallbacks(await fs.realpath(root))
+    const events: WorkspaceWatchChange[] = []
+    const abort = controller()
+    try {
+      await service.watchDirectories('task', ['src'], event => events.push(event), abort.signal)
+      // inotify delivers MOVED_FROM (a.ts) and MOVED_TO (b.ts); macOS kqueue
+      // only delivers the source. Driving both names proves the destination is
+      // passed through when the platform reports it, independent of which
+      // platform actually emits it.
+      control.emit('src', 'a.ts')
+      control.emit('src', 'b.ts')
+      expect(control.pending.size).toBe(1)
+      control.flush()
+      expect(events).toEqual([{ paths: ['src/a.ts', 'src/b.ts'], directories: ['src'] }])
+    } finally {
+      abort.abort()
+      control.restore()
+    }
+  })
+
   it('preserves the empty root directory in coarse-only and mixed notifications', async () => {
     const control = controlledWatchCallbacks(await fs.realpath(root))
     const events: WorkspaceWatchChange[] = []
@@ -207,7 +228,13 @@ describe('bounded workspace watches', () => {
     await fs.writeFile(path.join(root, 'src/a.ts'), 'one')
     await fs.writeFile(path.join(root, 'src/a.ts'), 'two')
     await fs.rename(path.join(root, 'src/a.ts'), path.join(root, 'src/b.ts'))
-    await until(() => events.some((event) => event.paths.includes('src/b.ts')))
+    await until(() => events.some((event) => event.directories.includes('src') && event.paths.length > 0))
+    // macOS kqueue reports only the pre-mutation name for a rename
+    // (`rename a.ts` when a.ts becomes b.ts) while inotify may also report the
+    // destination. Wait on the subscribed directory's named notification — the
+    // cross-platform contract — instead of a platform-specific rename target.
+    // The destination pass-through is pinned deterministically in the
+    // coalescing contract suite above.
     expect(events.flatMap((event) => event.paths)).toContain('src/a.ts')
     expect(events.every((event) => new Set(event.paths).size === event.paths.length)).toBe(true)
     expect(events.every((event) => event.directories.includes('src'))).toBe(true)
