@@ -20,7 +20,7 @@
 
 ccmax 是一个**桌面端 AI 编程工作台**，基于 Claude Code，把项目与多会话、代码审阅、模型接入、多 Agent 协作和本地自动化集中在一个 Electron 应用中，同时提供 CLI 和本地服务。源码支持 macOS、Windows 与 Linux。
 
-> **源码与发布包**：本文介绍当前源码的功能。最近发布的 **v0.6.8** 仅提供 macOS Apple Silicon 安装包；为单个 Agent 绑定专属供应商与模型的能力已进入当前源码，尚未包含在该发布包中。安装范围和签名情况见下方说明。
+> **源码与发布包**：本文介绍当前源码的功能。**v0.7.0** 包含单个 Agent 的专属供应商与模型绑定，仅提供 macOS Apple Silicon 安装包；其他平台可从源码构建。安装范围和签名情况见下方说明。
 
 <p align="center">
   <a href="#桌面端预览">桌面端预览</a> · <a href="#安装桌面端">安装桌面端</a> · <a href="#桌面端亮点">桌面端亮点</a> · <a href="#更多文档">更多文档</a>
@@ -58,7 +58,7 @@ ccmax 是一个**桌面端 AI 编程工作台**，基于 Claude Code，把项目
     </td>
     <td align="center" valign="top" width="33%">
       <a href="docs/images/app/zh-CN/readme-agent-runtime.webp"><img src="docs/images/app/zh-CN/readme-agent-runtime.webp" width="100%" alt="Agent 详情中的运行环境：绑定独立供应商与模型，并显示可用状态"></a>
-      <br><b>06 · Agent 专属模型</b><br>可选固定运行环境，当前源码可用
+      <br><b>06 · Agent 专属模型</b><br>可选固定供应商与模型
     </td>
   </tr>
   <tr>
@@ -83,16 +83,16 @@ ccmax 是一个**桌面端 AI 编程工作台**，基于 Claude Code，把项目
 
 ## 安装桌面端
 
-最近发布的 **v0.6.8** 仅提供 **macOS Apple Silicon（ARM64）** 安装包，要求 macOS 12.0 及以上。该版本没有 Windows、Linux 或 Intel Mac 安装包；其他平台可参考[贡献指南](docs/internals/contributing.md)从源码构建。
+最近发布的 **v0.7.0** 仅提供 **macOS Apple Silicon（ARM64）** 安装包，要求 macOS 12.0 及以上；Computer Use 原生助手要求 macOS 14.4 及以上。该版本没有 Windows、Linux 或 Intel Mac 安装包；其他平台可参考[贡献指南](docs/internals/contributing.md)从源码构建。
 
-1. 前往 [Releases](https://github.com/yaogjim/ccmax/releases)，从 v0.6.8 的 Assets 下载 `ccmax-0.6.8-mac-arm64.dmg` 和 `install-macos-unsigned.sh`。
+1. 前往 [Releases](https://github.com/yaogjim/ccmax/releases)，从 v0.7.0 的 Assets 下载 `ccmax-0.7.0-mac-arm64.dmg` 和 `install-macos-unsigned.sh`。
 2. 将脚本与 DMG 放在同一个目录，执行 `bash install-macos-unsigned.sh`。脚本会安装应用、移除隔离标记并启动。
 3. 手动安装方式：正常安装 DMG 后，执行 `xattr -dr com.apple.quarantine /Applications/ccmax.app`，再打开应用。
 4. 首次启动后，在「设置 → 模型配置」登录官方账号，或配置供应商、API Key 与默认模型。
 
-**签名说明**：该分支的 v0.6.8 使用本地自签名证书，未经 Apple Developer ID 签名和公证，首次打开可能出现「已损坏」或「无法验证开发者」提示。仅在确认安装包与脚本来源可信后，使用上述方式解除隔离标记。
+**签名说明**：该分支的 v0.7.0 使用本地自签名证书，未经 Apple Developer ID 签名和公证，首次打开可能出现「已损坏」或「无法验证开发者」提示。仅在确认安装包与脚本来源可信后，使用上述方式解除隔离标记。
 
-发布说明：[v0.6.8](release-notes/v0.6.8.md) · [签名策略](docs/start/code-signing.md) · [隐私与联网说明](docs/start/privacy.md)
+发布说明：[v0.7.0](release-notes/v0.7.0.md) · [签名策略](docs/start/code-signing.md) · [隐私与联网说明](docs/start/privacy.md)
 
 ## 从源码启动 CLI
 
@@ -125,7 +125,7 @@ cp .env.example .env
 - **跨会话引用与协作**：用 `@` 引用历史会话作为上下文，也可让 Agent 分派工作、读取其他会话结果并互通消息。Agent 之间的消息不构成用户授权。
 - **侧边问答**：输入 `/btw 问题`，或选中文字后在侧边聊天提问。临时对话继承父会话的上下文与模型，独立运行，不打断主任务；关闭对应标签或退出应用后清空。
 - **可视化 Agent 管理**：浏览、创建和编辑子 Agent，配置系统提示词、工具、模型与思考强度，也可调整内置 Agent 的模型。详见[子 Agent 与任务拆分](docs/desktop/agents.md)。
-- **Agent 专属供应商与模型（当前源码）**：可为单个 Agent 固定运行环境，主会话不受影响；失效时明确报错，不自动切换供应商。仅在桌面应用会话生效，同一父会话最多同时运行 3 个固定 Agent，共用工作目录，暂不支持续聊或独立 Worktree。任务内容会发送给所选供应商，配置前请确认信任关系。此功能尚未包含在 v0.6.8 发布包中。
+- **Agent 专属供应商与模型**：可为单个 Agent 固定运行环境，主会话不受影响；失效时明确报错，不自动切换供应商。仅在桌面应用会话生效，同一父会话最多同时运行 3 个固定 Agent，共用工作目录，暂不支持续聊或独立 Worktree。任务内容会发送给所选供应商，配置前请确认信任关系。团队计划成员仍使用计划中确认的运行环境。
 - **本地定时任务**：通过界面或自然语言创建、管理任务，查看运行记录，停止运行中的执行、确认后清除已结束记录；可选择桌面通知或已授权配对的 Telegram / 飞书通知目标。任务仅在桌面应用持续运行时触发。详见[定时任务](docs/desktop/schedule.md)。
 - **动态 Workflow 编排**：模型编写并运行编排脚本，并发或流水线调度子 Agent，支持阶段视图、中断与恢复。
 - **Computer Use**：授权后让 Agent 截图、点击、输入并操作桌面应用；macOS 原生运行时不占用真实鼠标和键盘。详见[Computer Use](docs/desktop/computer-use.md)。

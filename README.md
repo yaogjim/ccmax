@@ -20,7 +20,7 @@
 
 ccmax is a **desktop AI coding workbench** built on Claude Code: it brings projects and multi-session work, code review, model providers, multi-agent collaboration, and local automation into one Electron app, with a CLI and a local server alongside. The source supports macOS, Windows, and Linux.
 
-> **Source vs. release.** This page describes what the current source tree can do. The most recent published build is **v0.6.8**, which ships a macOS Apple Silicon installer only; pinning a dedicated provider and model to an individual agent has landed in the current source but is not part of that release. Installation scope and signing are covered below.
+> **Source vs. release.** This page describes what the current source tree can do. **v0.7.0** includes dedicated provider and model bindings for individual agents and ships a macOS Apple Silicon installer only; other platforms can be built from source. Installation scope and signing are covered below.
 
 <p align="center">
   <a href="#desktop-preview">Desktop Preview</a> · <a href="#install-the-desktop-app">Install</a> · <a href="#desktop-highlights">Desktop Highlights</a> · <a href="#more-documentation">More Documentation</a>
@@ -58,7 +58,7 @@ These screenshots come from a production build of the current source frontend, u
     </td>
     <td align="center" valign="top" width="33%">
       <a href="docs/images/app/en/readme-agent-runtime.webp"><img src="docs/images/app/en/readme-agent-runtime.webp" width="100%" alt="Agent detail runtime environment: a pinned provider and model with availability status"></a>
-      <br><b>06 · Agent-specific model</b><br>An optional pinned runtime, available in the current source.
+      <br><b>06 · Agent-specific model</b><br>An optional pinned provider and model.
     </td>
   </tr>
   <tr>
@@ -83,16 +83,16 @@ Start here: [install the app](docs/en/start/install.md) → [connect a model](do
 
 ## Install the Desktop App
 
-The latest release, **v0.6.8**, ships a **macOS Apple Silicon (ARM64)** installer only, requiring macOS 12.0 or later. There is no Windows, Linux, or Intel Mac build for this release; for other platforms, build from source as described in the [contributing guide](docs/en/internals/contributing.md).
+The latest release, **v0.7.0**, ships a **macOS Apple Silicon (ARM64)** installer only, requiring macOS 12.0 or later; the native Computer Use helper requires macOS 14.4 or later. There is no Windows, Linux, or Intel Mac build for this release; for other platforms, build from source as described in the [contributing guide](docs/en/internals/contributing.md).
 
-1. Download `ccmax-0.6.8-mac-arm64.dmg` and `install-macos-unsigned.sh` from the Assets of the v0.6.8 [release](https://github.com/yaogjim/ccmax/releases).
+1. Download `ccmax-0.7.0-mac-arm64.dmg` and `install-macos-unsigned.sh` from the Assets of the v0.7.0 [release](https://github.com/yaogjim/ccmax/releases).
 2. Put the script in the same folder as the DMG and run `bash install-macos-unsigned.sh`. It installs the app, removes the quarantine attribute, and launches it.
 3. Manual alternative: install the DMG as usual, then run `xattr -dr com.apple.quarantine /Applications/ccmax.app` before opening the app.
 4. On first launch, sign in to an official account under Settings → Models, or configure a provider, API key, and default model.
 
-**About signing.** The v0.6.8 build of this branch uses a local self-signed certificate. It is not signed with an Apple Developer ID and is not notarized, so the first launch may be blocked with a "damaged" or "cannot verify developer" warning. Only after confirming that the installer and script come from a trusted source should you clear the quarantine attribute as above.
+**About signing.** The v0.7.0 build of this branch uses a local self-signed certificate. It is not signed with an Apple Developer ID and is not notarized, so the first launch may be blocked with a "damaged" or "cannot verify developer" warning. Only after confirming that the installer and script come from a trusted source should you clear the quarantine attribute as above.
 
-Release notes: [v0.6.8](release-notes/v0.6.8.md) · [Code signing policy](docs/en/start/code-signing.md) · [Privacy and network access](docs/en/start/privacy.md)
+Release notes: [v0.7.0](release-notes/v0.7.0.md) · [Code signing policy](docs/en/start/code-signing.md) · [Privacy and network access](docs/en/start/privacy.md)
 
 ## Run the CLI from Source
 
@@ -125,7 +125,7 @@ See [environment variables](docs/en/cli/env.md), [CLI setup](docs/en/cli/index.m
 - **Cross-session references and collaboration** — reference an earlier session with `@` as context, and let agents dispatch work, read results from other sessions, and exchange messages. Messages between agents never count as user authorization.
 - **Side chats** — type `/btw <question>`, or select text and ask in the side chat. The temporary thread inherits the parent session's context and model, runs independently, and does not interrupt the main task; it is cleared when you close that tab or quit the app.
 - **Visual agent management** — browse, create, and edit subagents, configuring the system prompt, tools, model, and reasoning effort, and adjust the model of built-in agents. See [subagents and task splitting](docs/en/desktop/agents.md).
-- **Agent-specific provider and model (current source)** — you can pin a runtime to an individual agent without affecting the main session. If the pinned runtime becomes unavailable it fails with an explicit error instead of switching providers. This applies to desktop app sessions only; one parent session runs at most three pinned agents at a time, they share a single working directory, and pinned agents do not support resuming the conversation or an isolated Worktree. Task content is sent to the provider you choose, so confirm you trust it before configuring. This feature is not part of the v0.6.8 release.
+- **Agent-specific provider and model** — you can pin a runtime to an individual agent without affecting the main session. If the pinned runtime becomes unavailable it fails with an explicit error instead of switching providers. This applies to desktop app sessions only; one parent session runs at most three pinned agents at a time, they share a single working directory, and pinned agents do not support resuming the conversation or an isolated Worktree. Task content is sent to the provider you choose, so confirm you trust it before configuring. Team-plan members still use the runtime confirmed in their plan.
 - **Local scheduled tasks** — create and manage tasks from the UI or in natural language, view run history, stop a running execution, and clear finished records after confirmation; notifications can go to the desktop or to an authorized Telegram / Feishu target. Tasks trigger only while the desktop app keeps running. See [scheduled tasks](docs/en/desktop/schedule.md).
 - **Dynamic Workflow orchestration** — the model writes and runs orchestration scripts, driving subagents concurrently or in pipelines, with phase views, interrupts, and resume.
 - **Computer Use** — after authorization, let the agent take screenshots, click, type, and control desktop apps; on macOS the native runtime does not occupy your real mouse and keyboard. See [Computer Use](docs/en/desktop/computer-use.md).
