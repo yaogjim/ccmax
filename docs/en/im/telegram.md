@@ -48,6 +48,7 @@ Codes are valid for 60 minutes, work once, and are invalidated when a new one is
 - `/provider` — view or switch the provider
 - `/model [model]` — view or switch the model
 - `/skills` — list project Skills and invoke one by selecting it
+- `/answer <id> <answer>` — answer a model question; for multiple questions, send JSON keyed by the full question text
 
 ## Agent capabilities and boundaries
 
@@ -55,11 +56,13 @@ Telegram is not a separate question-and-answer model. Regular messages and Skill
 
 These capabilities are intended for one trusted user remotely controlling their own machine. A paired account receives the full Agent capabilities available in the selected project. Permission prompts are an operation gate, not an operating-system sandbox. Do not expose the Bot to public groups or untrusted accounts, and do not install unreviewed Skills, Plugins, or MCP servers from chat.
 
-The adapter accepts private chats only from paired or allowlisted accounts. Project lists, name matching, and historical session restore are restricted to the configured project root. New remote sessions always use the `default` permission mode, and historical `bypassPermissions` sessions are not restored remotely. Local images in Agent output must resolve inside the active session work directory; the Adapter never fetches remote image URLs from Agent-authored text.
+The adapter accepts private chats only from paired or allowlisted accounts. Project lists, name matching, and historical session restore are restricted to the configured project root. New remote sessions omit the permission mode so the server uses the user's global default. Restoring history preserves the existing permission mode, including `bypassPermissions` sessions inside the allowed roots; restoration itself does not change that mode. Local images in Agent output must resolve inside the active session work directory; the Adapter never fetches remote image URLs from Agent-authored text.
 
 ## Approval and reply behavior
 
 A permission request arrives as a message with three buttons: allow once, always allow the matching operation for this session, and deny. Only a currently pending request can be confirmed, and the choice is converted to a `permission_response` for that same Desktop session.
+
+When the model asks through `AskUserQuestion`, the message shows the full questions and options and offers only a deny button. For one question, use `/answer <id> <answer>` with an option label or your own text. Separate multiple selections with commas; numbers are not automatically mapped to options. For multiple questions, submit all answers in one JSON object, for example `/answer <id> {"Frontend framework?":"React","Database?":"SQLite"}`, using the exact full question texts as keys. Ordinary chat messages and allow buttons do not submit answers. Failed sends can be retried; submitted, Desktop-resolved, or expired requests cannot be answered again.
 
 Replies pass through a streaming buffer: a placeholder can be sent while Claude is thinking, text deltas accumulate in place, and completed text is split into platform-sized messages.
 

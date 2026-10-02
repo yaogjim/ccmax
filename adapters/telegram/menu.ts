@@ -58,6 +58,7 @@ export const TELEGRAM_BOT_COMMANDS: TelegramBotCommand[] = [
   { command: 'allow', description: '允许权限请求' },
   { command: 'always', description: '本会话永久允许' },
   { command: 'deny', description: '拒绝权限请求' },
+  { command: 'answer', description: '回答模型提问' },
 ]
 
 export async function syncTelegramBotCommands(

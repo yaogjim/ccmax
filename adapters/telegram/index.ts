@@ -14,6 +14,7 @@ import { loadConfig } from '../common/config.js'
 import {
   formatImStatus,
   formatPermissionRequest,
+  splitMessage,
 } from '../common/format.js'
 import {
   buildTelegramThinkingUpdate,
@@ -22,8 +23,10 @@ import { TelegramStreamDelivery } from './stream-delivery.js'
 import {
   formatPermissionDecisionStatus,
   formatPermissionInstructions,
+  formatQuestionInstructions,
   parsePermissionCommand,
   parsePermitCallbackData,
+  parseQuestionAnswer,
   type PermissionDecision,
 } from '../common/permission.js'
 import { SessionStore } from '../common/session-store.js'
@@ -64,6 +67,10 @@ const accumulatedThinkingText = new Map<string, string>()
 const pendingProjectSelection = new Map<string, boolean>()
 const runtimeStates = new Map<string, ChatRuntimeState>()
 const pendingPermissions = new Map<string, Set<string>>()
+/** Per-chat AskUserQuestion requests awaiting an /answer payload: requestId → tool input. */
+const pendingQuestions = new Map<string, Map<string, unknown>>()
+/** Telegram caps a text message at 4096 chars; leave the same headroom as streaming. */
+const TELEGRAM_TEXT_LIMIT = 4000
 /** Per-chat outbound image watcher for Agent-produced markdown images. */
 const tgImageWatchers = new Map<string, ImageBlockWatcher>()
 
@@ -128,7 +135,26 @@ function clearTransientChatState(chatId: string): void {
   runtime.verb = undefined
   runtime.pendingPermissionCount = 0
   pendingPermissions.delete(chatId)
+  pendingQuestions.delete(chatId)
   tgImageWatchers.delete(chatId)
+}
+
+/** Drop a single answered/expired question and prune an emptied chat entry. */
+function deletePendingQuestion(chatId: string, requestId: string): void {
+  const questions = pendingQuestions.get(chatId)
+  if (!questions) return
+  questions.delete(requestId)
+  if (questions.size === 0) pendingQuestions.delete(chatId)
+}
+
+/** Keep only questions the server still reports as pending (snapshot reconcile). */
+function prunePendingQuestions(chatId: string, keep: Set<string>): void {
+  const questions = pendingQuestions.get(chatId)
+  if (!questions) return
+  for (const requestId of questions.keys()) {
+    if (!keep.has(requestId)) questions.delete(requestId)
+  }
+  if (questions.size === 0) pendingQuestions.delete(chatId)
 }
 
 async function handlePermissionDecision(chatId: string, decision: PermissionDecision): Promise<void> {
@@ -141,13 +167,69 @@ async function handlePermissionDecision(chatId: string, decision: PermissionDeci
   const sent = bridge.sendPermissionResponse(chatId, decision.requestId, decision.allowed, decision.rule)
   if (sent) {
     pending.delete(decision.requestId)
+    if (pending.size === 0) pendingPermissions.delete(chatId)
     const runtime = getRuntimeState(chatId)
     runtime.pendingPermissionCount = Math.max(0, runtime.pendingPermissionCount - 1)
+    deletePendingQuestion(chatId, decision.requestId)
   }
   await bot.api.sendMessage(
     Number(chatId),
     sent ? `${formatPermissionDecisionStatus(decision)}。` : '权限响应发送失败，请检查会话状态。',
   )
+}
+
+/** Submit collected AskUserQuestion answers as an approved permission response.
+ *  Keeps the pending entry on send failure so the user can retry. */
+async function handleQuestionAnswer(chatId: string, requestId: string, payload: string): Promise<void> {
+  const numericChatId = Number(chatId)
+  const questions = pendingQuestions.get(chatId)
+  const input = questions?.get(requestId)
+  if (!questions || input === undefined) {
+    await bot.api.sendMessage(numericChatId, `未找到待回答的问题请求：${requestId}`)
+    return
+  }
+
+  const answers = parseQuestionAnswer(payload, input)
+  if (!answers) {
+    await bot.api.sendMessage(numericChatId, [
+      `❌ 无法识别答案，请使用：/answer ${requestId} <答案>`,
+      '多题请求需要一次性发送 JSON，键为完整问题文本。',
+    ].join('\n'))
+    return
+  }
+
+  const original = input && typeof input === 'object' && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : {}
+  const sent = bridge.sendPermissionResponse(chatId, requestId, true, undefined, { ...original, answers })
+  if (!sent) {
+    await bot.api.sendMessage(numericChatId, '⚠️ 答案发送失败，请检查会话状态后重试。')
+    return
+  }
+
+  deletePendingQuestion(chatId, requestId)
+  const pending = pendingPermissions.get(chatId)
+  if (pending) {
+    pending.delete(requestId)
+    if (pending.size === 0) pendingPermissions.delete(chatId)
+  }
+  const runtime = getRuntimeState(chatId)
+  runtime.pendingPermissionCount = pendingPermissions.get(chatId)?.size ?? 0
+  await bot.api.sendMessage(numericChatId, '✅ 已提交答案，等待模型继续。')
+}
+
+/** Parse `/answer <请求ID> <答案>` (optionally `/answer@bot`).
+ *  Returns null for unrelated text and 'malformed' when the prefix is used
+ *  without both an id and a payload, so it can be reported instead of being
+ *  forwarded as an ordinary user message. */
+function parseAnswerCommand(text: string): { requestId: string; payload: string } | 'malformed' | null {
+  const trimmed = text.trim()
+  if (!/^\/answer(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(trimmed)) return null
+  const match = /^\/answer(?:@[A-Za-z0-9_]+)?\s+(\S+)\s+([\s\S]+)$/i.exec(trimmed)
+  if (!match) return 'malformed'
+  const payload = match[2]!.trim()
+  if (!payload) return 'malformed'
+  return { requestId: match[1]!, payload }
 }
 
 async function ensureExistingSession(chatId: string): Promise<SessionRestoreResult> {
@@ -308,6 +390,16 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
   const numericChatId = Number(chatId)
   const runtime = getRuntimeState(chatId)
 
+  // Reconcile pending questions against approvals handled in Desktop or while
+  // this IM was offline, so a stale /answer cannot leak into the next turn.
+  if (msg.type === 'permission_resolved' && typeof msg.requestId === 'string') {
+    deletePendingQuestion(chatId, msg.requestId)
+  } else if (msg.type === 'permission_requests_snapshot' && Array.isArray(msg.toolRequestIds)) {
+    prunePendingQuestions(chatId, new Set<string>(msg.toolRequestIds.filter(
+      (id: unknown): id is string => typeof id === 'string' && id.length > 0,
+    )))
+  }
+
   if (syncImPermissionState(chatId, msg, runtime, pendingPermissions)) return
   switch (msg.type) {
     case 'connected':
@@ -371,11 +463,33 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
       break
 
     case 'permission_request': {
-      runtime.pendingPermissionCount += 1
-      runtime.state = 'permission_pending'
       const pending = pendingPermissions.get(chatId) ?? new Set<string>()
-      pending.add(msg.requestId)
-      pendingPermissions.set(chatId, pending)
+      if (!pending.has(msg.requestId)) {
+        pending.add(msg.requestId)
+        pendingPermissions.set(chatId, pending)
+      }
+      // Derive the count from the set so a replayed request cannot double-count.
+      runtime.pendingPermissionCount = pendingPermissions.get(chatId)?.size ?? 0
+      runtime.state = 'permission_pending'
+
+      if (msg.toolName === 'AskUserQuestion') {
+        const questions = pendingQuestions.get(chatId) ?? new Map<string, unknown>()
+        questions.set(msg.requestId, msg.input)
+        pendingQuestions.set(chatId, questions)
+        // Questions are answered through /answer; a bare allow would submit an
+        // empty answer, so only deny is offered here.
+        const chunks = splitMessage(formatQuestionInstructions(msg.requestId, msg.input), TELEGRAM_TEXT_LIMIT)
+        const keyboard = new InlineKeyboard().text('❌ 拒绝', `permit:${msg.requestId}:no`)
+        for (let index = 0; index < chunks.length; index += 1) {
+          await bot.api.sendMessage(
+            numericChatId,
+            chunks[index]!,
+            index === chunks.length - 1 ? { reply_markup: keyboard } : undefined,
+          )
+        }
+        break
+      }
+
       const text = `${formatPermissionRequest(msg.toolName, msg.input, msg.requestId)}\n\n${formatPermissionInstructions(msg.requestId)}`
       const keyboard = new InlineKeyboard()
         .text('✅ 允许', `permit:${msg.requestId}:yes`)
@@ -389,6 +503,12 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
     case 'message_complete':
       runtime.state = 'idle'
       runtime.verb = undefined
+      // Clear both maps before awaiting delivery: otherwise an old question id
+      // could still be approved without answers. The server replays any pending
+      // independent worker requests after this leader-turn boundary.
+      pendingQuestions.delete(chatId)
+      pendingPermissions.delete(chatId)
+      runtime.pendingPermissionCount = 0
       await streamDelivery.handleEvent(chatId, { type: 'message_complete' })
       accumulatedThinkingText.delete(chatId)
       break
@@ -450,6 +570,7 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
   sessionSelection.clear(chatId)
   commandController.clearPendingSelections(chatId)
   pendingPermissions.delete(chatId)
+  pendingQuestions.delete(chatId)
   runtimeStates.delete(chatId)
   tgImageWatchers.delete(chatId)
 
@@ -532,6 +653,11 @@ for (const command of ['allow', 'always', 'allow-always', 'deny'] as const) {
   })
 }
 
+// /answer rides the same authorized, deduplicated, queued pipeline as text.
+bot.command('answer', async (ctx) => {
+  await routeUserMessage(ctx, `/answer${ctx.match ? ` ${ctx.match}` : ''}`, [])
+})
+
 /** Shared per-user-message pipeline: dedup, pairing check, project-pick
  *  routing, enqueue, ensureSession, sendUserMessage with attachments.
  *  Caller has already extracted text and attachments from the context. */
@@ -562,10 +688,32 @@ async function routeUserMessage(
     ctx.message?.photo || ctx.message?.document || ctx.message?.video || ctx.message?.audio || ctx.message?.voice,
   )
   await enqueue(chatId, async () => {
+    if (!hasAttachments) {
+      const answerCommand = parseAnswerCommand(text)
+      if (answerCommand === 'malformed') {
+        await bot.api.sendMessage(Number(chatId), '用法：/answer <请求ID> <答案>；多题请回复 JSON。')
+        return
+      }
+      if (answerCommand) {
+        await handleQuestionAnswer(chatId, answerCommand.requestId, answerCommand.payload)
+        return
+      }
+    }
+
     const permissionDecision = !hasAttachments
       ? parsePermissionCommand(text, pendingPermissions.get(chatId))
       : null
     if (permissionDecision) {
+      // Questions require /answer or an explicit /deny command. In particular,
+      // replying "3" must not be mistaken for the tool-permission deny shortcut.
+      if (pendingQuestions.get(chatId)?.has(permissionDecision.requestId) &&
+        (permissionDecision.allowed || !text.trim().startsWith('/'))) {
+        await bot.api.sendMessage(
+          Number(chatId),
+          `⚠️ 该请求需要回答，请使用 /answer ${permissionDecision.requestId} <答案> 作答；不能直接允许。`,
+        )
+        return
+      }
       await handlePermissionDecision(chatId, permissionDecision)
       return
     }
@@ -686,14 +834,29 @@ bot.on('callback_query:data', async (ctx) => {
   if (!ctx.from || ctx.chat?.type !== 'private') return
   if (!dedup.tryRecord(`telegram:callback:${ctx.callbackQuery.id}`)) return
   const data = ctx.callbackQuery.data
-  await enqueue(String(ctx.chat.id), async () => {
+  const chatId = String(ctx.chat.id)
+  await enqueue(chatId, async () => {
     if (await tryHandleTelegramSelectionCallback(data, ctx, commandController)) return
 
     if (!data.startsWith('permit:')) return
 
     const decision = parsePermitCallbackData(data)
     if (!decision) return
-    await commandController.handlePermissionCallback(ctx, decision, pendingPermissions, (chatId) => getRuntimeState(chatId).pendingPermissionCount = Math.max(0, getRuntimeState(chatId).pendingPermissionCount - 1))
+    const questionInputs = pendingQuestions.get(chatId)
+    const result = await commandController.handlePermissionCallback(
+      ctx,
+      decision,
+      pendingPermissions,
+      (id) => {
+        const runtime = getRuntimeState(id)
+        runtime.pendingPermissionCount = Math.max(0, runtime.pendingPermissionCount - 1)
+      },
+      questionInputs ? new Set(questionInputs.keys()) : undefined,
+    )
+    if (result === 'sent' && questionInputs) {
+      questionInputs.delete(decision.requestId)
+      if (questionInputs.size === 0) pendingQuestions.delete(chatId)
+    }
   })
 })
 

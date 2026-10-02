@@ -93,12 +93,16 @@ export class WsBridge {
    * @param rule - optional rule name to make the permission persistent.
    *   Currently the server supports `'always'`, which uses the CLI's
    *   permission_suggestions to produce updatedPermissions so the same
-   *   tool call won't prompt again in this session. Omit for one-shot allow. */
+   *   tool call won't prompt again in this session. Omit for one-shot allow.
+   * @param updatedInput - optional replacement input for the pending tool call
+   *   (e.g. the collected `answers` for AskUserQuestion). Only attached when
+   *   provided, so ordinary approvals stay byte-for-byte unchanged. */
   sendPermissionResponse(
     chatId: string,
     requestId: string,
     allowed: boolean,
     rule?: string,
+    updatedInput?: Record<string, unknown>,
   ): boolean {
     const message: Record<string, unknown> = {
       type: 'permission_response',
@@ -106,6 +110,7 @@ export class WsBridge {
       allowed,
     }
     if (rule) message.rule = rule
+    if (updatedInput !== undefined) message.updatedInput = updatedInput
     return this.send(chatId, message)
   }
 

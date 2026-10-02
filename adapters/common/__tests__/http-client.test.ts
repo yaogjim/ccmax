@@ -219,6 +219,13 @@ describe('AdapterHttpClient', () => {
     )
   })
 
+  it.each([null, {}, { workDir: null }, { workDir: 123 }, { workDir: {} }, { workDir: [] }, { workDir: true }])('sessionExists rejects an unusable detail response %j without throwing', async (detail) => {
+    // A malformed 200 response must fail closed like a missing directory,
+    // rather than turning the restore preflight into a TypeError.
+    globalThis.fetch = mock(() => Promise.resolve(Response.json(detail))) as any
+    await expect(client.sessionExists('malformed-detail')).resolves.toBe(false)
+  })
+
   it('sessionExists accepts the server detail shape for an existing desktop worktree session', async () => {
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'im-root-'))
     const workDir = path.join(rootDir, '.claude', 'worktrees', 'existing-task')
@@ -246,21 +253,51 @@ describe('AdapterHttpClient', () => {
     }
   })
 
-  it('sessionExists rejects sessions outside the root or using bypassPermissions', async () => {
+  it('sessionExists allows a bypassPermissions session inside the root and rejects any session outside it', async () => {
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'im-root-'))
+    const insideDir = fs.mkdtempSync(path.join(rootDir, 'inside-'))
     const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'outside-'))
     try {
       client = new AdapterHttpClient('ws://127.0.0.1:3456', { allowedProjectRoots: [rootDir] })
       globalThis.fetch = mock((url: string) => {
-        const unsafe = url.endsWith('/outside')
+        if (url.endsWith('/bypass-inside')) {
+          return Promise.resolve(Response.json({
+            workDir: insideDir,
+            permissionMode: 'bypassPermissions',
+          }))
+        }
         return Promise.resolve(Response.json({
-          workDir: unsafe ? outsideDir : rootDir,
-          permissionMode: unsafe ? 'default' : 'bypassPermissions',
+          workDir: outsideDir,
+          permissionMode: url.endsWith('/outside-bypass') ? 'bypassPermissions' : 'default',
         }))
       }) as any
 
-      await expect(client.sessionExists('outside')).resolves.toBe(false)
-      await expect(client.sessionExists('bypass')).resolves.toBe(false)
+      // 已配对账号通过 IM 恢复自己根目录内的既有会话：尊重它原有的权限模式，
+      // 恢复既不设置、提升也不降低权限。
+      await expect(client.sessionExists('bypass-inside')).resolves.toBe(true)
+      // 目录边界与权限模式无关：根目录外一律拒绝。
+      await expect(client.sessionExists('outside-default')).resolves.toBe(false)
+      await expect(client.sessionExists('outside-bypass')).resolves.toBe(false)
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true })
+      fs.rmSync(outsideDir, { recursive: true, force: true })
+    }
+  })
+
+  it('sessionExists compares canonical work dirs so a symlink cannot escape the allowed root', async () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'im-root-'))
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'outside-'))
+    const escapingLink = path.join(rootDir, 'escape')
+    try {
+      fs.symlinkSync(outsideDir, escapingLink, 'dir')
+      client = new AdapterHttpClient('ws://127.0.0.1:3456', { allowedProjectRoots: [rootDir] })
+      globalThis.fetch = mock(() => Promise.resolve(Response.json({
+        workDir: escapingLink,
+        permissionMode: 'default',
+      }))) as any
+
+      // workDir 字面量在根目录内，但 realpath 落在根目录外，必须拒绝。
+      await expect(client.sessionExists('escaped')).resolves.toBe(false)
     } finally {
       fs.rmSync(rootDir, { recursive: true, force: true })
       fs.rmSync(outsideDir, { recursive: true, force: true })
@@ -308,6 +345,7 @@ describe('AdapterHttpClient', () => {
 
   it('listSessions calls GET /api/sessions with project and pagination query', async () => {
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'im-root-'))
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'im-outside-'))
     try {
       client = new AdapterHttpClient('ws://127.0.0.1:3456', { allowedProjectRoots: [rootDir] })
       globalThis.fetch = mock(() =>
@@ -326,16 +364,16 @@ describe('AdapterHttpClient', () => {
               permissionMode: 'default',
             },
             {
-              id: 'unsafe-session',
-              title: 'Unsafe',
+              id: 'outside-session',
+              title: 'Outside the boundary',
               createdAt: '2026-06-09T00:00:00.000Z',
               modifiedAt: '2026-06-09T01:00:00.000Z',
               messageCount: 1,
-              projectPath: rootDir,
-              projectRoot: rootDir,
-              workDir: rootDir,
+              projectPath: outsideDir,
+              projectRoot: outsideDir,
+              workDir: outsideDir,
               workDirExists: true,
-              permissionMode: 'bypassPermissions',
+              permissionMode: 'default',
             },
           ],
           total: 2,
@@ -353,15 +391,60 @@ describe('AdapterHttpClient', () => {
       )
     } finally {
       fs.rmSync(rootDir, { recursive: true, force: true })
+      fs.rmSync(outsideDir, { recursive: true, force: true })
+    }
+  })
+
+  // /sessions 曾经把根目录内的 bypassPermissions 会话一并隐藏，导致已配对用户
+  // 在 IM 里看不到、也切不进自己的会话。列表与恢复预检都只应服从目录边界：
+  // 已配对账号本就拥有完整 Agent 能力，恢复沿用用户既有权限模式，不主动改动。
+  it('lists and resumes a bypassPermissions session inside the allowed roots', async () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'im-root-'))
+    try {
+      client = new AdapterHttpClient('ws://127.0.0.1:3456', { allowedProjectRoots: [rootDir] })
+      globalThis.fetch = mock((url: string) => {
+        if (url.includes('/api/sessions/')) {
+          return Promise.resolve(Response.json({
+            id: 'bypass-session',
+            workDir: rootDir,
+            permissionMode: 'bypassPermissions',
+          }))
+        }
+        return Promise.resolve(Response.json({
+          sessions: [{
+            id: 'bypass-session',
+            title: 'Bypass session',
+            createdAt: '2026-09-01T00:00:00.000Z',
+            modifiedAt: '2026-09-01T01:00:00.000Z',
+            messageCount: 2,
+            projectPath: rootDir,
+            projectRoot: rootDir,
+            workDir: rootDir,
+            workDirExists: true,
+            permissionMode: 'bypassPermissions',
+          }],
+          total: 1,
+        }))
+      }) as any
+
+      await expect(client.listSessions({ project: rootDir })).resolves.toMatchObject({
+        sessions: [{ id: 'bypass-session' }],
+        total: 1,
+      })
+      // 列表可见即可切换：预检同样放行，恢复后继续用会话原有的 bypassPermissions。
+      await expect(client.sessionExists('bypass-session')).resolves.toBe(true)
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true })
     }
   })
 
   it('preserves server pagination when an entire page is filtered out', async () => {
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'im-root-'))
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'im-outside-'))
     try {
       client = new AdapterHttpClient('ws://127.0.0.1:3456', { allowedProjectRoots: [rootDir] })
       globalThis.fetch = mock(() => Promise.resolve(Response.json({
-        sessions: [{ id: 'unsafe-session', workDir: rootDir, permissionMode: 'bypassPermissions' }],
+        sessions: [{ id: 'outside-session', workDir: outsideDir, permissionMode: 'default' }],
         total: 6,
       }))) as any
 
@@ -371,6 +454,7 @@ describe('AdapterHttpClient', () => {
       })
     } finally {
       fs.rmSync(rootDir, { recursive: true, force: true })
+      fs.rmSync(outsideDir, { recursive: true, force: true })
     }
   })
 

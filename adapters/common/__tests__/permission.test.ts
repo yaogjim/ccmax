@@ -2,9 +2,48 @@ import { describe, expect, it } from 'bun:test'
 import {
   formatPermissionDecisionStatus,
   formatPermissionInstructions,
+  formatQuestionInstructions,
   parsePermissionCommand,
   parsePermitCallbackData,
+  parseQuestionAnswer,
 } from '../permission.js'
+
+const singleQuestionInput = {
+  questions: [
+    {
+      question: '选哪个库？',
+      header: 'Library',
+      options: [
+        { label: 'Axios', description: '成熟稳定' },
+        { label: 'Fetch', description: '浏览器内置' },
+      ],
+      multiSelect: false,
+    },
+  ],
+}
+
+const multiQuestionInput = {
+  questions: [
+    {
+      question: '前端框架？',
+      header: 'Framework',
+      options: [
+        { label: 'React', description: '生态丰富' },
+        { label: 'Vue', description: '上手简单' },
+      ],
+      multiSelect: false,
+    },
+    {
+      question: '数据库？',
+      header: 'Database',
+      options: [
+        { label: 'Postgres', description: '功能完整' },
+        { label: 'SQLite', description: '零运维' },
+      ],
+      multiSelect: false,
+    },
+  ],
+}
 
 describe('permission helpers', () => {
   it('parses text permission commands', () => {
@@ -39,5 +78,104 @@ describe('permission helpers', () => {
     expect(formatPermissionInstructions('req-1')).toContain('/always req-1')
     expect(formatPermissionDecisionStatus({ allowed: true, rule: 'always' })).toContain('永久允许')
     expect(formatPermissionDecisionStatus({ allowed: false })).toContain('拒绝')
+  })
+})
+
+describe('parseQuestionAnswer', () => {
+  it('maps plain text onto the single question, trimmed', () => {
+    expect(parseQuestionAnswer('  Axios  ', singleQuestionInput)).toEqual({ '选哪个库？': 'Axios' })
+  })
+
+  it('returns null for empty text on a single question', () => {
+    expect(parseQuestionAnswer('   ', singleQuestionInput)).toBeNull()
+    expect(parseQuestionAnswer('', singleQuestionInput)).toBeNull()
+  })
+
+  it('parses a JSON answers map for a single question that starts with {', () => {
+    expect(parseQuestionAnswer('{"选哪个库？":"Fetch"}', singleQuestionInput)).toEqual({ '选哪个库？': 'Fetch' })
+  })
+
+  it('parses a JSON answers map for multiple questions', () => {
+    expect(
+      parseQuestionAnswer('{"前端框架？":"React","数据库？":"Postgres"}', multiQuestionInput),
+    ).toEqual({ '前端框架？': 'React', '数据库？': 'Postgres' })
+  })
+
+  it('does not map plain text onto multiple questions positionally', () => {
+    expect(parseQuestionAnswer('React', multiQuestionInput)).toBeNull()
+    expect(parseQuestionAnswer('1 React 2 Postgres', multiQuestionInput)).toBeNull()
+    expect(parseQuestionAnswer('1. React\n2. Postgres', multiQuestionInput)).toBeNull()
+  })
+
+  it('requires the JSON keys to exactly cover every question', () => {
+    expect(parseQuestionAnswer('{"前端框架？":"React"}', multiQuestionInput)).toBeNull()
+    expect(
+      parseQuestionAnswer('{"前端框架？":"React","数据库？":"Postgres","多余":"x"}', multiQuestionInput),
+    ).toBeNull()
+    expect(
+      parseQuestionAnswer('{"前端框架？":"React","另一个？":"Postgres"}', multiQuestionInput),
+    ).toBeNull()
+  })
+
+  it('rejects empty or non-string JSON answer values', () => {
+    expect(parseQuestionAnswer('{"前端框架？":"  ","数据库？":"Postgres"}', multiQuestionInput)).toBeNull()
+    expect(parseQuestionAnswer('{"前端框架？":1,"数据库？":"Postgres"}', multiQuestionInput)).toBeNull()
+  })
+
+  it('rejects malformed JSON', () => {
+    expect(parseQuestionAnswer('{not json}', singleQuestionInput)).toBeNull()
+    expect(parseQuestionAnswer('[1,2]', multiQuestionInput)).toBeNull()
+    expect(parseQuestionAnswer('null', multiQuestionInput)).toBeNull()
+  })
+
+  it('rejects prototype-dangerous answer keys', () => {
+    const proto = { questions: [{ question: '__proto__' }] }
+    const ctor = { questions: [{ question: 'constructor' }] }
+    const prototype = { questions: [{ question: 'prototype' }] }
+    expect(parseQuestionAnswer('{"__proto__":"drop"}', proto)).toBeNull()
+    expect(parseQuestionAnswer('{"constructor":"drop"}', ctor)).toBeNull()
+    expect(parseQuestionAnswer('{"prototype":"drop"}', prototype)).toBeNull()
+  })
+
+  it('rejects malformed question input', () => {
+    expect(parseQuestionAnswer('A', null)).toBeNull()
+    expect(parseQuestionAnswer('A', undefined)).toBeNull()
+    expect(parseQuestionAnswer('A', {})).toBeNull()
+    expect(parseQuestionAnswer('A', { questions: 'nope' })).toBeNull()
+    expect(parseQuestionAnswer('A', { questions: [] })).toBeNull()
+    expect(parseQuestionAnswer('A', { questions: [{ question: '' }] })).toBeNull()
+    expect(parseQuestionAnswer('A', { questions: [{ question: '   ' }] })).toBeNull()
+    expect(parseQuestionAnswer('A', { questions: [{ question: 42 }] })).toBeNull()
+    expect(parseQuestionAnswer('A', { questions: [{ question: 'x' }, { question: 'x' }] })).toBeNull()
+  })
+
+  it('does not strip a command prefix and forwards unambiguous text verbatim', () => {
+    expect(parseQuestionAnswer('/answer req-1 Axios', singleQuestionInput)).toEqual({
+      '选哪个库？': '/answer req-1 Axios',
+    })
+  })
+})
+
+describe('formatQuestionInstructions', () => {
+  it('lists the single question and its options with the /answer command', () => {
+    const text = formatQuestionInstructions('req-7', singleQuestionInput)
+    expect(text).toContain('req-7')
+    expect(text).toContain('选哪个库？')
+    expect(text).toContain('Axios')
+    expect(text).toContain('Fetch')
+    expect(text).toContain('/answer req-7')
+  })
+
+  it('documents the JSON answers map for multiple questions', () => {
+    const text = formatQuestionInstructions('req-9', multiQuestionInput)
+    expect(text).toContain('前端框架？')
+    expect(text).toContain('数据库？')
+    expect(text).toContain('/answer req-9')
+    expect(text).toContain('{')
+  })
+
+  it('falls back to a generic /answer hint for malformed input', () => {
+    expect(formatQuestionInstructions('req-0', null)).toContain('/answer req-0')
+    expect(formatQuestionInstructions('req-0', {})).toContain('/answer req-0')
   })
 })

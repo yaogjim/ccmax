@@ -6,6 +6,7 @@ import type { ServerWebSocket } from 'bun'
 import { SessionStore } from '../../common/session-store.js'
 import { WsBridge } from '../../common/ws-bridge.js'
 import { AttachmentStore } from '../../common/attachment/attachment-store.js'
+import { TelegramStreamDelivery } from '../stream-delivery.js'
 
 // Import the actual entrypoint with isolated configuration. Telegram API calls
 // terminate in grammY's documented transformer; HTTP and WS use loopback only.
@@ -70,6 +71,31 @@ describe('Telegram entrypoint session routing', () => {
 
   function broadcast(sessionId: string, message: unknown): void {
     for (const socket of sockets.get(sessionId) ?? []) socket.send(JSON.stringify(message))
+  }
+
+  function permissionResponses(requestId: string): any[] {
+    return messages.filter((item) => item.message.type === 'permission_response' && item.message.requestId === requestId)
+  }
+
+  const singleQuestionInput = {
+    questions: [
+      {
+        question: '选哪个库？',
+        header: 'Library',
+        options: [
+          { label: 'Axios', description: '成熟稳定' },
+          { label: 'Fetch', description: '浏览器内置' },
+        ],
+        multiSelect: false,
+      },
+    ],
+  }
+
+  const multiQuestionInput = {
+    questions: [
+      { question: '前端框架？', header: 'Framework', options: [{ label: 'React' }, { label: 'Vue' }], multiSelect: false },
+      { question: '数据库？', header: 'Database', options: [{ label: 'Postgres' }, { label: 'SQLite' }], multiSelect: false },
+    ],
   }
 
   beforeAll(async () => {
@@ -352,6 +378,263 @@ describe('Telegram entrypoint session routing', () => {
     await eventually(() => expect(texts(708).some((value) => value.includes('Fixture turn failed'))).toBe(true))
     expect(texts(708).some((value) => value.includes('Result from the restored session.'))).toBe(true)
     expect(texts(708).some((value) => value.includes('Checking the previous context'))).toBe(true)
+  })
+
+  it('answers a single AskUserQuestion through /answer and only offers deny', async () => {
+    const chatId = 720
+    const session = 'stream'
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Ask me a question')
+    await eventually(() => expect(messages.some((item) => item.sessionId === session && item.message.content === 'Ask me a question')).toBe(true))
+
+    const promptStart = apiCalls.length
+    broadcast(session, { type: 'permission_request', requestId: 'q-single', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('选哪个库？'))).toBe(true))
+
+    const prompt = apiCalls.slice(promptStart).find((call) =>
+      call.method === 'sendMessage' && call.payload.chat_id === chatId && call.payload.text?.includes('选哪个库？'))
+    expect(prompt).toBeDefined()
+    expect(prompt!.payload.text).toContain('/answer q-single')
+    const keyboard = JSON.stringify(prompt!.payload.reply_markup)
+    expect(keyboard).toContain('拒绝')
+    expect(keyboard).not.toContain('允许')
+
+    await text(chatId, '/answer q-single Axios')
+    await eventually(() => expect(permissionResponses('q-single').some((item) =>
+      item.message.allowed === true &&
+      item.message.updatedInput?.answers?.['选哪个库？'] === 'Axios' &&
+      Array.isArray(item.message.updatedInput?.questions) &&
+      item.message.updatedInput?.questions[0]?.question === '选哪个库？',
+    )).toBe(true))
+  })
+
+  it('answers a multi-question request only from a complete JSON payload', async () => {
+    const chatId = 721
+    const session = 'stream'
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Multi question')
+    await eventually(() => expect(messages.some((item) => item.sessionId === session && item.message.content === 'Multi question')).toBe(true))
+    broadcast(session, { type: 'permission_request', requestId: 'q-multi', toolName: 'AskUserQuestion', input: multiQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('前端框架？'))).toBe(true))
+
+    await text(chatId, '/answer q-multi React')
+    await eventually(() => expect(texts(chatId).at(-1)).toContain('JSON'))
+    expect(permissionResponses('q-multi')).toEqual([])
+
+    await text(chatId, '/answer q-multi {"前端框架？":"React"}')
+    await eventually(() => expect(texts(chatId).at(-1)).toContain('JSON'))
+    expect(permissionResponses('q-multi')).toEqual([])
+
+    await text(chatId, `/answer q-multi ${JSON.stringify({ '前端框架？': 'React', '数据库？': 'Postgres' })}`)
+    await eventually(() => expect(permissionResponses('q-multi').some((item) =>
+      item.message.updatedInput?.answers?.['数据库？'] === 'Postgres' &&
+      item.message.updatedInput?.answers?.['前端框架？'] === 'React',
+    )).toBe(true))
+  })
+
+  it('refuses plain replies and /allow or /always for a question while allowing deny', async () => {
+    const chatId = 722
+    const session = 'stream'
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Guard me')
+    await eventually(() => expect(messages.some((item) => item.sessionId === session && item.message.content === 'Guard me')).toBe(true))
+    broadcast(session, { type: 'permission_request', requestId: 'q-guard', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('选哪个库？'))).toBe(true))
+
+    for (const value of ['1', '2', '3']) {
+      // Option numbers are not tool approval/rejection shortcuts for a question.
+      await text(chatId, value)
+      await eventually(() => expect(texts(chatId).at(-1)).toContain('/answer'))
+      expect(permissionResponses('q-guard')).toEqual([])
+    }
+
+    await text(chatId, '/allow q-guard')
+    await eventually(() => expect(texts(chatId).at(-1)).toContain('/answer'))
+    expect(permissionResponses('q-guard')).toEqual([])
+
+    await text(chatId, '/always q-guard')
+    await eventually(() => expect(texts(chatId).at(-1)).toContain('/answer'))
+    expect(permissionResponses('q-guard')).toEqual([])
+
+    await text(chatId, '/deny q-guard')
+    await eventually(() => expect(permissionResponses('q-guard').some((item) => item.message.allowed === false)).toBe(true))
+  })
+
+  it('rejects callback approval of a question but allows callback deny', async () => {
+    const chatId = 723
+    const session = 'stream'
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Callback guard')
+    await eventually(() => expect(messages.some((item) => item.sessionId === session && item.message.content === 'Callback guard')).toBe(true))
+    broadcast(session, { type: 'permission_request', requestId: 'q-callback', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('选哪个库？'))).toBe(true))
+
+    await callback(chatId, 'permit:q-callback:yes')
+    await eventually(() => expect(apiCalls.some((call) => call.method === 'answerCallbackQuery' && call.payload.text === '请使用 /answer 提交答案')).toBe(true))
+    expect(permissionResponses('q-callback')).toEqual([])
+
+    await callback(chatId, 'permit:q-callback:no')
+    await eventually(() => expect(permissionResponses('q-callback').some((item) => item.message.allowed === false)).toBe(true))
+  })
+
+  it('keeps a failed answer retryable and clears questions on resolution, snapshot, and /new', async () => {
+    const chatId = 724
+    const session = 'stream'
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Retry me')
+    await eventually(() => expect(messages.some((item) => item.sessionId === session && item.message.content === 'Retry me')).toBe(true))
+
+    broadcast(session, { type: 'permission_request', requestId: 'q-retry', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('选哪个库？'))).toBe(true))
+
+    const failing = spyOn(WsBridge.prototype, 'sendPermissionResponse').mockReturnValueOnce(false)
+    try {
+      await text(chatId, '/answer q-retry Axios')
+      await eventually(() => expect(texts(chatId).at(-1)).toContain('发送失败'))
+      expect(permissionResponses('q-retry')).toEqual([])
+    } finally {
+      failing.mockRestore()
+    }
+
+    await text(chatId, '/answer q-retry Fetch')
+    await eventually(() => expect(permissionResponses('q-retry').some((item) =>
+      item.message.updatedInput?.answers?.['选哪个库？'] === 'Fetch')).toBe(true))
+
+    broadcast(session, { type: 'permission_request', requestId: 'q-resolved', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('q-resolved'))).toBe(true))
+    broadcast(session, { type: 'permission_resolved', permissionType: 'tool', requestId: 'q-resolved' })
+    // Frames for one chat are handled in order; a later prompt proves the
+    // desktop resolution cleanup already ran.
+    broadcast(session, { type: 'permission_request', requestId: 'q-barrier-resolved', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('q-barrier-resolved'))).toBe(true))
+    await text(chatId, '/answer q-resolved Axios')
+    await eventually(() => expect(texts(chatId).at(-1)).toContain('未找到待回答的问题请求'))
+    expect(permissionResponses('q-resolved')).toEqual([])
+
+    broadcast(session, { type: 'permission_request', requestId: 'q-snapshot', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('q-snapshot'))).toBe(true))
+    broadcast(session, { type: 'permission_requests_snapshot', toolRequestIds: [], computerUseRequestIds: [], turnActive: true })
+    broadcast(session, { type: 'permission_request', requestId: 'q-barrier-snapshot', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('q-barrier-snapshot'))).toBe(true))
+    await text(chatId, '/answer q-snapshot Axios')
+    await eventually(() => expect(texts(chatId).at(-1)).toContain('未找到待回答的问题请求'))
+    expect(permissionResponses('q-snapshot')).toEqual([])
+
+    broadcast(session, { type: 'permission_request', requestId: 'q-new', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('q-new'))).toBe(true))
+    await text(chatId, '/new')
+    await text(chatId, '/answer q-new Axios')
+    await eventually(() => expect(texts(chatId).at(-1)).toContain('未找到待回答的问题请求'))
+    expect(permissionResponses('q-new')).toEqual([])
+  })
+
+  it('clears both pending maps before terminal delivery and guards replayed worker questions', async () => {
+    const chatId = 728
+    const session = 'question-terminal'
+    sessionPaths.set(session, project)
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Terminal boundary')
+    await eventually(() => expect(messages.some((item) => item.sessionId === session && item.message.content === 'Terminal boundary')).toBe(true))
+    broadcast(session, { type: 'permission_request', requestId: 'q-terminal', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('q-terminal'))).toBe(true))
+
+    // Hold final Telegram delivery while the user clicks an old allow button.
+    // Clearing only question input used to leave the same id approvable without answers.
+    let entered = false
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const original = TelegramStreamDelivery.prototype.handleEvent
+    const sendResponse = spyOn(WsBridge.prototype, 'sendPermissionResponse')
+    const delivery = spyOn(TelegramStreamDelivery.prototype, 'handleEvent').mockImplementation(async function (this: TelegramStreamDelivery, id, event) {
+      if (id === String(chatId) && event.type === 'message_complete') {
+        entered = true
+        await gate
+      }
+      return original.call(this, id, event)
+    })
+    try {
+      broadcast(session, { type: 'message_complete' })
+      await eventually(() => expect(entered).toBe(true))
+      await text(chatId, '/allow q-terminal')
+      expect(sendResponse).not.toHaveBeenCalled()
+      expect(permissionResponses('q-terminal')).toEqual([])
+      await callback(chatId, 'permit:q-terminal:yes')
+      expect(sendResponse).not.toHaveBeenCalled()
+      expect(permissionResponses('q-terminal')).toEqual([])
+      await text(chatId, '/answer q-terminal Axios')
+      expect(texts(chatId).at(-1)).toContain('未找到待回答的问题请求')
+      await text(chatId, '/status')
+      await eventually(() => expect(texts(chatId).at(-1)).toContain('当前会话状态'))
+      expect(texts(chatId).at(-1)).not.toContain('待确认')
+
+      // The server replays independent worker requests after the leader result.
+      // Replayed questions must recover the answer guard and pending count.
+      release()
+      broadcast(session, { type: 'permission_request', requestId: 'q-worker-replay', toolName: 'AskUserQuestion', input: singleQuestionInput })
+      await eventually(() => expect(texts(chatId).some((value) => value.includes('q-worker-replay'))).toBe(true))
+      await text(chatId, '/allow q-worker-replay')
+      expect(texts(chatId).at(-1)).toContain('/answer')
+      expect(permissionResponses('q-worker-replay')).toEqual([])
+      await text(chatId, '/answer q-worker-replay Fetch')
+      await eventually(() => expect(permissionResponses('q-worker-replay')).toHaveLength(1))
+      // A second submission cannot send another approval or enter ordinary chat.
+      await text(chatId, '/answer q-worker-replay Axios')
+      expect(texts(chatId).at(-1)).toContain('未找到待回答的问题请求')
+      expect(permissionResponses('q-worker-replay')).toHaveLength(1)
+      expect(messages.some((item) => item.message.type === 'user_message' && item.message.content === '/answer q-worker-replay Axios')).toBe(false)
+    } finally {
+      release()
+      delivery.mockRestore()
+      sendResponse.mockRestore()
+    }
+  })
+
+  it('does not double-count a repeated question request and splits long prompts', async () => {
+    const chatId = 725
+    const session = 'stream'
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Count me')
+    await eventually(() => expect(messages.some((item) => item.sessionId === session && item.message.content === 'Count me')).toBe(true))
+
+    broadcast(session, { type: 'permission_request', requestId: 'q-count', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    broadcast(session, { type: 'permission_request', requestId: 'q-count', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    broadcast(session, { type: 'permission_request', requestId: 'q-barrier-count', toolName: 'AskUserQuestion', input: singleQuestionInput })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('q-barrier-count'))).toBe(true))
+    // Two frames for one requestId must count once; a third distinct request makes two.
+    await text(chatId, '/status')
+    await eventually(() => expect(texts(chatId).filter((value) => value.includes('当前会话状态')).at(-1)).toContain('审批: 2 个待确认'))
+
+    const longInput = { questions: [{ question: `长问题 ${'x'.repeat(5000)}`, options: [{ label: 'A' }] }] }
+    const longStart = apiCalls.length
+    broadcast(session, { type: 'permission_request', requestId: 'q-long', toolName: 'AskUserQuestion', input: longInput })
+    await eventually(() => expect(apiCalls.slice(longStart).some((call) =>
+      call.method === 'sendMessage' && call.payload.chat_id === chatId && call.payload.text?.includes('/answer q-long'),
+    )).toBe(true))
+
+    const chunks = apiCalls.slice(longStart).filter((call) => call.method === 'sendMessage' && call.payload.chat_id === chatId)
+    expect(chunks.length).toBeGreaterThanOrEqual(2)
+    for (const chunk of chunks) expect(chunk.payload.text.length).toBeLessThanOrEqual(4000)
+    expect(chunks.at(-1)!.payload.reply_markup).toBeDefined()
+    for (const chunk of chunks.slice(0, -1)) expect(chunk.payload.reply_markup).toBeUndefined()
+  })
+
+  it('rejects unauthorized, unknown, and malformed /answer commands', async () => {
+    await text(726, '/answer q-single Axios', { userId: 99 })
+    await eventually(() => expect(texts(726).at(-1)).toContain('未授权'))
+
+    const chatId = 727
+    const session = 'stream'
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Unknown answer')
+    await eventually(() => expect(messages.some((item) => item.sessionId === session && item.message.content === 'Unknown answer')).toBe(true))
+
+    await text(chatId, '/answer does-not-exist Axios')
+    await eventually(() => expect(texts(chatId).at(-1)).toContain('未找到待回答的问题请求'))
+    expect(permissionResponses('does-not-exist')).toEqual([])
+
+    await text(chatId, '/answer')
+    await eventually(() => expect(texts(chatId).at(-1)).toContain('/answer'))
+    expect(messages.some((item) => item.message.content === '/answer' && item.message.type === 'user_message')).toBe(false)
   })
 
   it('starts the registered bot and publishes its menu without external access', async () => {

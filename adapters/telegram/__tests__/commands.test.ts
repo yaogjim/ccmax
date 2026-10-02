@@ -3,6 +3,7 @@ import {
   OPENAI_OFFICIAL_DEFAULT_MODEL_ID,
   buildModelSelectionItems,
   buildProviderSelectionItems,
+  buildTelegramHelpText,
   createTelegramCommandController,
   createTelegramRuntimeCommandController,
   registerAuthorizedTelegramCommand,
@@ -322,6 +323,39 @@ describe('Telegram command controller helpers', () => {
     })).toBe('sent')
     expect(sendPermissionResponse).toHaveBeenCalledWith('42', 'req-1', true, undefined)
     expect(pendingRequestIds.has('req-1')).toBe(false)
+  })
+
+  it('refuses to approve a pending AskUserQuestion through a permission callback', () => {
+    const sendPermissionResponse = mock(() => true)
+    const pendingRequestIds = new Set(['q-1'])
+
+    expect(resolveTelegramPermissionCallback({
+      chatId: '42',
+      userId: 7,
+      decision: { requestId: 'q-1', allowed: true },
+      pendingRequestIds,
+      pendingQuestionRequestIds: new Set(['q-1']),
+      isAllowedUser: () => true,
+      sendPermissionResponse,
+    })).toBe('question_answer_required')
+    expect(sendPermissionResponse).not.toHaveBeenCalled()
+    expect(pendingRequestIds.has('q-1')).toBe(true)
+    expect(pendingRequestIds.size).toBe(1)
+
+    expect(resolveTelegramPermissionCallback({
+      chatId: '42',
+      userId: 7,
+      decision: { requestId: 'q-1', allowed: false },
+      pendingRequestIds,
+      pendingQuestionRequestIds: new Set(['q-1']),
+      isAllowedUser: () => true,
+      sendPermissionResponse,
+    })).toBe('sent')
+    expect(sendPermissionResponse).toHaveBeenCalledWith('42', 'q-1', false, undefined)
+  })
+
+  it('documents /answer in the help text', () => {
+    expect(buildTelegramHelpText()).toContain('/answer')
   })
 
   it('scopes duplicate message keys to the Telegram chat', () => {
@@ -939,5 +973,14 @@ describe('Telegram command controller helpers', () => {
       allowed: false,
     }, new Map([['42', new Set(['send-failed'])]]), () => {})).resolves.toBe('send_failed')
     expect(failedCtx.answers).toContain('权限响应发送失败')
+
+    sendPermissionSucceeds = true
+    const questionCtx = createCommandContext()
+    await expect(controller.handlePermissionCallback(questionCtx.ctx, {
+      requestId: 'q-cb',
+      allowed: true,
+    }, new Map([['42', new Set(['q-cb'])]]), () => {}, new Set(['q-cb']))).resolves.toBe('question_answer_required')
+    expect(questionCtx.answers).toContain('请使用 /answer 提交答案')
+    expect(questionCtx.edits).toEqual([])
   })
 })

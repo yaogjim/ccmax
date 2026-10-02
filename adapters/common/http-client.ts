@@ -154,7 +154,12 @@ export class AdapterHttpClient {
         workDir?: string
         permissionMode?: string
       }
-      return this.isSafeRemoteSession(data)
+      // 恢复预检只校验目录边界；会话是否存在由上面的 404 分支判定。
+      // 这里不按既有 permissionMode 拒绝：已配对账号本就拥有完整 Agent 能力，
+      // 新建会话也继承用户全局默认模式；恢复只是沿用用户既有模式继续，
+      // 既不主动设置，也不提升或降低权限。permissionMode 保留在响应类型里
+      // 以便上层展示，但恢复预检不对它做判断。
+      return this.isWithinAllowedProjectRoots(data?.workDir)
     } finally {
       clearTimeout(timer)
     }
@@ -289,10 +294,9 @@ export class AdapterHttpClient {
         throw new Error(`Failed to list sessions: ${(err as any).message}`)
       }
       const data = (await res.json()) as { sessions: SessionListItem[]; total: number }
-      const sessions = data.sessions.filter((session) => this.isSafeRemoteSession({
-        workDir: session.workDir,
-        permissionMode: session.permissionMode,
-      }))
+      // 列表只做目录边界过滤，不按 permissionMode 隐藏会话：已配对账号应当能
+      // 看到并按需切换自己的全部历史会话，包括 bypassPermissions 会话。
+      const sessions = data.sessions.filter((session) => this.isWithinAllowedProjectRoots(session.workDir))
       // total counts server candidates before the local safety filter. Keep it
       // for offset pagination, including pages with no locally allowed sessions.
       return { sessions, total: data.total }
@@ -426,13 +430,14 @@ export class AdapterHttpClient {
     return resolved
   }
 
-  private isSafeRemoteSession(
-    status: { workDir?: string | null; permissionMode?: string } | undefined,
-  ): boolean {
-    if (!status?.workDir || status.permissionMode === 'bypassPermissions') {
-      return false
-    }
-    return Boolean(this.resolveAllowedProjectPath(status.workDir))
+  /**
+   * 目录边界：IM 适配器允许触达的根目录。
+   *
+   * 用 `resolveAllowedProjectPath`，因此对 symlink / 非 canonical 路径做了
+   * `realpath` 解析后再比较，保留 canonical、symlink 边界语义。
+   */
+  private isWithinAllowedProjectRoots(workDir: string | null | undefined): boolean {
+    return Boolean(this.resolveAllowedProjectPath(workDir))
   }
 }
 
@@ -450,6 +455,7 @@ function isPathWithinAllowedRoots(target: string, roots: string[]): boolean {
 }
 
 function resolveExistingProjectPath(query: string): string | null {
+  if (typeof query !== 'string') return null
   const trimmed = query.trim()
   if (!trimmed) return null
 

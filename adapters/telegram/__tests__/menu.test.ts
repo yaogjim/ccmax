@@ -16,6 +16,10 @@ describe('Telegram menu helpers', () => {
     }
   })
 
+  it('publishes an /answer command for AskUserQuestion replies', () => {
+    expect(TELEGRAM_BOT_COMMANDS.some((command) => command.command === 'answer')).toBe(true)
+  })
+
   it('deletes stale bot commands before setting the current menu', async () => {
     const calls: string[] = []
     const api = {

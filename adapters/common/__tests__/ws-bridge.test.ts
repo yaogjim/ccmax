@@ -160,6 +160,44 @@ describe('WsBridge: handler serialization', () => {
     bridge.destroy()
   })
 
+  it('sends updatedInput with a permission response only when provided', async () => {
+    const bridge = new WsBridge(serverUrl, 'test')
+    bridge.connectSession('chat-updated', 'sess-updated')
+    expect(await bridge.waitForOpen('chat-updated')).toBe(true)
+    const serverWs = await waitForServerConnection()
+
+    const received: any[] = []
+    serverWs.on('message', (raw) => {
+      received.push(JSON.parse(raw.toString()))
+    })
+
+    expect(
+      bridge.sendPermissionResponse('chat-updated', 'req-1', true, undefined, {
+        answers: { '选哪个库？': 'Axios' },
+      }),
+    ).toBe(true)
+    // A plain approval (and an approval with a rule) must not gain updatedInput.
+    expect(bridge.sendPermissionResponse('chat-updated', 'req-2', true)).toBe(true)
+    expect(bridge.sendPermissionResponse('chat-updated', 'req-3', true, 'always')).toBe(true)
+    expect(await waitFor(() => received.length === 3)).toBe(true)
+
+    expect(received[0]).toEqual({
+      type: 'permission_response',
+      requestId: 'req-1',
+      allowed: true,
+      updatedInput: { answers: { '选哪个库？': 'Axios' } },
+    })
+    expect(received[1]).toEqual({ type: 'permission_response', requestId: 'req-2', allowed: true })
+    expect(received[2]).toEqual({
+      type: 'permission_response',
+      requestId: 'req-3',
+      allowed: true,
+      rule: 'always',
+    })
+
+    bridge.destroy()
+  })
+
   it('processes handler calls in strict FIFO order per chatId', async () => {
     const bridge = new WsBridge(serverUrl, 'test')
     const events: string[] = []

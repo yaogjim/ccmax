@@ -94,6 +94,7 @@ export type TelegramRuntimeCommandController = TelegramCommandController & {
     decision: PermissionDecision,
     pendingPermissions: Map<string, Set<string>>,
     onResolved: (chatId: string) => void,
+    pendingQuestionRequestIds?: Set<string>,
   ) => Promise<TelegramPermissionCallbackResult>
 }
 export type TelegramPermissionCallbackResult =
@@ -101,6 +102,7 @@ export type TelegramPermissionCallbackResult =
   | 'unauthorized'
   | 'not_pending'
   | 'send_failed'
+  | 'question_answer_required'
 
 export function telegramMessageDedupKey(chatId: string, messageId: number): string {
   return `telegram:${chatId}:${messageId}`
@@ -146,6 +148,7 @@ export function resolveTelegramPermissionCallback(params: {
   userId: number
   decision: PermissionDecision
   pendingRequestIds?: Set<string>
+  pendingQuestionRequestIds?: Set<string>
   isAllowedUser: (userId: number) => boolean
   sendPermissionResponse: (
     chatId: string,
@@ -156,6 +159,11 @@ export function resolveTelegramPermissionCallback(params: {
 }): TelegramPermissionCallbackResult {
   if (!params.isAllowedUser(params.userId)) return 'unauthorized'
   if (!params.pendingRequestIds?.has(params.decision.requestId)) return 'not_pending'
+  // AskUserQuestion approvals must carry collected answers through /answer;
+  // a bare allow button would submit an empty answer. Deny stays available.
+  if (params.decision.allowed && params.pendingQuestionRequestIds?.has(params.decision.requestId)) {
+    return 'question_answer_required'
+  }
 
   const sent = params.sendPermissionResponse(
     params.chatId,
@@ -174,6 +182,7 @@ async function handleTelegramPermissionCallback(
   decision: PermissionDecision,
   deps: Pick<TelegramRuntimeCommandControllerDeps, 'isAllowedUser'> & {
     pendingPermissions: Map<string, Set<string>>
+    pendingQuestionRequestIds?: Set<string>
     sendPermissionResponse: (
       chatId: string,
       requestId: string,
@@ -196,6 +205,7 @@ async function handleTelegramPermissionCallback(
     userId: callbackUserId,
     decision,
     pendingRequestIds: deps.pendingPermissions.get(chatId),
+    pendingQuestionRequestIds: deps.pendingQuestionRequestIds,
     isAllowedUser: deps.isAllowedUser,
     sendPermissionResponse: deps.sendPermissionResponse,
   })
@@ -204,7 +214,9 @@ async function handleTelegramPermissionCallback(
       ? '未授权'
       : result === 'not_pending'
         ? '权限请求已失效'
-        : '权限响应发送失败'
+        : result === 'question_answer_required'
+          ? '请使用 /answer 提交答案'
+          : '权限响应发送失败'
     await ctx.answerCallbackQuery(message).catch(() => {})
     return result
   }
@@ -282,12 +294,13 @@ export function createTelegramRuntimeCommandController(
   })
   return {
     ...controller,
-    handlePermissionCallback: (ctx, decision, pendingPermissions, onResolved) => handleTelegramPermissionCallback(
+    handlePermissionCallback: (ctx, decision, pendingPermissions, onResolved, pendingQuestionRequestIds) => handleTelegramPermissionCallback(
       ctx,
       decision,
       {
         isAllowedUser: deps.isAllowedUser,
         pendingPermissions,
+        pendingQuestionRequestIds,
         sendPermissionResponse: (chatId, requestId, allowed, rule) =>
           deps.bridge.sendPermissionResponse(chatId, requestId, allowed, rule),
         onResolved,
@@ -769,6 +782,7 @@ export function buildTelegramHelpText(): string {
     '/provider — 切换 Provider',
     '/model [model] — 查看或切换模型',
     '/skills — 查看当前项目可用 Skills',
+    '/answer <id> <答案> — 回答模型提问（AskUserQuestion），多题用 JSON',
   ].join('\n')
 }
 
