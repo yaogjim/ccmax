@@ -54,6 +54,24 @@ AZURE_OPENAI_API_KEY=your_azure_openai_key
 AZURE_OPENAI_CODEX_DEPLOYMENT=your_codex_deployment
 ```
 
+### Scheduled-task timeout
+
+Each task's run limit is set per task in the **Timeout per run (seconds)** field of the **New task / Edit task** dialog, and may be left blank. The default is 600 seconds (10 minutes); `1800` means 30 minutes. On timeout, the CLI subprocess is terminated and that run is marked `timeout`. The value is persisted as an integer number of milliseconds under `timeoutMs` in the task file `scheduled_tasks.json` (normally `~/.claude/scheduled_tasks.json`), read together with the task, so it does not depend on whether ccmax was launched from Finder, the Dock, or a terminal.
+
+No app restart is needed after saving: subsequent runs use the new value, while the run already in progress keeps its original limit. Clearing the field (or sending `null` on update) removes the per-task override so the environment variable or default below applies again.
+
+Priority: the task's `timeoutMs` → the Server process environment variable `CC_HAHA_TASK_TIMEOUT_MS` → the built-in `600000` ms default. Both the task value and the environment variable accept integer milliseconds in `1`–`2147483647`. Invalid task values are rejected when saving; at execution time, a malformed stored value or invalid environment variable falls back to the next layer. The field is entered in seconds and may be precise to the millisecond (for example `0.5` for 500 ms); `0` is not unlimited.
+
+The environment variable remains a compatibility entry point, applied only when the task has no valid override. Set it before starting ccmax. On macOS, quit an already running app normally, then launch it from Terminal, for example with a 30-minute limit:
+
+```bash
+CC_HAHA_TASK_TIMEOUT_MS=1800000 /Applications/ccmax.app/Contents/MacOS/ccmax
+```
+
+For a source Server launch, prefix its startup command with the same variable. Finder and Dock launches do not automatically inherit a Terminal `export`, and CLI `settings.json.env` is not a reliable way to configure the Server.
+
+This limit is separate from the single-model-request `API_TIMEOUT_MS` and does not limit ordinary IM chat turns. Increasing it does not fix provider, network, or user-answer waits; keep a finite limit.
+
 ### Local runtime and privacy
 
 | Variable | Description |

@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { tasksApi } from '../api/tasks'
-import type { CronTask, CreateTaskInput, TaskRun } from '../types/task'
+import type { CronTask, CreateTaskInput, TaskRun, TaskUpdateInput } from '../types/task'
 
 type TaskStore = {
   tasks: CronTask[]
@@ -10,7 +10,7 @@ type TaskStore = {
 
   fetchTasks: () => Promise<void>
   createTask: (input: CreateTaskInput) => Promise<void>
-  updateTask: (id: string, updates: Partial<CronTask>) => Promise<void>
+  updateTask: (id: string, updates: TaskUpdateInput) => Promise<void>
   deleteTask: (id: string) => Promise<void>
   runTask: (taskId: string) => Promise<void>
   fetchRecentRuns: () => Promise<void>

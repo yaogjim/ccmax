@@ -8,7 +8,7 @@ import { useProviderStore } from '../../stores/providerStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useTaskStore } from '../../stores/taskStore'
-import type { CronTask } from '../../types/task'
+import type { CreateTaskInput, CronTask } from '../../types/task'
 
 const baseTask: CronTask = {
   id: 'task-1',
@@ -285,6 +285,143 @@ describe('NewTaskModal', () => {
 
       fireEvent.click(screen.getByLabelText(/Push notification on completion/))
       expect(screen.getByLabelText(/Telegram/)).toBeDisabled()
+    })
+  })
+
+  // The run timeout belongs to the individual task: there is no global settings
+  // endpoint to fall back on, so every create/edit must carry its own value.
+  describe('per-task timeout', () => {
+    function renderModal(editTask?: CronTask) {
+      useSettingsStore.setState({ locale: 'en' })
+      useAdapterStore.setState({
+        fetchConfig: vi.fn(async () => {}),
+        config: {},
+      } as Partial<ReturnType<typeof useAdapterStore.getState>>)
+      return render(<NewTaskModal open onClose={vi.fn()} editTask={editTask} />)
+    }
+
+    function fillRequiredFields() {
+      fireEvent.change(screen.getByLabelText(/^Name/), { target: { value: 'timeout task' } })
+      fireEvent.change(screen.getByLabelText(/^Description/), { target: { value: 'desc' } })
+      fireEvent.change(screen.getByPlaceholderText(/Look at the commits/i), {
+        target: { value: 'prompt' },
+      })
+    }
+
+    it('sends the entered seconds to the server as milliseconds on create', async () => {
+      const createTask = vi.fn(async () => {})
+      useTaskStore.setState({ createTask } as Partial<ReturnType<typeof useTaskStore.getState>>)
+      renderModal()
+      fillRequiredFields()
+
+      fireEvent.change(screen.getByLabelText(/Timeout per run/), { target: { value: '90' } })
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Create task' }))
+        await Promise.resolve()
+      })
+
+      await waitFor(() => expect(createTask).toHaveBeenCalledTimes(1))
+      expect(createTask).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 90_000 }))
+    })
+
+    it('omits the field on create when blank so the server default applies', async () => {
+      const createTask = vi.fn(async (_input: CreateTaskInput) => {})
+      useTaskStore.setState({ createTask } as Partial<ReturnType<typeof useTaskStore.getState>>)
+      renderModal()
+      fillRequiredFields()
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Create task' }))
+        await Promise.resolve()
+      })
+
+      await waitFor(() => expect(createTask).toHaveBeenCalledTimes(1))
+      // A `timeoutMs: undefined` key would serialize away too, but asserting the
+      // absent property keeps the contract explicit.
+      expect(createTask.mock.calls[0]?.[0]).not.toHaveProperty('timeoutMs')
+    })
+
+    it('reloads the persisted value into the field when editing', () => {
+      renderModal({ ...baseTask, timeoutMs: 120_000 })
+      expect(screen.getByLabelText(/Timeout per run/)).toHaveValue('120')
+    })
+
+    it('clears a saved timeout by sending null when the field is emptied', async () => {
+      const updateTask = vi.fn(async () => {})
+      useTaskStore.setState({ updateTask } as Partial<ReturnType<typeof useTaskStore.getState>>)
+      renderModal({ ...baseTask, timeoutMs: 120_000 })
+
+      fireEvent.change(screen.getByLabelText(/Timeout per run/), { target: { value: '' } })
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+        await Promise.resolve()
+      })
+
+      await waitFor(() => expect(updateTask).toHaveBeenCalledTimes(1))
+      expect(updateTask).toHaveBeenCalledWith('task-1', expect.objectContaining({ timeoutMs: null }))
+    })
+
+    it('treats a task stored before the field existed as empty', () => {
+      renderModal(baseTask)
+      expect(screen.getByLabelText(/Timeout per run/)).toHaveValue('')
+    })
+
+    it('sends an edited seconds value to the server as milliseconds', async () => {
+      // 1800s is a normal in-range edit: 30 minutes as 1_800_000 ms, not the
+      // previous 120_000 and not the raw seconds value.
+      const updateTask = vi.fn(async () => {})
+      useTaskStore.setState({ updateTask } as Partial<ReturnType<typeof useTaskStore.getState>>)
+      renderModal({ ...baseTask, timeoutMs: 120_000 })
+
+      fireEvent.change(screen.getByLabelText(/Timeout per run/), { target: { value: '1800' } })
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+        await Promise.resolve()
+      })
+
+      await waitFor(() => expect(updateTask).toHaveBeenCalledTimes(1))
+      expect(updateTask).toHaveBeenCalledWith('task-1', expect.objectContaining({ timeoutMs: 1_800_000 }))
+    })
+
+    it('blocks the save instead of accepting a value past the ceiling', async () => {
+      const updateTask = vi.fn(async () => {})
+      useTaskStore.setState({ updateTask } as Partial<ReturnType<typeof useTaskStore.getState>>)
+      renderModal({ ...baseTask, timeoutMs: 120_000 })
+
+      // 2147483.648s is one millisecond past 2_147_483_647 ms, the largest
+      // delay `setTimeout` accepts; storing it would arm a timer that fires
+      // immediately.
+      fireEvent.change(screen.getByLabelText(/Timeout per run/), { target: { value: '2147483.648' } })
+
+      expect(screen.getByRole('alert')).toHaveTextContent(/up to/)
+      expect(screen.getByRole('button', { name: 'Save changes' })).toBeDisabled()
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+        await Promise.resolve()
+      })
+      expect(updateTask).not.toHaveBeenCalled()
+    })
+
+    it('blocks the save instead of accepting zero', async () => {
+      const createTask = vi.fn(async () => {})
+      useTaskStore.setState({ createTask } as Partial<ReturnType<typeof useTaskStore.getState>>)
+      renderModal()
+      fillRequiredFields()
+
+      fireEvent.change(screen.getByLabelText(/Timeout per run/), { target: { value: '0' } })
+
+      expect(screen.getByRole('alert')).toHaveTextContent(/greater than 0/)
+      expect(screen.getByRole('button', { name: 'Create task' })).toBeDisabled()
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Create task' }))
+        await Promise.resolve()
+      })
+      expect(createTask).not.toHaveBeenCalled()
     })
   })
 })

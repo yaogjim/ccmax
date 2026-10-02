@@ -41,6 +41,12 @@ export type CronTask = {
   folderPath?: string
   useWorktree?: boolean
   notification?: TaskNotificationConfig
+  /**
+   * Per-task run timeout in positive integer milliseconds (server range
+   * `1..2147483647`). Absent means the environment variable
+   * `CC_HAHA_TASK_TIMEOUT_MS`, then the built-in 600s default, applies.
+   */
+  timeoutMs?: number
 }
 
 export type CreateTaskInput = {
@@ -57,6 +63,19 @@ export type CreateTaskInput = {
   folderPath?: string
   useWorktree?: boolean
   notification?: TaskNotificationConfig
+  /** Per-task run timeout in milliseconds. Optional on create. */
+  timeoutMs?: number
+}
+
+/**
+ * Update payload for one task. `timeoutMs: null` is meaningful and must not be
+ * folded into `Partial<CronTask>`: `number | null` intersected with the stored
+ * `number` collapses to `number`, which would reject the clear operation
+ * TypeScript-wise while the server accepts it.
+ */
+export type TaskUpdateInput = Omit<Partial<CronTask>, 'timeoutMs'> & {
+  /** `null` clears the explicit value so the environment/default applies. */
+  timeoutMs?: number | null
 }
 
 /** IM channel a task notification can be delivered to. */

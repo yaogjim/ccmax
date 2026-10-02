@@ -3060,6 +3060,9 @@ Row 9, all 8 cells: continuing from straight down, turning left through lower-le
   'newTask.recipientLabel': 'Notification recipient',
   'newTask.recipientPlaceholder': 'Select a recipient',
   'newTask.recipientRequired': 'Select a recipient for each IM channel. Notifications are sent only to the paired user you choose.',
+  'newTask.timeoutLabel': 'Timeout per run (seconds)',
+  'newTask.timeoutHint': 'Applies to this task only. Leave blank to inherit the default: the {env} environment variable when set, otherwise {seconds} seconds.',
+  'newTask.timeoutInvalid': 'Enter a number of seconds greater than 0 and up to {max}, with no more than millisecond precision.',
 
   // ─── Cron Descriptions ──────────────────────────────────────
   'cron.everyMinute': 'Runs every minute',

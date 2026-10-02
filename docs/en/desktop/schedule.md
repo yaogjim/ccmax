@@ -47,6 +47,7 @@ You can also list, inspect, update, enable, disable, delete, or immediately run 
 - **Model** — set per task, independent of your session default. Routine checks are fine on a cheaper model.
 - **Working directory** — where the task runs. You can also enable **Isolated worktree** so the task works in a separate Git worktree and never touches your main branch.
 - **Frequency** — every N minutes, every N hours, daily, weekdays (Mon–Fri), specific days, monthly, or a custom cron expression. Time-of-day options get their own picker beside the frequency. Custom cron is "minute hour day month weekday" and invalid expressions are flagged as you type.
+- **Timeout per run (seconds)** — optional. Leave blank to inherit the default: the `CC_HAHA_TASK_TIMEOUT_MS` environment variable when set, otherwise 600 seconds (10 minutes). It bounds only this task's single run — not ordinary chats or API requests.
 - **Push notification on completion** — pick channels: native desktop notifications and any IM channels you've configured (Telegram, Feishu). For each IM channel you also pick one **notification recipient** from the accounts already paired with that channel. If no IM channel is set up, the form points you to **Settings → IM Adapters**; setup steps are in [Phone (H5) and IM](./remote.md).
 
 Desktop notifications need **System Notifications** enabled in **Settings → General** and permission granted at the OS level.

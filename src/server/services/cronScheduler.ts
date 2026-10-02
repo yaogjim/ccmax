@@ -20,6 +20,7 @@ import { SessionService } from './sessionService.js'
 import { sendTaskNotification } from './notificationService.js'
 import type { NotificationDeliveryReport } from './notificationService.js'
 import { ProviderService } from './providerService.js'
+import { isValidTaskTimeoutMs } from './cronService.js'
 import { SettingsService } from './settingsService.js'
 import { isProviderManagedEnvVar } from '../../utils/managedEnvConstants.js'
 import {
@@ -516,18 +517,35 @@ function trimRuns(data: RunsFile): void {
 
 // ─── Scheduler ─────────────────────────────────────────────────────────────────
 
-const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes
+/** Applied when neither the task nor the environment supplies a timeout. */
+export const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes
 
+/**
+ * Resolve the timeout for one execution, fixed for the whole run:
+ *   1. the task's own `timeoutMs` override (when present and in range),
+ *   2. the process-level `CC_HAHA_TASK_TIMEOUT_MS`,
+ *   3. `DEFAULT_TASK_TIMEOUT_MS`.
+ *
+ * A stored override that is missing or out of range is ignored rather than
+ * trusted, so an old or hand-edited record cannot change the fallback chain.
+ */
 export function resolveCronTaskTimeoutMs(
+  task?: Pick<CronTask, 'timeoutMs'>,
   env: { CC_HAHA_TASK_TIMEOUT_MS?: string } = process.env,
 ): number {
+  if (task && isValidTaskTimeoutMs(task.timeoutMs)) {
+    return task.timeoutMs
+  }
+
   const raw = env.CC_HAHA_TASK_TIMEOUT_MS?.trim()
   if (!raw) return DEFAULT_TASK_TIMEOUT_MS
 
+  // The same bounds the task override is held to. `Number.isInteger(x) && x > 0`
+  // alone accepted values past the 32-bit ceiling `setTimeout` overflows on,
+  // so a large env value armed a timer that fired immediately instead of after
+  // the requested delay.
   const timeoutMs = Number(raw)
-  return Number.isInteger(timeoutMs) && timeoutMs > 0
-    ? timeoutMs
-    : DEFAULT_TASK_TIMEOUT_MS
+  return isValidTaskTimeoutMs(timeoutMs) ? timeoutMs : DEFAULT_TASK_TIMEOUT_MS
 }
 
 type TaskWorkDirResolution =
@@ -1012,7 +1030,9 @@ export class CronScheduler {
       ...this.getRuntimeArgs(task),
     ])
 
-    const taskTimeoutMs = resolveCronTaskTimeoutMs()
+    // Resolve once; later edits to the task or environment only affect the
+    // next execution. This keeps a single run on a single fixed limit.
+    const taskTimeoutMs = resolveCronTaskTimeoutMs(task)
     let timeoutId: Timer | undefined
     let timedOut = false
 

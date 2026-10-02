@@ -3061,6 +3061,9 @@ export const jp: Record<TranslationKey, string> = {
   'newTask.recipientLabel': '通知の宛先',
   'newTask.recipientPlaceholder': '宛先を選択',
   'newTask.recipientRequired': '各 IM チャンネルの宛先を選択してください。通知は明示的に選択したペアリング済みユーザーにのみ送信されます。',
+  'newTask.timeoutLabel': '1 回の実行タイムアウト（秒）',
+  'newTask.timeoutHint': 'このタスクにのみ適用されます。空欄の場合は既定値を継承します。環境変数 {env} があればそれを、なければ {seconds} 秒を使用します。',
+  'newTask.timeoutInvalid': '0 より大きい秒数を {max} 以下で入力してください。精度はミリ秒までです。',
 
   // ─── Cron Descriptions ──────────────────────────────────────
   'cron.everyMinute': '毎分実行',

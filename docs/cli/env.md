@@ -54,6 +54,24 @@ AZURE_OPENAI_API_KEY=your_azure_openai_key
 AZURE_OPENAI_CODEX_DEPLOYMENT=your_codex_deployment
 ```
 
+### 定时任务超时
+
+每个任务的运行时限在「新建任务 / 编辑任务」窗口的「单次执行超时（秒）」里单独填写，可以留空。默认 600 秒（10 分钟），填 `1800` 表示 30 分钟；超时后 CLI 子进程被终止，这次运行记录标记为 `timeout`。该值以毫秒整数 `timeoutMs` 保存在任务文件 `scheduled_tasks.json`（默认 `~/.claude/scheduled_tasks.json`）中，随任务一起读取，因此不受从 Finder、Dock 还是终端启动的影响。
+
+保存后无需重启应用：后续运行使用新值，已经开始的那次运行保持原时限。清空该字段（或在接口更新时传 `null`）会删除任务级覆盖，重新沿用下面的环境变量或默认值。
+
+优先级为：任务的 `timeoutMs` → Server 进程环境变量 `CC_HAHA_TASK_TIMEOUT_MS` → 默认 `600000` 毫秒。任务值和环境变量都接受 `1`–`2147483647` 的整数毫秒；保存任务时会拒绝非法值，执行时若读取到手工改坏的任务值或非法环境变量，则回退到下一层。界面按秒填写，可以精确到毫秒（例如 `0.5` 表示 500 毫秒）；`0` 不代表无限运行。
+
+环境变量仍是兼容入口，需在启动 ccmax 前设置；它只在该任务没有有效覆盖值时生效。macOS 上先正常退出已运行的应用，再在终端中启动，例如设置为 30 分钟：
+
+```bash
+CC_HAHA_TASK_TIMEOUT_MS=1800000 /Applications/ccmax.app/Contents/MacOS/ccmax
+```
+
+从源码启动本地 Server 时，同样把该变量放在启动命令前。Finder 或 Dock 启动不会自动继承终端里的 `export`；也不能依赖 CLI 的 `settings.json.env` 为 Server 设置这个值。
+
+这个时限与 `API_TIMEOUT_MS` 的单次模型请求超时不同，也不限制普通 IM 聊天回合。调大任务时限不会修复模型、网络或等待用户回答的问题，建议保留有限时限。
+
 ### 本地运行与隐私
 
 | 变量 | 说明 |

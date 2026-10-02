@@ -836,6 +836,256 @@ describe('Scheduled Tasks API', () => {
     const list = (await listResp.json()) as { tasks: Array<{ cron: string }> }
     expect(list.tasks[0]?.cron).toBe('0 9 * * *')
   })
+
+  it('rejects an invalid timeoutMs on create and update', async () => {
+    const createReq = new Request('http://localhost/api/scheduled-tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cron: '0 9 * * *',
+        prompt: 'bad timeout',
+        timeoutMs: 0,
+      }),
+    })
+    const createResp = await handleScheduledTasksApi(
+      createReq,
+      new URL(createReq.url),
+      ['api', 'scheduled-tasks'],
+    )
+    expect(createResp.status).toBe(400)
+
+    const okReq = new Request('http://localhost/api/scheduled-tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cron: '0 9 * * *',
+        prompt: 'ok timeout',
+        timeoutMs: 90_500,
+      }),
+    })
+    const okResp = await handleScheduledTasksApi(okReq, new URL(okReq.url), [
+      'api',
+      'scheduled-tasks',
+    ])
+    const { task } = (await okResp.json()) as {
+      task: { id: string; timeoutMs?: number }
+    }
+    expect(okResp.status).toBe(201)
+    expect(task.timeoutMs).toBe(90_500)
+
+    const badUpdates: unknown[] = [-1, 1.5, 2_147_483_648, '600000']
+    for (const bad of badUpdates) {
+      const updateReq = new Request(
+        `http://localhost/api/scheduled-tasks/${task.id}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timeoutMs: bad }),
+        },
+      )
+      const updateResp = await handleScheduledTasksApi(
+        updateReq,
+        new URL(updateReq.url),
+        ['api', 'scheduled-tasks', task.id],
+      )
+      expect(updateResp.status).toBe(400)
+    }
+
+    // The stored value survived the rejected updates.
+    const listReq = new Request('http://localhost/api/scheduled-tasks', {
+      method: 'GET',
+    })
+    const listResp = await handleScheduledTasksApi(
+      listReq,
+      new URL(listReq.url),
+      ['api', 'scheduled-tasks'],
+    )
+    const list = (await listResp.json()) as {
+      tasks: Array<{ id: string; timeoutMs?: number }>
+    }
+    expect(list.tasks.find((entry) => entry.id === task.id)?.timeoutMs).toBe(
+      90_500,
+    )
+  })
+
+  it('clears the timeout override with null on update', async () => {
+    const createReq = new Request('http://localhost/api/scheduled-tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cron: '0 9 * * *',
+        prompt: 'clear me',
+        timeoutMs: 90_500,
+      }),
+    })
+    const createResp = await handleScheduledTasksApi(
+      createReq,
+      new URL(createReq.url),
+      ['api', 'scheduled-tasks'],
+    )
+    const { task } = (await createResp.json()) as { task: { id: string } }
+
+    const updateReq = new Request(
+      `http://localhost/api/scheduled-tasks/${task.id}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timeoutMs: null }),
+      },
+    )
+    const updateResp = await handleScheduledTasksApi(
+      updateReq,
+      new URL(updateReq.url),
+      ['api', 'scheduled-tasks', task.id],
+    )
+    const updated = (await updateResp.json()) as {
+      task: { timeoutMs?: number }
+    }
+    expect(updateResp.status).toBe(200)
+    expect(updated.task.timeoutMs).toBeUndefined()
+
+    const raw = JSON.parse(
+      await fs.readFile(path.join(tmpDir, 'scheduled_tasks.json'), 'utf-8'),
+    ) as { tasks: Array<Record<string, unknown>> }
+    expect(raw.tasks[0] && 'timeoutMs' in raw.tasks[0]).toBe(false)
+  })
+})
+
+// ─── CronService: per-task execution timeout override ───────────────────────
+//
+// The timeout is a per-task value, not a global setting. Create/update must
+// reject anything that is not an in-range integer millisecond count, `null`
+// clears a saved override, and an old record without the field (or with
+// unknown fields) survives a read/modify/write untouched.
+
+describe('CronService task timeout override', () => {
+  let service: CronService
+  const tasksPath = () => path.join(tmpDir, 'scheduled_tasks.json')
+
+  async function readRawTasks(): Promise<Array<Record<string, unknown>>> {
+    const raw = await fs.readFile(tasksPath(), 'utf-8')
+    return (JSON.parse(raw) as { tasks: Array<Record<string, unknown>> }).tasks
+  }
+
+  beforeEach(async () => {
+    tmpDir = await createTmpDir()
+    process.env.CLAUDE_CONFIG_DIR = tmpDir
+    service = new CronService()
+  })
+
+  afterEach(async () => {
+    if (originalConfigDir) {
+      process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+    } else {
+      delete process.env.CLAUDE_CONFIG_DIR
+    }
+    await cleanupTmpDir(tmpDir)
+  })
+
+  it('stores an independent override per task and reloads it', async () => {
+    const withOverride = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'has timeout',
+      timeoutMs: 90_500,
+    })
+    const withoutOverride = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'no timeout',
+    })
+
+    expect(withOverride.timeoutMs).toBe(90_500)
+    expect(withoutOverride.timeoutMs).toBeUndefined()
+
+    // A brand-new service instance reads the same on-disk values.
+    const reloaded = await new CronService().listTasks()
+    expect(reloaded.find((task) => task.id === withOverride.id)?.timeoutMs).toBe(90_500)
+    expect(reloaded.find((task) => task.id === withoutOverride.id)?.timeoutMs).toBeUndefined()
+  })
+
+  it('accepts the inclusive bounds and rejects every other shape', async () => {
+    await expect(
+      service.createTask({ cron: '0 9 * * *', prompt: 'min', timeoutMs: 1 }),
+    ).resolves.toMatchObject({ timeoutMs: 1 })
+    await expect(
+      service.createTask({
+        cron: '0 9 * * *',
+        prompt: 'max',
+        timeoutMs: 2_147_483_647,
+      }),
+    ).resolves.toMatchObject({ timeoutMs: 2_147_483_647 })
+
+    const badValues: unknown[] = [0, -1, 1.5, 2_147_483_648, Number.NaN, '600000']
+    for (const bad of badValues) {
+      await expect(
+        service.createTask({
+          cron: '0 9 * * *',
+          prompt: 'bad',
+          timeoutMs: bad as number,
+        }),
+      ).rejects.toThrow(/timeoutMs/)
+    }
+  })
+
+  it('clears a saved override on update and stores no field', async () => {
+    const created = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'override',
+      timeoutMs: 30_000,
+    })
+
+    const updated = await service.updateTask(created.id, { timeoutMs: 45_000 })
+    expect(updated.timeoutMs).toBe(45_000)
+
+    const cleared = await service.updateTask(created.id, {
+      timeoutMs: null as unknown as number,
+    })
+    expect(cleared.timeoutMs).toBeUndefined()
+
+    const [raw] = await readRawTasks()
+    expect(raw && 'timeoutMs' in raw).toBe(false)
+    expect((await new CronService().listTasks())[0]?.timeoutMs).toBeUndefined()
+  })
+
+  it('rejects an invalid update and keeps the stored value', async () => {
+    const created = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'keep',
+      timeoutMs: 30_000,
+    })
+
+    await expect(
+      service.updateTask(created.id, { timeoutMs: 0 }),
+    ).rejects.toThrow(/timeoutMs/)
+
+    expect((await service.listTasks())[0]?.timeoutMs).toBe(30_000)
+  })
+
+  it('preserves an old record without the field and its unknown fields', async () => {
+    await fs.writeFile(
+      tasksPath(),
+      JSON.stringify({
+        tasks: [
+          {
+            id: 'legacy1',
+            cron: '0 9 * * *',
+            prompt: 'legacy task',
+            createdAt: 1,
+            unknownFutureField: { keep: true },
+          },
+        ],
+      }),
+    )
+
+    const [before] = await readRawTasks()
+    expect(before && 'timeoutMs' in before).toBe(false)
+
+    await service.updateTask('legacy1', { prompt: 'renamed' })
+
+    const [after] = await readRawTasks()
+    expect(after?.['prompt']).toBe('renamed')
+    expect(after?.['unknownFutureField']).toEqual({ keep: true })
+    expect(after && 'timeoutMs' in after).toBe(false)
+  })
 })
 
 // ─── CronService: notification shape & recipient validation ─────────────────

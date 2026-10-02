@@ -170,63 +170,207 @@ describe('cron scheduler launcher resolution', () => {
     await cleanupTmpDir(tmpDir)
   })
 
-  it('uses a configurable scheduled task timeout with the default unchanged', () => {
-    expect(resolveCronTaskTimeoutMs({})).toBe(10 * 60 * 1000)
-    expect(resolveCronTaskTimeoutMs({ CC_HAHA_TASK_TIMEOUT_MS: '1800000' })).toBe(1_800_000)
-    expect(resolveCronTaskTimeoutMs({ CC_HAHA_TASK_TIMEOUT_MS: 'not-a-number' })).toBe(10 * 60 * 1000)
-    expect(resolveCronTaskTimeoutMs({ CC_HAHA_TASK_TIMEOUT_MS: '0' })).toBe(10 * 60 * 1000)
+  it('resolves the timeout from task override, environment, then the 600 s default', () => {
+    expect(resolveCronTaskTimeoutMs({}, {})).toBe(600_000)
+    expect(
+      resolveCronTaskTimeoutMs({}, { CC_HAHA_TASK_TIMEOUT_MS: '1800000' }),
+    ).toBe(1_800_000)
+    expect(
+      resolveCronTaskTimeoutMs({}, { CC_HAHA_TASK_TIMEOUT_MS: 'not-a-number' }),
+    ).toBe(600_000)
+    expect(resolveCronTaskTimeoutMs({}, { CC_HAHA_TASK_TIMEOUT_MS: '0' })).toBe(
+      600_000,
+    )
+
+    // A valid per-task override wins over the environment.
+    expect(
+      resolveCronTaskTimeoutMs(
+        { timeoutMs: 90_500 },
+        { CC_HAHA_TASK_TIMEOUT_MS: '12345' },
+      ),
+    ).toBe(90_500)
+    expect(resolveCronTaskTimeoutMs({ timeoutMs: 2_147_483_647 }, {})).toBe(
+      2_147_483_647,
+    )
   })
 
-  unixOnly('executeTask arms the subprocess timeout from CC_HAHA_TASK_TIMEOUT_MS', async () => {
-    const binDir = path.join(tmpDir, 'bin')
-    const sidecarPath = path.join(tmpDir, 'claude-sidecar')
-    const appRoot = path.join(tmpDir, 'app-root')
-    await fs.mkdir(binDir, { recursive: true })
-    await fs.mkdir(appRoot, { recursive: true })
-    await fs.writeFile(
-      sidecarPath,
-      [
-        '#!/bin/sh',
-        '/bin/cat >/dev/null',
-        'printf \'%s\\n\' \'{"type":"result","result":"timeout env ok"}\'',
-        'exit 0',
-        '',
-      ].join('\n'),
-      'utf-8',
+  it('ignores an out-of-range stored task override', () => {
+    expect(
+      resolveCronTaskTimeoutMs(
+        { timeoutMs: 0 },
+        { CC_HAHA_TASK_TIMEOUT_MS: '12345' },
+      ),
+    ).toBe(12_345)
+    expect(resolveCronTaskTimeoutMs({ timeoutMs: 1.5 }, {})).toBe(600_000)
+    expect(resolveCronTaskTimeoutMs({ timeoutMs: 2_147_483_648 }, {})).toBe(
+      600_000,
     )
-    await fs.chmod(sidecarPath, 0o755)
+  })
 
-    const originalSetTimeout = globalThis.setTimeout
-    const timeoutCalls: number[] = []
-    globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
-      timeoutCalls.push(timeout ?? 0)
-      return originalSetTimeout(handler, timeout, ...args)
-    }) as typeof setTimeout
+  it('falls back to the default when the environment timeout is out of range', () => {
+    // One millisecond past the accepted ceiling. The bare
+    // `Number.isInteger(x) && x > 0` check this replaced returned it unchanged,
+    // and `setTimeout` treats a delay above 2^31-1 as 1 ms, so the run's own
+    // guard fired before the task had any chance to work.
+    expect(
+      resolveCronTaskTimeoutMs({}, { CC_HAHA_TASK_TIMEOUT_MS: '2147483648' }),
+    ).toBe(600_000)
+    expect(
+      resolveCronTaskTimeoutMs({}, { CC_HAHA_TASK_TIMEOUT_MS: '4294967296' }),
+    ).toBe(600_000)
+    expect(
+      resolveCronTaskTimeoutMs({}, { CC_HAHA_TASK_TIMEOUT_MS: '9999999999999' }),
+    ).toBe(600_000)
+    // The boundary value itself is still honoured.
+    expect(
+      resolveCronTaskTimeoutMs({}, { CC_HAHA_TASK_TIMEOUT_MS: '2147483647' }),
+    ).toBe(2_147_483_647)
+  })
 
-    process.env.PATH = binDir
-    process.env.CLAUDE_CLI_PATH = sidecarPath
-    process.env.CLAUDE_APP_ROOT = appRoot
-    process.env.CC_HAHA_TASK_TIMEOUT_MS = '12345'
+  unixOnly(
+    'executeTask arms each run from its task override, then the environment',
+    async () => {
+      const binDir = path.join(tmpDir, 'bin')
+      const sidecarPath = path.join(tmpDir, 'claude-sidecar')
+      const appRoot = path.join(tmpDir, 'app-root')
+      await fs.mkdir(binDir, { recursive: true })
+      await fs.mkdir(appRoot, { recursive: true })
+      await fs.writeFile(
+        sidecarPath,
+        [
+          '#!/bin/sh',
+          '/bin/cat >/dev/null',
+          "printf '%s\\n' '{\"type\":\"result\",\"result\":\"timeout env ok\"}'",
+          'exit 0',
+          '',
+        ].join('\n'),
+        'utf-8',
+      )
+      await fs.chmod(sidecarPath, 0o755)
 
-    try {
+      const originalSetTimeout = globalThis.setTimeout
+      const timeoutCalls: number[] = []
+      globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+        timeoutCalls.push(timeout ?? 0)
+        return originalSetTimeout(handler, timeout, ...args)
+      }) as typeof setTimeout
+
+      process.env.PATH = binDir
+      process.env.CLAUDE_CLI_PATH = sidecarPath
+      process.env.CLAUDE_APP_ROOT = appRoot
+      process.env.HOME = tmpDir
+      process.env.CC_HAHA_TASK_TIMEOUT_MS = '12345'
+
+      try {
+        const cronService = new CronService()
+        const scheduler = new CronScheduler(cronService)
+
+        // No task override: the environment value still applies.
+        const envTask = await cronService.createTask({
+          cron: '* * * * *',
+          prompt: 'cron timeout env test',
+          name: 'Timeout Env Task',
+          recurring: true,
+          folderPath: tmpDir,
+        })
+        expect((await scheduler.executeTask(envTask)).status).toBe('completed')
+        expect(timeoutCalls).toContain(12_345)
+
+        // A task override wins over the still-exported environment.
+        const overrideTask = await cronService.createTask({
+          cron: '* * * * *',
+          prompt: 'cron timeout override test',
+          name: 'Timeout Override Task',
+          recurring: true,
+          folderPath: tmpDir,
+          timeoutMs: 90_500,
+        })
+        timeoutCalls.length = 0
+        expect((await scheduler.executeTask(overrideTask)).status).toBe('completed')
+        expect(timeoutCalls).toContain(90_500)
+        expect(timeoutCalls).not.toContain(12_345)
+
+        // An edited override applies to the next run, not the current one.
+        const bumped = await cronService.updateTask(overrideTask.id, {
+          timeoutMs: 1_800_000,
+        })
+        timeoutCalls.length = 0
+        expect((await scheduler.executeTask(bumped)).status).toBe('completed')
+        expect(timeoutCalls).toContain(1_800_000)
+        expect(timeoutCalls).not.toContain(90_500)
+
+        // Clearing the override falls back to the environment.
+        const cleared = await cronService.updateTask(overrideTask.id, {
+          timeoutMs: null,
+        })
+        timeoutCalls.length = 0
+        expect((await scheduler.executeTask(cleared)).status).toBe('completed')
+        expect(timeoutCalls).toContain(12_345)
+
+        // With no environment value either, the 600 s default applies.
+        delete process.env.CC_HAHA_TASK_TIMEOUT_MS
+        timeoutCalls.length = 0
+        expect((await scheduler.executeTask(cleared)).status).toBe('completed')
+        expect(timeoutCalls).toContain(600_000)
+      } finally {
+        globalThis.setTimeout = originalSetTimeout
+      }
+    },
+  )
+
+  unixOnly(
+    'executeTask kills a real overrunning process at the per-task timeout',
+    async () => {
+      const binDir = path.join(tmpDir, 'bin')
+      const sidecarPath = path.join(tmpDir, 'slow-sidecar')
+      const appRoot = path.join(tmpDir, 'app-root')
+      await fs.mkdir(binDir, { recursive: true })
+      await fs.mkdir(appRoot, { recursive: true })
+      await fs.writeFile(
+        sidecarPath,
+        [
+          '#!/bin/sh',
+          '/bin/cat >/dev/null',
+          // Absolute path: the task child env scopes PATH, so a bare `sleep`
+          // may not resolve. `exec` makes the killed pid the sleeper itself.
+          'exec /bin/sleep 30',
+          '',
+        ].join('\n'),
+        'utf-8',
+      )
+      await fs.chmod(sidecarPath, 0o755)
+
+      process.env.PATH = binDir
+      process.env.CLAUDE_CLI_PATH = sidecarPath
+      process.env.CLAUDE_APP_ROOT = appRoot
+      process.env.HOME = tmpDir
+      delete process.env.CC_HAHA_TASK_TIMEOUT_MS
+
       const cronService = new CronService()
       const scheduler = new CronScheduler(cronService)
       const task = await cronService.createTask({
         cron: '* * * * *',
-        prompt: 'cron timeout env test',
-        name: 'Timeout Env Task',
+        prompt: 'overrunning task',
+        name: 'Overrunning Task',
         recurring: true,
         folderPath: tmpDir,
+        timeoutMs: 300,
       })
 
-      const run = await scheduler.executeTask(task)
+      try {
+        const startedAt = Date.now()
+        const run = await scheduler.executeTask(task)
+        const elapsed = Date.now() - startedAt
 
-      expect(run.status).toBe('completed')
-      expect(timeoutCalls).toContain(12_345)
-    } finally {
-      globalThis.setTimeout = originalSetTimeout
-    }
-  })
+        expect(run.status).toBe('timeout')
+        expect(run.error).toContain('300')
+        // The 30 s child is killed at the limit instead of being waited out.
+        expect(elapsed).toBeLessThan(10_000)
+      } finally {
+        scheduler.stop()
+      }
+    },
+  )
 
   it('uses the bundled sidecar launcher when one is configured', () => {
     const sidecarPath = path.join(tmpDir, 'claude-sidecar')

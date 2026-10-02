@@ -52,6 +52,11 @@ export type CronTask = {
   providerId?: string | null
   folderPath?: string
   useWorktree?: boolean
+  /**
+   * Per-task execution timeout override in milliseconds. Absent means "use the
+   * fallback chain" (env `CC_HAHA_TASK_TIMEOUT_MS`, then the 600 s default).
+   */
+  timeoutMs?: number
   notification?: TaskNotificationConfig
 }
 
@@ -67,6 +72,24 @@ export type CronTaskView = CronTask & {
 
 type TasksFile = {
   tasks: CronTask[]
+}
+
+/** Inclusive bounds for a per-task execution timeout override (milliseconds). */
+export const MIN_TASK_TIMEOUT_MS = 1
+export const MAX_TASK_TIMEOUT_MS = 2_147_483_647
+
+/**
+ * Structural check for a per-task timeout value. Used both when validating a
+ * create/update payload and when reading a value a hand-edited file may hold,
+ * so an out-of-range record falls back instead of arming a nonsensical timer.
+ */
+export function isValidTaskTimeoutMs(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= MIN_TASK_TIMEOUT_MS &&
+    value <= MAX_TASK_TIMEOUT_MS
+  )
 }
 
 const TASKS_FILE_WRITE_ATTEMPTS = 2
@@ -314,6 +337,21 @@ function normalizeEnabled(enabled: boolean | undefined): boolean {
   return enabled !== false
 }
 
+/**
+ * Validate a create/update `timeoutMs` payload. `null` and omission both mean
+ * "clear / fall back", so they normalize to undefined; anything else must be an
+ * in-range integer and is rejected rather than silently coerced.
+ */
+function normalizeTaskTimeoutMs(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!isValidTaskTimeoutMs(value)) {
+    throw ApiError.badRequest(
+      `timeoutMs must be an integer between ${MIN_TASK_TIMEOUT_MS} and ${MAX_TASK_TIMEOUT_MS}`,
+    )
+  }
+  return value
+}
+
 function normalizeTask(task: CronTask): CronTask {
   return { ...task, enabled: normalizeEnabled(task.enabled) }
 }
@@ -438,13 +476,19 @@ export class CronService {
     assertValidCron(task.cron)
 
     const notification = await this.resolveNotification(task.notification)
+    const timeoutMs = normalizeTaskTimeoutMs(task.timeoutMs)
 
     return withTasksFileMutation(this.getTasksFilePath(), async () => {
       const data = await this.readTasksFile()
-      const { notification: _rawNotification, ...rest } = task
+      const {
+        notification: _rawNotification,
+        timeoutMs: _rawTimeoutMs,
+        ...rest
+      } = task
       const newTask: CronTask = {
         ...rest,
         ...(notification === undefined ? {} : { notification }),
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
         // New tasks default to enabled — matches the desktop UI, which always
         // sends `enabled: true` on create.
         enabled: normalizeEnabled(task.enabled),
@@ -467,6 +511,12 @@ export class CronService {
     const notification = hasNotificationUpdate
       ? await this.resolveNotification(requestedNotification)
       : undefined
+    // `null` clears the override; a missing key leaves the stored value alone.
+    const requestedTimeout = (updates as { timeoutMs?: unknown }).timeoutMs
+    const hasTimeoutUpdate = requestedTimeout !== undefined
+    const timeoutMs = hasTimeoutUpdate
+      ? normalizeTaskTimeoutMs(requestedTimeout)
+      : undefined
 
     return withTasksFileMutation(this.getTasksFilePath(), async () => {
       const data = await this.readTasksFile()
@@ -485,6 +535,9 @@ export class CronService {
       }
       if (hasNotificationUpdate) {
         safeUpdates.notification = notification
+      }
+      if (hasTimeoutUpdate) {
+        safeUpdates.timeoutMs = timeoutMs
       }
       data.tasks[index] = {
         ...data.tasks[index],

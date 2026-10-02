@@ -13,6 +13,13 @@ import { PromptEditor } from './PromptEditor'
 import { DayOfWeekPicker } from './DayOfWeekPicker'
 import { useTranslation } from '../../i18n'
 import { describeCron, isValidCron, parseCron, type FrequencyKey } from '../../lib/cronDescribe'
+import {
+  CRON_TASK_TIMEOUT_DEFAULT_SECONDS,
+  CRON_TASK_TIMEOUT_ENV_VAR,
+  CRON_TASK_TIMEOUT_MAX_SECONDS,
+  formatCronTaskTimeoutSeconds,
+  parseCronTaskTimeoutSeconds,
+} from '../../lib/cronTaskTimeout'
 import { getSessionSeedWorkDir } from '../../lib/sessionWorkspace'
 import type { CronTask, NotificationRecipientSpec } from '../../types/task'
 import type { PairedUser } from '../../types/adapter'
@@ -160,6 +167,12 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
   const [telegramRecipient, setTelegramRecipient] = useState('')
   const [feishuRecipient, setFeishuRecipient] = useState('')
   const [recipientError, setRecipientError] = useState(false)
+  // Blank means "no explicit per-task value": the server falls back to
+  // CC_HAHA_TASK_TIMEOUT_MS, then the 600s default. A task stored without the
+  // field therefore loads as an empty input, exactly like a fresh one.
+  const [timeoutSeconds, setTimeoutSeconds] = useState(
+    formatCronTaskTimeoutSeconds(editTask?.timeoutMs),
+  )
   const [isSubmitting, setIsSubmitting] = useState(false)
 
   // Older tasks stored a channel without any recipient (the server used to
@@ -194,13 +207,21 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
     minuteInterval, hourInterval, minuteOffset, selectedDays, monthDay, customCron,
   })
 
+  const timeoutParse = parseCronTaskTimeoutSeconds(timeoutSeconds)
+  // Only surface the error once the user typed something unusable — a blank
+  // field is the documented "use the default" state, not a mistake.
+  const timeoutError = timeoutParse.kind === 'invalid'
+    ? t('newTask.timeoutInvalid', { max: CRON_TASK_TIMEOUT_MAX_SECONDS })
+    : undefined
+
   const canSubmit =
     name.trim() &&
     description.trim() &&
     prompt.trim() &&
     (frequency !== 'customCron' || isValidCron(customCron)) &&
     (frequency !== 'specificDays' || selectedDays.length > 0) &&
-    (!notifyEnabled || notifyChannels.length > 0)
+    (!notifyEnabled || notifyChannels.length > 0) &&
+    timeoutParse.kind !== 'invalid'
 
   // Every selected IM channel needs an explicit target. A missing one is
   // reported on save, never silently sent to everyone.
@@ -226,7 +247,7 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
         recipients.feishu = recipientSpecFor(feishuRecipient, feishuPairedUsers)
       }
       const hasRecipients = Object.keys(recipients).length > 0
-      const payload = {
+      const basePayload = {
         name: name.trim(),
         description: description.trim(),
         cron: cronValue,
@@ -241,9 +262,21 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
           : undefined,
       }
       if (isEdit) {
-        await updateTask(editTask!.id, payload)
+        // An empty field on an existing task is an explicit clear: send `null`
+        // so a previously saved value is removed instead of being left behind.
+        await updateTask(editTask!.id, {
+          ...basePayload,
+          timeoutMs: timeoutParse.kind === 'valid' ? timeoutParse.ms : null,
+        })
       } else {
-        await createTask({ ...payload, enabled: true, recurring: true })
+        // A new task with a blank field carries no timeoutMs at all, so the
+        // environment variable and built-in default resolve it server-side.
+        await createTask({
+          ...basePayload,
+          enabled: true,
+          recurring: true,
+          ...(timeoutParse.kind === 'valid' ? { timeoutMs: timeoutParse.ms } : {}),
+        })
       }
       onClose()
     } catch (err) {
@@ -418,6 +451,22 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
             error={customCron.trim() && !isValidCron(customCron) ? t('newTask.invalidCron') : undefined}
           />
         )}
+
+        {/* Per-task run timeout. Deliberately here rather than in General
+            settings: the server has no global timeout endpoint, and the value
+            belongs to the task it applies to. */}
+        <Input
+          label={t('newTask.timeoutLabel')}
+          value={timeoutSeconds}
+          onChange={(e) => setTimeoutSeconds(e.target.value)}
+          placeholder={String(CRON_TASK_TIMEOUT_DEFAULT_SECONDS)}
+          inputMode="decimal"
+          hint={t('newTask.timeoutHint', {
+            seconds: CRON_TASK_TIMEOUT_DEFAULT_SECONDS,
+            env: CRON_TASK_TIMEOUT_ENV_VAR,
+          })}
+          error={timeoutError}
+        />
 
         {/* Notification. The three hand-rolled checkboxes here were part of the
             19 across the app that varied in size, accent token and how the

@@ -4,6 +4,7 @@ import type {
   CreateTaskInput,
   NotificationDeliveryRecord,
   TaskRun,
+  TaskUpdateInput,
 } from '../types/task'
 
 type TasksResponse = { tasks: CronTask[] }
@@ -45,7 +46,7 @@ export const tasksApi = {
     return api.post<TaskResponse>('/api/scheduled-tasks', input)
   },
 
-  update(id: string, updates: Partial<CronTask>) {
+  update(id: string, updates: TaskUpdateInput) {
     return api.put<TaskResponse>(`/api/scheduled-tasks/${id}`, updates)
   },
 

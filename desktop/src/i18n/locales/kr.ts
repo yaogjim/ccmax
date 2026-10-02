@@ -3063,6 +3063,9 @@ export const kr: Record<TranslationKey, string> = {
   'newTask.recipientLabel': '알림 수신자',
   'newTask.recipientPlaceholder': '수신자 선택',
   'newTask.recipientRequired': '각 IM 채널의 수신자를 선택하세요. 알림은 명시적으로 선택한 페어링된 사용자에게만 전송됩니다.',
+  'newTask.timeoutLabel': '1회 실행 시간 초과(초)',
+  'newTask.timeoutHint': '이 작업에만 적용됩니다. 비워 두면 기본값을 따릅니다. 환경 변수 {env}가 있으면 이를, 없으면 {seconds}초를 사용합니다.',
+  'newTask.timeoutInvalid': '0보다 큰 초를 {max} 이하로 입력하세요. 정밀도는 밀리초까지입니다.',
 
   // ─── Cron Descriptions ──────────────────────────────────────
   'cron.everyMinute': '매분 실행',

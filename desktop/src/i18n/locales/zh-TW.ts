@@ -3060,6 +3060,9 @@ export const zh: Record<TranslationKey, string> = {
   'newTask.recipientLabel': '通知收件人',
   'newTask.recipientPlaceholder': '請選擇收件人',
   'newTask.recipientRequired': '請為每個 IM 渠道選擇收件人。通知只會傳送給你明確選擇的已配對使用者。',
+  'newTask.timeoutLabel': '單次執行逾時（秒）',
+  'newTask.timeoutHint': '僅作用於本任務。留空則繼承預設值：優先環境變數 {env}，未設定時為 {seconds} 秒。',
+  'newTask.timeoutInvalid': '請輸入大於 0 的秒數，最大 {max}，且不超過毫秒精度。',
 
   // ─── Cron 描述 ──────────────────────────────────────
   'cron.everyMinute': '每分鐘執行',
