@@ -58,6 +58,7 @@ Every tool registers in one registry, grouped by capability: files, shell, syste
 | Background memory consolidation | [AutoDream memory consolidation](./autodream.md) |
 | Screen control tools, authorization, coordinate mapping | [Computer Use architecture](./computer-use.md) |
 | IM message protocol, access control, permission relay | [Channel system](./channel.md) |
+| Media handling for inbound IM messages (voice / image / files) | [IM message pipeline](./im-media-pipeline.md) |
 | What to run before a PR, and the release process | [Contributing and quality gates](./contributing.md) |
 | Running the CLI in a terminal or from a script | [CLI install and run](../cli/index.md) |
 

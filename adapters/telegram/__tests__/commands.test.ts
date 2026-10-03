@@ -358,6 +358,18 @@ describe('Telegram command controller helpers', () => {
     expect(buildTelegramHelpText()).toContain('/answer')
   })
 
+  it('documents whisper.cpp-compatible CLIs and does not list Python whisper', () => {
+    const help = buildTelegramHelpText()
+    expect(help).toContain('whisper-cli')
+    expect(help).toContain('whisper-cpp')
+    expect(help).toContain('默认关闭')
+    expect(help).toContain('不代表已经听懂')
+    expect(help).toContain('不支持 Python 的 whisper 命令')
+    // The generic Python console script must not be advertised as a compatible binary.
+    expect(help).not.toContain('whisper-cli / whisper-cpp / whisper')
+    expect(help).not.toMatch(/whisper-cli \/ whisper-cpp \/ whisper/)
+  })
+
   it('scopes duplicate message keys to the Telegram chat', () => {
     expect(telegramMessageDedupKey('42', 7)).toBe('telegram:42:7')
     expect(telegramMessageDedupKey('43', 7)).not.toBe(telegramMessageDedupKey('42', 7))
@@ -910,6 +922,7 @@ describe('Telegram command controller helpers', () => {
       },
       setRuntimeModel: (chatId, modelId) => events.push(`model:${chatId}:${modelId}`),
       setRuntimeBusy: (chatId) => events.push(`busy:${chatId}`),
+      cancelPendingInput: (chatId) => events.push(`cancel:${chatId}`),
     })
 
     await controller.setModelFromCommand('42', 'model-x')
@@ -934,6 +947,8 @@ describe('Telegram command controller helpers', () => {
     expect(events).toContain('message:42:connected')
     expect(events).toContain('permit:42:req-1:true:')
     expect(events).toContain('decrement:42')
+    // Resuming a session must invalidate input still being transcribed.
+    expect(events).toContain('cancel:42')
     expect(permissionCtx.edits[0]).toContain('已允许')
 
     await controller.handleSkillsCommand(createCommandContext().ctx)
@@ -982,5 +997,54 @@ describe('Telegram command controller helpers', () => {
     }, new Map([['42', new Set(['q-cb'])]]), () => {}, new Set(['q-cb']))).resolves.toBe('question_answer_required')
     expect(questionCtx.answers).toContain('请使用 /answer 提交答案')
     expect(questionCtx.edits).toEqual([])
+  })
+
+  describe('numeric session picks', () => {
+    /** `/resume` → pick the only project by number → the session list is open. */
+    async function openResumeSessionList() {
+      const { controller, deps, sent, bridgeEvents } = createController()
+      const chat = '42'
+      await controller.handleResumeCommand(createCommandContext().ctx)
+      expect(controller.pendingSelectionKind(chat)).toBe('resume_project')
+      expect(await controller.selectPendingByNumber(chat, 1, 7)).toBe(true)
+      expect(controller.pendingSelectionKind(chat)).toBe('resume_session')
+      return { controller, deps, sent, bridgeEvents, chat }
+    }
+
+    it('maps a number through the visible page and restores that session', async () => {
+      const { controller, sent, bridgeEvents, chat } = await openResumeSessionList()
+      const before = sent.length
+      expect(await controller.selectPendingByNumber(chat, 1, 7)).toBe(true)
+      // The same restore path the inline button takes...
+      expect(bridgeEvents).toContain(`connect:${chat}:session-123456789`)
+      expect(bridgeEvents).toContain(`store:${chat}:session-123456789:/work/repo`)
+      // ...answered with a new message, because there was no prompt to edit.
+      expect(sent.slice(before).some((item) => item.text.includes('已恢复会话'))).toBe(true)
+      expect(controller.pendingSelectionKind(chat)).toBeNull()
+    })
+
+    it('reports an off-page number instead of swallowing it', async () => {
+      const { controller, sent, chat } = await openResumeSessionList()
+      const before = sent.length
+      expect(await controller.selectPendingByNumber(chat, 9, 7)).toBe(true)
+      expect(sent.slice(before).some((item) => item.text.includes('编号无效'))).toBe(true)
+      // The list stays open, so the user can answer with a number that exists.
+      expect(controller.pendingSelectionKind(chat)).toBe('resume_session')
+    })
+
+    it('never treats a digit as list input without a pending picker', async () => {
+      const { controller, sent } = createController()
+      expect(controller.pendingSelectionKind('42')).toBeNull()
+      expect(await controller.selectPendingByNumber('42', 1, 7)).toBe(false)
+      expect(sent).toEqual([])
+    })
+
+    it('refuses a number from an unauthorized user', async () => {
+      const { controller, deps, sent, chat } = await openResumeSessionList()
+      const before = sent.length
+      deps.isAllowedUser.mockImplementation(() => false)
+      expect(await controller.selectPendingByNumber(chat, 1, 999)).toBe(false)
+      expect(sent.length).toBe(before)
+    })
   })
 })

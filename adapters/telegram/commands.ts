@@ -27,6 +27,16 @@ export const OPENAI_OFFICIAL_PROVIDER_ID = 'openai-official'
 export const OFFICIAL_DEFAULT_MODEL_ID = 'claude-opus-4-8'
 export const OPENAI_OFFICIAL_DEFAULT_MODEL_ID = 'gpt-5.3-codex'
 
+/**
+ * Picker kinds whose numbered rows are also accepted as a numeric *text*
+ * reply. Only the session-restore lists: switching provider/model/skill with a
+ * stray digit would be a silent, unrelated side effect of typing a number.
+ */
+export const TELEGRAM_NUMERIC_PICK_KINDS: TelegramSelectionKind[] = [
+  'resume_project',
+  'resume_session',
+]
+
 type TelegramSendApi = {
   sendMessage: (chatId: number, text: string, options?: TelegramSendOptions) => Promise<unknown>
 }
@@ -85,6 +95,10 @@ export type TelegramCommandControllerDeps = {
   waitForBridgeOpen: (chatId: string) => Promise<boolean>
   sendUserMessage: (chatId: string, content: string) => boolean
   setRuntimeModel: RuntimeModelSetter
+  /** Cancel inbound work still in flight for this chat (voice download or
+   *  transcription). Called before a session switch so a late transcript
+   *  cannot land in the newly selected session. */
+  cancelPendingInput?: (chatId: string) => void
 }
 
 export type TelegramCommandController = ReturnType<typeof createTelegramCommandController>
@@ -260,6 +274,8 @@ export type TelegramRuntimeCommandControllerDeps = {
   handleServerMessage: (chatId: string, msg: unknown) => void | Promise<void>
   setRuntimeModel: (chatId: string, modelId: string) => void
   setRuntimeBusy: (chatId: string) => void
+  /** Abort a chat's in-flight inbound work before a session switch. */
+  cancelPendingInput?: (chatId: string) => void
 }
 
 export function createTelegramRuntimeCommandController(
@@ -285,6 +301,7 @@ export function createTelegramRuntimeCommandController(
     ),
     handleServerMessage: deps.handleServerMessage,
     waitForBridgeOpen: (chatId) => deps.bridge.waitForOpen(chatId),
+    cancelPendingInput: deps.cancelPendingInput,
     sendUserMessage: (chatId, content) => {
       const sent = deps.bridge.sendUserMessage(chatId, content)
       if (sent) deps.setRuntimeBusy(chatId)
@@ -677,6 +694,9 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
       return
     }
 
+    // Invalidate input still being transcribed before switching bindings.
+    deps.cancelPendingInput?.(chatId)
+
     const result = await restoreSelectedSession({
       httpClient: deps.httpClient,
       bridge: {
@@ -696,6 +716,81 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
     }, chatId, { id: item.value, workDir, title: item.label })
     if (result.ok) pendingSelections.delete(chatId)
     await ctx.editMessageText(result.message)
+  }
+
+  /** Apply one picked item. Shared by the inline buttons and by a numeric text
+   *  reply, so both routes behave identically. */
+  const applySelection = async (
+    ctx: TelegramCommandContext,
+    kind: TelegramSelectionKind,
+    item: TelegramSelectionItem,
+  ): Promise<void> => {
+    switch (kind) {
+      case 'provider':
+        await applyProviderSelection(ctx, item)
+        break
+      case 'model':
+        await applyModelSelection(ctx, item)
+        break
+      case 'resume_project':
+        await showResumeSessionPicker(ctx, item)
+        break
+      case 'resume_session':
+        await resumeSessionForChat(ctx, item)
+        break
+      case 'skill':
+        await applySkillSelection(ctx, item)
+        break
+    }
+  }
+
+  /**
+   * Context for a pick that arrived as a *text* reply instead of a button
+   * press. It keeps the chat identity the handlers key on, but sends a new
+   * message instead of editing the original prompt.
+   */
+  const textReplyContext = (chatId: string, userId: number): TelegramCommandContext => ({
+    chat: { id: chatId, type: 'private' },
+    from: { id: userId },
+    callbackQuery: { message: { chat: { id: chatId } } },
+    reply: (text: string) => deps.api.sendMessage(Number(chatId), text),
+    editMessageText: (text: string, options?: TelegramSendOptions) =>
+      deps.api.sendMessage(Number(chatId), text, options),
+    answerCallbackQuery: async () => {},
+  })
+
+  /**
+   * Resolve a numeric text reply against this chat's pending session picker.
+   *
+   * The number is mapped through the picker's *current page* — the numbers the
+   * user can see — and applied with the same handler the inline buttons use.
+   * Nothing is guessed: without a pending session list this returns false, and
+   * a digit that is not on the visible page is reported instead of being
+   * silently swallowed. Provider/model/skill menus stay button-only.
+   */
+  const selectPendingByNumber = async (
+    chatId: string,
+    value: number,
+    userId: number,
+  ): Promise<boolean> => {
+    if (!deps.isAllowedUser(userId)) return false
+    const selection = peekPendingSelection(pendingSelections, chatId)
+    if (!selection || !TELEGRAM_NUMERIC_PICK_KINDS.includes(selection.kind)) return false
+    const page = buildTelegramSelectionPage({
+      kind: selection.kind,
+      items: selection.items,
+      page: selection.page,
+    })
+    const item = page.visibleItems[value - 1]
+    if (!item) {
+      await deps.api.sendMessage(
+        Number(chatId),
+        '编号无效，请使用当前页显示的编号，或重新发送 /resume 刷新列表。',
+      )
+      return true
+    }
+    await applySelection(textReplyContext(chatId, userId), selection.kind, item)
+    return true
   }
 
   const handleSelectionCallback = async (
@@ -735,23 +830,7 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
     }
 
     await ctx.answerCallbackQuery('处理中...').catch(() => {})
-    switch (callback.kind) {
-      case 'provider':
-        await applyProviderSelection(ctx, item)
-        break
-      case 'model':
-        await applyModelSelection(ctx, item)
-        break
-      case 'resume_project':
-        await showResumeSessionPicker(ctx, item)
-        break
-      case 'resume_session':
-        await resumeSessionForChat(ctx, item)
-        break
-      case 'skill':
-        await applySkillSelection(ctx, item)
-        break
-    }
+    await applySelection(ctx, callback.kind, item)
     return true
   }
 
@@ -763,6 +842,11 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
     handleResumeCommand,
     handleSelectionCallback,
     clearPendingSelections: (chatId: string) => pendingSelections.delete(chatId),
+    /** Which list this chat is currently answering, or null. Read-only pending
+     *  getter for the entrypoint's receive-time routing. */
+    pendingSelectionKind: (chatId: string): TelegramSelectionKind | null =>
+      peekPendingSelection(pendingSelections, chatId)?.kind ?? null,
+    selectPendingByNumber,
     showProviderPicker,
     showModelPicker,
     showSkills,
@@ -783,6 +867,13 @@ export function buildTelegramHelpText(): string {
     '/model [model] — 查看或切换模型',
     '/skills — 查看当前项目可用 Skills',
     '/answer <id> <答案> — 回答模型提问（AskUserQuestion），多题用 JSON',
+    '',
+    '语音消息：默认关闭转写。只有显式配置后，语音便签才会在本机转写成文字再交给模型。',
+    '未配置或转写失败时，已下载的语音会作为文件送达，并提示没有识别出内容——这不代表已经听懂。',
+    '转写需要本机安装 FFmpeg（解码音频）与 whisper.cpp 兼容 CLI（whisper-cli 或 whisper-cpp；不支持 Python 的 whisper 命令），',
+    '并在 ~/.claude/adapters.json 配置 stt.provider = "whisper-local"，',
+    '可选 stt.whisperPath / stt.whisperModel 指定可执行文件与模型，stt.ffmpegPath 指定 FFmpeg，',
+    '或用环境变量 CC_STT_PROVIDER / CC_STT_WHISPER_PATH / CC_STT_WHISPER_MODEL / CC_STT_FFMPEG_PATH。',
   ].join('\n')
 }
 
@@ -912,6 +1003,25 @@ function getPendingSelection(
 ): PendingTelegramSelection | null {
   const selection = pendingSelections.get(chatId)
   if (!selection || selection.kind !== kind) return null
+  if (selection.expiresAt < Date.now()) {
+    pendingSelections.delete(chatId)
+    return null
+  }
+  return selection
+}
+
+/**
+ * The chat's pending picker regardless of kind, or null. Expired pickers are
+ * pruned on read. Read-only: unlike `getPendingSelection` it answers no
+ * callback and mutates nothing else, so an entrypoint can ask "is a list
+ * waiting for this chat?" before deciding that a bare number is list input.
+ */
+function peekPendingSelection(
+  pendingSelections: Map<string, PendingTelegramSelection>,
+  chatId: string,
+): PendingTelegramSelection | null {
+  const selection = pendingSelections.get(chatId)
+  if (!selection) return null
   if (selection.expiresAt < Date.now()) {
     pendingSelections.delete(chatId)
     return null

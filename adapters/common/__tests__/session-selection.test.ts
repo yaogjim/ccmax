@@ -70,6 +70,21 @@ function harness() {
 }
 
 describe('IM history selection (#1286)', () => {
+  it('pendingKind 只暴露实际有效列表，过期后清理且不改变绑定', async () => {
+    const h = harness()
+    expect(h.controller.pendingKind('chat')).toBeNull()
+    await h.controller.handleInput('chat', '/sessions')
+    expect(h.controller.pendingKind('chat')).toBe('sessions')
+    h.state.now = SESSION_SELECTION_TTL_MS
+    expect(h.controller.pendingKind('chat')).toBeNull()
+    expect(h.store.get('chat')?.sessionId).toBe('current')
+    h.store.delete('chat')
+    await h.controller.handleInput('chat', '/sessions')
+    expect(h.controller.pendingKind('chat')).toBe('projects')
+    h.controller.clear('chat')
+    expect(h.controller.pendingKind('chat')).toBeNull()
+  })
+
   it('lists current project history without touching its binding, then persists the selected original ID', async () => {
     const h = harness()
     await h.controller.handleInput('chat', '/sessions')

@@ -9,7 +9,7 @@ order: 3
 
 For people who only want to use WeChat: the whole setup is one QR scan, with no developer platform to register on. The trade-off is that permission approval is text replies rather than tappable buttons, and only private chats are supported.
 
-Besides text, this path also accepts transcribed voice content, images, and file attachments.
+Besides text, this path accepts platform-provided voice transcripts, images, and file attachments. WeChat and Enterprise WeChat are separate integrations; this page describes the WeChat tab in Settings.
 
 ## Bind the bot account
 
@@ -59,6 +59,14 @@ A permission request arrives as text containing a request ID. Reply with one of:
 - `/deny <requestId>` — deny
 
 Messages are received through long polling and long replies are split into platform-sized messages. A typing indicator is shown while Claude thinks or runs tools. Images enter model input inline; other files are downloaded to a local temporary path. Oversized attachments are reported back in the chat.
+
+## Sending voice, images, and files
+
+- **Voice**: WeChat transcribes voice on its own servers and pushes the text to the bot, so ccmax reads that text (the protocol's `voice_item.text` field). Transcription is done by the WeChat platform and its quality is up to the platform; the field is something the platform *may* provide, and not every voice note is guaranteed to yield complete text. When the platform provides no text, ccmax does not backfill a transcription on your machine (this WeChat path has no local STT), so it cannot understand that voice note.
+- **Images**: downloaded, decrypted, and inlined into model input, so the model genuinely "sees" the picture.
+- **Files**: stored at a local temporary path and handed to the session; the model receives a path, but it can read the file content with tools — a reference is not "cannot read".
+
+Attachments over the size limit are rejected, and the bot reports it in the chat.
 
 ## Unbind
 

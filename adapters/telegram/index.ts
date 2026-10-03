@@ -36,9 +36,20 @@ import { SessionSelectionController } from '../common/session-selection.js'
 import { syncImPermissionState } from '../common/permission-sync.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
 import { TelegramMediaService } from './media.js'
+import {
+  collectTelegramLocalAttachments,
+  assembleTelegramMessage,
+  isTelegramTranscriptionEnabled,
+  planTelegramOutbound,
+  setTelegramTranscriber,
+  setTelegramLanguageHint,
+  splitTelegramNotices,
+  type TelegramFileDownloader,
+} from './inbound.js'
+import type { EnrichedMessage } from '../common/attachment/pipeline.js'
+import { resolveConfiguredTranscriber, sttLanguageHint } from '../common/stt.js'
 import { AttachmentStore } from '../common/attachment/attachment-store.js'
-import { checkAttachmentLimit } from '../common/attachment/attachment-limits.js'
-import type { AttachmentRef } from '../common/ws-bridge.js'
+import type { LocalAttachment } from '../common/attachment/attachment-types.js'
 import { ImageBlockWatcher } from '../common/attachment/image-block-watcher.js'
 import type { PendingUpload } from '../common/attachment/attachment-types.js'
 import { sendSafeOutboundImage } from '../common/attachment/outbound-image.js'
@@ -51,6 +62,16 @@ const config = loadConfig()
 if (!config.telegram.botToken) {
   console.error('[Telegram] Missing TELEGRAM_BOT_TOKEN. Set env or ~/.claude/adapters.json')
   process.exit(1)
+}
+
+// End-to-end STT wiring: construct the configured provider and hand it to the
+// inbound pipeline's module-level slot. No STT config → no provider → voice
+// degrades to a file reference with a notice (unchanged).
+const telegramTranscriber = resolveConfiguredTranscriber(config)
+setTelegramTranscriber(telegramTranscriber)
+setTelegramLanguageHint(sttLanguageHint(config))
+if (telegramTranscriber) {
+  console.log('[Telegram] Voice transcription enabled: stt.provider =', config.stt.provider)
 }
 
 export const bot = new Bot(config.telegram.botToken)
@@ -71,6 +92,187 @@ const pendingPermissions = new Map<string, Set<string>>()
 const pendingQuestions = new Map<string, Map<string, unknown>>()
 /** Telegram caps a text message at 4096 chars; leave the same headroom as streaming. */
 const TELEGRAM_TEXT_LIMIT = 4000
+
+/**
+ * Global transcription admission control. Local Whisper loads a model per
+ * run, so at most `MAX_CONCURRENT_TRANSCRIPTIONS` voices transcribe at once
+ * across all chats; extras wait in a bounded FIFO. Past the bound the voice
+ * is explicitly refused instead of buffering unbounded audio bytes.
+ */
+const MAX_CONCURRENT_TRANSCRIPTIONS = 2
+const MAX_QUEUED_TRANSCRIPTIONS = 8
+
+type LimiterTicket = { release: () => void }
+
+class TranscriptionLimiter {
+  private active = 0
+  private readonly waiters: Array<{ start: () => void; cancel: () => void }> = []
+
+  constructor(
+    private readonly maxConcurrency: number,
+    private readonly maxQueue: number,
+  ) {}
+
+  /** Acquire a slot, waiting in the bounded FIFO when all are busy.
+   *  Returns 'over_capacity' when the wait queue is full, or 'cancelled'
+   *  when `signal` aborts before a slot is granted. */
+  async acquire(signal: AbortSignal): Promise<LimiterTicket | 'over_capacity' | 'cancelled'> {
+    if (signal.aborted) return 'cancelled'
+    if (this.active < this.maxConcurrency) {
+      this.active += 1
+      return this.makeTicket()
+    }
+    if (this.waiters.length >= this.maxQueue) return 'over_capacity'
+
+    return await new Promise<LimiterTicket | 'cancelled'>((resolve) => {
+      const waiter = {
+        start: () => {
+          signal.removeEventListener('abort', onAbort)
+          this.active += 1
+          resolve(this.makeTicket())
+        },
+        cancel: () => {
+          signal.removeEventListener('abort', onAbort)
+          resolve('cancelled')
+        },
+      }
+      const onAbort = (): void => {
+        const index = this.waiters.indexOf(waiter)
+        if (index >= 0) this.waiters.splice(index, 1)
+        waiter.cancel()
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      this.waiters.push(waiter)
+    })
+  }
+
+  /** Drain every queued waiter (shutdown); active tickets release themselves. */
+  clearQueue(): void {
+    for (const waiter of this.waiters.splice(0)) waiter.cancel()
+  }
+
+  private makeTicket(): LimiterTicket {
+    let released = false
+    return {
+      release: () => {
+        if (released) return
+        released = true
+        this.active = Math.max(0, this.active - 1)
+        this.waiters.shift()?.start()
+      },
+    }
+  }
+}
+
+const transcriptionLimiter = new TranscriptionLimiter(
+  MAX_CONCURRENT_TRANSCRIPTIONS,
+  MAX_QUEUED_TRANSCRIPTIONS,
+)
+
+/**
+ * Per-chat ceiling on inbound inputs that are received but not finished.
+ *
+ * The cap is counted from *receive* time, so input waiting for its queue slot
+ * still counts: it holds audio bytes in memory and a slot in the chat's
+ * queue. Past the cap the input is refused with a visible notice instead of
+ * buffering without bound.
+ */
+export const MAX_PENDING_INPUTS_PER_CHAT = 8
+
+/**
+ * One inbound user input, registered *before* it enters the chat's serial
+ * queue.
+ *
+ * Registering at receive time — rather than inside the queued task, which is
+ * where the download used to start — is what lets `/stop`, `/clear`, `/new`, a
+ * session switch, stale-session recovery and shutdown cancel work that is
+ * queued but has not started yet. `generation` is the chat's invalidation
+ * counter observed at receive time; it catches the window where an
+ * invalidation lands after the last abort check but before the send.
+ *
+ * The session this input delivers into is deliberately *not* captured here:
+ * input that arrives while a `/new` (or a session switch) is still creating its
+ * binding has to be delivered into the new one, so the task observes the
+ * binding itself, after that command finished.
+ */
+type PendingInput = {
+  controller: AbortController
+  generation: number
+  /**
+   * Settles when the task that owns this input has finished — including any
+   * transcription provider's abort cleanup (killing a detached child and
+   * removing its temp files). `stopTelegramAdapter` awaits these so the
+   * process cannot exit before that cleanup completed.
+   */
+  completion: Promise<void>
+  resolveCompletion: () => void
+}
+
+const pendingInputs = new Map<string, PendingInput[]>()
+const inputGenerations = new Map<string, number>()
+
+function pendingInputGeneration(chatId: string): number {
+  return inputGenerations.get(chatId) ?? 0
+}
+
+function countPendingInputs(chatId: string): number {
+  return pendingInputs.get(chatId)?.length ?? 0
+}
+
+function registerChatInput(chatId: string): PendingInput {
+  let resolveCompletion!: () => void
+  const completion = new Promise<void>((resolve) => { resolveCompletion = resolve })
+  const input: PendingInput = {
+    controller: new AbortController(),
+    generation: pendingInputGeneration(chatId),
+    completion,
+    resolveCompletion,
+  }
+  const list = pendingInputs.get(chatId)
+  if (list) list.push(input)
+  else pendingInputs.set(chatId, [input])
+  return input
+}
+
+function releaseChatInput(chatId: string, input: PendingInput): void {
+  const list = pendingInputs.get(chatId)
+  if (list) {
+    const index = list.indexOf(input)
+    if (index >= 0) list.splice(index, 1)
+    if (list.length === 0) pendingInputs.delete(chatId)
+  }
+  // Always resolve, even if the input was already dropped from the map: the
+  // shutdown path awaits every registered completion.
+  input.resolveCompletion()
+}
+
+/**
+ * Invalidate every input received for this chat so far — queued, downloading,
+ * transcribing, or already past `ensureSession` — and advance the chat's
+ * generation so a task that already cleared its last abort check still refuses
+ * to send. Called by `/stop`, `/clear`, `/new`, a session switch, stale-session
+ * recovery and adapter shutdown.
+ *
+ * A binding change made by the input's own task (creating its session on
+ * first use) must NOT invalidate that task, so session creation deliberately
+ * does not call this.
+ */
+function invalidateChatInputs(chatId: string): void {
+  inputGenerations.set(chatId, pendingInputGeneration(chatId) + 1)
+  const list = pendingInputs.get(chatId)
+  if (!list) return
+  for (const input of list) input.controller.abort()
+}
+
+/** Shutdown: invalidate every chat's pending input, active or queued. */
+function invalidateAllChatInputs(): void {
+  for (const chatId of [...pendingInputs.keys()]) invalidateChatInputs(chatId)
+  transcriptionLimiter.clearQueue()
+}
+
+/** Set by {@link stopTelegramAdapter}; every send path refuses while true. */
+let shuttingDown = false
+
 /** Per-chat outbound image watcher for Agent-produced markdown images. */
 const tgImageWatchers = new Map<string, ImageBlockWatcher>()
 
@@ -103,6 +305,7 @@ const commandController = createTelegramRuntimeCommandController({
   handleServerMessage: (chatId, msg) => handleServerMessage(chatId, msg as ServerMessage),
   setRuntimeModel: (chatId, modelId) => { getRuntimeState(chatId).model = modelId },
   setRuntimeBusy: (chatId) => { getRuntimeState(chatId).state = 'thinking' },
+  cancelPendingInput: (chatId) => { invalidateChatInputs(chatId) },
 })
 const sessionSelection = new SessionSelectionController({
   httpClient, bridge, sessionStore,
@@ -318,6 +521,11 @@ async function ensureSession(chatId: string): Promise<boolean> {
 
 async function createSessionForChat(chatId: string, workDir: string): Promise<boolean> {
   const numericChatId = Number(chatId)
+  // Deliberately no pending-input invalidation here: this is also the path a
+  // message task takes to create its own session on first use, and cancelling
+  // itself would drop the message it is trying to deliver. The callers that
+  // really replace a binding (`/new`, session restore, stale-session recovery)
+  // invalidate explicitly.
   try {
     // Always tear down any stale WS connection before creating a new session.
     // Without this, bridge.connectSession() below would short-circuit when an
@@ -524,6 +732,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         const workDir = stored?.workDir || defaultWorkDir
         if (workDir) {
           await bot.api.sendMessage(numericChatId, '⚠️ 会话上下文已失效，正在自动重建...')
+          invalidateChatInputs(chatId)
           clearTransientChatState(chatId)
           bridge.resetSession(chatId)
           sessionStore.delete(chatId)
@@ -555,7 +764,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
 // ---------- bot handlers ----------
 
 registerTelegramExtendedCommands(bot, commandController)
-registerTelegramSessionCommands(bot, (ctx, text) => routeUserMessage(ctx as Context, text, []))
+registerTelegramSessionCommands(bot, (ctx, text) => routeUserMessage(ctx as Context, text))
 
 /** Reset session state and start a new session for chatId.
  *  If `query` is provided, match a project by index or name;
@@ -563,6 +772,10 @@ registerTelegramSessionCommands(bot, (ctx, text) => routeUserMessage(ctx as Cont
 async function startNewSession(chatId: string, query?: string): Promise<void> {
   const numericChatId = Number(chatId)
 
+  // No pending-input invalidation here: a `/new` arrives through
+  // `routeSessionInput`, which invalidates input received *before* the command
+  // at receive time. Invalidating again from inside this task would also kill
+  // input that arrived while the new session was still being created.
   bridge.resetSession(chatId)
   sessionStore.delete(chatId)
   streamDelivery.clear(chatId)
@@ -612,6 +825,10 @@ const isAuthorizedTelegramUser = (userId: number) => isAllowedUser('telegram', u
 
 registerAuthorizedTelegramCommand(bot, 'stop', isAuthorizedTelegramUser, (ctx) => {
   const chatId = String(ctx.chat!.id)
+  // Cancel input still queued, downloading or transcribing: /stop must not
+  // wait for a long local transcription, and a cancelled transcript is never
+  // sent. Runs outside the chat queue, so it is prompt.
+  invalidateChatInputs(chatId)
   void (async () => {
     const result = await ensureExistingSession(chatId)
     if (result.status !== 'restored') {
@@ -630,6 +847,9 @@ registerAuthorizedTelegramCommand(bot, 'status', isAuthorizedTelegramUser, async
 
 registerAuthorizedTelegramCommand(bot, 'clear', isAuthorizedTelegramUser, (ctx) => {
   const chatId = String(ctx.chat!.id)
+  // Invalidate input that has not reached the Agent yet: a late transcript must
+  // not be written into the freshly cleared context.
+  invalidateChatInputs(chatId)
   void (async () => {
     const result = await ensureExistingSession(chatId)
     if (result.status !== 'restored') {
@@ -649,22 +869,199 @@ registerAuthorizedTelegramCommand(bot, 'clear', isAuthorizedTelegramUser, (ctx) 
 
 for (const command of ['allow', 'always', 'allow-always', 'deny'] as const) {
   bot.command(command, async (ctx) => {
-    await routeUserMessage(ctx, `/${command}${ctx.match ? ` ${ctx.match}` : ''}`, [])
+    await routeUserMessage(ctx, `/${command}${ctx.match ? ` ${ctx.match}` : ''}`)
   })
 }
 
 // /answer rides the same authorized, deduplicated, queued pipeline as text.
 bot.command('answer', async (ctx) => {
-  await routeUserMessage(ctx, `/answer${ctx.match ? ` ${ctx.match}` : ''}`, [])
+  await routeUserMessage(ctx, `/answer${ctx.match ? ` ${ctx.match}` : ''}`)
 })
 
-/** Shared per-user-message pipeline: dedup, pairing check, project-pick
- *  routing, enqueue, ensureSession, sendUserMessage with attachments.
- *  Caller has already extracted text and attachments from the context. */
+/** Lazy media collector: runs after authorization and dedup, and inside the
+ *  chat's serial queue, so a slow download/transcription cannot be overtaken
+ *  by a later text. */
+type TelegramMediaCollector = (
+  signal: AbortSignal,
+) => Promise<{ locals: LocalAttachment[]; rejections: string[] }>
+
+/**
+ * Session commands in flight, keyed by chat.
+ *
+ * Session commands run on the short control queue so a local transcription
+ * cannot hold them behind it. Normal input still runs on the chat's serial
+ * queue, which keeps its receive order, so it must wait for a session command
+ * that was received *before* it — otherwise a `/new` and the text after it
+ * could race and the text would land in the old session.
+ */
+const sessionCommandBarriers = new Map<string, Promise<void>>()
+
+async function awaitSessionCommandBarrier(chatId: string): Promise<void> {
+  const barrier = sessionCommandBarriers.get(chatId)
+  if (!barrier) return
+  await barrier.catch(() => {})
+}
+
+/**
+ * Receive-time classification of session input, mirroring
+ * `tryHandleTelegramSessionInput`.
+ *
+ * `switchesBinding` marks input that will replace the chat's session binding;
+ * it invalidates everything received before it. A command that only shows
+ * options leaves pending input alone, so browsing `/projects` never cancels a
+ * voice that is already transcribing.
+ */
+type SessionInputRoute = {
+  /** `command`: `/new`, `/projects`, `/resume`, `/sessions`, picker replies.
+   *  `pick`: a number answering a list that is actually on screen. */
+  kind: 'none' | 'command' | 'pick'
+  switchesBinding: boolean
+}
+
+const NO_SESSION_INPUT: SessionInputRoute = { kind: 'none', switchesBinding: false }
+
+/**
+ * A bare number is *only* list input while a list is waiting for this chat, and
+ * which list decides whether answering it replaces the binding. The pending
+ * state of the owning controller is the evidence — the digits are never
+ * guessed — so ordinary chat text that happens to be a number stays a chat
+ * message.
+ */
+function classifyNumericPick(chatId: string, trimmed: string): SessionInputRoute {
+  if (!/^\d+$/.test(trimmed)) return NO_SESSION_INPUT
+  const telegramKind = commandController.pendingSelectionKind(chatId)
+  if (telegramKind === 'resume_session') return { kind: 'pick', switchesBinding: true }
+  if (telegramKind === 'resume_project') return { kind: 'pick', switchesBinding: false }
+  const sharedKind = sessionSelection.pendingKind(chatId)
+  if (sharedKind === 'sessions') return { kind: 'pick', switchesBinding: true }
+  if (sharedKind === 'projects') return { kind: 'pick', switchesBinding: false }
+  return NO_SESSION_INPUT
+}
+
+function classifySessionInput(chatId: string, text: string, hasAttachments: boolean): SessionInputRoute {
+  if (hasAttachments) return NO_SESSION_INPUT
+  const trimmed = text.trim()
+  if (!trimmed) return NO_SESSION_INPUT
+  const command = /^\/(new|projects|sessions|resume)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(trimmed)
+  if (command) {
+    const [, name, args] = command
+    if (name === 'new') return { kind: 'command', switchesBinding: true }
+    if (name === 'projects') return { kind: 'command', switchesBinding: false }
+    const argument = (args ?? '').trim()
+    if (!argument || argument === 'next' || argument === 'prev' || argument === 'projects') {
+      return { kind: 'command', switchesBinding: false }
+    }
+    return { kind: 'command', switchesBinding: true }
+  }
+  if (trimmed === '/cancel') return { kind: 'command', switchesBinding: false }
+  // A reply to the project picker that `showProjectPicker` opened starts a new
+  // session, i.e. it replaces the binding.
+  if (pendingProjectSelection.has(chatId)) return { kind: 'command', switchesBinding: true }
+  return classifyNumericPick(chatId, trimmed)
+}
+
+/**
+ * Resolve the number of a list that is on screen. The controllers own the
+ * pending state, so a reply that raced the list's expiry is reported instead of
+ * disappearing into the void.
+ */
+async function resolveNumericPick(chatId: string, text: string, userId: number): Promise<void> {
+  if (await commandController.selectPendingByNumber(chatId, Number(text.trim()), userId)) return
+  await bot.api.sendMessage(
+    Number(chatId),
+    '选择列表不存在或已过期，请重新发送 /resume 或 /sessions。',
+  )
+}
+
+/**
+ * Run one session command on the short control queue.
+ *
+ * A command that replaces the binding invalidates the chat's pending input at
+ * *receive* time, before it queues: input received earlier must not be
+ * delivered, while input that arrives later — including input that arrives
+ * while the switch is still creating its session — must be. Invalidating inside
+ * the queued task instead would drop that later input for no reason.
+ */
+async function routeSessionInput(
+  chatId: string,
+  text: string,
+  route: SessionInputRoute,
+  userId: number,
+): Promise<void> {
+  if (route.switchesBinding) invalidateChatInputs(chatId)
+  const task = enqueue(`control:${chatId}`, async () => {
+    if (shuttingDown) return
+    const handled = await tryHandleTelegramSessionInput(chatId, text, false, {
+      startNewSession,
+      showProjectPicker,
+      showResumeProjectPicker: commandController.showResumeProjectPicker,
+      handleSessionInput: (id, input) => sessionSelection.handleInput(id, input),
+    })
+    if (handled) return
+    if (route.kind === 'pick') {
+      await resolveNumericPick(chatId, text, userId)
+      return
+    }
+    if (pendingProjectSelection.has(chatId) && text.trim()) {
+      await startNewSession(chatId, text.trim())
+    }
+  })
+  sessionCommandBarriers.set(chatId, task)
+  try {
+    await task
+  } finally {
+    if (sessionCommandBarriers.get(chatId) === task) sessionCommandBarriers.delete(chatId)
+  }
+}
+
+/**
+ * Final gate before `bridge.sendUserMessage`. Every entry is a way the send
+ * could become wrong: work dropped on purpose, a `/stop`/`/clear`/`/new` or
+ * switch that landed after the last check, adapter shutdown, or a binding that
+ * moved away from the one this task started delivering into (`ownerAtStart`,
+ * observed after any earlier session command finished).
+ */
+function canDeliverInput(
+  chatId: string,
+  input: PendingInput,
+  ownerAtStart: string | null,
+): boolean {
+  if (shuttingDown) return false
+  if (input.controller.signal.aborted) return false
+  if (input.generation !== pendingInputGeneration(chatId)) return false
+  const ownerNow = sessionStore.get(chatId)?.sessionId ?? null
+  if (ownerNow === null) return false
+  // A null baseline is the "this input creates its own session" case; anything
+  // else must still be bound to the session it started delivering into.
+  if (ownerAtStart !== null && ownerNow !== ownerAtStart) return false
+  return true
+}
+
+/** Tell the user that local transcription is running; returns the notice id
+ *  so the caller can remove it once the outcome is known. */
+async function sendTranscriptionProgress(chatId: string): Promise<number | undefined> {
+  try {
+    const message = await bot.api.sendMessage(Number(chatId), '🎧 正在本机转写语音…')
+    return message.message_id
+  } catch {
+    return undefined
+  }
+}
+
+/** Remove the progress notice; the real outcome (echo or degrade notice) is
+ *  what the user should be left with. */
+async function clearTranscriptionProgress(chatId: string, messageId?: number): Promise<void> {
+  if (messageId === undefined) return
+  await bot.api.deleteMessage(Number(chatId), messageId).catch(() => {})
+}
+
+/** Shared per-user-message pipeline: dedup, pairing check, capacity admission,
+ *  session-command routing, per-chat queueing, media collection, transcription,
+ *  ensureSession, sendUserMessage and transcript echo. */
 async function routeUserMessage(
   ctx: Context,
   text: string,
-  attachments: AttachmentRef[],
+  media?: TelegramMediaCollector,
 ): Promise<void> {
   if (!ctx.from || ctx.chat?.type !== 'private') return
   const chatId = String(ctx.chat.id)
@@ -682,151 +1079,254 @@ async function routeUserMessage(
     }
     return
   }
+  if (shuttingDown) return
 
-  // Captions remain conversation content even when an attachment download fails.
-  const hasAttachments = attachments.length > 0 || Boolean(
-    ctx.message?.photo || ctx.message?.document || ctx.message?.video || ctx.message?.audio || ctx.message?.voice,
-  )
+  // Media is only *collected* after the private-chat/authorization/dedup gates
+  // above: an unauthorized sender's bytes never reach the local stage dir.
+  const hasAttachments = media !== undefined
+
+  // Permission replies and AskUserQuestion answers are short operations that
+  // must not wait behind a long voice transcription (docs §"顺序、控制命令与
+  // 会话归属"). They ride the per-chat control queue.
+  if (isPermissionReply(text, hasAttachments, chatId)) {
+    await enqueue(`control:${chatId}`, () => handlePermissionReply(chatId, text))
+    return
+  }
+
+  // Session commands are short and binding-scoped: same short control queue,
+  // and a command that replaces the binding invalidates older input first.
+  const sessionInput = classifySessionInput(chatId, text, hasAttachments)
+  if (sessionInput.kind !== 'none') {
+    await routeSessionInput(chatId, text, sessionInput, userId)
+    return
+  }
+
+  // Admission control, counted from receive time: input waiting for its queue
+  // slot already holds staged bytes and a queue slot.
+  if (countPendingInputs(chatId) >= MAX_PENDING_INPUTS_PER_CHAT) {
+    await bot.api.sendMessage(
+      Number(chatId),
+      `⚠️ 待处理消息过多（本次上限 ${MAX_PENDING_INPUTS_PER_CHAT} 条），请等待当前任务完成后再发送。`,
+    ).catch(() => {})
+    return
+  }
+
+  // Registered *before* the queue slot: `/stop`, `/clear`, `/new`, a session
+  // switch or shutdown must cancel input that is queued but not yet started.
+  const input = registerChatInput(chatId)
+
   await enqueue(chatId, async () => {
-    if (!hasAttachments) {
-      const answerCommand = parseAnswerCommand(text)
-      if (answerCommand === 'malformed') {
-        await bot.api.sendMessage(Number(chatId), '用法：/answer <请求ID> <答案>；多题请回复 JSON。')
+    let ticket: LimiterTicket | undefined
+    let progressMessageId: number | undefined
+    try {
+      if (!canStartInput(chatId, input)) return
+      // Deliver in receive order relative to session commands: a switch that
+      // was received earlier must have landed before this message is sent.
+      await awaitSessionCommandBarrier(chatId)
+      if (!canStartInput(chatId, input)) return
+      // The binding this input delivers into, observed *after* any session
+      // command received earlier finished: a message that arrives while a
+      // `/new` is still creating its session is a message for that new session,
+      // so the binding is not captured at receive time.
+      const ownerAtStart = sessionStore.get(chatId)?.sessionId ?? null
+
+      if (await tryHandleTelegramSessionInput(chatId, text, hasAttachments, {
+        startNewSession,
+        showProjectPicker,
+        showResumeProjectPicker: commandController.showResumeProjectPicker,
+        handleSessionInput: (id, inputText) => sessionSelection.handleInput(id, inputText),
+      })) return
+
+      if (!hasAttachments && pendingProjectSelection.has(chatId)) {
+        if (text.trim()) await startNewSession(chatId, text.trim())
         return
       }
-      if (answerCommand) {
-        await handleQuestionAnswer(chatId, answerCommand.requestId, answerCommand.payload)
+
+      let locals: LocalAttachment[] = []
+      if (media) {
+        const collected = await media(input.controller.signal)
+        if (input.controller.signal.aborted) return
+        for (const rejection of collected.rejections) {
+          await ctx.reply(rejection).catch(() => {})
+        }
+        locals = collected.locals
+        // A media message with no surviving attachment and no caption is a no-op.
+        if (locals.length === 0 && !text.trim()) return
+      }
+
+      // Local transcription is globally concurrency-limited; over capacity is
+      // an explicit refusal that still delivers the voice as a file.
+      const hasVoice = locals.some((local) => local.mediaKind === 'voice')
+      let pipelineLocals = locals
+      if (hasVoice && isTelegramTranscriptionEnabled()) {
+        progressMessageId = await sendTranscriptionProgress(chatId)
+      }
+      if (hasVoice && isTelegramTranscriptionEnabled()) {
+        const acquired = await transcriptionLimiter.acquire(input.controller.signal)
+        // Own the granted ticket before checking cancellation: abort can land
+        // while acquire resolves, and the outer finally must release that slot.
+        if (typeof acquired === 'object') ticket = acquired
+        if (acquired === 'cancelled' || input.controller.signal.aborted) return
+        if (acquired === 'over_capacity') {
+          await bot.api.sendMessage(
+            Number(chatId),
+            '🎧 语音转写队列已满，本语音将作为文件转交，请稍后再试。',
+          )
+          // Deliver the voice as a plain file rather than holding its bytes.
+          pipelineLocals = locals.map((local) =>
+            local.mediaKind === 'voice' ? { ...local, mediaKind: undefined } : local)
+        } else {
+          ticket = acquired
+        }
+      }
+
+      let enriched: EnrichedMessage
+      try {
+        enriched = await assembleTelegramMessage(pipelineLocals, text, input.controller.signal)
+      } finally {
+        // Release the global transcription slot as soon as transcription is
+        // finished (or failed): restoring a session and echoing the result
+        // back must not occupy a slot other chats are waiting for.
+        ticket?.release()
+        ticket = undefined
+      }
+      if (enriched.cancelled || input.controller.signal.aborted) return
+
+      const ready = await ensureSession(chatId)
+      if (!ready) return
+      // `ensureSession` awaited across a window in which /stop, /clear, /new, a
+      // session switch or shutdown could land; re-validate before announcing
+      // anything about this input.
+      if (!canDeliverInput(chatId, input, ownerAtStart)) return
+
+      // What happened to the voice, but not the handover claim: the
+      // `bridge.sendUserMessage` below is what actually hands the file over, so
+      // 「已作为文件转交」 is only asserted after that send succeeded — and never
+      // when this input was cancelled instead.
+      const { degrade, claims } = splitTelegramNotices(enriched.notices)
+      for (const notice of degrade) {
+        await ctx.reply(notice).catch(() => {})
+      }
+
+      const { content, attachments: refs } = planTelegramOutbound(enriched)
+      if (!content && !refs) return
+      // Re-check authorization before the send.
+      if (!isAllowedUser('telegram', userId)) {
+        await bot.api.sendMessage(Number(chatId), '🔒 当前账号已不再被授权，消息未发送。').catch(() => {})
         return
       }
-    }
+      // Last gate before the send: the notice replies above awaited, so /stop,
+      // /clear, /new, a session switch or shutdown may have landed in between.
+      // Authorization alone cannot see any of those, so the abort flag,
+      // generation and binding are re-checked here with no await in between.
+      if (!canDeliverInput(chatId, input, ownerAtStart)) return
 
-    const permissionDecision = !hasAttachments
-      ? parsePermissionCommand(text, pendingPermissions.get(chatId))
-      : null
-    if (permissionDecision) {
-      // Questions require /answer or an explicit /deny command. In particular,
-      // replying "3" must not be mistaken for the tool-permission deny shortcut.
-      if (pendingQuestions.get(chatId)?.has(permissionDecision.requestId) &&
-        (permissionDecision.allowed || !text.trim().startsWith('/'))) {
-        await bot.api.sendMessage(
-          Number(chatId),
-          `⚠️ 该请求需要回答，请使用 /answer ${permissionDecision.requestId} <答案> 作答；不能直接允许。`,
-        )
+      const sent = bridge.sendUserMessage(chatId, content, refs)
+      if (!sent) {
+        await bot.api.sendMessage(Number(chatId), '⚠️ 消息发送失败，连接可能已断开。请发送 /new 重新开始。')
         return
       }
-      await handlePermissionDecision(chatId, permissionDecision)
-      return
-    }
-
-    if (await tryHandleTelegramSessionInput(chatId, text, hasAttachments, {
-      startNewSession,
-      showProjectPicker,
-      showResumeProjectPicker: commandController.showResumeProjectPicker,
-      handleSessionInput: (id, input) => sessionSelection.handleInput(id, input),
-    })) return
-
-    if (!hasAttachments && pendingProjectSelection.has(chatId)) {
-      if (text.trim()) await startNewSession(chatId, text.trim())
-      return
-    }
-    const ready = await ensureSession(chatId)
-    if (!ready) return
-    const effective =
-      text || (attachments.length > 0 ? '(用户发送了附件)' : '')
-    if (!effective && attachments.length === 0) return
-    const sent = bridge.sendUserMessage(chatId, effective, attachments.length ? attachments : undefined)
-    if (!sent) {
-      await bot.api.sendMessage(Number(chatId), '⚠️ 消息发送失败，连接可能已断开。请发送 /new 重新开始。')
-    } else {
       getRuntimeState(chatId).state = 'thinking'
+      // The file rode this message: only now is the handover claim true.
+      for (const claim of claims) {
+        await ctx.reply(claim).catch(() => {})
+      }
+      // Echo the exact outbound content as plain text after a successful send
+      // so a mistranscription is visible. Replaces the filename-only receipt.
+      if (enriched.transcripts.length > 0) {
+        await echoPlainText(chatId, content)
+      }
+    } finally {
+      ticket?.release()
+      // Shutdown awaits the completion signal below, and that must represent
+      // the provider cleanup (already finished by now), never a best-effort
+      // Telegram delete that may be uncancellable. Skipping the progress
+      // cleanup during shutdown keeps stopTelegramAdapter() from hanging on a
+      // notification round-trip while the process is trying to exit.
+      if (!shuttingDown) await clearTranscriptionProgress(chatId, progressMessageId)
+      releaseChatInput(chatId, input)
     }
   })
 }
 
-/** Scan ctx.message for photo/document/video/audio/voice, download
- *  each via TelegramMediaService, apply size/mime limits, and produce
- *  a ready-to-send AttachmentRef[] plus any rejection hints. */
+/** A queued input that has already been invalidated must not run at all. */
+function canStartInput(chatId: string, input: PendingInput): boolean {
+  if (shuttingDown) return false
+  if (input.controller.signal.aborted) return false
+  if (input.generation !== pendingInputGeneration(chatId)) return false
+  return true
+}
+
+/** Echo content verbatim as plain text (no parse_mode) so a transcript cannot
+ *  trigger Telegram Markdown/HTML formatting, chunked for the message limit. */
+async function echoPlainText(chatId: string, content: string): Promise<void> {
+  if (!content.trim()) return
+  const numericChatId = Number(chatId)
+  for (const chunk of splitMessage(content, TELEGRAM_TEXT_LIMIT)) {
+    await bot.api.sendMessage(numericChatId, chunk).catch(() => {})
+  }
+}
+
+/** True when the text is a permission reply or an AskUserQuestion answer, i.e.
+ *  a short control operation that must bypass the transcription-blocked queue.
+ *  Captions on media messages are never treated as permission input. */
+function isPermissionReply(text: string, hasAttachments: boolean, chatId: string): boolean {
+  if (hasAttachments) return false
+  if (parseAnswerCommand(text) !== null) return true
+  return parsePermissionCommand(text, pendingPermissions.get(chatId)) !== null
+}
+
+async function handlePermissionReply(chatId: string, text: string): Promise<void> {
+  const answerCommand = parseAnswerCommand(text)
+  if (answerCommand === 'malformed') {
+    await bot.api.sendMessage(Number(chatId), '用法：/answer <请求ID> <答案>；多题请回复 JSON。')
+    return
+  }
+  if (answerCommand) {
+    await handleQuestionAnswer(chatId, answerCommand.requestId, answerCommand.payload)
+    return
+  }
+
+  const permissionDecision = parsePermissionCommand(text, pendingPermissions.get(chatId))
+  if (!permissionDecision) return
+  // Questions require /answer or an explicit /deny command. In particular,
+  // replying "3" must not be mistaken for the tool-permission deny shortcut.
+  if (pendingQuestions.get(chatId)?.has(permissionDecision.requestId) &&
+    (permissionDecision.allowed || !text.trim().startsWith('/'))) {
+    await bot.api.sendMessage(
+      Number(chatId),
+      `⚠️ 该请求需要回答，请使用 /answer ${permissionDecision.requestId} <答案> 作答；不能直接允许。`,
+    )
+    return
+  }
+  await handlePermissionDecision(chatId, permissionDecision)
+}
+
+/** Materialize ctx.message media into staged LocalAttachments (download +
+ *  size/mime gates). Ref assembly — and voice transcription — is owned by the
+ *  shared pipeline from here on. `signal` cancels an in-flight download. */
 async function collectAttachmentsFromCtx(
   ctx: Context,
-): Promise<{ attachments: AttachmentRef[]; rejections: string[] }> {
-  const msg = ctx.message
-  if (!msg || !ctx.chat) return { attachments: [], rejections: [] }
+  signal?: AbortSignal,
+): Promise<{ locals: LocalAttachment[]; rejections: string[] }> {
+  if (!ctx.message || !ctx.chat) return { locals: [], rejections: [] }
   const sessionId = sessionStore.get(String(ctx.chat.id))?.sessionId ?? String(ctx.chat.id)
-  const attachments: AttachmentRef[] = []
-  const rejections: string[] = []
-
-  const runOne = async (
-    fileId: string,
-    fileName?: string,
-    mimeType?: string,
-  ): Promise<void> => {
-    try {
-      const local = await media.downloadFile(fileId, sessionId, { fileName, mimeType })
-      const check = checkAttachmentLimit(local.kind, local.size, local.mimeType)
-      if (!check.ok) {
-        rejections.push(check.hint)
-        return
-      }
-      if (local.kind === 'image') {
-        attachments.push({
-          type: 'image',
-          name: local.name,
-          data: local.buffer.toString('base64'),
-          mimeType: local.mimeType,
-        })
-      } else {
-        attachments.push({
-          type: 'file',
-          name: local.name,
-          path: local.path,
-          mimeType: local.mimeType,
-        })
-      }
-    } catch (err) {
-      console.error('[Telegram] downloadFile failed:', err)
-      rejections.push('📎 附件下载失败,请稍后重试')
-    }
-  }
-
-  // Photos: grammY exposes an array of sizes, largest last.
-  if (msg.photo && msg.photo.length > 0) {
-    const largest = msg.photo[msg.photo.length - 1]!
-    await runOne(largest.file_id, `photo-${largest.file_unique_id}.jpg`, 'image/jpeg')
-  }
-  if (msg.document) {
-    await runOne(msg.document.file_id, msg.document.file_name, msg.document.mime_type)
-  }
-  if (msg.video) {
-    await runOne(msg.video.file_id, msg.video.file_name, msg.video.mime_type)
-  }
-  if (msg.audio) {
-    await runOne(msg.audio.file_id, msg.audio.file_name, msg.audio.mime_type)
-  }
-  if (msg.voice) {
-    await runOne(
-      msg.voice.file_id,
-      `voice-${msg.voice.file_unique_id}.ogg`,
-      msg.voice.mime_type ?? 'audio/ogg',
-    )
-  }
-
-  return { attachments, rejections }
+  const download: TelegramFileDownloader = (fileId, hint, limits) =>
+    media.downloadFile(fileId, sessionId, hint, limits)
+  return collectTelegramLocalAttachments(ctx.message, { download, signal })
 }
 
 bot.on('message:text', async (ctx) => {
-  await routeUserMessage(ctx, ctx.message.text, [])
+  await routeUserMessage(ctx, ctx.message.text)
 })
 
 bot.on(
   ['message:photo', 'message:document', 'message:video', 'message:audio', 'message:voice'],
   async (ctx) => {
     const caption = ctx.message.caption ?? ''
-    const { attachments, rejections } = await collectAttachmentsFromCtx(ctx)
-    for (const r of rejections) {
-      await ctx.reply(r).catch(() => {})
-    }
-    if (attachments.length === 0 && !caption.trim()) return
-    await routeUserMessage(ctx, caption, attachments)
+    // Downloads run lazily inside routeUserMessage, after the authorization and
+    // dedup gates and in the chat's serial queue.
+    await routeUserMessage(ctx, caption, (signal) => collectAttachmentsFromCtx(ctx, signal))
   },
 )
 
@@ -835,7 +1335,12 @@ bot.on('callback_query:data', async (ctx) => {
   if (!dedup.tryRecord(`telegram:callback:${ctx.callbackQuery.id}`)) return
   const data = ctx.callbackQuery.data
   const chatId = String(ctx.chat.id)
-  await enqueue(chatId, async () => {
+  // Menu and permission callbacks both ride the short control queue: neither
+  // may wait behind a local transcription. Landing a session switch also
+  // invalidates the binding's pending input inside the selection handler, so a
+  // transcript still in flight cannot be delivered into the session the user
+  // just left.
+  await enqueue(`control:${chatId}`, async () => {
     if (await tryHandleTelegramSelectionCallback(data, ctx, commandController)) return
 
     if (!data.startsWith('permit:')) return
@@ -862,13 +1367,27 @@ bot.on('callback_query:data', async (ctx) => {
 
 // ---------- start ----------
 
-export function stopTelegramAdapter(): void {
+export async function stopTelegramAdapter(): Promise<void> {
+  // Shutdown: refuse every later send, cancel pending downloads and
+  // transcriptions (queued or active) and drain the wait queue so no child
+  // process survives and no late message is sent.
+  shuttingDown = true
+  invalidateAllChatInputs()
+  // Snapshot every input still in flight. Each completion settles once its
+  // task has finished, which for an aborted transcription is after the
+  // provider has killed its (detached) child process and removed its temp
+  // files. Awaiting them is what keeps process.exit() from cutting that
+  // cleanup short.
+  const inFlight = [...pendingInputs.values()]
+    .flatMap((inputs) => inputs.map((input) => input.completion))
   if (bot.isRunning()) void bot.stop()
   bridge.destroy()
   dedup.destroy()
+  await Promise.all(inFlight)
 }
 
 export function startTelegramAdapter(): void {
+  shuttingDown = false
   console.log('[Telegram] Starting bot...')
   console.log(`[Telegram] Server: ${config.serverUrl}`)
   console.log(`[Telegram] Allowed users: ${config.telegram.allowedUsers.length === 0 ? 'paired users only' : config.telegram.allowedUsers.join(', ')}`)
@@ -877,11 +1396,15 @@ export function startTelegramAdapter(): void {
   })
   void syncTelegramBotCommands(bot.api).then(() => console.log('[Telegram] Command menu synced')).catch((err) => console.warn('[Telegram] Command menu sync failed:', err instanceof Error ? err.message : err))
   void bot.start({ onStart: () => console.log('[Telegram] Bot is running!') })
-  process.once('SIGINT', () => {
+  // SIGTERM is what the desktop host sends first (with a graceful window) when
+  // it stops the sidecar, so both signals must run the same asynchronous
+  // shutdown and only exit once provider cleanup has finished.
+  const shutdown = (): void => {
     console.log('[Telegram] Shutting down...')
-    stopTelegramAdapter()
-    process.exit(0)
-  })
+    void stopTelegramAdapter().finally(() => process.exit(0))
+  }
+  process.once('SIGINT', shutdown)
+  process.once('SIGTERM', shutdown)
 }
 
 // Desktop's shared sidecar imports this module with its explicit adapter flag.

@@ -58,6 +58,7 @@ adapters/             IM 接入 —— 每个平台一个独立 sidecar，桥回
 | 后台自动整合记忆 | [AutoDream 记忆整合](./autodream.md) |
 | 屏幕控制的工具、授权、坐标换算 | [Computer Use 架构](./computer-use.md) |
 | IM 消息协议、访问控制、权限中继 | [Channel 系统](./channel.md) |
+| IM 入站消息的媒体处理（语音 / 图片 / 文件） | [IM 消息管道](./im-media-pipeline.md) |
 | 提 PR 前要跑哪些检查、发版流程 | [参与贡献与质量门禁](./contributing.md) |
 | 在终端里跑 CLI、写自动化脚本 | [CLI 安装与启动](../cli/index.md) |
 

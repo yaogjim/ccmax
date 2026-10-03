@@ -104,11 +104,32 @@ export type SlackConfig = {
   allowedProjectRoots: string[]
 }
 
+/** Speech-to-text settings for the inbound voice pipeline. Absent provider
+ *  (`provider: ''`) means no transcription: every voice message degrades to
+ *  a file reference with a notice — exactly the pre-STT behavior. */
+export type SttConfig = {
+  /** The only implemented provider. Anything else (including the reserved
+   *  'openai-compat' id and typos) resolves to `''` with a warning. */
+  provider: '' | 'whisper-local'
+  /** Local Whisper executable path (or bare name found on $PATH). */
+  whisperPath: string
+  /** ggml model file path; empty → ~/.claude/whisper/ggml-base.bin. */
+  whisperModel: string
+  /** Audio decoder used to normalize inbound audio; empty → probe `ffmpeg`
+   *  on $PATH. Forwarded to the provider as its `decodeCommand`. */
+  ffmpegPath: string
+  /** 中文 initial prompt；空白或缺省使用 provider 默认引导词。 */
+  whisperPrompt?: string
+  /** Extra language hint forwarded to the provider; empty → 'zh'. */
+  language: string
+}
+
 export type AdapterConfig = {
   serverUrl: string
   defaultProjectDir: string
   pairing: PairingState
   allowedProjectRoots: string[]
+  stt: SttConfig
   telegram: TelegramConfig
   feishu: FeishuConfig
   wechat: WechatConfig
@@ -155,6 +176,7 @@ export function loadConfig(): AdapterConfig {
   const wecom = file.wecom ?? {}
   const qq = file.qq ?? {}
   const slack = file.slack ?? {}
+  const stt = readSttSection(file.stt)
   const pairing = file.pairing ?? {}
   const fallbackWorkDir = resolveUserDefaultWorkDir()
   const whatsappAuthDir = resolveConfiguredPath(
@@ -172,6 +194,22 @@ export function loadConfig(): AdapterConfig {
     // File scope only. ADAPTER_ALLOWED_PROJECT_ROOTS is applied by
     // resolveAllowedProjectRoots so this field keeps one meaning.
     allowedProjectRoots: readProjectRoots(file.allowedProjectRoots),
+    // Priority: env > ~/.claude/adapters.json > default ('' = STT off).
+    // Only whisper-local exists; an unknown provider value falls back to ''
+    // (with a warning) so a typo cannot masquerade as "configured but
+    // silently broken". A non-empty env var wins; an empty one falls through
+    // to the file so a blank `CC_STT_*` does not clobber the user's config.
+    // Every field is coerced to a trimmed string at this boundary: the file
+    // is user-edited JSON, and a non-string (e.g. an object in `whisperPath`)
+    // would otherwise reach a child-process argv and crash on `.trim()`.
+    stt: {
+      provider: normalizeSttProvider(pickSttValue('CC_STT_PROVIDER', stt.provider)),
+      whisperPath: readSttString(pickSttValue('CC_STT_WHISPER_PATH', stt.whisperPath), 'whisperPath'),
+      whisperModel: readSttString(pickSttValue('CC_STT_WHISPER_MODEL', stt.whisperModel), 'whisperModel'),
+      whisperPrompt: readSttString(pickSttValue('CC_STT_WHISPER_PROMPT', stt.whisperPrompt), 'whisperPrompt'),
+      ffmpegPath: readSttString(pickSttValue('CC_STT_FFMPEG_PATH', stt.ffmpegPath), 'ffmpegPath'),
+      language: readSttLanguage(pickSttValue('CC_STT_LANGUAGE', stt.language)),
+    },
     telegram: {
       botToken: process.env.TELEGRAM_BOT_TOKEN || tg.botToken || '',
       allowedUsers: tg.allowedUsers ?? [],
@@ -248,6 +286,71 @@ export function loadConfig(): AdapterConfig {
 
 export function getConfiguredWorkDir(config: AdapterConfig, platformConfig: AdapterPlatformConfig): string {
   return config.defaultProjectDir || platformConfig.defaultWorkDir
+}
+
+// ---------------------------------------------------------------------------
+// STT field coercion
+//
+// `adapters.json` is user-edited JSON: any field can hold any JSON type. These
+// helpers form the single boundary where the raw value becomes a provider
+// argument, so a malformed field is diagnosed and dropped instead of being
+// forwarded to a spawned process and crashing on `.trim()`.
+// ---------------------------------------------------------------------------
+
+/** `stt` must be an object; anything else is diagnosed and treated as absent. */
+function readSttSection(value: unknown): Record<string, unknown> {
+  if (value === undefined || value === null) return {}
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>
+  }
+  console.warn(`[Config] Ignoring stt: expected an object but the file has ${typeLabel(value)}`)
+  return {}
+}
+
+/** A non-empty env value wins over the file; an empty/blank env falls through. */
+function pickSttValue(envKey: string, fileValue: unknown): unknown {
+  const fromEnv = process.env[envKey]
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv
+  return fileValue
+}
+
+function readSttString(value: unknown, field: string): string {
+  if (value === undefined || value === null) return ''
+  if (typeof value !== 'string') {
+    console.warn(`[Config] Ignoring stt.${field}: expected a string but the file has ${typeLabel(value)}`)
+    return ''
+  }
+  return value.trim()
+}
+
+/** Language tokens interpolate into a whisper `-l <lang>` argv entry, so only a
+ *  plain language code is accepted; anything else is dropped with a warning. */
+const STT_LANGUAGE_PATTERN = /^[A-Za-z][A-Za-z0-9-]*$/
+
+function readSttLanguage(value: unknown): string {
+  const raw = readSttString(value, 'language')
+  if (!raw) return ''
+  if (!STT_LANGUAGE_PATTERN.test(raw)) {
+    console.warn(`[Config] Ignoring stt.language ${JSON.stringify(raw)}: not a valid language code`)
+    return ''
+  }
+  return raw
+}
+
+function typeLabel(value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'an array'
+  return `a ${typeof value}`
+}
+
+function normalizeSttProvider(value: unknown): SttConfig['provider'] {
+  if (value === undefined || value === null || value === '') return ''
+  if (value === 'whisper-local') return 'whisper-local'
+  console.warn(
+    `[Config] Unsupported stt.provider ${JSON.stringify(value)}; STT is off ` +
+      `(only "whisper-local" is implemented)`,
+  )
+  return ''
 }
 
 /**

@@ -134,6 +134,24 @@ export class SessionSelectionController {
     this.pickers.delete(chatId)
   }
 
+  /**
+   * Which list is waiting for this chat, or null when none is.
+   *
+   * Read-only pending getter for platform entrypoints: a bare number is only a
+   * list answer while a list is actually open, so the caller has to ask instead
+   * of guessing from the digits. An expired picker is pruned on read, exactly
+   * like `requirePicker` would.
+   */
+  pendingKind(chatId: string): Picker['kind'] | null {
+    const picker = this.pickers.get(chatId)
+    if (!picker) return null
+    if (picker.expiresAt <= this.now()) {
+      this.clear(chatId)
+      return null
+    }
+    return picker.kind
+  }
+
   async handleInput(chatId: string, input: string): Promise<boolean> {
     const text = input.trim()
     const list = /^(?:\/sessions|会话列表)(?:\s+(.*))?$/.exec(text)

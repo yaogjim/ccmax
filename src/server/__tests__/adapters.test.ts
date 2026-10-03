@@ -74,6 +74,36 @@ describe('Adapters API', () => {
     expect(json.wechat.accountId).toBe('bot-1')
   })
 
+  it('桌面设置保存保留手工转写配置及未知字段，环境覆盖不写回', async () => {
+    const stt = {
+      provider: 'whisper-local',
+      whisperPath: '/fixture/whisper-cli',
+      whisperModel: '/fixture/multilingual.bin',
+      ffmpegPath: '/fixture/ffmpeg',
+      language: 'zh',
+      futureOption: { keep: true },
+    }
+    await writeRawConfig({
+      stt,
+      futureRoot: { keep: 'root' },
+      telegram: { botToken: 'fixture-token', futurePlatform: 'keep' },
+    })
+    const originalProvider = process.env.CC_STT_PROVIDER
+    process.env.CC_STT_PROVIDER = 'runtime-only-fixture'
+    try {
+      const put = makeRequest('PUT', '/api/adapters', { telegram: { allowedUsers: [7001] } })
+      expect((await handleAdaptersApi(put.req, put.url, put.segments)).status).toBe(200)
+      const stored = JSON.parse(await fs.readFile(path.join(tmpDir, 'adapters.json'), 'utf8'))
+      expect(stored.stt).toEqual(stt)
+      expect(stored.futureRoot).toEqual({ keep: 'root' })
+      expect(stored.telegram.futurePlatform).toBe('keep')
+      expect(stored.telegram.allowedUsers).toEqual([7001])
+    } finally {
+      if (originalProvider === undefined) delete process.env.CC_STT_PROVIDER
+      else process.env.CC_STT_PROVIDER = originalProvider
+    }
+  })
+
   it('writes adapter credentials with owner-only permissions', async () => {
     const put = makeRequest('PUT', '/api/adapters', {
       telegram: {

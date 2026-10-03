@@ -64,6 +64,20 @@ const checks: Check[] = [
     command: ['bun', 'run', 'test', '--', '--run', 'electron/services/userDataProfileMigration.test.ts'],
     cwd: 'desktop',
   },
+  {
+    title: 'Adapter STT config load compatibility and env overlay',
+    command: ['bun', '--no-env-file', 'test', 'common/__tests__/stt.test.ts'],
+    cwd: 'adapters',
+  },
+  {
+    title: 'Adapter pairing write preserves STT and unknown fields',
+    command: ['bun', '--no-env-file', 'test', 'common/__tests__/pairing.test.ts', '--test-name-pattern', '转写配置'],
+    cwd: 'adapters',
+  },
+  {
+    title: 'Server adapter settings save preserves STT and unknown fields',
+    command: ['bun', '--no-env-file', 'test', './src/server/__tests__/adapters.test.ts', '--test-name-pattern', '转写配置'],
+  },
 ]
 
 async function runCheck(check: Check): Promise<number> {

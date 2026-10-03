@@ -200,7 +200,13 @@ export class ElectronServerRuntime {
     const serverUrl = await this.getServerUrl()
     const server = this.server
     if (!server || server.url !== serverUrl) return
-    this.stopAdapterChildren(server.adapterChildren)
+    const stopping = [...server.adapterChildren]
+    await stopAndWaitForSidecars(
+      stopping,
+      () => this.stopAdapterChildren(server.adapterChildren),
+      SERVER_SHUTDOWN_TIMEOUT_MS,
+    )
+    if (this.server !== server) return
     await this.startAdaptersSidecars(serverUrl, undefined, server)
   }
 
@@ -228,28 +234,26 @@ export class ElectronServerRuntime {
   }
 
   async stopAllAndWait(timeoutMs = SERVER_SHUTDOWN_TIMEOUT_MS): Promise<void> {
-    const serverChildren = new Set<SidecarChild>()
-    if (this.startingServer) serverChildren.add(this.startingServer.child)
-    if (this.server) serverChildren.add(this.server.child)
-    const exitWaits = new Map(
-      [...serverChildren].map(child => [child, waitForSidecarExit(child, timeoutMs)]),
-    )
-
-    this.stopAll(process.platform === 'win32')
-
-    const results = await Promise.all(
-      [...exitWaits].map(async ([child, exited]) => ({ child, exited: await exited })),
-    )
-    const stillRunning = results.filter(result => !result.exited).map(result => result.child)
-    if (stillRunning.length === 0) return
-
-    for (const child of stillRunning) {
-      if (process.platform === 'win32') killSidecar(child, true)
-      else child.kill('SIGKILL')
+    const children = new Set<SidecarChild>()
+    if (this.startingServer) {
+      children.add(this.startingServer.child)
+      for (const child of this.startingServer.adapterChildren) children.add(child)
     }
-    await Promise.all(
-      stillRunning.map(child => waitForSidecarExit(child, SERVER_FORCE_EXIT_TIMEOUT_MS)),
-    )
+    if (this.server) {
+      children.add(this.server.child)
+      for (const child of this.server.adapterChildren) children.add(child)
+    }
+    for (const child of this.adapters) children.add(child)
+
+    const adapterRestart = this.adapterRestartPromise
+    await Promise.all([
+      stopAndWaitForSidecars(
+        children,
+        () => this.stopAll(process.platform === 'win32'),
+        timeoutMs,
+      ),
+      adapterRestart ? adapterRestart.then(() => undefined, () => undefined) : Promise.resolve(),
+    ])
   }
 
   private async startServerAfterDelay(generation: number, delayMs: number): Promise<string> {
@@ -636,4 +640,27 @@ function waitForSidecarExit(child: SidecarChild, timeoutMs: number): Promise<boo
     child.once('exit', onExit)
     child.once('error', onError)
   })
+}
+
+async function stopAndWaitForSidecars(
+  children: Iterable<SidecarChild>,
+  stop: () => void,
+  timeoutMs: number,
+): Promise<void> {
+  const unique = [...new Set(children)]
+  const exitWaits = unique.map(child => waitForSidecarExit(child, timeoutMs))
+  stop()
+  const results = await Promise.all(
+    unique.map(async (child, index) => ({ child, exited: await exitWaits[index]! })),
+  )
+  const stillRunning = results.filter(result => !result.exited).map(result => result.child)
+  if (stillRunning.length === 0) return
+
+  for (const child of stillRunning) {
+    if (process.platform === 'win32') killSidecar(child, true)
+    else child.kill('SIGKILL')
+  }
+  await Promise.all(
+    stillRunning.map(child => waitForSidecarExit(child, SERVER_FORCE_EXIT_TIMEOUT_MS)),
+  )
 }

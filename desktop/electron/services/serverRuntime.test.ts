@@ -42,7 +42,64 @@ let isolatedConfigDir = ''
 class FakeSidecarChild extends EventEmitter {
   readonly stdout = new PassThrough()
   readonly stderr = new PassThrough()
-  readonly kill = vi.fn()
+  exitCode: number | null = null
+  signalCode: NodeJS.Signals | null = null
+  private heldExit: Promise<void> | null = null
+  private releaseHeldExitFn: (() => void) | null = null
+
+  /** Keep kill() from emitting exit until releaseHeldExit(). SIGKILL still exits immediately. */
+  holdExit(): void {
+    if (this.heldExit) return
+    this.heldExit = new Promise(resolve => {
+      this.releaseHeldExitFn = resolve
+    })
+  }
+
+  releaseHeldExit(): void {
+    this.releaseHeldExitFn?.()
+    this.releaseHeldExitFn = null
+    this.heldExit = null
+  }
+
+  readonly kill = vi.fn((signal?: NodeJS.Signals) => {
+    void this.exitAfterKill(signal)
+    return true
+  })
+
+  private async exitAfterKill(signal?: NodeJS.Signals): Promise<void> {
+    if (signal === 'SIGKILL') {
+      this.finishExit(signal)
+      return
+    }
+    if (this.heldExit) await this.heldExit
+    else await Promise.resolve()
+    this.finishExit(signal)
+  }
+
+  private finishExit(signal?: NodeJS.Signals): void {
+    if (this.exitCode != null || this.signalCode != null) return
+    this.exitCode = signal == null ? 0 : null
+    this.signalCode = signal ?? null
+    this.emit('exit', this.exitCode, this.signalCode)
+  }
+}
+
+async function waitForFakeSidecarExit(child: FakeSidecarChild, timeoutMs = 500): Promise<void> {
+  if (child.exitCode != null || child.signalCode != null) return
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('FakeSidecarChild did not emit exit; test fixture is broken'))
+    }, timeoutMs)
+    child.once('exit', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
+async function flushAsyncWork(): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt++) await Promise.resolve()
+  await new Promise(resolve => setTimeout(resolve, 0))
 }
 
 function createRuntime(options: {
@@ -326,6 +383,42 @@ describe('ElectronServerRuntime', () => {
     }
   })
 
+  it('does not resolve stopAllAndWait while adapter sidecars are still cleaning up', async () => {
+    const runtime = createRuntime()
+    await runtime.startServer()
+    const serverChild = sidecarMocks.serverChildren[0]!
+    const adapters = [...sidecarMocks.adapterChildren]
+    expect(adapters.length).toBeGreaterThan(0)
+    for (const adapter of adapters) adapter.holdExit()
+
+    let settled = false
+    const stopping = runtime.stopAllAndWait(1_000).then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+
+    await waitForFakeSidecarExit(serverChild)
+    expect(serverChild.exitCode != null || serverChild.signalCode != null).toBe(true)
+    await flushAsyncWork()
+    for (const adapter of adapters) {
+      expect(adapter.kill).toHaveBeenCalled()
+      expect(adapter.exitCode).toBeNull()
+      expect(adapter.signalCode).toBeNull()
+    }
+    expect(settled).toBe(false)
+
+    for (const adapter of adapters) adapter.releaseHeldExit()
+    await stopping
+    expect(settled).toBe(true)
+    for (const adapter of adapters) {
+      expect(adapter.exitCode != null || adapter.signalCode != null).toBe(true)
+    }
+  })
+
   it('passes a sanitized bridge startup failure to the server without silently using direct mode', async () => {
     const bridge = {
       start: vi.fn(async () => {
@@ -601,6 +694,75 @@ describe('ElectronServerRuntime', () => {
     }
     for (const adapter of sidecarMocks.adapterChildren.slice(ADAPTER_COUNT)) {
       expect(adapter.kill).not.toHaveBeenCalled()
+    }
+  })
+
+  it('does not spawn replacement adapter sidecars until the previous generation has exited', async () => {
+    const runtime = createRuntime()
+    await runtime.startServer()
+    const originalAdapters = [...sidecarMocks.adapterChildren]
+    expect(originalAdapters).toHaveLength(ADAPTER_COUNT)
+    for (const adapter of originalAdapters) adapter.holdExit()
+
+    const restarting = runtime.restartAdaptersSidecars()
+    await waitForMockCalls(originalAdapters[0]!.kill, 1)
+    await flushAsyncWork()
+
+    expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT)
+    for (const adapter of originalAdapters) {
+      expect(adapter.kill).toHaveBeenCalledTimes(1)
+      expect(adapter.exitCode).toBeNull()
+      expect(adapter.signalCode).toBeNull()
+    }
+
+    for (const adapter of originalAdapters) adapter.releaseHeldExit()
+    await restarting
+    expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT * 2)
+    for (const adapter of sidecarMocks.adapterChildren.slice(ADAPTER_COUNT)) {
+      expect(adapter.kill).not.toHaveBeenCalled()
+    }
+  })
+
+  it('does not resolve stopAllAndWait during adapter restart until the old generation exits', async () => {
+    const runtime = createRuntime()
+    await runtime.startServer()
+    const serverChild = sidecarMocks.serverChildren[0]!
+    const originalAdapters = [...sidecarMocks.adapterChildren]
+    expect(originalAdapters).toHaveLength(ADAPTER_COUNT)
+    for (const adapter of originalAdapters) adapter.holdExit()
+
+    const restarting = runtime.restartAdaptersSidecars()
+    await waitForMockCalls(originalAdapters[0]!.kill, 1)
+    await flushAsyncWork()
+    expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT)
+    for (const adapter of originalAdapters) {
+      expect(adapter.kill).toHaveBeenCalledTimes(1)
+      expect(adapter.exitCode).toBeNull()
+      expect(adapter.signalCode).toBeNull()
+    }
+
+    let settled = false
+    const stopping = runtime.stopAllAndWait(1_000).then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+
+    await waitForFakeSidecarExit(serverChild)
+    expect(serverChild.exitCode != null || serverChild.signalCode != null).toBe(true)
+    await flushAsyncWork()
+    expect(settled).toBe(false)
+    expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT)
+
+    for (const adapter of originalAdapters) adapter.releaseHeldExit()
+    await Promise.all([stopping, restarting])
+    expect(settled).toBe(true)
+    expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT)
+    for (const adapter of originalAdapters) {
+      expect(adapter.exitCode != null || adapter.signalCode != null).toBe(true)
     }
   })
 

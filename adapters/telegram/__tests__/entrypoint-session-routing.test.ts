@@ -167,7 +167,7 @@ describe('Telegram entrypoint session routing', () => {
   })
 
   afterAll(async () => {
-    entry?.stopTelegramAdapter()
+    await entry?.stopTelegramAdapter()
     await server?.stop(true)
     for (const [key, value] of previousEnv) {
       if (value === undefined) delete process.env[key]
@@ -641,6 +641,7 @@ describe('Telegram entrypoint session routing', () => {
     const gc = spyOn(AttachmentStore.prototype, 'gc').mockResolvedValue({ removed: 0, bytes: 0 })
     const start = spyOn(entry.bot, 'start').mockImplementation(async (options) => { await options?.onStart?.(entry.bot.botInfo) })
     const previousListeners = process.listeners('SIGINT')
+    const previousTermListeners = process.listeners('SIGTERM')
     try {
       entry.startTelegramAdapter()
       await eventually(() => expect(apiCalls.some((call) => call.method === 'setMyCommands')).toBe(true))
@@ -651,6 +652,9 @@ describe('Telegram entrypoint session routing', () => {
     } finally {
       for (const listener of process.listeners('SIGINT')) {
         if (!previousListeners.includes(listener)) process.removeListener('SIGINT', listener)
+      }
+      for (const listener of process.listeners('SIGTERM')) {
+        if (!previousTermListeners.includes(listener)) process.removeListener('SIGTERM', listener)
       }
       start.mockRestore()
       gc.mockRestore()
