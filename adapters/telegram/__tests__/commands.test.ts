@@ -1,6 +1,7 @@
 import { describe, expect, it, mock } from 'bun:test'
 import {
   OPENAI_OFFICIAL_DEFAULT_MODEL_ID,
+  TELEGRAM_NUMERIC_PICK_KINDS,
   buildModelSelectionItems,
   buildProviderSelectionItems,
   buildTelegramHelpText,
@@ -16,6 +17,30 @@ import {
   telegramMessageDedupKey,
   tryHandleTelegramSelectionCallback,
 } from '../commands.js'
+import { parseTelegramSelectionCallback } from '../menu.js'
+
+function markupFrom(options: unknown) {
+  return (options as { reply_markup?: { inline_keyboard: Array<Array<{ callback_data: string }>> } } | undefined)?.reply_markup
+}
+
+function callbackFromMarkup(markup: ReturnType<typeof markupFrom> | undefined, action = 'pick') {
+  const data = markup?.inline_keyboard.flat().find((button) => button.callback_data.includes(`:${action}:`))?.callback_data
+  return data ? parseTelegramSelectionCallback(data) : null
+}
+
+function callbackFromSent(
+  sent: Array<{ options?: unknown }>,
+  patch?: Partial<NonNullable<ReturnType<typeof parseTelegramSelectionCallback>>>,
+) {
+  return { ...callbackFromMarkup(markupFrom(sent.at(-1)?.options))!, ...patch }
+}
+
+function callbackFromEdit(
+  editOptions: unknown[],
+  patch?: Partial<NonNullable<ReturnType<typeof parseTelegramSelectionCallback>>>,
+) {
+  return { ...callbackFromMarkup(markupFrom(editOptions.at(-1)))!, ...patch }
+}
 
 function createCommandContext(options?: {
   chatId?: number
@@ -25,6 +50,7 @@ function createCommandContext(options?: {
 }) {
   const replies: string[] = []
   const edits: string[] = []
+  const editOptions: unknown[] = []
   const answers: Array<string | undefined> = []
   const ctx = {
     chat: { id: options?.chatId ?? 42, type: 'private' },
@@ -39,14 +65,15 @@ function createCommandContext(options?: {
     reply: mock(async (text: string) => {
       replies.push(text)
     }),
-    editMessageText: mock(async (text: string) => {
+    editMessageText: mock(async (text: string, options?: unknown) => {
       edits.push(text)
+      editOptions.push(options)
     }),
     answerCallbackQuery: mock(async (text?: string) => {
       answers.push(text)
     }),
   }
-  return { ctx, replies, edits, answers }
+  return { ctx, replies, edits, editOptions, answers }
 }
 
 function createController(overrides?: Record<string, unknown>) {
@@ -155,6 +182,10 @@ function createController(overrides?: Record<string, unknown>) {
     setRuntimeModel: mock((_chatId: string, modelId: string) => {
       runtimeModels.push(modelId)
     }),
+    startNewProject: mock(async (chatId: string, path: string) => {
+      bridgeEvents.push(`new:${chatId}:${path}`)
+      return true
+    }),
     ...overrides,
   } as any
 
@@ -222,12 +253,13 @@ describe('Telegram command controller helpers', () => {
       title: 'Pick',
       items: [{ label: 'Model', value: 'm' }],
       page: 0,
+      token: 'aabbccdd',
       expiresAt: Date.now() + 1000,
     })
     expect(view.text).toContain('1. Model')
     expect(view.replyMarkup.inline_keyboard[0][0]).toEqual({
       text: 'Model',
-      callback_data: 'tgsel:model:pick:0',
+      callback_data: 'tgsel:model:aabbccdd:pick:0',
     })
   })
 
@@ -256,7 +288,7 @@ describe('Telegram command controller helpers', () => {
     expect(handled).toBe(true)
     expect(controller.handleSelectionCallback).toHaveBeenCalledWith(
       expect.anything(),
-      { kind: 'model', action: 'pick', index: 2 },
+      { kind: 'model', token: '', action: 'pick', index: 2 },
     )
     expect(await tryHandleTelegramSelectionCallback('permit:req:yes', createCommandContext().ctx, controller))
       .toBe(false)
@@ -461,11 +493,11 @@ describe('Telegram command controller helpers', () => {
     await controller.handleModelCommand(createCommandContext().ctx)
     const page = createCommandContext()
     page.ctx.editMessageText = mock(async () => { throw new Error('edit failed') })
-    await controller.handleSelectionCallback(page.ctx, {
+    await controller.handleSelectionCallback(page.ctx, callbackFromSent(sent, {
       kind: 'model',
       action: 'page',
       index: 0,
-    })
+    }))
     expect(sent.at(-1)?.text).toContain('选择模型')
 
     const noInvocable = createController({
@@ -509,15 +541,16 @@ describe('Telegram command controller helpers', () => {
     await controller.handleProviderCommand(command.ctx)
 
     expect(sent[0].text).toContain('选择 Provider')
-    expect((sent[0].options as any).reply_markup.inline_keyboard[1][0].callback_data)
-      .toBe('tgsel:provider:pick:1')
+    const providerData = (sent[0].options as any).reply_markup.inline_keyboard[1][0].callback_data as string
+    expect(providerData).toMatch(/^tgsel:provider:[0-9a-f]{8}:pick:1$/)
+    expect(providerData.length).toBeLessThanOrEqual(64)
 
     const callback = createCommandContext()
-    await controller.handleSelectionCallback(callback.ctx, {
+    await controller.handleSelectionCallback(callback.ctx, callbackFromSent(sent, {
       kind: 'provider',
       action: 'pick',
       index: 1,
-    })
+    }))
 
     expect(deps.httpClient.activateProvider).toHaveBeenCalledWith('openai-official')
     expect(deps.httpClient.setCurrentModel).toHaveBeenCalledWith(OPENAI_OFFICIAL_DEFAULT_MODEL_ID)
@@ -531,11 +564,11 @@ describe('Telegram command controller helpers', () => {
 
     expect(sent[0].text).toContain('选择模型（Anthropic）')
     const callback = createCommandContext()
-    await controller.handleSelectionCallback(callback.ctx, {
+    await controller.handleSelectionCallback(callback.ctx, callbackFromSent(sent, {
       kind: 'model',
       action: 'pick',
       index: 0,
-    })
+    }))
 
     expect(deps.httpClient.setCurrentModel).toHaveBeenCalledWith('claude-sonnet-4-5')
     expect(runtimeModels).toEqual(['claude-sonnet-4-5'])
@@ -550,11 +583,11 @@ describe('Telegram command controller helpers', () => {
     expect(sent[0].text).toContain('当前项目可用 Skills')
 
     const callback = createCommandContext()
-    await controller.handleSelectionCallback(callback.ctx, {
+    await controller.handleSelectionCallback(callback.ctx, callbackFromSent(sent, {
       kind: 'skill',
       action: 'pick',
       index: 0,
-    })
+    }))
     expect(deps.ensureExistingSession).toHaveBeenCalledWith('42')
     expect(sentUserMessages).toEqual([{ chatId: '42', content: '/skill-a' }])
     expect(callback.edits[0]).toContain('已调用 Skill：Skill A')
@@ -568,11 +601,11 @@ describe('Telegram command controller helpers', () => {
     expect(unavailable.sent.at(-1)?.text).toContain('当前项目可用 Skills')
 
     const callback = createCommandContext()
-    await unavailable.controller.handleSelectionCallback(callback.ctx, {
+    await unavailable.controller.handleSelectionCallback(callback.ctx, callbackFromSent(unavailable.sent, {
       kind: 'skill',
       action: 'pick',
       index: 0,
-    })
+    }))
 
     expect(unavailable.sentUserMessages).toEqual([])
     expect(callback.edits[0]).toContain('会话已失效')
@@ -602,9 +635,10 @@ describe('Telegram command controller helpers', () => {
     const { controller, deps, sent, sentUserMessages } = createController({ ensureExistingSession: restore })
     await controller.handleSkillsCommand(createCommandContext().ctx)
     restore.mockResolvedValueOnce({ status: 'unavailable', session })
+    const skillCallback = callbackFromSent([sent[0]!], { kind: 'skill', action: 'pick', index: 0 })
 
     const failed = createCommandContext()
-    await controller.handleSelectionCallback(failed.ctx, { kind: 'skill', action: 'pick', index: 0 })
+    await controller.handleSelectionCallback(failed.ctx, skillCallback)
     expect(sent.at(-1)?.text).toContain('已保留会话和工作目录')
     expect(sent.at(-1)?.text).not.toContain('/new')
     expect(failed.edits).toEqual([])
@@ -613,7 +647,7 @@ describe('Telegram command controller helpers', () => {
     expect(deps.deleteStoredSession).not.toHaveBeenCalled()
 
     const retry = createCommandContext()
-    await controller.handleSelectionCallback(retry.ctx, { kind: 'skill', action: 'pick', index: 0 })
+    await controller.handleSelectionCallback(retry.ctx, skillCallback)
     expect(sentUserMessages).toEqual([{ chatId: '42', content: '/skill-a' }])
     expect(retry.edits[0]).toContain('已调用 Skill')
   })
@@ -625,11 +659,11 @@ describe('Telegram command controller helpers', () => {
     await disconnected.controller.handleSkillsCommand(createCommandContext().ctx)
 
     const callback = createCommandContext()
-    await disconnected.controller.handleSelectionCallback(callback.ctx, {
+    await disconnected.controller.handleSelectionCallback(callback.ctx, callbackFromSent(disconnected.sent, {
       kind: 'skill',
       action: 'pick',
       index: 0,
-    })
+    }))
 
     expect(callback.edits[0]).toContain('发送失败')
   })
@@ -640,11 +674,11 @@ describe('Telegram command controller helpers', () => {
 
     expect(sent[0].text).toContain('选择要恢复的项目')
     const projectCallback = createCommandContext()
-    await controller.handleSelectionCallback(projectCallback.ctx, {
+    await controller.handleSelectionCallback(projectCallback.ctx, callbackFromSent(sent, {
       kind: 'resume_project',
       action: 'pick',
       index: 0,
-    })
+    }))
 
     expect(deps.httpClient.listSessions).toHaveBeenCalledWith({
       limit: 100,
@@ -653,11 +687,11 @@ describe('Telegram command controller helpers', () => {
     expect(projectCallback.edits[0]).toContain('选择要恢复的会话')
 
     const sessionCallback = createCommandContext()
-    await controller.handleSelectionCallback(sessionCallback.ctx, {
+    await controller.handleSelectionCallback(sessionCallback.ctx, callbackFromEdit(projectCallback.editOptions, {
       kind: 'resume_session',
       action: 'pick',
       index: 0,
-    })
+    }))
 
     expect(bridgeEvents).toContain('connect:42:session-123456789')
     expect(bridgeEvents.indexOf('store:42:session-123456789:/work/repo'))
@@ -667,22 +701,23 @@ describe('Telegram command controller helpers', () => {
   })
 
   it('keeps the current binding when a selected historical session has been deleted', async () => {
-    const { controller, deps, bridgeEvents } = createController()
+    const { controller, deps, sent, bridgeEvents } = createController()
     deps.httpClient.sessionExists = mock(async () => false)
     await controller.handleResumeCommand(createCommandContext().ctx)
-    await controller.handleSelectionCallback(createCommandContext().ctx, {
+    const project = createCommandContext()
+    await controller.handleSelectionCallback(project.ctx, callbackFromSent(sent, {
       kind: 'resume_project', action: 'pick', index: 0,
-    })
+    }))
     const callback = createCommandContext()
-    await controller.handleSelectionCallback(callback.ctx, {
+    await controller.handleSelectionCallback(callback.ctx, callbackFromEdit(project.editOptions, {
       kind: 'resume_session', action: 'pick', index: 0,
-    })
+    }))
     expect(bridgeEvents).toEqual([])
     expect(callback.edits[0]).toContain('不存在')
   })
 
   it('loads every history page and restores a worktree through the project resume menu', async () => {
-    const { controller, deps } = createController()
+    const { controller, deps, sent } = createController()
     const histories = Array.from({ length: 105 }, (_, index) => ({
       id: `session-${String(index).padStart(3, '0')}`,
       title: index === 104 ? 'Tree migration' : `History ${index}`,
@@ -701,13 +736,14 @@ describe('Telegram command controller helpers', () => {
     })
 
     await controller.handleResumeCommand(createCommandContext().ctx)
-    await controller.handleSelectionCallback(createCommandContext().ctx, {
+    const project = createCommandContext()
+    await controller.handleSelectionCallback(project.ctx, callbackFromSent(sent, {
       kind: 'resume_project', action: 'pick', index: 0,
-    })
+    }))
     const lastPage = createCommandContext()
-    await controller.handleSelectionCallback(lastPage.ctx, {
+    await controller.handleSelectionCallback(lastPage.ctx, callbackFromEdit(project.editOptions, {
       kind: 'resume_session', action: 'page', index: 13,
-    })
+    }))
     expect(lastPage.edits[0]).toContain('Tree migration')
     expect(lastPage.edits[0]).not.toContain('Other project')
     expect(deps.httpClient.listSessions.mock.calls).toEqual([
@@ -716,25 +752,26 @@ describe('Telegram command controller helpers', () => {
     ])
 
     const callback = createCommandContext()
-    await controller.handleSelectionCallback(callback.ctx, {
+    await controller.handleSelectionCallback(callback.ctx, callbackFromEdit(lastPage.editOptions, {
       kind: 'resume_session', action: 'pick', index: 104,
-    })
+    }))
     expect(deps.setStoredSession).toHaveBeenCalledWith('42', 'session-104', '/work/repo-feature')
     expect(deps.connectBridgeSession).toHaveBeenCalledWith('42', 'session-104')
     expect(callback.edits[0]).toContain('已恢复会话')
   })
 
   it('refuses to switch an active turn or permission request from the resume menu', async () => {
-    const { controller, deps, bridgeEvents } = createController({ isBusy: () => true })
+    const { controller, deps, sent, bridgeEvents } = createController({ isBusy: () => true })
     await controller.handleResumeCommand(createCommandContext().ctx)
     expect(deps.clearOtherSelections).toHaveBeenCalledWith('42')
-    await controller.handleSelectionCallback(createCommandContext().ctx, {
+    const project = createCommandContext()
+    await controller.handleSelectionCallback(project.ctx, callbackFromSent(sent, {
       kind: 'resume_project', action: 'pick', index: 0,
-    })
+    }))
     const callback = createCommandContext()
-    await controller.handleSelectionCallback(callback.ctx, {
+    await controller.handleSelectionCallback(callback.ctx, callbackFromEdit(project.editOptions, {
       kind: 'resume_session', action: 'pick', index: 0,
-    })
+    }))
     expect(bridgeEvents).toEqual([])
     expect(callback.edits[0]).toContain('/stop')
     expect(deps.httpClient.sessionExists).not.toHaveBeenCalled()
@@ -754,16 +791,17 @@ describe('Telegram command controller helpers', () => {
   })
 
   it('reports a preflight failure without disconnecting the current session', async () => {
-    const { controller, deps, bridgeEvents } = createController()
+    const { controller, deps, sent, bridgeEvents } = createController()
     deps.httpClient.sessionExists.mockRejectedValueOnce(new Error('server unavailable'))
     await controller.handleResumeCommand(createCommandContext().ctx)
-    await controller.handleSelectionCallback(createCommandContext().ctx, {
+    const project = createCommandContext()
+    await controller.handleSelectionCallback(project.ctx, callbackFromSent(sent, {
       kind: 'resume_project', action: 'pick', index: 0,
-    })
+    }))
     const callback = createCommandContext()
-    await controller.handleSelectionCallback(callback.ctx, {
+    await controller.handleSelectionCallback(callback.ctx, callbackFromEdit(project.editOptions, {
       kind: 'resume_session', action: 'pick', index: 0,
-    })
+    }))
     expect(bridgeEvents).toEqual([])
     expect(callback.edits[0]).toContain('server unavailable')
   })
@@ -778,7 +816,7 @@ describe('Telegram command controller helpers', () => {
     })
     expect(denied.answers[0]).toBe('未授权')
 
-    const { controller, deps, bridgeEvents } = createController({
+    const { controller, deps, sent, bridgeEvents } = createController({
       waitForBridgeOpen: mock(async () => false),
     })
     const stale = createCommandContext()
@@ -791,33 +829,34 @@ describe('Telegram command controller helpers', () => {
 
     await controller.handleModelCommand(createCommandContext().ctx)
     const noop = createCommandContext()
-    await controller.handleSelectionCallback(noop.ctx, {
+    await controller.handleSelectionCallback(noop.ctx, callbackFromSent(sent, {
       kind: 'model',
       action: 'noop',
       index: 0,
-    })
+    }))
     expect(noop.answers).toContain(undefined)
 
     const missing = createCommandContext()
-    await controller.handleSelectionCallback(missing.ctx, {
+    await controller.handleSelectionCallback(missing.ctx, callbackFromSent(sent, {
       kind: 'model',
       action: 'pick',
       index: 99,
-    })
+    }))
     expect(missing.answers[0]).toContain('选项不存在')
 
     await controller.handleResumeCommand(createCommandContext().ctx)
-    await controller.handleSelectionCallback(createCommandContext().ctx, {
+    const project = createCommandContext()
+    await controller.handleSelectionCallback(project.ctx, callbackFromSent(sent, {
       kind: 'resume_project',
       action: 'pick',
       index: 0,
-    })
+    }))
     const timeout = createCommandContext()
-    await controller.handleSelectionCallback(timeout.ctx, {
+    await controller.handleSelectionCallback(timeout.ctx, callbackFromEdit(project.editOptions, {
       kind: 'resume_session',
       action: 'pick',
       index: 0,
-    })
+    }))
 
     expect(deps.deleteStoredSession).not.toHaveBeenCalled()
     expect(deps.setStoredSession).not.toHaveBeenCalled()
@@ -830,22 +869,22 @@ describe('Telegram command controller helpers', () => {
     await provider.controller.handleProviderCommand(createCommandContext().ctx)
     provider.deps.httpClient.activateProvider.mockImplementationOnce(async () => { throw new Error('provider failed') })
     const providerPick = createCommandContext()
-    await provider.controller.handleSelectionCallback(providerPick.ctx, {
+    await provider.controller.handleSelectionCallback(providerPick.ctx, callbackFromSent(provider.sent, {
       kind: 'provider',
       action: 'pick',
       index: 1,
-    })
+    }))
     expect(providerPick.edits[0]).toContain('Provider 切换失败')
 
     const model = createController()
     await model.controller.handleModelCommand(createCommandContext().ctx)
     model.deps.httpClient.setCurrentModel.mockImplementationOnce(async () => { throw new Error('model failed') })
     const modelPick = createCommandContext()
-    await model.controller.handleSelectionCallback(modelPick.ctx, {
+    await model.controller.handleSelectionCallback(modelPick.ctx, callbackFromSent(model.sent, {
       kind: 'model',
       action: 'pick',
       index: 0,
-    })
+    }))
     expect(modelPick.edits[0]).toContain('模型切换失败')
 
     const sessions = createController({
@@ -856,11 +895,11 @@ describe('Telegram command controller helpers', () => {
     })
     await sessions.controller.handleResumeCommand(createCommandContext().ctx)
     const projectPick = createCommandContext()
-    await sessions.controller.handleSelectionCallback(projectPick.ctx, {
+    await sessions.controller.handleSelectionCallback(projectPick.ctx, callbackFromSent(sessions.sent, {
       kind: 'resume_project',
       action: 'pick',
       index: 0,
-    })
+    }))
     expect(projectPick.edits[0]).toContain('没有可恢复会话')
 
     const sessionFailure = createController({
@@ -871,11 +910,11 @@ describe('Telegram command controller helpers', () => {
     })
     await sessionFailure.controller.handleResumeCommand(createCommandContext().ctx)
     const failedProjectPick = createCommandContext()
-    await sessionFailure.controller.handleSelectionCallback(failedProjectPick.ctx, {
+    await sessionFailure.controller.handleSelectionCallback(failedProjectPick.ctx, callbackFromSent(sessionFailure.sent, {
       kind: 'resume_project',
       action: 'pick',
       index: 0,
-    })
+    }))
     expect(failedProjectPick.edits[0]).toContain('无法获取会话列表')
   })
 
@@ -883,8 +922,13 @@ describe('Telegram command controller helpers', () => {
     const events: string[] = []
     let allowPermissionUser = true
     let sendPermissionSucceeds = true
+    const runtimeSent: Array<{ text: string; options?: unknown }> = []
     const controller = createTelegramRuntimeCommandController({
-      botApi: { sendMessage: mock(async () => {}) },
+      botApi: {
+        sendMessage: mock(async (_chatId: number, text: string, options?: unknown) => {
+          runtimeSent.push({ text, options })
+        }),
+      },
       httpClient: createController().deps.httpClient,
       defaultWorkDir: '/work/repo',
       bridge: {
@@ -927,16 +971,17 @@ describe('Telegram command controller helpers', () => {
 
     await controller.setModelFromCommand('42', 'model-x')
     await controller.handleResumeCommand(createCommandContext().ctx)
-    await controller.handleSelectionCallback(createCommandContext().ctx, {
+    const project = createCommandContext()
+    await controller.handleSelectionCallback(project.ctx, callbackFromSent(runtimeSent, {
       kind: 'resume_project',
       action: 'pick',
       index: 0,
-    })
-    await controller.handleSelectionCallback(createCommandContext().ctx, {
+    }))
+    await controller.handleSelectionCallback(createCommandContext().ctx, callbackFromEdit(project.editOptions, {
       kind: 'resume_session',
       action: 'pick',
       index: 0,
-    })
+    }))
     const permissionCtx = createCommandContext()
     await controller.handlePermissionCallback(permissionCtx.ctx, {
       requestId: 'req-1',
@@ -952,9 +997,9 @@ describe('Telegram command controller helpers', () => {
     expect(permissionCtx.edits[0]).toContain('已允许')
 
     await controller.handleSkillsCommand(createCommandContext().ctx)
-    await controller.handleSelectionCallback(createCommandContext().ctx, {
+    await controller.handleSelectionCallback(createCommandContext().ctx, callbackFromSent(runtimeSent, {
       kind: 'skill', action: 'pick', index: 0,
-    })
+    }))
     expect(events).toContain('send:42:/skill-a')
     expect(events).toContain('busy:42')
 
@@ -1045,6 +1090,174 @@ describe('Telegram command controller helpers', () => {
       deps.isAllowedUser.mockImplementation(() => false)
       expect(await controller.selectPendingByNumber(chat, 1, 999)).toBe(false)
       expect(sent.length).toBe(before)
+    })
+  })
+
+  describe('tokenized menus and new_project', () => {
+    it('includes new_project in numeric kinds', () => {
+      expect(TELEGRAM_NUMERIC_PICK_KINDS).toContain('new_project')
+    })
+
+    it('picks the snapshot realPath from new_project buttons and numbers', async () => {
+      const { controller, deps, sent, bridgeEvents } = createController()
+      await controller.showNewProjectPicker('42')
+      const first = callbackFromMarkup(markupFrom(sent[0]?.options))
+      expect(first?.kind).toBe('new_project')
+      expect(first?.token).toMatch(/^[0-9a-f]{8}$/)
+      expect(first?.token && first.token.length + 6).toBeLessThanOrEqual(64)
+      expect(sent[0]?.text).toContain('/work/repo')
+
+      const button = createCommandContext()
+      await controller.handleSelectionCallback(button.ctx, first!)
+      expect(deps.startNewProject).toHaveBeenCalledWith('42', '/work/repo')
+      expect(bridgeEvents).toContain('new:42:/work/repo')
+
+      deps.startNewProject.mockClear()
+      await controller.showNewProjectPicker('42')
+      expect(await controller.selectPendingByNumber('42', 1, 7)).toBe(true)
+      expect(deps.startNewProject).toHaveBeenCalledWith('42', '/work/repo')
+    })
+
+    it('rejects a successful reopen of the same kind against the old card', async () => {
+      const { controller, deps, sent } = createController()
+      await controller.showNewProjectPicker('42')
+      const stale = callbackFromMarkup(markupFrom(sent[0]?.options))!
+      await controller.showNewProjectPicker('42')
+      const fresh = callbackFromMarkup(markupFrom(sent.at(-1)?.options))!
+      expect(fresh.token).not.toBe(stale.token)
+
+      const expired = createCommandContext()
+      await controller.handleSelectionCallback(expired.ctx, stale)
+      expect(expired.answers[0]).toContain('选择已过期')
+      expect(deps.startNewProject).not.toHaveBeenCalled()
+
+      const ok = createCommandContext()
+      await controller.handleSelectionCallback(ok.ctx, fresh)
+      expect(deps.startNewProject).toHaveBeenCalledWith('42', '/work/repo')
+    })
+
+    it('rejects the previous page after paging a tokenized menu', async () => {
+      const { controller, deps, sent } = createController({
+        httpClient: {
+          ...createController().deps.httpClient,
+          listRecentProjects: mock(async () => Array.from({ length: 9 }, (_, index) => ({
+            projectName: `repo-${index}`,
+            realPath: `/work/repo-${index}`,
+            branch: 'main',
+            sessionCount: 1,
+          }))),
+        },
+      })
+      await controller.showNewProjectPicker('42')
+      const firstPage = callbackFromMarkup(markupFrom(sent[0]?.options))!
+      const pageCtx = createCommandContext()
+      await controller.handleSelectionCallback(pageCtx.ctx, {
+        ...firstPage,
+        action: 'page',
+        index: 1,
+      })
+      const secondPage = callbackFromMarkup(markupFrom(pageCtx.editOptions.at(-1)))!
+      expect(secondPage.token).not.toBe(firstPage.token)
+
+      const stale = createCommandContext()
+      await controller.handleSelectionCallback(stale.ctx, firstPage)
+      expect(stale.answers[0]).toContain('选择已过期')
+      expect(deps.startNewProject).not.toHaveBeenCalled()
+
+      const ok = createCommandContext()
+      await controller.handleSelectionCallback(ok.ctx, {
+        ...secondPage,
+        action: 'pick',
+        index: 8,
+      })
+      expect(deps.startNewProject).toHaveBeenCalledWith('42', '/work/repo-8')
+    })
+
+    it('isolates menu tokens per chat', async () => {
+      const { controller, deps, sent } = createController()
+      await controller.showNewProjectPicker('42')
+      const tokenA = callbackFromMarkup(markupFrom(sent[0]?.options))!
+      await controller.showNewProjectPicker('99')
+      const other = createCommandContext({ chatId: 99 })
+      await controller.handleSelectionCallback(other.ctx, tokenA)
+      expect(other.answers[0]).toContain('选择已过期')
+      expect(deps.startNewProject).not.toHaveBeenCalled()
+    })
+
+    it('treats tokenless upgrade callbacks as expired', async () => {
+      const { controller, deps, sent } = createController()
+      await controller.handleModelCommand(createCommandContext().ctx)
+      expect(callbackFromMarkup(markupFrom(sent[0]?.options))?.token).toBeTruthy()
+      const expired = createCommandContext()
+      await controller.handleSelectionCallback(expired.ctx, {
+        kind: 'model',
+        token: '',
+        action: 'pick',
+        index: 0,
+      })
+      expect(expired.answers[0]).toContain('选择已过期')
+      expect(deps.httpClient.setCurrentModel).not.toHaveBeenCalled()
+    })
+
+    it('refuses a busy chat before creating a new_project session and keeps the list', async () => {
+      const cancelPendingInput = mock(() => {})
+      const { controller, deps, sent } = createController({
+        isBusy: mock(() => true),
+        cancelPendingInput,
+      })
+      await controller.showNewProjectPicker('42')
+      const first = callbackFromMarkup(markupFrom(sent[0]?.options))!
+      const busy = createCommandContext()
+      await controller.handleSelectionCallback(busy.ctx, first)
+      expect(deps.startNewProject).not.toHaveBeenCalled()
+      expect(cancelPendingInput).not.toHaveBeenCalled()
+      expect(busy.edits[0]).toContain('/stop')
+      expect(controller.pendingSelectionKind('42')).toBe('new_project')
+
+      deps.isBusy.mockImplementation(() => false)
+      const retry = createCommandContext()
+      await controller.handleSelectionCallback(retry.ctx, first)
+      expect(deps.startNewProject).toHaveBeenCalledWith('42', '/work/repo')
+      expect(cancelPendingInput).toHaveBeenCalledWith('42')
+    })
+
+    it('keeps the new_project list when createSession fails', async () => {
+      const { controller, deps, sent } = createController()
+      deps.startNewProject.mockResolvedValueOnce(false)
+      await controller.showNewProjectPicker('42')
+      const first = callbackFromMarkup(markupFrom(sent[0]?.options))!
+      await controller.handleSelectionCallback(createCommandContext().ctx, first)
+      expect(controller.pendingSelectionKind('42')).toBe('new_project')
+      expect(await controller.selectPendingByNumber('42', 1, 7)).toBe(true)
+      expect(deps.startNewProject).toHaveBeenCalledTimes(2)
+    })
+
+    it('cancels a new_project menu without creating a session', async () => {
+      const { controller, deps, sent } = createController()
+      await controller.showNewProjectPicker('42')
+      const cancel = callbackFromMarkup(markupFrom(sent[0]?.options), 'cancel')!
+      const ctx = createCommandContext()
+      await controller.handleSelectionCallback(ctx.ctx, cancel)
+      expect(deps.startNewProject).not.toHaveBeenCalled()
+      expect(deps.clearOtherSelections).toHaveBeenCalledWith('42')
+      expect(controller.pendingSelectionKind('42')).toBeNull()
+      expect(ctx.edits[0]).toContain('已取消选择')
+    })
+
+    it('refreshes a new_project menu with a new token and rejects the old card', async () => {
+      const { controller, deps, sent } = createController()
+      await controller.showNewProjectPicker('42')
+      const stale = callbackFromMarkup(markupFrom(sent[0]?.options), 'refresh')!
+      const ctx = createCommandContext()
+      await controller.handleSelectionCallback(ctx.ctx, stale)
+      const fresh = callbackFromMarkup(markupFrom(ctx.editOptions.at(-1)), 'refresh')!
+      expect(fresh.token).not.toBe(stale.token)
+      expect(controller.pendingSelectionKind('42')).toBe('new_project')
+
+      const expired = createCommandContext()
+      await controller.handleSelectionCallback(expired.ctx, stale)
+      expect(expired.answers[0]).toContain('选择已过期')
+      expect(deps.startNewProject).not.toHaveBeenCalled()
     })
   })
 })

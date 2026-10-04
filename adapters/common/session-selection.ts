@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import type { AdapterHttpClient, RecentProject, SessionListItem } from './http-client.js'
@@ -10,14 +11,36 @@ export type SessionRestoreDeps = {
   sessionStore: Pick<SessionStore, 'get' | 'set' | 'delete'>
   onServerMessage: (chatId: string, message: ServerMessage) => void | Promise<void>
   clearTransientState: (chatId: string) => void
+  /** Called after preflight succeeds, immediately before changing the binding. */
+  beforeSessionSwitch?: (chatId: string) => void
   isBusy?: (chatId: string) => boolean
 }
+
+export type SessionSelectionViewItem = {
+  label: string
+  value: string
+  description?: string
+  index: number
+}
+
+export type SessionSelectionView = {
+  token: string
+  kind: 'projects' | 'sessions'
+  title: string
+  page: number
+  totalPages: number
+  items: SessionSelectionViewItem[]
+  currentSessionId?: string
+}
+
+export type SessionSelectionAction = 'pick' | 'page' | 'projects' | 'refresh' | 'cancel'
 
 export type SessionSelectionDeps = SessionRestoreDeps & {
   httpClient: Pick<AdapterHttpClient, 'sessionExists' | 'listRecentProjects' | 'matchProject' | 'listSessions'>
   sendNotice: (chatId: string, text: string) => Promise<void>
   clearProjectSelection: (chatId: string) => void
   now?: () => number
+  presentSelection?: (chatId: string, view: SessionSelectionView) => Promise<void>
 }
 
 /** Attaching an IM is a binding change, never a new transcript or a prompt. */
@@ -40,6 +63,7 @@ export async function restoreSelectedSession(
 
   const previous = deps.sessionStore.get(chatId)
   const buffered: ServerMessage[] = []
+  deps.beforeSessionSwitch?.(chatId)
   deps.bridge.resetSession(chatId)
   try {
     deps.bridge.connectSession(chatId, session.id)
@@ -76,10 +100,15 @@ export const SESSION_SELECTION_TTL_MS = 15 * 60 * 1000
 type Picker = {
   expiresAt: number
   page: number
+  token: string
 } & (
   | { kind: 'projects'; projects: RecentProject[] }
   | { kind: 'sessions'; project: string; sessions: SessionListItem[] }
 )
+
+function newSelectionToken(): string {
+  return randomBytes(4).toString('hex')
+}
 
 function oneLine(value: string, length = 100): string {
   return value.replace(/[\r\n\t]+/g, ' ').slice(0, length)
@@ -152,6 +181,54 @@ export class SessionSelectionController {
     return picker.kind
   }
 
+  async handleSelectionAction(
+    chatId: string,
+    token: string,
+    action: SessionSelectionAction,
+    index?: number,
+  ): Promise<boolean> {
+    const picker = this.activePicker(chatId)
+    if (!picker || !token || picker.token !== token) {
+      await this.deps.sendNotice(chatId, '选择列表不存在或已过期，请发送 /sessions 重新选择。')
+      return true
+    }
+
+    try {
+      if (action === 'cancel') {
+        this.clear(chatId)
+        this.deps.clearProjectSelection(chatId)
+        await this.deps.sendNotice(chatId, '已取消选择，当前会话未改变。')
+        return true
+      }
+      if (action === 'projects') {
+        await this.openProjects(chatId, await this.deps.httpClient.listRecentProjects())
+        return true
+      }
+      if (action === 'refresh') {
+        if (picker.kind === 'projects') await this.openProjects(chatId, await this.deps.httpClient.listRecentProjects())
+        else await this.openProject(chatId, picker.project)
+        return true
+      }
+      if (action === 'page') {
+        const count = picker.kind === 'projects' ? picker.projects.length : picker.sessions.length
+        const totalPages = Math.max(1, Math.ceil(count / PAGE_SIZE))
+        const nextPage = Math.max(0, Math.min(totalPages - 1, index ?? picker.page))
+        if (nextPage === picker.page) return true
+        picker.page = nextPage
+        await this.show(chatId, picker)
+        return true
+      }
+      if (action === 'pick') {
+        await this.selectByIndex(chatId, picker, index ?? -1)
+        return true
+      }
+    } catch (err) {
+      await this.deps.sendNotice(chatId, `无法恢复会话：${err instanceof Error ? err.message : String(err)}。请重试 /sessions。`)
+      return true
+    }
+    return false
+  }
+
   async handleInput(chatId: string, input: string): Promise<boolean> {
     const text = input.trim()
     const list = /^(?:\/sessions|会话列表)(?:\s+(.*))?$/.exec(text)
@@ -185,7 +262,8 @@ export class SessionSelectionController {
       } else {
         const active = await this.requirePicker(chatId, picker)
         if (!active) return true
-        await this.select(chatId, active, resume?.[1] ?? text)
+        const pageLocal = Boolean(this.deps.presentSelection)
+        await this.select(chatId, active, resume?.[1] ?? text, pageLocal)
       }
     } catch (err) {
       await this.deps.sendNotice(chatId, `无法恢复会话：${err instanceof Error ? err.message : String(err)}。请重试 /sessions。`)
@@ -193,8 +271,19 @@ export class SessionSelectionController {
     return true
   }
 
+  private activePicker(chatId: string): Picker | null {
+    const picker = this.pickers.get(chatId)
+    if (!picker) return null
+    if (picker.expiresAt <= this.now()) {
+      this.clear(chatId)
+      return null
+    }
+    return picker
+  }
+
   private async requirePicker(chatId: string, picker: Picker | undefined): Promise<Picker | null> {
-    if (picker && picker.expiresAt > this.now()) return picker
+    const active = picker && picker.expiresAt > this.now() ? picker : this.activePicker(chatId)
+    if (active) return active
     this.clear(chatId)
     await this.deps.sendNotice(chatId, '选择列表不存在或已过期，请发送 /sessions 重新选择。')
     return null
@@ -225,7 +314,7 @@ export class SessionSelectionController {
       await this.deps.sendNotice(chatId, '没有可访问的历史项目。发送 /new 新建会话，或 /sessions <项目绝对路径> 查找旧会话。')
       return
     }
-    const picker: Picker = { kind: 'projects', projects, page: 0, expiresAt: this.now() + SESSION_SELECTION_TTL_MS }
+    const picker: Picker = { kind: 'projects', projects, page: 0, token: '', expiresAt: this.now() + SESSION_SELECTION_TTL_MS }
     this.pickers.set(chatId, picker)
     await this.show(chatId, picker)
   }
@@ -237,13 +326,23 @@ export class SessionSelectionController {
       await this.deps.sendNotice(chatId, `该项目没有可恢复会话：${project}\n发送 /sessions projects 选择其他项目，或 /new <项目> 新建会话。`)
       return
     }
-    const picker: Picker = { kind: 'sessions', project, sessions, page: 0, expiresAt: this.now() + SESSION_SELECTION_TTL_MS }
+    const picker: Picker = { kind: 'sessions', project, sessions, page: 0, token: '', expiresAt: this.now() + SESSION_SELECTION_TTL_MS }
     this.pickers.set(chatId, picker)
     await this.show(chatId, picker)
   }
 
-  private async select(chatId: string, picker: Picker, query: string): Promise<void> {
-    const index = /^\d+$/.test(query) ? Number(query) - 1 : -1
+  private async select(chatId: string, picker: Picker, query: string, pageLocal = false): Promise<void> {
+    const parsed = /^\d+$/.test(query) ? Number(query) - 1 : -1
+    const start = picker.page * PAGE_SIZE
+    const index = pageLocal ? start + parsed : parsed
+    if (pageLocal && (parsed < 0 || parsed >= PAGE_SIZE)) {
+      await this.deps.sendNotice(chatId, '编号无效，请使用当前页显示的编号，或发送 /sessions 刷新列表。')
+      return
+    }
+    await this.selectByIndex(chatId, picker, index)
+  }
+
+  private async selectByIndex(chatId: string, picker: Picker, index: number): Promise<void> {
     const start = picker.page * PAGE_SIZE
     const visible = index >= start && index < start + PAGE_SIZE
     if (picker.kind === 'projects') {
@@ -261,7 +360,41 @@ export class SessionSelectionController {
     await this.deps.sendNotice(chatId, '编号无效，请使用当前页显示的编号，或发送 /sessions 刷新列表。')
   }
 
+  private toView(chatId: string, picker: Picker): SessionSelectionView {
+    const start = picker.page * PAGE_SIZE
+    const currentSessionId = this.deps.sessionStore.get(chatId)?.sessionId
+    const items = picker.kind === 'projects' ? picker.projects : picker.sessions
+    const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE))
+    const visible = picker.kind === 'projects'
+      ? picker.projects.slice(start, start + PAGE_SIZE).map((project, i) => ({
+        index: start + i,
+        label: oneLine(project.projectName, 60),
+        value: project.realPath,
+        description: oneLine(project.realPath, 180),
+      }))
+      : picker.sessions.slice(start, start + PAGE_SIZE).map((session, i) => ({
+        index: start + i,
+        label: `${oneLine(session.title || '未命名会话', 60)}${session.id === currentSessionId ? '（当前）' : ''}`,
+        value: session.id,
+        description: `${session.modifiedAt.slice(0, 16).replace('T', ' ')} · ${session.messageCount} 条消息 · ${session.id.slice(0, 8)}`,
+      }))
+    return {
+      token: picker.token,
+      kind: picker.kind,
+      title: picker.kind === 'projects' ? '选择历史会话所在的项目：' : `历史会话：${picker.project}`,
+      page: picker.page,
+      totalPages,
+      items: visible,
+      currentSessionId,
+    }
+  }
+
   private async show(chatId: string, picker: Picker): Promise<void> {
+    picker.token = newSelectionToken()
+    if (this.deps.presentSelection) {
+      await this.deps.presentSelection(chatId, this.toView(chatId, picker))
+      return
+    }
     const start = picker.page * PAGE_SIZE
     const currentId = this.deps.sessionStore.get(chatId)?.sessionId
     const items = picker.kind === 'projects' ? picker.projects : picker.sessions

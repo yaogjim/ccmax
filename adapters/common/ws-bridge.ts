@@ -114,6 +114,11 @@ export class WsBridge {
     return this.send(chatId, message)
   }
 
+  /** Notify the server that a user has started answering, cancelling its automatic answer timer. */
+  sendQuestionActivity(chatId: string, requestId: string): boolean {
+    return this.send(chatId, { type: 'ask_user_question_activity', requestId })
+  }
+
   /** Stop the current generation. */
   sendStopGeneration(chatId: string): boolean {
     return this.send(chatId, { type: 'stop_generation' })

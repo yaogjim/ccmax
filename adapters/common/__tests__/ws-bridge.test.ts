@@ -198,6 +198,23 @@ describe('WsBridge: handler serialization', () => {
     bridge.destroy()
   })
 
+  it('sends question activity over the existing protocol and fails when disconnected', async () => {
+    const bridge = new WsBridge(serverUrl, 'test', 'fixture-token')
+    try {
+      expect(bridge.sendQuestionActivity('chat-activity', 'req-activity')).toBe(false)
+      bridge.connectSession('chat-activity', 'sess-activity')
+      expect(await bridge.waitForOpen('chat-activity')).toBe(true)
+      const serverWs = await waitForServerConnection()
+      const received: unknown[] = []
+      serverWs.on('message', (raw) => received.push(JSON.parse(raw.toString())))
+      expect(bridge.sendQuestionActivity('chat-activity', 'req-activity')).toBe(true)
+      expect(await waitFor(() => received.length === 1)).toBe(true)
+      expect(received).toEqual([{ type: 'ask_user_question_activity', requestId: 'req-activity' }])
+    } finally {
+      bridge.destroy()
+    }
+  })
+
   it('processes handler calls in strict FIFO order per chatId', async () => {
     const bridge = new WsBridge(serverUrl, 'test')
     const events: string[] = []

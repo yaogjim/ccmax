@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { formatImHelp } from '../common/format.js'
 import { listProjectSessionHistory, restoreSelectedSession } from '../common/session-selection.js'
 import { SESSION_RECONNECT_NOTICE, type SessionRestoreResult } from '../common/session-recovery.js'
@@ -35,6 +36,7 @@ export const OPENAI_OFFICIAL_DEFAULT_MODEL_ID = 'gpt-5.3-codex'
 export const TELEGRAM_NUMERIC_PICK_KINDS: TelegramSelectionKind[] = [
   'resume_project',
   'resume_session',
+  'new_project',
 ]
 
 type TelegramSendApi = {
@@ -69,10 +71,11 @@ type PendingTelegramSelection = {
   title: string
   items: TelegramSelectionItem[]
   page: number
+  token: string
   expiresAt: number
 }
 
-type NewSelection = Omit<PendingTelegramSelection, 'expiresAt'>
+type NewSelection = Omit<PendingTelegramSelection, 'expiresAt' | 'token'>
 
 type RuntimeModelSetter = (chatId: string, modelId: string) => void
 
@@ -99,6 +102,7 @@ export type TelegramCommandControllerDeps = {
    *  transcription). Called before a session switch so a late transcript
    *  cannot land in the newly selected session. */
   cancelPendingInput?: (chatId: string) => void
+  startNewProject?: (chatId: string, path: string) => Promise<boolean | void>
 }
 
 export type TelegramCommandController = ReturnType<typeof createTelegramCommandController>
@@ -276,6 +280,7 @@ export type TelegramRuntimeCommandControllerDeps = {
   setRuntimeBusy: (chatId: string) => void
   /** Abort a chat's in-flight inbound work before a session switch. */
   cancelPendingInput?: (chatId: string) => void
+  startNewProject?: (chatId: string, path: string) => Promise<boolean | void>
 }
 
 export function createTelegramRuntimeCommandController(
@@ -302,6 +307,7 @@ export function createTelegramRuntimeCommandController(
     handleServerMessage: deps.handleServerMessage,
     waitForBridgeOpen: (chatId) => deps.bridge.waitForOpen(chatId),
     cancelPendingInput: deps.cancelPendingInput,
+    startNewProject: deps.startNewProject,
     sendUserMessage: (chatId, content) => {
       const sent = deps.bridge.sendUserMessage(chatId, content)
       if (sent) deps.setRuntimeBusy(chatId)
@@ -359,6 +365,7 @@ export async function tryHandleTelegramSessionInput(
     showProjectPicker: (chatId: string) => Promise<void>
     showResumeProjectPicker: (chatId: string) => Promise<void>
     handleSessionInput: (chatId: string, text: string) => Promise<boolean>
+    showSessions?: (chatId: string) => Promise<void>
   },
 ): Promise<boolean> {
   if (hasAttachments) return false
@@ -374,6 +381,10 @@ export async function tryHandleTelegramSessionInput(
   }
   if (trimmed === '/resume') {
     await deps.showResumeProjectPicker(chatId)
+    return true
+  }
+  if (trimmed === '/sessions' && deps.showSessions) {
+    await deps.showSessions(chatId)
     return true
   }
   return await deps.handleSessionInput(chatId, text)
@@ -627,6 +638,60 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
     ].filter(Boolean).join('\n'))
   }
 
+  const showNewProjectPicker = async (chatId: string): Promise<void> => {
+    deps.clearOtherSelections(chatId)
+    pendingSelections.delete(chatId)
+    try {
+      const projects = await deps.httpClient.listRecentProjects()
+      if (projects.length === 0) {
+        await deps.api.sendMessage(Number(chatId), '没有找到最近项目。请先发送 /new 创建会话。')
+        return
+      }
+
+      await sendSelection(chatId, {
+        kind: 'new_project',
+        title: '选择要新建会话的项目：',
+        items: projects.map((project) => ({
+          label: `${project.projectName}${project.branch ? ` (${project.branch})` : ''}`,
+          value: project.realPath,
+          description: project.realPath,
+        })),
+        page: 0,
+      })
+    } catch (err) {
+      await sendError(deps.api, chatId, '无法获取项目列表', err)
+    }
+  }
+
+  const applyNewProjectSelection = async (
+    ctx: TelegramCommandContext,
+    item: TelegramSelectionItem,
+  ): Promise<void> => {
+    const chatId = getCallbackChatId(ctx)
+    if (!chatId) return
+    if (!deps.startNewProject) {
+      await ctx.editMessageText('无法创建新会话。')
+      return
+    }
+    if (deps.isBusy(chatId)) {
+      await ctx.editMessageText('当前会话正在运行或等待审批，请先处理审批或发送 /stop，等停止后再切换。')
+      return
+    }
+    deps.cancelPendingInput?.(chatId)
+    try {
+      const ok = await deps.startNewProject(chatId, item.value)
+      if (ok === false) {
+        await ctx.editMessageText(`无法在该项目创建会话：${item.value}`)
+        return
+      }
+    } catch (err) {
+      await ctx.editMessageText(`❌ 无法创建会话：${toErrorMessage(err)}`)
+      return
+    }
+    pendingSelections.delete(chatId)
+    await ctx.editMessageText(`已选择项目：${stripSelectedPrefix(item.label)}\n${item.value}`)
+  }
+
   const showResumeProjectPicker = async (chatId: string): Promise<void> => {
     deps.clearOtherSelections(chatId)
     pendingSelections.delete(chatId)
@@ -738,6 +803,9 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
       case 'resume_session':
         await resumeSessionForChat(ctx, item)
         break
+      case 'new_project':
+        await applyNewProjectSelection(ctx, item)
+        break
       case 'skill':
         await applySkillSelection(ctx, item)
         break
@@ -778,6 +846,7 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
     if (!selection || !TELEGRAM_NUMERIC_PICK_KINDS.includes(selection.kind)) return false
     const page = buildTelegramSelectionPage({
       kind: selection.kind,
+      token: selection.token,
       items: selection.items,
       page: selection.page,
     })
@@ -804,13 +873,48 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
     }
 
     const selection = getPendingSelection(pendingSelections, chatId, callback.kind)
-    if (!selection) {
+    if (!selection || !callback.token || callback.token !== selection.token) {
       await ctx.answerCallbackQuery('选择已过期，请重新发送命令').catch(() => {})
       return true
     }
 
     if (callback.action === 'noop') {
       await ctx.answerCallbackQuery().catch(() => {})
+      return true
+    }
+
+    if (callback.action === 'cancel') {
+      pendingSelections.delete(chatId)
+      deps.clearOtherSelections(chatId)
+      await ctx.answerCallbackQuery().catch(() => {})
+      await ctx.editMessageText('已取消选择，当前会话未改变。')
+      return true
+    }
+
+    if (callback.action === 'refresh') {
+      await ctx.answerCallbackQuery().catch(() => {})
+      if (selection.kind === 'new_project') {
+        try {
+          const projects = await deps.httpClient.listRecentProjects()
+          if (projects.length === 0) {
+            pendingSelections.delete(chatId)
+            await ctx.editMessageText('没有找到最近项目。请先发送 /new 创建会话。')
+            return true
+          }
+          await editSelection(ctx, {
+            kind: 'new_project',
+            title: '选择要新建会话的项目：',
+            items: projects.map((project) => ({
+              label: `${project.projectName}${project.branch ? ` (${project.branch})` : ''}`,
+              value: project.realPath,
+              description: project.realPath,
+            })),
+            page: 0,
+          })
+        } catch (err) {
+          await ctx.editMessageText(`❌ 无法获取项目列表：${toErrorMessage(err)}`)
+        }
+      }
       return true
     }
 
@@ -851,6 +955,7 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
     showModelPicker,
     showSkills,
     showResumeProjectPicker,
+    showNewProjectPicker,
     setModelFromCommand,
   }
 }
@@ -862,11 +967,15 @@ export function buildTelegramHelpText(): string {
     formatImHelp(),
     '',
     'Telegram 扩展命令：',
-    '/resume — 按钮选择项目与历史会话',
+    '/projects — 按钮选择项目并新建会话',
+    '/sessions / /resume — 按钮选择历史会话',
+    '/cancel — 取消列表选择，保留当前会话',
     '/provider — 切换 Provider',
     '/model [model] — 查看或切换模型',
     '/skills — 查看当前项目可用 Skills',
-    '/answer <id> <答案> — 回答模型提问（AskUserQuestion），多题用 JSON',
+    '模型提问：直接点选或回复问题消息，多题逐题填写后确认提交。',
+    '/answer <JSON> — 可选批量作答，键可用题号，无需请求 ID',
+    '/answer <id> <答案> — 保留原命令作答方式',
     '',
     '语音消息：默认关闭转写。只有显式配置后，语音便签才会在本机转写成文字再交给模型。',
     '未配置或转写失败时，已下载的语音会作为文件送达，并提示没有识别出内容——这不代表已经听懂。',
@@ -947,6 +1056,7 @@ export function renderSelectionView(selection: PendingTelegramSelection): {
 } {
   const page = buildTelegramSelectionPage({
     kind: selection.kind,
+    token: selection.token,
     items: selection.items,
     page: selection.page,
   })
@@ -990,6 +1100,7 @@ function setPendingSelection(
 ): PendingTelegramSelection {
   const next = {
     ...selection,
+    token: randomBytes(4).toString('hex'),
     expiresAt: Date.now() + TELEGRAM_SELECTION_TTL_MS,
   }
   pendingSelections.set(chatId, next)

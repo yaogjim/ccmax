@@ -10,6 +10,7 @@ function createSessionRoutes() {
     showProjectPicker: mock(async () => {}),
     showResumeProjectPicker: mock(async () => {}),
     handleSessionInput: mock(async () => false),
+    showSessions: mock(async () => {}),
   }
 }
 
@@ -59,5 +60,21 @@ describe('Telegram session input routing', () => {
     expect(await tryHandleTelegramSessionInput('42', '/projects', false, routes)).toBe(true)
     expect(routes.showProjectPicker).toHaveBeenCalledWith('42')
     expect(await tryHandleTelegramSessionInput('42', 'ordinary text', false, routes)).toBe(false)
+  })
+
+  it('lets the entrypoint hook bare /sessions without dropping the existing signature', async () => {
+    const withHook = createSessionRoutes()
+    expect(await tryHandleTelegramSessionInput('42', '/sessions', false, withHook)).toBe(true)
+    expect(withHook.showSessions).toHaveBeenCalledWith('42')
+    expect(withHook.handleSessionInput).not.toHaveBeenCalled()
+
+    const withoutHook = {
+      startNewSession: mock(async () => {}),
+      showProjectPicker: mock(async () => {}),
+      showResumeProjectPicker: mock(async () => {}),
+      handleSessionInput: mock(async () => true),
+    }
+    expect(await tryHandleTelegramSessionInput('42', '/sessions', false, withoutHook)).toBe(true)
+    expect(withoutHook.handleSessionInput).toHaveBeenCalledWith('42', '/sessions')
   })
 })

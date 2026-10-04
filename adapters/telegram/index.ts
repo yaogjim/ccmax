@@ -23,10 +23,8 @@ import { TelegramStreamDelivery } from './stream-delivery.js'
 import {
   formatPermissionDecisionStatus,
   formatPermissionInstructions,
-  formatQuestionInstructions,
   parsePermissionCommand,
   parsePermitCallbackData,
-  parseQuestionAnswer,
   type PermissionDecision,
 } from '../common/permission.js'
 import { SessionStore } from '../common/session-store.js'
@@ -53,7 +51,8 @@ import type { LocalAttachment } from '../common/attachment/attachment-types.js'
 import { ImageBlockWatcher } from '../common/attachment/image-block-watcher.js'
 import type { PendingUpload } from '../common/attachment/attachment-types.js'
 import { sendSafeOutboundImage } from '../common/attachment/outbound-image.js'
-import { syncTelegramBotCommands } from './menu.js'
+import { syncTelegramBotCommands, buildTelegramHistoryView, parseTelegramHistoryCallback } from './menu.js'
+import { createTelegramQuestionController } from './question-controller.js'
 import { createTelegramRuntimeCommandController, registerAuthorizedTelegramCommand, registerTelegramExtendedCommands, registerTelegramSessionCommands, shouldProcessTelegramMessage, tryHandleTelegramSelectionCallback, tryHandleTelegramSessionInput } from './commands.js'
 
 // ---------- init ----------
@@ -84,8 +83,6 @@ const attachmentStore = new AttachmentStore()
 const media = new TelegramMediaService(bot, attachmentStore)
 
 const accumulatedThinkingText = new Map<string, string>()
-// Track chats waiting for project selection
-const pendingProjectSelection = new Map<string, boolean>()
 const runtimeStates = new Map<string, ChatRuntimeState>()
 const pendingPermissions = new Map<string, Set<string>>()
 /** Per-chat AskUserQuestion requests awaiting an /answer payload: requestId → tool input. */
@@ -292,13 +289,29 @@ type ChatRuntimeState = {
   pendingPermissionCount: number
 }
 
+const questionController = createTelegramQuestionController({
+  api: bot.api,
+  isAllowedUser: (userId) => isAllowedUser('telegram', userId),
+  getSessionId: (chatId) => sessionStore.get(chatId)?.sessionId ?? null,
+  submitAnswers: submitQuestionAnswers,
+  deny: (chatId, requestId) => {
+    if (!pendingQuestions.get(chatId)?.has(requestId)) return false
+    const sent = bridge.sendPermissionResponse(chatId, requestId, false)
+    if (sent) resolveQuestionRequest(chatId, requestId)
+    return sent
+  },
+  activity: (chatId, requestId) => bridge.sendQuestionActivity(chatId, requestId),
+})
 const isChatBusy = (chatId: string) => getRuntimeState(chatId).state !== 'idle' || Boolean(pendingPermissions.get(chatId)?.size)
 const commandController = createTelegramRuntimeCommandController({
   botApi: bot.api, httpClient, defaultWorkDir, bridge, sessionStore,
   ensureExistingSession, clearTransientChatState,
-  clearOtherSelections: (chatId) => {
-    pendingProjectSelection.delete(chatId)
-    sessionSelection.clear(chatId)
+  clearOtherSelections: (chatId) => { sessionSelection.clear(chatId) },
+  startNewProject: async (chatId, workDir) => {
+    if (isChatBusy(chatId)) return false
+    const created = await createSessionForChat(chatId, workDir)
+    if (created) clearTransientChatState(chatId)
+    return created
   },
   isBusy: isChatBusy,
   isAllowedUser: (userId) => isAllowedUser('telegram', userId),
@@ -310,12 +323,14 @@ const commandController = createTelegramRuntimeCommandController({
 const sessionSelection = new SessionSelectionController({
   httpClient, bridge, sessionStore,
   sendNotice: async (chatId, text) => { await bot.api.sendMessage(Number(chatId), text) },
+  presentSelection: async (chatId, view) => {
+    const rendered = buildTelegramHistoryView(view)
+    await bot.api.sendMessage(Number(chatId), rendered.text, { reply_markup: rendered.reply_markup })
+  },
   onServerMessage: handleServerMessage,
   clearTransientState: clearTransientChatState,
-  clearProjectSelection: (chatId) => {
-    pendingProjectSelection.delete(chatId)
-    commandController.clearPendingSelections(chatId)
-  },
+  beforeSessionSwitch: invalidateChatInputs,
+  clearProjectSelection: (chatId) => { commandController.clearPendingSelections(chatId) },
   isBusy: isChatBusy,
 })
 
@@ -339,11 +354,13 @@ function clearTransientChatState(chatId: string): void {
   runtime.pendingPermissionCount = 0
   pendingPermissions.delete(chatId)
   pendingQuestions.delete(chatId)
+  questionController.clear(chatId)
   tgImageWatchers.delete(chatId)
 }
 
 /** Drop a single answered/expired question and prune an emptied chat entry. */
 function deletePendingQuestion(chatId: string, requestId: string): void {
+  questionController.remove(chatId, requestId)
   const questions = pendingQuestions.get(chatId)
   if (!questions) return
   questions.delete(requestId)
@@ -352,6 +369,7 @@ function deletePendingQuestion(chatId: string, requestId: string): void {
 
 /** Keep only questions the server still reports as pending (snapshot reconcile). */
 function prunePendingQuestions(chatId: string, keep: Set<string>): void {
+  questionController.prune(chatId, keep)
   const questions = pendingQuestions.get(chatId)
   if (!questions) return
   for (const requestId of questions.keys()) {
@@ -381,58 +399,23 @@ async function handlePermissionDecision(chatId: string, decision: PermissionDeci
   )
 }
 
-/** Submit collected AskUserQuestion answers as an approved permission response.
- *  Keeps the pending entry on send failure so the user can retry. */
-async function handleQuestionAnswer(chatId: string, requestId: string, payload: string): Promise<void> {
-  const numericChatId = Number(chatId)
+/** Update transport state after a successful response; the controller owns UI disposal. */
+function resolveQuestionRequest(chatId: string, requestId: string): void {
   const questions = pendingQuestions.get(chatId)
-  const input = questions?.get(requestId)
-  if (!questions || input === undefined) {
-    await bot.api.sendMessage(numericChatId, `未找到待回答的问题请求：${requestId}`)
-    return
-  }
-
-  const answers = parseQuestionAnswer(payload, input)
-  if (!answers) {
-    await bot.api.sendMessage(numericChatId, [
-      `❌ 无法识别答案，请使用：/answer ${requestId} <答案>`,
-      '多题请求需要一次性发送 JSON，键为完整问题文本。',
-    ].join('\n'))
-    return
-  }
-
-  const original = input && typeof input === 'object' && !Array.isArray(input)
-    ? input as Record<string, unknown>
-    : {}
-  const sent = bridge.sendPermissionResponse(chatId, requestId, true, undefined, { ...original, answers })
-  if (!sent) {
-    await bot.api.sendMessage(numericChatId, '⚠️ 答案发送失败，请检查会话状态后重试。')
-    return
-  }
-
-  deletePendingQuestion(chatId, requestId)
+  questions?.delete(requestId)
+  if (questions?.size === 0) pendingQuestions.delete(chatId)
   const pending = pendingPermissions.get(chatId)
-  if (pending) {
-    pending.delete(requestId)
-    if (pending.size === 0) pendingPermissions.delete(chatId)
-  }
-  const runtime = getRuntimeState(chatId)
-  runtime.pendingPermissionCount = pendingPermissions.get(chatId)?.size ?? 0
-  await bot.api.sendMessage(numericChatId, '✅ 已提交答案，等待模型继续。')
+  pending?.delete(requestId)
+  if (pending?.size === 0) pendingPermissions.delete(chatId)
+  getRuntimeState(chatId).pendingPermissionCount = pendingPermissions.get(chatId)?.size ?? 0
 }
 
-/** Parse `/answer <请求ID> <答案>` (optionally `/answer@bot`).
- *  Returns null for unrelated text and 'malformed' when the prefix is used
- *  without both an id and a payload, so it can be reported instead of being
- *  forwarded as an ordinary user message. */
-function parseAnswerCommand(text: string): { requestId: string; payload: string } | 'malformed' | null {
-  const trimmed = text.trim()
-  if (!/^\/answer(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.test(trimmed)) return null
-  const match = /^\/answer(?:@[A-Za-z0-9_]+)?\s+(\S+)\s+([\s\S]+)$/i.exec(trimmed)
-  if (!match) return 'malformed'
-  const payload = match[2]!.trim()
-  if (!payload) return 'malformed'
-  return { requestId: match[1]!, payload }
+function submitQuestionAnswers(chatId: string, requestId: string, answers: Record<string, string>): boolean {
+  const input = pendingQuestions.get(chatId)?.get(requestId)
+  if (!input || typeof input !== 'object' || Array.isArray(input) || !pendingPermissions.get(chatId)?.has(requestId)) return false
+  const sent = bridge.sendPermissionResponse(chatId, requestId, true, undefined, { ...input, answers })
+  if (sent) resolveQuestionRequest(chatId, requestId)
+  return sent
 }
 
 async function ensureExistingSession(chatId: string): Promise<SessionRestoreResult> {
@@ -550,28 +533,7 @@ async function createSessionForChat(chatId: string, workDir: string): Promise<bo
 }
 
 async function showProjectPicker(chatId: string): Promise<void> {
-  sessionSelection.clear(chatId)
-  commandController.clearPendingSelections(chatId)
-  pendingProjectSelection.delete(chatId)
-  const numericChatId = Number(chatId)
-  try {
-    const projects = await httpClient.listRecentProjects()
-    if (projects.length === 0) {
-      await bot.api.sendMessage(numericChatId,
-        `没有找到最近的项目。发送 /new 会使用默认工作目录：${defaultWorkDir}\n也可以发送 /new /path/to/project 指定项目。`)
-      return
-    }
-
-    const lines = projects.slice(0, 10).map((p, i) =>
-      `${i + 1}. ${p.projectName}${p.branch ? ` (${p.branch})` : ''}\n   ${p.realPath}`
-    )
-    pendingProjectSelection.set(chatId, true)
-    await bot.api.sendMessage(numericChatId,
-      `选择项目（回复编号）：\n\n${lines.join('\n\n')}\n\n💡 下次可直接 /new <编号、名称或绝对路径> 快速新建会话`)
-  } catch (err) {
-    await bot.api.sendMessage(numericChatId,
-      `❌ 无法获取项目列表: ${err instanceof Error ? err.message : String(err)}`)
-  }
+  await commandController.showNewProjectPicker(chatId)
 }
 
 // ---------- outbound media dispatch ----------
@@ -684,17 +646,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         const questions = pendingQuestions.get(chatId) ?? new Map<string, unknown>()
         questions.set(msg.requestId, msg.input)
         pendingQuestions.set(chatId, questions)
-        // Questions are answered through /answer; a bare allow would submit an
-        // empty answer, so only deny is offered here.
-        const chunks = splitMessage(formatQuestionInstructions(msg.requestId, msg.input), TELEGRAM_TEXT_LIMIT)
-        const keyboard = new InlineKeyboard().text('❌ 拒绝', `permit:${msg.requestId}:no`)
-        for (let index = 0; index < chunks.length; index += 1) {
-          await bot.api.sendMessage(
-            numericChatId,
-            chunks[index]!,
-            index === chunks.length - 1 ? { reply_markup: keyboard } : undefined,
-          )
-        }
+        await questionController.receive(chatId, msg.requestId, msg.input)
         break
       }
 
@@ -715,6 +667,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
       // could still be approved without answers. The server replays any pending
       // independent worker requests after this leader-turn boundary.
       pendingQuestions.delete(chatId)
+      questionController.clear(chatId)
       pendingPermissions.delete(chatId)
       runtime.pendingPermissionCount = 0
       await streamDelivery.handleEvent(chatId, { type: 'message_complete' })
@@ -779,11 +732,11 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
   bridge.resetSession(chatId)
   sessionStore.delete(chatId)
   streamDelivery.clear(chatId)
-  pendingProjectSelection.delete(chatId)
   sessionSelection.clear(chatId)
   commandController.clearPendingSelections(chatId)
   pendingPermissions.delete(chatId)
   pendingQuestions.delete(chatId)
+  questionController.clear(chatId)
   runtimeStates.delete(chatId)
   tgImageWatchers.delete(chatId)
 
@@ -829,6 +782,7 @@ registerAuthorizedTelegramCommand(bot, 'stop', isAuthorizedTelegramUser, (ctx) =
   // wait for a long local transcription, and a cancelled transcript is never
   // sent. Runs outside the chat queue, so it is prompt.
   invalidateChatInputs(chatId)
+  questionController.clear(chatId)
   void (async () => {
     const result = await ensureExistingSession(chatId)
     if (result.status !== 'restored') {
@@ -850,6 +804,7 @@ registerAuthorizedTelegramCommand(bot, 'clear', isAuthorizedTelegramUser, (ctx) 
   // Invalidate input that has not reached the Agent yet: a late transcript must
   // not be written into the freshly cleared context.
   invalidateChatInputs(chatId)
+  questionController.clear(chatId)
   void (async () => {
     const result = await ensureExistingSession(chatId)
     if (result.status !== 'restored') {
@@ -930,7 +885,7 @@ const NO_SESSION_INPUT: SessionInputRoute = { kind: 'none', switchesBinding: fal
 function classifyNumericPick(chatId: string, trimmed: string): SessionInputRoute {
   if (!/^\d+$/.test(trimmed)) return NO_SESSION_INPUT
   const telegramKind = commandController.pendingSelectionKind(chatId)
-  if (telegramKind === 'resume_session') return { kind: 'pick', switchesBinding: true }
+  if (telegramKind === 'new_project' || telegramKind === 'resume_session') return { kind: 'pick', switchesBinding: true }
   if (telegramKind === 'resume_project') return { kind: 'pick', switchesBinding: false }
   const sharedKind = sessionSelection.pendingKind(chatId)
   if (sharedKind === 'sessions') return { kind: 'pick', switchesBinding: true }
@@ -954,9 +909,6 @@ function classifySessionInput(chatId: string, text: string, hasAttachments: bool
     return { kind: 'command', switchesBinding: true }
   }
   if (trimmed === '/cancel') return { kind: 'command', switchesBinding: false }
-  // A reply to the project picker that `showProjectPicker` opened starts a new
-  // session, i.e. it replaces the binding.
-  if (pendingProjectSelection.has(chatId)) return { kind: 'command', switchesBinding: true }
   return classifyNumericPick(chatId, trimmed)
 }
 
@@ -994,16 +946,13 @@ async function routeSessionInput(
     const handled = await tryHandleTelegramSessionInput(chatId, text, false, {
       startNewSession,
       showProjectPicker,
-      showResumeProjectPicker: commandController.showResumeProjectPicker,
+      showResumeProjectPicker: async (id) => { await sessionSelection.handleInput(id, '/sessions') },
       handleSessionInput: (id, input) => sessionSelection.handleInput(id, input),
     })
     if (handled) return
     if (route.kind === 'pick') {
       await resolveNumericPick(chatId, text, userId)
       return
-    }
-    if (pendingProjectSelection.has(chatId) && text.trim()) {
-      await startNewSession(chatId, text.trim())
     }
   })
   sessionCommandBarriers.set(chatId, task)
@@ -1088,8 +1037,9 @@ async function routeUserMessage(
   // Permission replies and AskUserQuestion answers are short operations that
   // must not wait behind a long voice transcription (docs §"顺序、控制命令与
   // 会话归属"). They ride the per-chat control queue.
-  if (isPermissionReply(text, hasAttachments, chatId)) {
-    await enqueue(`control:${chatId}`, () => handlePermissionReply(chatId, text))
+  const replyToMessageId = ctx.message?.reply_to_message?.message_id
+  if (isPermissionReply(text, hasAttachments, chatId, replyToMessageId)) {
+    await enqueue(`control:${chatId}`, () => handlePermissionReply(chatId, text, userId, replyToMessageId))
     return
   }
 
@@ -1133,14 +1083,9 @@ async function routeUserMessage(
       if (await tryHandleTelegramSessionInput(chatId, text, hasAttachments, {
         startNewSession,
         showProjectPicker,
-        showResumeProjectPicker: commandController.showResumeProjectPicker,
+        showResumeProjectPicker: async (id) => { await sessionSelection.handleInput(id, '/sessions') },
         handleSessionInput: (id, inputText) => sessionSelection.handleInput(id, inputText),
       })) return
-
-      if (!hasAttachments && pendingProjectSelection.has(chatId)) {
-        if (text.trim()) await startNewSession(chatId, text.trim())
-        return
-      }
 
       let locals: LocalAttachment[] = []
       if (media) {
@@ -1270,33 +1215,28 @@ async function echoPlainText(chatId: string, content: string): Promise<void> {
 /** True when the text is a permission reply or an AskUserQuestion answer, i.e.
  *  a short control operation that must bypass the transcription-blocked queue.
  *  Captions on media messages are never treated as permission input. */
-function isPermissionReply(text: string, hasAttachments: boolean, chatId: string): boolean {
+function hasOtherQuestionInteraction(chatId: string): boolean {
+  return Boolean(sessionSelection.pendingKind(chatId) || commandController.pendingSelectionKind(chatId))
+    || [...(pendingPermissions.get(chatId) ?? [])].some((id) => !pendingQuestions.get(chatId)?.has(id))
+}
+
+function isPermissionReply(text: string, hasAttachments: boolean, chatId: string, replyToMessageId?: number): boolean {
   if (hasAttachments) return false
-  if (parseAnswerCommand(text) !== null) return true
+  if (questionController.shouldHandleText({ chatId, text, replyToMessageId, hasOtherSelection: hasOtherQuestionInteraction(chatId) })) return true
   return parsePermissionCommand(text, pendingPermissions.get(chatId)) !== null
 }
 
-async function handlePermissionReply(chatId: string, text: string): Promise<void> {
-  const answerCommand = parseAnswerCommand(text)
-  if (answerCommand === 'malformed') {
-    await bot.api.sendMessage(Number(chatId), '用法：/answer <请求ID> <答案>；多题请回复 JSON。')
-    return
-  }
-  if (answerCommand) {
-    await handleQuestionAnswer(chatId, answerCommand.requestId, answerCommand.payload)
-    return
-  }
+async function handlePermissionReply(chatId: string, text: string, userId: number, replyToMessageId?: number): Promise<void> {
+  if (await questionController.handleText({
+    chatId, text, userId, replyToMessageId, hasOtherSelection: hasOtherQuestionInteraction(chatId),
+  })) return
 
   const permissionDecision = parsePermissionCommand(text, pendingPermissions.get(chatId))
   if (!permissionDecision) return
-  // Questions require /answer or an explicit /deny command. In particular,
-  // replying "3" must not be mistaken for the tool-permission deny shortcut.
+  // Question answers never use the ordinary tool approval shortcut.
   if (pendingQuestions.get(chatId)?.has(permissionDecision.requestId) &&
     (permissionDecision.allowed || !text.trim().startsWith('/'))) {
-    await bot.api.sendMessage(
-      Number(chatId),
-      `⚠️ 该请求需要回答，请使用 /answer ${permissionDecision.requestId} <答案> 作答；不能直接允许。`,
-    )
+    await bot.api.sendMessage(Number(chatId), '该请求需要回答，请点选问题选项或回复问题消息；不能直接允许。')
     return
   }
   await handlePermissionDecision(chatId, permissionDecision)
@@ -1341,6 +1281,17 @@ bot.on('callback_query:data', async (ctx) => {
   // transcript still in flight cannot be delivered into the session the user
   // just left.
   await enqueue(`control:${chatId}`, async () => {
+    if (!isAllowedUser('telegram', ctx.from!.id)) {
+      await ctx.answerCallbackQuery('未授权').catch(() => {})
+      return
+    }
+    if (await questionController.handleCallback(ctx, data)) return
+    const history = parseTelegramHistoryCallback(data)
+    if (history) {
+      await ctx.answerCallbackQuery().catch(() => {})
+      await sessionSelection.handleSelectionAction(chatId, history.token, history.action, history.index)
+      return
+    }
     if (await tryHandleTelegramSelectionCallback(data, ctx, commandController)) return
 
     if (!data.startsWith('permit:')) return

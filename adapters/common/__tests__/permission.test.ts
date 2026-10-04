@@ -101,6 +101,17 @@ describe('parseQuestionAnswer', () => {
     ).toEqual({ '前端框架？': 'React', '数据库？': 'Postgres' })
   })
 
+  it('parses strict 1-based numeric JSON keys that exactly cover every question', () => {
+    expect(
+      parseQuestionAnswer('{"1":"React","2":"Postgres"}', multiQuestionInput),
+    ).toEqual({ '前端框架？': 'React', '数据库？': 'Postgres' })
+    expect(parseQuestionAnswer('{"1":"Fetch"}', singleQuestionInput)).toEqual({ '选哪个库？': 'Fetch' })
+  })
+
+  it('does not map a single-question digit reply onto an option', () => {
+    expect(parseQuestionAnswer('1', singleQuestionInput)).toEqual({ '选哪个库？': '1' })
+  })
+
   it('does not map plain text onto multiple questions positionally', () => {
     expect(parseQuestionAnswer('React', multiQuestionInput)).toBeNull()
     expect(parseQuestionAnswer('1 React 2 Postgres', multiQuestionInput)).toBeNull()
@@ -114,6 +125,11 @@ describe('parseQuestionAnswer', () => {
     ).toBeNull()
     expect(
       parseQuestionAnswer('{"前端框架？":"React","另一个？":"Postgres"}', multiQuestionInput),
+    ).toBeNull()
+    expect(parseQuestionAnswer('{"1":"React","数据库？":"Postgres"}', multiQuestionInput)).toBeNull()
+    expect(parseQuestionAnswer('{"1":"React"}', multiQuestionInput)).toBeNull()
+    expect(
+      parseQuestionAnswer('{"1":"React","2":"Postgres","3":"x"}', multiQuestionInput),
     ).toBeNull()
   })
 

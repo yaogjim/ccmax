@@ -3,13 +3,29 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { SessionSelectionController, SESSION_SELECTION_TTL_MS, listProjectSessionHistory } from '../session-selection.js'
+import type { SessionSelectionView } from '../session-selection.js'
 import type { RecentProject, SessionListItem } from '../http-client.js'
 import { SessionStore } from '../session-store.js'
 import type { ServerMessage } from '../ws-bridge.js'
 
 let tmp: string
-beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'im-session-picker-')) })
-afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }) })
+const savedEnv = {
+  HOME: process.env.HOME,
+  CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+}
+beforeEach(() => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'im-session-picker-'))
+  process.env.HOME = tmp
+  process.env.CLAUDE_CONFIG_DIR = path.join(tmp, '.claude')
+  fs.mkdirSync(process.env.CLAUDE_CONFIG_DIR, { recursive: true })
+})
+afterEach(() => {
+  fs.rmSync(tmp, { recursive: true, force: true })
+  if (savedEnv.HOME === undefined) delete process.env.HOME
+  else process.env.HOME = savedEnv.HOME
+  if (savedEnv.CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR
+  else process.env.CLAUDE_CONFIG_DIR = savedEnv.CLAUDE_CONFIG_DIR
+})
 
 function session(id: string, workDir: string, extra: Partial<SessionListItem> = {}): SessionListItem {
   return { id, title: `历史 ${id}`, createdAt: '2026-08-01', modifiedAt: '2026-08-31', messageCount: 3, projectPath: 'encoded', workDir, workDirExists: true, ...extra }
@@ -19,7 +35,7 @@ function project(name: string, realPath: string): RecentProject {
   return { projectName: name, realPath, projectPath: realPath, isGit: true, repoName: name, branch: 'main', modifiedAt: '2026-08-31', sessionCount: 3 }
 }
 
-function harness() {
+function harness(options?: { present?: boolean }) {
   const store = new SessionStore(path.join(tmp, 'sessions.json'))
   store.set('chat', 'current', tmp)
   const notices: string[] = []
@@ -27,6 +43,8 @@ function harness() {
   const resets: string[] = []
   const events: ServerMessage[] = []
   const fetches: number[] = []
+  const views: SessionSelectionView[] = []
+  const createdSessions: string[] = []
   const state = {
     sessions: [session('old', tmp)], projects: [project('demo', tmp)],
     exists: true, open: true, busy: false, now: 0, clears: 0, projectClears: 0,
@@ -65,8 +83,11 @@ function harness() {
     clearProjectSelection() { state.projectClears++ },
     isBusy() { return state.busy },
     now: () => state.now,
+    ...(options?.present ? {
+      presentSelection: async (_chatId: string, view: SessionSelectionView) => { views.push(view) },
+    } : {}),
   })
-  return { controller, store, notices, connections, resets, events, fetches, state }
+  return { controller, store, notices, connections, resets, events, fetches, views, createdSessions, state }
 }
 
 describe('IM history selection (#1286)', () => {
@@ -226,5 +247,106 @@ describe('IM history selection (#1286)', () => {
     expect(h.notices.at(-1)).toContain('offline')
     expect(h.store.get('chat')?.sessionId).toBe('current')
     expect(h.resets).toEqual([])
+  })
+})
+
+describe('IM history selection button presenter', () => {
+  it('presents a tokenized current-page view instead of the text list', async () => {
+    const h = harness({ present: true })
+    h.state.sessions = Array.from({ length: 12 }, (_, i) => session(`id-${String(i).padStart(2, '0')}`, tmp))
+    await h.controller.handleInput('chat', '/sessions')
+    const view = h.views.at(-1)!
+    expect(h.notices).toEqual([])
+    expect(view.kind).toBe('sessions')
+    expect(view.token).toMatch(/^[0-9a-f]{8}$/)
+    expect(view.page).toBe(0)
+    expect(view.totalPages).toBe(2)
+    expect(view.items).toHaveLength(8)
+    expect(view.items.map((item) => item.index)).toEqual([0, 1, 2, 3, 4, 5, 6, 7])
+    expect(view.items[0]?.value).toBe('id-00')
+    expect(view.items[0]?.description).toContain('3 条消息')
+    expect(view.currentSessionId).toBe('current')
+  })
+
+  it('maps bare numbers to the current page when presenting buttons', async () => {
+    const h = harness({ present: true })
+    h.state.sessions = Array.from({ length: 12 }, (_, i) => session(`id-${String(i).padStart(2, '0')}`, tmp))
+    await h.controller.handleInput('chat', '/sessions')
+    await h.controller.handleSelectionAction('chat', h.views[0]!.token, 'page', 1)
+    expect(h.views.at(-1)?.items.map((item) => item.index)).toEqual([8, 9, 10, 11])
+    await h.controller.handleInput('chat', '1')
+    expect(h.store.get('chat')?.sessionId).toBe('id-08')
+    expect(h.createdSessions).toEqual([])
+  })
+
+  it('rejects an old token after the same kind is opened again', async () => {
+    const h = harness({ present: true })
+    await h.controller.handleInput('chat', '/sessions')
+    const stale = h.views[0]!.token
+    await h.controller.handleInput('chat', '/sessions')
+    const fresh = h.views.at(-1)!.token
+    expect(fresh).not.toBe(stale)
+    expect(await h.controller.handleSelectionAction('chat', stale, 'pick', 0)).toBe(true)
+    expect(h.store.get('chat')?.sessionId).toBe('current')
+    expect(h.connections).toEqual([])
+    expect(h.notices.at(-1)).toContain('已过期')
+    expect(await h.controller.handleSelectionAction('chat', fresh, 'pick', 0)).toBe(true)
+    expect(h.store.get('chat')?.sessionId).toBe('old')
+  })
+
+  it('rejects the previous page token after paging', async () => {
+    const h = harness({ present: true })
+    h.state.sessions = Array.from({ length: 12 }, (_, i) => session(`id-${String(i).padStart(2, '0')}`, tmp))
+    await h.controller.handleInput('chat', '/sessions')
+    const firstPage = h.views[0]!.token
+    expect(await h.controller.handleSelectionAction('chat', firstPage, 'page', 1)).toBe(true)
+    const secondPage = h.views.at(-1)!.token
+    expect(secondPage).not.toBe(firstPage)
+    expect(await h.controller.handleSelectionAction('chat', firstPage, 'pick', 0)).toBe(true)
+    expect(h.store.get('chat')?.sessionId).toBe('current')
+    expect(h.notices.at(-1)).toContain('已过期')
+    expect(await h.controller.handleSelectionAction('chat', secondPage, 'pick', 8)).toBe(true)
+    expect(h.store.get('chat')?.sessionId).toBe('id-08')
+  })
+
+  it('does not let another chat use this chat token', async () => {
+    const h = harness({ present: true })
+    await h.controller.handleInput('chat', '/sessions')
+    const token = h.views[0]!.token
+    expect(await h.controller.handleSelectionAction('other', token, 'pick', 0)).toBe(true)
+    expect(h.store.get('chat')?.sessionId).toBe('current')
+    expect(h.connections).toEqual([])
+    expect(h.notices.at(-1)).toContain('已过期')
+  })
+
+  it('restores through a shared history pick without creating a session', async () => {
+    const h = harness({ present: true })
+    await h.controller.handleInput('chat', '/sessions')
+    const view = h.views[0]!
+    expect(await h.controller.handleSelectionAction('chat', view.token, 'pick', view.items[0]!.index)).toBe(true)
+    expect(h.connections).toEqual(['old'])
+    expect(h.createdSessions).toEqual([])
+    expect(h.store.get('chat')?.sessionId).toBe('old')
+    expect(h.notices.at(-1)).toContain('已恢复会话')
+  })
+
+  it('refuses a history pick while the chat is busy', async () => {
+    const h = harness({ present: true })
+    await h.controller.handleInput('chat', '/sessions')
+    h.state.busy = true
+    const view = h.views[0]!
+    expect(await h.controller.handleSelectionAction('chat', view.token, 'pick', 0)).toBe(true)
+    expect(h.store.get('chat')?.sessionId).toBe('current')
+    expect(h.connections).toEqual([])
+    expect(h.notices.at(-1)).toContain('/stop')
+  })
+
+  it('maps /resume N to the current page when presenting buttons', async () => {
+    const h = harness({ present: true })
+    h.state.sessions = Array.from({ length: 12 }, (_, i) => session(`id-${String(i).padStart(2, '0')}`, tmp))
+    await h.controller.handleInput('chat', '/sessions')
+    await h.controller.handleSelectionAction('chat', h.views[0]!.token, 'page', 1)
+    await h.controller.handleInput('chat', '/resume 1')
+    expect(h.store.get('chat')?.sessionId).toBe('id-08')
   })
 })

@@ -141,6 +141,31 @@ describe('Telegram entrypoint voice lifecycle', () => {
       .map((call) => call.payload.text)
   }
 
+  function lastMarkup(chatId: number) {
+    return [...apiCalls].reverse().find((call) =>
+      (call.method === 'sendMessage' || call.method === 'editMessageText')
+      && call.payload?.chat_id === chatId
+      && call.payload?.reply_markup?.inline_keyboard,
+    )
+  }
+
+  function callbackData(chatId: number, match: string | RegExp): string {
+    const buttons = lastMarkup(chatId)?.payload.reply_markup.inline_keyboard.flat() ?? []
+    const found = [...buttons].reverse().find((button: { text: string; callback_data: string }) => {
+      const haystack = `${button.text}\n${button.callback_data}`
+      return typeof match === 'string' ? haystack.includes(match) : match.test(button.text) || match.test(button.callback_data)
+    })
+    if (!found) throw new Error(`button not found: ${String(match)}; buttons=${JSON.stringify(buttons)}`)
+    return found.callback_data
+  }
+
+  function lastCardMessageId(chatId: number): number | undefined {
+    const call = lastMarkup(chatId)
+    if (typeof call?.result?.message_id === 'number') return call.result.message_id
+    if (typeof call?.payload?.message_id === 'number') return call.payload.message_id
+    return undefined
+  }
+
   function getFileCalls(): number {
     return apiCalls.filter((call) => call.method === 'getFile').length
   }
@@ -188,7 +213,7 @@ describe('Telegram entrypoint voice lifecycle', () => {
     }
   }
 
-  async function callback(chatId: number, data: string): Promise<void> {
+  async function callback(chatId: number, data: string, options: { messageId?: number } = {}): Promise<void> {
     await entry.bot.handleUpdate({
       update_id: nextId++,
       callback_query: {
@@ -196,7 +221,12 @@ describe('Telegram entrypoint voice lifecycle', () => {
         data,
         chat_instance: 'fixture',
         from: { id: 7, is_bot: false, first_name: 'Fixture' },
-        message: { message_id: 1, date: 1, chat: { id: chatId, type: 'private' }, text: 'fixture menu' },
+        message: {
+          message_id: options.messageId ?? lastCardMessageId(chatId) ?? 1,
+          date: 1,
+          chat: { id: chatId, type: 'private' },
+          text: 'fixture menu',
+        },
       },
     } as any)
   }
@@ -535,26 +565,28 @@ describe('Telegram entrypoint voice lifecycle', () => {
 
     const pendingVoice = update(voiceUpdate(chatId, 'pick-fid'))
     await eventually(() => expect(provider.calls.length).toBe(1))
+    try {
+      // The restore list is opened and answered *by number* while the voice is
+      // still in flight. The entrypoint knows a list is waiting from the
+      // controller's pending picker, so the digits ride the short control queue
+      // instead of queueing behind the transcription.
+      await text(chatId, '/resume')
+      await eventually(() => expect(texts(chatId).some((value) => /历史会话|选择要恢复/.test(value))).toBe(true))
+      await text(chatId, '2')
 
-    // The restore list is opened and answered *by number* while the voice is
-    // still in flight. The entrypoint knows a list is waiting from the
-    // controller's pending picker, so the digits ride the short control queue
-    // instead of queueing behind the transcription.
-    await text(chatId, '/resume')
-    await eventually(() => expect(texts(chatId).some((value) => value.includes('选择要恢复的项目'))).toBe(true))
-    await text(chatId, '1')
-    await eventually(() => expect(texts(chatId).some((value) => value.includes('选择要恢复的会话'))).toBe(true))
-    await text(chatId, '2')
+      // Picking a session replaces the binding...
+      expect(store.get(String(chatId))?.sessionId).toBe('other-session')
+      // ...and the input that was still being transcribed was invalidated.
+      expect(provider.aborted).toBe(1)
 
-    // Picking a session replaces the binding...
-    expect(store.get(String(chatId))?.sessionId).toBe('other-session')
-    // ...and the input that was still being transcribed was invalidated.
-    expect(provider.aborted).toBe(1)
-
-    await pendingVoice
-    await new Promise((resolve) => setTimeout(resolve, 30))
-    expect(messages.filter((item) => JSON.stringify(item.message).includes('pick-fid'))).toEqual([])
-    broadcast('other-session', { type: 'message_complete' })
+      await pendingVoice
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(messages.filter((item) => JSON.stringify(item.message).includes('pick-fid'))).toEqual([])
+      broadcast('other-session', { type: 'message_complete' })
+    } finally {
+      await text(chatId, '/stop')
+      await pendingVoice
+    }
   })
 
   it('keeps a message that arrived in the same tick as /new', async () => {
@@ -772,21 +804,25 @@ describe('Telegram entrypoint voice lifecycle', () => {
 
     const pendingVoice = update(voiceUpdate(chatId, 'switch-fid'))
     await eventually(() => expect(provider.calls.length).toBe(1))
+    try {
+      // Every step below must complete while the provider is still blocked: the
+      // callback path is the one that used to wait behind the transcription.
+      await text(chatId, '/resume')
+      await eventually(() => expect(texts(chatId).some((value) => /历史会话|选择要恢复/.test(value))).toBe(true))
+      await callback(chatId, callbackData(chatId, /tgh:[0-9a-f]+:pick:1$/))
+      expect(store.get(String(chatId))?.sessionId).toBe('other-session')
+      // The in-flight transcription was cancelled by the switch itself, not just
+      // dropped later by the ownership re-check.
+      expect(provider.aborted).toBe(1)
 
-    // Every step below must complete while the provider is still blocked: the
-    // callback path is the one that used to wait behind the transcription.
-    await text(chatId, '/resume')
-    await callback(chatId, 'tgsel:resume_project:pick:0')
-    await callback(chatId, 'tgsel:resume_session:pick:1')
-    expect(store.get(String(chatId))?.sessionId).toBe('other-session')
-    // The in-flight transcription was cancelled by the switch itself, not just
-    // dropped later by the ownership re-check.
-    expect(provider.aborted).toBe(1)
-
-    await pendingVoice
-    await new Promise((resolve) => setTimeout(resolve, 30))
-    expect(messages.filter((item) => (item.message.content ?? '').includes('switch-fid'))).toEqual([])
-    broadcast('other-session', { type: 'message_complete' })
+      await pendingVoice
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(messages.filter((item) => (item.message.content ?? '').includes('switch-fid'))).toEqual([])
+      broadcast('other-session', { type: 'message_complete' })
+    } finally {
+      await text(chatId, '/stop')
+      await pendingVoice
+    }
   })
 
   it('全局只同时转写两条，等待容量满时降级，取消后释放并发槽', async () => {
@@ -865,39 +901,120 @@ describe('Telegram entrypoint voice lifecycle', () => {
 
   it('lets /answer complete while a slow transcription still holds the message queue', async () => {
     const chatId = 761
-    store.set(String(chatId), 'voice-session', project)
+    const session = 'voice-answer'
+    sessionPaths.set(session, project)
+    store.set(String(chatId), session, project)
     await text(chatId, 'Open the session')
-    await eventually(() => expect(voiceMessages('voice-session').some((item) => item.message.content === 'Open the session')).toBe(true))
-    broadcast('voice-session', {
+    await eventually(() => expect(voiceMessages(session).some((item) => item.message.content === 'Open the session')).toBe(true))
+    broadcast(session, {
       type: 'permission_request',
       requestId: 'q-voice',
       toolName: 'AskUserQuestion',
       input: askUserQuestionInput,
     })
-    await eventually(() => expect(texts(chatId).some((value) => value.includes('/answer q-voice'))).toBe(true))
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('选哪个库？'))).toBe(true))
 
     const provider = new ControllableTranscriptionProvider()
     setTelegramTranscriber(provider)
     const pendingVoice = update(voiceUpdate(chatId, 'answer-fid'))
     await eventually(() => expect(provider.calls.length).toBe(1))
+    try {
+      await text(chatId, '/answer q-voice Axios')
+      await eventually(() => expect(messages.some((item) =>
+        item.sessionId === session &&
+        item.message.type === 'permission_response' &&
+        item.message.requestId === 'q-voice' &&
+        item.message.allowed === true &&
+        item.message.updatedInput?.answers?.['选哪个库？'] === 'Axios',
+      )).toBe(true))
+      await eventually(() => expect(texts(chatId).some((value) => value.includes('已提交答案'))).toBe(true))
+      // /answer rode the control queue: the voice is still blocked, not delivered.
+      expect(provider.calls.length).toBe(1)
+      expect(provider.aborted).toBe(0)
+      expect(voiceMessages(session).some((item) => item.message.content?.includes('answer-fid'))).toBe(false)
+    } finally {
+      await text(chatId, '/stop')
+      await pendingVoice
+    }
+    broadcast(session, { type: 'message_complete' })
+  })
 
-    await text(chatId, '/answer q-voice Axios')
-    await eventually(() => expect(messages.some((item) =>
-      item.sessionId === 'voice-session' &&
-      item.message.type === 'permission_response' &&
-      item.message.requestId === 'q-voice' &&
-      item.message.allowed === true &&
-      item.message.updatedInput?.answers?.['选哪个库？'] === 'Axios',
-    )).toBe(true))
-    await eventually(() => expect(texts(chatId).some((value) => value.includes('已提交答案'))).toBe(true))
-    // /answer rode the control queue: the voice is still blocked, not delivered.
-    expect(provider.calls.length).toBe(1)
-    expect(provider.aborted).toBe(0)
-    expect(voiceMessages('voice-session').some((item) => item.message.content?.includes('answer-fid'))).toBe(false)
+  it('lets a unique question text reply complete while a slow transcription still holds the message queue', async () => {
+    const chatId = 766
+    const session = 'voice-question-text'
+    sessionPaths.set(session, project)
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Open the session')
+    await eventually(() => expect(voiceMessages(session).some((item) => item.message.content === 'Open the session')).toBe(true))
+    broadcast(session, {
+      type: 'permission_request',
+      requestId: 'q-voice-text',
+      toolName: 'AskUserQuestion',
+      input: askUserQuestionInput,
+    })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('选哪个库？'))).toBe(true))
 
-    await text(chatId, '/stop')
-    await pendingVoice
-    broadcast('voice-session', { type: 'message_complete' })
+    const provider = new ControllableTranscriptionProvider()
+    setTelegramTranscriber(provider)
+    const pendingVoice = update(voiceUpdate(chatId, 'answer-text-fid'))
+    await eventually(() => expect(provider.calls.length).toBe(1))
+    const pendingText = text(chatId, 'Axios')
+    try {
+      await eventually(() => expect(messages.some((item) =>
+        item.sessionId === session &&
+        item.message.type === 'permission_response' &&
+        item.message.requestId === 'q-voice-text' &&
+        item.message.allowed === true &&
+        item.message.updatedInput?.answers?.['选哪个库？'] === 'Axios',
+      )).toBe(true))
+      expect(provider.calls.length).toBe(1)
+      expect(provider.aborted).toBe(0)
+      expect(voiceMessages(session).some((item) => item.message.content?.includes('answer-text-fid'))).toBe(false)
+      expect(voiceMessages(session).some((item) => item.message.content === 'Axios')).toBe(false)
+    } finally {
+      await text(chatId, '/stop')
+      await pendingVoice
+      await pendingText
+    }
+    broadcast(session, { type: 'message_complete' })
+  })
+
+  it('lets a question option button complete while a slow transcription still holds the message queue', async () => {
+    const chatId = 767
+    const session = 'voice-question-button'
+    sessionPaths.set(session, project)
+    store.set(String(chatId), session, project)
+    await text(chatId, 'Open the session')
+    await eventually(() => expect(voiceMessages(session).some((item) => item.message.content === 'Open the session')).toBe(true))
+    broadcast(session, {
+      type: 'permission_request',
+      requestId: 'q-voice-button',
+      toolName: 'AskUserQuestion',
+      input: askUserQuestionInput,
+    })
+    await eventually(() => expect(texts(chatId).some((value) => value.includes('选哪个库？'))).toBe(true))
+
+    const provider = new ControllableTranscriptionProvider()
+    setTelegramTranscriber(provider)
+    const pendingVoice = update(voiceUpdate(chatId, 'answer-button-fid'))
+    await eventually(() => expect(provider.calls.length).toBe(1))
+    try {
+      await callback(chatId, callbackData(chatId, 'Axios'))
+      await eventually(() => expect(messages.some((item) =>
+        item.sessionId === session &&
+        item.message.type === 'permission_response' &&
+        item.message.requestId === 'q-voice-button' &&
+        item.message.allowed === true &&
+        item.message.updatedInput?.answers?.['选哪个库？'] === 'Axios',
+      )).toBe(true))
+      expect(provider.calls.length).toBe(1)
+      expect(provider.aborted).toBe(0)
+      expect(voiceMessages(session).some((item) => item.message.content?.includes('answer-button-fid'))).toBe(false)
+    } finally {
+      await text(chatId, '/stop')
+      await pendingVoice
+    }
+    broadcast(session, { type: 'message_complete' })
   })
 
   it('does not echo success, claim handover, or retry when sendUserMessage fails after a successful transcript', async () => {

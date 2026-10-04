@@ -39,8 +39,10 @@ Codes are valid for 60 minutes, work once, and are invalidated when a new one is
 
 - `/start` — show help and available commands
 - `/help` — show available commands
-- `/projects` — list recent projects and switch
-- `/resume` — choose and restore a previous session
+- `/projects` — list recent projects and start a new session from a button
+- `/sessions` — list and restore historical sessions in the current project
+- `/resume` — restore a previous session; with a binding this lists the current project's history, otherwise it asks you to pick a project first
+- `/cancel` — cancel the current project or session picker
 - `/status` — project, model, run state, and task summary
 - `/new` — clear the current binding and choose a project again
 - `/clear` — clear context, keep the project binding
@@ -48,7 +50,7 @@ Codes are valid for 60 minutes, work once, and are invalidated when a new one is
 - `/provider` — view or switch the provider
 - `/model [model]` — view or switch the model
 - `/skills` — list project Skills and invoke one by selecting it
-- `/answer <id> <answer>` — answer a model question; for multiple questions, send JSON keyed by the full question text
+- `/answer [id] <answer>` — answer a model question. For one question, tap an option or send text; for several questions, answer them one by one, or submit JSON keyed by question number or the full question text, with or without a request id
 
 ## Agent capabilities and boundaries
 
@@ -62,7 +64,9 @@ The adapter accepts private chats only from paired or allowlisted accounts. Proj
 
 A permission request arrives as a message with three buttons: allow once, always allow the matching operation for this session, and deny. Only a currently pending request can be confirmed, and the choice is converted to a `permission_response` for that same Desktop session.
 
-When the model asks through `AskUserQuestion`, the message shows the full questions and options and offers only a deny button. For one question, use `/answer <id> <answer>` with an option label or your own text. Separate multiple selections with commas; numbers are not automatically mapped to options. For multiple questions, submit all answers in one JSON object, for example `/answer <id> {"Frontend framework?":"React","Database?":"SQLite"}`, using the exact full question texts as keys. Ordinary chat messages and allow buttons do not submit answers. Failed sends can be retried; submitted, Desktop-resolved, or expired requests cannot be answered again.
+When the model asks through `AskUserQuestion`, Telegram sends a card with option buttons and walks the questions one at a time. For a single question, tapping an option or sending text submits the full answer. For several questions, taps collect answers until a summary; then **Submit all** sends them once. You can also reply to a specific question message to target that request. If several questions are pending, ordinary text does not guess the latest one — pick the target first.
+
+`/answer` can omit the request id: `/answer Axios` is enough when only one question is waiting. For several questions, send JSON keyed either by the full question text or by 1-based numbers, for example `/answer {"1":"React","2":"SQLite"}`. The older `/answer <id> {...}` form still works. Drafts stay in memory for this process only and are not written to the session file. `/stop` invalidates the current question without sending a deny; `/deny` is what returns a rejection to the same Desktop session. `/allow` and `/always` cannot answer a question. Failed sends can be retried from the latest card; submitted, Desktop-resolved, or expired requests cannot be answered again.
 
 Replies pass through a streaming buffer: a placeholder can be sent while Claude is thinking, text deltas accumulate in place, and completed text is split into platform-sized messages.
 
