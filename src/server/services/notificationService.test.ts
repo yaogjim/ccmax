@@ -7,16 +7,20 @@ import type { TaskRun } from './cronScheduler.js'
 import {
   NOTIFICATION_DELIVERY_UNCONFIRMED_AFTER_RESTART,
   NotificationDeliveryStore,
+  getNotificationDeliveryStorePath,
 } from './notificationDeliveryStore.js'
 import {
   resetNotificationRecoveryStateForTests,
   sendImmediateMessage,
   sendTaskNotification,
+  sendTelegramChannelMessage as sendTelegramHttp,
   startPendingDeliveryRecovery,
   type NotificationDeliveryReport,
   type NotificationLogger,
   type TaskNotificationInput,
 } from './notificationService.js'
+import { TelegramPublicService, setTelegramPublicServiceForTests } from './telegramPublicService.js'
+import { TelegramPublicStore, getTelegramPublicStorePath } from './telegramPublicStore.js'
 
 type FetchCall = {
   url: string
@@ -104,6 +108,7 @@ describe('notificationService', () => {
     globalThis.fetch = originalFetch
     configSpy.mockRestore()
     resetNotificationRecoveryStateForTests()
+    setTelegramPublicServiceForTests(null)
     restoreEnv('CLAUDE_CONFIG_DIR', originalConfigDir)
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
@@ -856,6 +861,50 @@ describe('notificationService', () => {
       expect(fresh?.outcome).toBe('delivered')
       expect(fake.calls).toHaveLength(1)
     })
+
+    test('leftover dedicated pending is not resent through deliverTelegram when public is enabled', async () => {
+      const storePath = path.join(tmpDir, 'journal-startup-gate.json')
+      const store = new NotificationDeliveryStore(storePath)
+      await store.enqueuePending([{
+        deliveryId: 'run-old::telegram::111::0',
+        runId: 'run-old',
+        taskId: 'task-old',
+        channel: 'telegram',
+        recipientId: '111',
+        recipientDisplayName: 'user-111',
+        createdAt: '2026-09-26T00:00:00.000Z',
+      }])
+      resetNotificationRecoveryStateForTests()
+      rawConfig = {
+        telegram: {
+          botToken: 'bot-token',
+          pairedUsers: [telegramUser(111)],
+          public: { enabled: true },
+        },
+      }
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
+
+      await startPendingDeliveryRecovery({ store, logger, fetchImpl: fake.impl })
+      expect(fake.calls).toHaveLength(0)
+      expect((await store.list())[0]?.outcome).toBe('indeterminate')
+
+      const leftoverRetry = await sendTaskNotification(
+        runFixture({ id: 'run-old' }),
+        { enabled: true, channels: ['telegram'], recipients: { telegram: [111] } },
+        options(fake, { store, getDedicatedBinding: () => ({ sessionId: 'sess-bound' }) }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(leftoverRetry.ok).toBe(false)
+      expect(leftoverRetry.failed[0]?.errorCode).toBe('delivery_record_failed')
+
+      const mismatched = await sendTaskNotification(
+        runFixture({ id: 'run-new', sessionId: 'sess-other' }),
+        { enabled: true, channels: ['telegram'], recipients: { telegram: [111] } },
+        options(fake, { store, getDedicatedBinding: () => ({ sessionId: 'sess-bound' }) }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(mismatched.failed[0]?.errorCode).toBe('dedicated_binding_mismatch')
+    })
   })
 
   // ─── Credential redaction ─────────────────────────────────────────────────
@@ -1038,6 +1087,313 @@ describe('notificationService', () => {
       expect(fake.calls).toHaveLength(2)
       expect(fake.calls[1]!.body.receive_id).toBe('ou_1')
       expect(fake.calls[1]!.body.msg_type).toBe('interactive')
+    })
+
+    test('keeps dedicated Telegram behavior when public is disabled even without a source session', async () => {
+      rawConfig = { telegram: { botToken: 'bot-token', pairedUsers: [telegramUser(111)] } }
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
+      const result = await sendImmediateMessage(
+        { channel: 'telegram', recipient: 111, text: 'legacy' },
+        options(fake, { getDedicatedBinding: () => ({ sessionId: 'other' }) }),
+      )
+      expect(result.ok).toBe(true)
+      expect(fake.calls).toHaveLength(1)
+    })
+  })
+
+  describe('telegram entry isolation', () => {
+    test('dedicated send fails when public is enabled and the source is not the recipient binding', async () => {
+      rawConfig = {
+        telegram: {
+          botToken: 'bot-token',
+          pairedUsers: [telegramUser(111)],
+          public: { enabled: true, botToken: 'public-token' },
+        },
+      }
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 123 } }))
+      const result = await sendImmediateMessage(
+        { channel: 'telegram', recipient: 111, text: 'nope', sourceSessionId: 'sess-other' },
+        options(fake, { getDedicatedBinding: () => ({ sessionId: 'sess-bound' }) }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(result.ok).toBe(false)
+      expect(result.delivery?.errorCode).toBe('dedicated_binding_mismatch')
+      expect(result.delivery?.error).toContain('公共')
+    })
+
+    test('dedicated send succeeds when public is enabled and the source matches the binding', async () => {
+      rawConfig = {
+        telegram: {
+          botToken: 'bot-token',
+          pairedUsers: [telegramUser(111)],
+          public: { enabled: true },
+        },
+      }
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 9 } }))
+      const result = await sendImmediateMessage(
+        { channel: 'telegram', recipient: 111, text: 'ok', sourceSessionId: 'sess-bound' },
+        options(fake, { getDedicatedBinding: () => ({ sessionId: 'sess-bound' }) }),
+      )
+      expect(result.ok).toBe(true)
+      expect(fake.calls).toHaveLength(1)
+      expect(fake.calls[0]!.url).toContain('botbot-token')
+    })
+
+    test('scheduled telegram notification without run.sessionId fails with a migration hint when public is enabled', async () => {
+      rawConfig = {
+        telegram: {
+          botToken: 'bot-token',
+          pairedUsers: [telegramUser(111)],
+          public: { enabled: true },
+        },
+      }
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+      const report = await sendTaskNotification(
+        runFixture(),
+        { enabled: true, channels: ['telegram'], recipients: { telegram: [111] } },
+        options(fake, { getDedicatedBinding: () => ({ sessionId: 'sess-bound' }) }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(report.ok).toBe(false)
+      expect(report.failed[0]!.errorCode).toBe('source_session_required')
+      expect(report.failed[0]!.error).toContain('公共')
+    })
+
+    test('public send requires sourceSessionId and uses sendSessionReport, not the dedicated token or old store', async () => {
+      rawConfig = {
+        telegram: {
+          botToken: 'dedicated-token',
+          pairedUsers: [telegramUser(111)],
+          public: { enabled: true, botToken: 'public-token' },
+        },
+      }
+      const storePath = path.join(tmpDir, 'public-not-old-store.json')
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+      const reports: Array<{ sessionId: string; eventId: string; text: string }> = []
+      const missing = await sendImmediateMessage(
+        { channel: 'telegram', entrypoint: 'public', text: 'hello' },
+        options(fake, { store: new NotificationDeliveryStore(storePath) }),
+      )
+      expect(missing.ok).toBe(false)
+      expect(missing.issues[0]?.code).toBe('source_session_required')
+      expect(missing.recordPath).toContain('telegram-public.json')
+      expect(fake.calls).toHaveLength(0)
+
+      const result = await sendImmediateMessage(
+        { channel: 'telegram', entrypoint: 'public', text: 'hello', sourceSessionId: 'sess-sub' },
+        options(fake, {
+          store: new NotificationDeliveryStore(storePath),
+          sendPublicSessionReport: async (sessionId, eventId, text) => {
+            reports.push({ sessionId, eventId, text })
+            return { queued: true }
+          },
+        }),
+      )
+      expect(result.ok).toBe(true)
+      expect(result.queued).toBe(true)
+      expect(result.delivery).toMatchObject({
+        outcome: 'pending',
+        attempts: 0,
+        recipientId: 'sess-sub',
+        recipientLabel: 'public',
+      })
+      expect(result.recordPath).toContain('telegram-public.json')
+      expect(reports).toEqual([{ sessionId: 'sess-sub', eventId: expect.any(String), text: 'hello' }])
+      expect(fake.calls).toHaveLength(0)
+      expect(await new NotificationDeliveryStore(storePath).list()).toHaveLength(0)
+    })
+
+    test('public send does not fall back to dedicated and is not swallowed by an old delivery key', async () => {
+      rawConfig = {
+        telegram: {
+          botToken: 'dedicated-token',
+          pairedUsers: [telegramUser(111)],
+          public: { enabled: true, botToken: 'public-token' },
+        },
+      }
+      const storePath = path.join(tmpDir, 'public-idempotency.json')
+      const store = new NotificationDeliveryStore(storePath)
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+      expect((await sendImmediateMessage(
+        { channel: 'telegram', recipient: 111, text: 'old', runId: 'same-run', sourceSessionId: 'sess-bound' },
+        options(fake, {
+          store,
+          getDedicatedBinding: () => ({ sessionId: 'sess-bound' }),
+        }),
+      )).ok).toBe(true)
+      expect(fake.calls).toHaveLength(1)
+
+      const publicCalls: string[] = []
+      const publicResult = await sendImmediateMessage(
+        {
+          channel: 'telegram',
+          entrypoint: 'public',
+          text: 'public body',
+          runId: 'same-run',
+          sourceSessionId: 'sess-sub',
+        },
+        options(fake, {
+          store,
+          sendPublicSessionReport: async (sessionId) => {
+            publicCalls.push(sessionId)
+            throw new Error('未订阅该会话')
+          },
+        }),
+      )
+      expect(publicCalls).toEqual(['sess-sub'])
+      expect(publicResult.ok).toBe(false)
+      expect(publicResult.queued).toBeUndefined()
+      expect(publicResult.issues[0]?.message).toContain('未订阅')
+      expect(publicResult.recordPath).toContain('telegram-public.json')
+      expect(fake.calls).toHaveLength(1)
+    })
+
+    test('feishu is unchanged when telegram public is enabled', async () => {
+      rawConfig = {
+        telegram: { public: { enabled: true, botToken: 'public-token' } },
+        feishu: {
+          appId: 'cli_app',
+          appSecret: 'secret',
+          pairedUsers: [{ userId: 'ou_1', displayName: 'Feishu User', pairedAt: 1 }],
+        },
+      }
+      const fake = createFakeFetch((call) => {
+        if (call.url.includes('tenant_access_token')) {
+          return Response.json({ code: 0, tenant_access_token: 'tenant-token' })
+        }
+        return Response.json({ code: 0, data: { message_id: 'om_1' } })
+      })
+      const result = await sendImmediateMessage(
+        { channel: 'feishu', recipient: 'ou_1', text: 'hi there' },
+        options(fake),
+      )
+      expect(result.ok).toBe(true)
+      expect(fake.calls).toHaveLength(2)
+    })
+
+    test('public entrypoint on feishu is rejected without contacting either platform', async () => {
+      rawConfig = {
+        feishu: {
+          appId: 'cli_app',
+          appSecret: 'secret',
+          pairedUsers: [{ userId: 'ou_1', displayName: 'Feishu User', pairedAt: 1 }],
+        },
+      }
+      const fake = createFakeFetch(() => Response.json({ code: 0 }))
+      const result = await sendImmediateMessage(
+        { channel: 'feishu', recipient: 'ou_1', text: 'hi', entrypoint: 'public' },
+        options(fake),
+      )
+      expect(result.ok).toBe(false)
+      expect(result.issues[0]?.code).toBe('public_route_rejected')
+      expect(fake.calls).toHaveLength(0)
+    })
+
+    test('real public service queues then delivers through sendTelegramChannelMessage and never writes the old store', async () => {
+      const work = path.join(tmpDir, 'work')
+      await fs.mkdir(work, { recursive: true })
+      rawConfig = {
+        telegram: {
+          botToken: 'dedicated-token',
+          pairedUsers: [telegramUser(111)],
+          public: {
+            enabled: true,
+            botToken: 'public-token',
+            ownerUserId: 4242,
+            generation: 3,
+            allowedProjectRoots: [work],
+          },
+        },
+      }
+
+      let release!: () => void
+      const gate = new Promise<void>(resolve => {
+        release = resolve
+      })
+      const publicFake = createFakeFetch(async () => {
+        await gate
+        return Response.json({ ok: true, result: { message_id: 77 } })
+      })
+      const dedicatedFake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+      const oldStorePath = path.join(tmpDir, 'public-real-old-store.json')
+      const publicStorePath = getTelegramPublicStorePath()
+      const service = new TelegramPublicService({
+        store: new TelegramPublicStore(publicStorePath),
+        now: () => Date.parse('2026-04-04T00:00:00.000Z'),
+        sleep: async () => {},
+        getRawConfig: async () => rawConfig,
+        getSessionSummary: async id => id === 'sess-sub'
+          ? { id, title: '修复登录', projectPath: work, projectRoot: work, workDir: work }
+          : null,
+        observeSessionTurns: () => () => {},
+        sendTelegramChannelMessage: (token, chatId, text, sendOptions) =>
+          sendTelegramHttp(token, chatId, text, { ...sendOptions, fetch: publicFake.impl }),
+        getDedicatedBinding: () => ({ sessionId: 'sess-bound' }),
+        handler: {
+          submitHumanSessionTurn: async () => {},
+          respondToSessionPermission: async () => false,
+          respondToSessionComputerUsePermission: async () => false,
+          isSessionPermissionPending: () => false,
+          getSessionTurnState: () => 'idle',
+        },
+      })
+      setTelegramPublicServiceForTests(service)
+      try {
+        await service.start()
+        await service.registerRuntime({ botId: 99, generation: 3 })
+        await service.subscribe('sess-sub')
+
+        const unsubscribed = await sendImmediateMessage(
+          { channel: 'telegram', entrypoint: 'public', text: 'hello', sourceSessionId: 'sess-other' },
+          options(dedicatedFake, { store: new NotificationDeliveryStore(oldStorePath) }),
+        )
+        expect(unsubscribed.ok).toBe(false)
+        expect(unsubscribed.issues[0]?.code).toBe('public_route_rejected')
+        expect(dedicatedFake.calls).toHaveLength(0)
+
+        const queued = await sendImmediateMessage(
+          {
+            channel: 'telegram',
+            entrypoint: 'public',
+            text: 'hello public',
+            sourceSessionId: 'sess-sub',
+            runId: 'evt-1',
+          },
+          options(dedicatedFake, { store: new NotificationDeliveryStore(oldStorePath) }),
+        )
+        expect(queued).toMatchObject({
+          ok: true,
+          queued: true,
+          delivery: { outcome: 'pending', attempts: 0, recipientId: 'sess-sub' },
+          recordPath: publicStorePath,
+        })
+        expect(await new NotificationDeliveryStore(oldStorePath).list()).toHaveLength(0)
+        expect(dedicatedFake.calls).toHaveLength(0)
+
+        const before = await new TelegramPublicStore(publicStorePath).read()
+        const row = before.outbox.find(item => item.eventId === 'evt-1')
+        expect(row).toBeTruthy()
+        expect(['queued', 'sending']).toContain(row!.status)
+        expect(row!.status).not.toBe('delivered')
+
+        release()
+        await service.flushForTests()
+        const after = await new TelegramPublicStore(publicStorePath).read()
+        const delivered = after.outbox.find(item => item.eventId === 'evt-1')
+        expect(delivered?.status).toBe('delivered')
+        expect(delivered?.messageId).toBe(77)
+        expect(publicFake.calls.length).toBeGreaterThan(0)
+        expect(publicFake.calls[0]!.url).toContain('botpublic-token')
+        expect(publicFake.calls[0]!.url).not.toContain('dedicated-token')
+        expect(dedicatedFake.calls).toHaveLength(0)
+        expect(await new NotificationDeliveryStore(oldStorePath).list()).toHaveLength(0)
+        expect(await new NotificationDeliveryStore(getNotificationDeliveryStorePath()).list()).toHaveLength(0)
+        await expect(fs.access(oldStorePath)).rejects.toMatchObject({ code: 'ENOENT' })
+        await expect(fs.access(getNotificationDeliveryStorePath())).rejects.toMatchObject({ code: 'ENOENT' })
+      } finally {
+        service.stop()
+        setTelegramPublicServiceForTests(null)
+      }
     })
   })
 })

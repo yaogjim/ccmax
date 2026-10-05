@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { AdapterFileConfig } from '../types/adapter'
+import type { AdapterFileConfig, TelegramPublicConfig } from '../types/adapter'
 
 export type DingtalkRegistrationBegin = {
   deviceCode: string
@@ -67,6 +67,40 @@ export type SlackManifestInfo = {
   manifest: string
   createAppUrl: string
 }
+
+export type TelegramPublicPairing = {
+  code: string
+  expiresAt: number
+  createdAt: number
+}
+
+export type TelegramPublicSubscription = {
+  sessionId: string
+  shortId: string
+  title: string
+  project: string
+}
+
+export type TelegramPublicDelivery = {
+  id: string
+  status: string
+  error?: string
+}
+
+export type TelegramPublicStatus = {
+  botId?: number
+  /** Live runtime flag from the server. A persisted botId is not "running". */
+  running?: boolean
+  generation: number
+  subscriptions: TelegramPublicSubscription[]
+  deliveries: TelegramPublicDelivery[]
+}
+
+/** Fields a normal PUT may send for `telegram.public`. Owner/pairing/generation are server-managed. */
+export type TelegramPublicEditablePatch = Pick<
+  TelegramPublicConfig,
+  'enabled' | 'botToken' | 'allowedProjectRoots'
+>
 
 export const adaptersApi = {
   getConfig() {
@@ -162,5 +196,27 @@ export const adaptersApi = {
 
   unbindSlack() {
     return api.post<AdapterFileConfig>('/api/adapters/slack/unbind', {})
+  },
+
+  generateTelegramPublicPairing() {
+    return api.post<TelegramPublicPairing>('/api/adapters/telegram/public/pairing', {})
+  },
+
+  resetTelegramPublicPairing() {
+    return api.delete<AdapterFileConfig>('/api/adapters/telegram/public/pairing')
+  },
+
+  getTelegramPublicStatus() {
+    return api.get<TelegramPublicStatus>('/api/telegram/public/status')
+  },
+
+  addTelegramPublicSubscription(sessionId: string) {
+    return api.post<TelegramPublicStatus>('/api/telegram/public/subscriptions', { sessionId })
+  },
+
+  removeTelegramPublicSubscription(sessionId: string) {
+    return api.delete<TelegramPublicStatus>(
+      `/api/telegram/public/subscriptions/${encodeURIComponent(sessionId)}`,
+    )
   },
 }

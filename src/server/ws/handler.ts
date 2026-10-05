@@ -11,7 +11,7 @@ import type { ServerWebSocket } from 'bun'
 import { sessionMessageUuid } from '../../utils/sessionMessageInbox.js'
 import { parseSessionCollaborationEnvelope } from '../../utils/sessionCollaborationEnvelope.js'
 import { isShutdownTeamPrompt } from '../../utils/swarm/teamShutdownPrompt.js'
-import { admitSessionUserTurn, emitSessionTurnEvent } from '../services/sessionTurnEvents.js'
+import { admitSessionUserTurn, emitSessionTurnEvent, beginSessionTurn, getSessionTurnContext, getSessionPermissionOrigin, clearSessionTurnContext, type SessionTurnOrigin } from '../services/sessionTurnEvents.js'
 import { ApiError } from '../middleware/errorHandler.js'
 import { resolveSessionReferenceContext, splitSessionReferenceContext } from '../services/sessionReferenceContext.js'
 
@@ -561,6 +561,7 @@ export type WebSocketData = {
   sdkToken: string | null
   serverPort: number
   serverHost: string
+  imOrigin?: Omit<SessionTurnOrigin, 'turnId'>
 }
 
 // Active WebSocket clients, grouped by session. Desktop, H5, and IM adapters can
@@ -673,6 +674,17 @@ export const handleWebSocket = {
           'PET_CAPABILITY_DENIED',
         )
         return
+      }
+
+      if (ws.data.imOrigin?.entrypoint === 'telegram-dedicated') {
+        const requestId = 'requestId' in message && typeof message.requestId === 'string' ? message.requestId : undefined
+        const origin = (requestId ? getSessionPermissionOrigin(ws.data.sessionId, requestId) : undefined)
+          ?? getSessionTurnContext(ws.data.sessionId)?.origin
+        if (origin?.entrypoint === 'telegram-public' &&
+          ['permission_response', 'computer_use_permission_response', 'ask_user_question_activity', 'stop_generation'].includes(message.type)) {
+          sendError(ws, '该操作属于公共入口，请在那里或桌面处理。', 'IM_ROUTE_DENIED')
+          return
+        }
       }
 
       switch (message.type) {
@@ -827,6 +839,14 @@ async function handleUserMessage(
 ) {
   const persistTitleSource = sessionService.shouldPersistSession()
   const { sessionId } = ws.data
+  const entrypoint = ws.data.imOrigin?.entrypoint ?? 'desktop'
+  const previous = getSessionTurnContext(sessionId)
+  if (!collaboration && hasPendingOrActiveUserTurn(sessionId) &&
+    previous?.origin.entrypoint !== entrypoint &&
+    (entrypoint === 'telegram-public' || previous?.origin.entrypoint === 'telegram-public')) {
+    sendMessage(ws, { type: 'error', code: 'SESSION_BUSY', message: 'Session already has an active turn' })
+    return
+  }
 
   const desktopSlashCommand = collaboration ? null : getDesktopSlashCommand(message.content)
   if (desktopSlashCommand?.commandName === 'clear' && desktopSlashCommand.args.trim()) {
@@ -842,6 +862,17 @@ async function handleUserMessage(
   if (desktopSlashCommand?.commandName === 'clear') {
     await handleDesktopClearCommand(ws)
     return
+  }
+
+  // Public IM input is a human turn, not a collaboration inbox message.
+  // Keep the source on the accepted turn, never in model-provided text.
+  activeTurn.expectedReplayUuid ??= crypto.randomUUID()
+  if (!collaboration) {
+    beginSessionTurn(sessionId, { ...ws.data.imOrigin, entrypoint, turnId: activeTurn.expectedReplayUuid })
+  } else {
+    // Existing agent inbox turns have no human entry identity. In particular,
+    // never reuse the previous public turn's delivery or approval ownership.
+    clearSessionTurnContext(sessionId)
   }
 
   // Keep a stopped-turn fence until the replacement replay proves that later
@@ -1082,6 +1113,61 @@ async function handleUserMessage(
   }
 }
 
+/** Submit authenticated IM text through the ordinary human input path. */
+export async function submitHumanSessionTurn(
+  sessionId: string,
+  content: string,
+  options: { serverHost: string; serverPort: number; inputId: string; origin: SessionTurnOrigin },
+): Promise<void> {
+  if (!content.trim()) throw ApiError.badRequest('Message content is required')
+  if (getSessionTurnState(sessionId) !== 'idle') throw ApiError.conflict('Session already has an active turn')
+  let failure: string | undefined
+  const connection = sessionTurnConnection(sessionId, options, message => {
+    if (message.type === 'error') failure = message.message
+  })
+  connection.data.imOrigin = options.origin
+  const turn: ActiveUserTurnState = { messageSent: false, expectedReplayUuid: sessionMessageUuid(options.inputId) }
+  try {
+    await handleUserMessage(connection, { type: 'user_message', content }, turn)
+  } catch (error) {
+    if (activeUserTurns.get(sessionId) === turn) {
+      clearActiveUserTurn(sessionId, turn)
+      failSessionChatActivity(sessionId)
+    }
+    throw error
+  }
+  if (!turn.messageSent) throw new Error(failure ?? 'Human turn was not accepted')
+}
+
+export function isSessionPermissionPending(sessionId: string, requestId: string): boolean {
+  return conversationService.getPendingPermissionRequests(sessionId).some(request => request.requestId === requestId) ||
+    computerUseApprovalService.getPendingRequests(sessionId).some(request => request.requestId === requestId)
+}
+
+/** Reuse the same permission resolution and renderer broadcast as WebSocket input. */
+export async function respondToSessionPermission(
+  sessionId: string,
+  params: { requestId: string; allowed: boolean; updatedInput?: Record<string, unknown> },
+): Promise<boolean> {
+  if (!conversationService.getPendingPermissionRequests(sessionId).some(request => request.requestId === params.requestId)) return false
+  return finalizePermissionResponse(
+    sessionTurnConnection(sessionId, { serverHost: '127.0.0.1', serverPort: 0 }),
+    { type: 'permission_response', ...params },
+  )
+}
+
+export async function respondToSessionComputerUsePermission(
+  sessionId: string,
+  requestId: string,
+  response: Extract<ClientMessage, { type: 'computer_use_permission_response' }>['response'],
+): Promise<boolean> {
+  if (!computerUseApprovalService.getPendingRequests(sessionId).some(request => request.requestId === requestId)) return false
+  return handleComputerUsePermissionResponse(
+    sessionTurnConnection(sessionId, { serverHost: '127.0.0.1', serverPort: 0 }),
+    { type: 'computer_use_permission_response', requestId, response },
+  )
+}
+
 /** Shared turn admission for desktop input and independent background sessions. */
 export async function submitSessionTurn(
   sessionId: string,
@@ -1155,9 +1241,10 @@ function bindSessionTurnObserver(sessionId: string): void {
       trackCliBackgroundTaskLifecycle(sessionId, message)
       persistThenForwardCliMessage(sessionId, message, () => {})
     }
+    const context = getSessionTurnContext(sessionId)
     queueMicrotask(() => {
       if (sessionTurnObservers.get(sessionId) === callback) {
-        emitSessionTurnEvent({ type: 'output', sessionId, message })
+        emitSessionTurnEvent({ type: 'output', sessionId, message, ...context })
       }
     })
   }
@@ -1166,6 +1253,7 @@ function bindSessionTurnObserver(sessionId: string): void {
 }
 
 function clearSessionTurnObserver(sessionId: string): void {
+  clearSessionTurnContext(sessionId)
   const callback = sessionTurnObservers.get(sessionId)
   sessionTurnObservers.delete(sessionId)
   if (callback) conversationService.removeOutputCallback(sessionId, callback)
@@ -1522,7 +1610,7 @@ const EXIT_PLAN_MODE_TOOL_NAME = 'ExitPlanMode'
 function finalizePermissionResponse(
   ws: SessionConnection,
   message: Extract<ClientMessage, { type: 'permission_response' }>,
-): void {
+): boolean {
   const { sessionId } = ws.data
   const resolved = conversationService.respondToPermission(
     sessionId,
@@ -1543,6 +1631,7 @@ function finalizePermissionResponse(
     })
   }
   console.log(`[WS] Permission response for ${message.requestId}: ${message.allowed}`)
+  return resolved
 }
 
 function handlePermissionResponse(
@@ -1746,8 +1835,9 @@ async function handlePlanApprovalWithRuntimeOverride(
 function handleComputerUsePermissionResponse(
   ws: SessionConnection,
   message: Extract<ClientMessage, { type: 'computer_use_permission_response' }>
-) {
+): boolean {
   const { sessionId } = ws.data
+  if (!computerUseApprovalService.getPendingRequests(sessionId).some(request => request.requestId === message.requestId)) return false
   const ok = computerUseApprovalService.resolveApproval(
     message.requestId,
     message.response,
@@ -1756,7 +1846,7 @@ function handleComputerUsePermissionResponse(
     console.warn(
       `[WS] Ignored Computer Use permission response for unknown request ${message.requestId} from ${sessionId}`
     )
-    return
+    return false
   }
   sendToSession(sessionId, {
     type: 'permission_resolved',
@@ -1765,6 +1855,7 @@ function handleComputerUsePermissionResponse(
     allowed: message.response.userConsented !== false,
   })
   emitSessionTurnEvent({ type: 'output', sessionId, message: { type: 'control_response', request_id: message.requestId } })
+  return true
 }
 
 async function handleSetPermissionMode(
@@ -4037,6 +4128,10 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
 
 
 function sendMessage(ws: SessionConnection, message: ServerMessage) {
+  if (ws.data.imOrigin?.entrypoint === 'telegram-dedicated' &&
+    getSessionTurnContext(ws.data.sessionId)?.origin.entrypoint === 'telegram-public' &&
+    !['connected', 'pong', 'session_state', 'permission_resolved'].includes(message.type) &&
+    !(message.type === 'error' && ['IM_ROUTE_DENIED', 'SESSION_BUSY'].includes(message.code))) return
   const outgoing = ws.data.clientKind === 'pet'
     ? toPetServerMessage(message)
     : message
@@ -5148,6 +5243,7 @@ export function getActiveSessionIds(): string[] {
 }
 
 export function __resetWebSocketHandlerStateForTests(): void {
+  for (const sessionId of new Set([...activeUserTurns.keys(), ...sessionTurnObservers.keys(), ...activeSessions.keys()])) clearSessionTurnContext(sessionId)
   for (const timer of sessionCleanupTimers.values()) clearTimeout(timer)
   for (const timer of prewarmIdleTimers.values()) clearTimeout(timer)
   for (const remove of sessionDisconnectWatchers.values()) remove()

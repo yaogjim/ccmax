@@ -160,6 +160,40 @@ describe('WsBridge: handler serialization', () => {
     bridge.destroy()
   })
 
+  it('adds dedicated telegram routing identifiers only for the tg platform', async () => {
+    let requestUrl = ''
+    server.once('connection', (_ws, request) => {
+      requestUrl = request.url || ''
+    })
+    const bridge = new WsBridge(serverUrl, 'tg', 'fixture-token')
+    bridge.connectSession('7700123', 'sess-tg')
+    expect(await bridge.waitForOpen('7700123')).toBe(true)
+    await waitForServerConnection()
+
+    const url = new URL(requestUrl, serverUrl)
+    expect(url.searchParams.get('im_entry')).toBe('telegram-dedicated')
+    expect(url.searchParams.get('im_chat_id')).toBe('7700123')
+    expect(url.searchParams.get('token')).toBe('fixture-token')
+    bridge.destroy()
+  })
+
+  it('does not add telegram routing identifiers for other platforms', async () => {
+    let requestUrl = ''
+    server.once('connection', (_ws, request) => {
+      requestUrl = request.url || ''
+    })
+    const bridge = new WsBridge(serverUrl, 'feishu', 'fixture-token')
+    bridge.connectSession('oc_chat', 'sess-feishu')
+    expect(await bridge.waitForOpen('oc_chat')).toBe(true)
+    await waitForServerConnection()
+
+    const url = new URL(requestUrl, serverUrl)
+    expect(url.searchParams.get('im_entry')).toBeNull()
+    expect(url.searchParams.get('im_chat_id')).toBeNull()
+    expect(url.searchParams.get('token')).toBe('fixture-token')
+    bridge.destroy()
+  })
+
   it('sends updatedInput with a permission response only when provided', async () => {
     const bridge = new WsBridge(serverUrl, 'test')
     bridge.connectSession('chat-updated', 'sess-updated')

@@ -13,6 +13,9 @@
  * 鉴权边界：**仅接受本地 bearer 令牌**（`CC_HAHA_LOCAL_ACCESS_TOKEN`）。
  * 定时任务/通知投递属于本机桌面能力，H5 令牌、Anthropic API Key、远程浏览器
  * 一律不能触达；即使全局中间件在本机场景下放行，这里也会独立再校验一次。
+ *
+ * Telegram 公共入口：JSON 里的 `sourceSessionId` 只是受信任本机调用方提交的
+ * 来源声明，用来做订阅/专属绑定校验，不是授权本身；绝不从 `text` 推断会话。
  */
 
 import { isLocalAccessAuthorized } from '../localAccessAuth.js'
@@ -22,6 +25,7 @@ import {
   type ImmediateMessageResult,
   type NotificationChannel,
   type NotificationRecipientSpec,
+  type TelegramMessageEntrypoint,
 } from '../services/notificationService.js'
 
 /** Hard cap on an immediate message body, mirroring the task-notification budget. */
@@ -67,6 +71,12 @@ function optionalReference(value: unknown, field: string): string | undefined {
   if (trimmed.length === 0) return undefined
   if (trimmed.length > MAX_REFERENCE_LENGTH) throw ApiError.badRequest(`${field} is too long`)
   return trimmed
+}
+
+function parseEntrypoint(value: unknown): TelegramMessageEntrypoint | undefined {
+  if (value === undefined || value === null || value === '') return undefined
+  if (value === 'dedicated' || value === 'public') return value
+  throw ApiError.badRequest('entrypoint must be dedicated or public')
 }
 
 async function parseJsonBody(req: Request): Promise<Record<string, unknown>> {
@@ -119,13 +129,26 @@ export async function handleNotificationsApi(
         throw ApiError.badRequest(`title must be at most ${MAX_TITLE_LENGTH} characters`)
       }
 
+      const entrypoint = parseEntrypoint(body.entrypoint)
+      if (entrypoint === 'public' && body.channel !== 'telegram') {
+        throw ApiError.badRequest('entrypoint public is only valid for telegram')
+      }
+
+      const sourceSessionId = optionalReference(body.sourceSessionId, 'sourceSessionId')
+      const hasRecipient = body.recipient !== undefined && body.recipient !== null && body.recipient !== ''
+      if (!hasRecipient && entrypoint !== 'public') {
+        throw new ApiError(400, invalidRecipientSpec().message, 'BAD_REQUEST')
+      }
+
       const input = {
         channel: body.channel,
-        recipient: parseRecipient(body.recipient),
+        ...(hasRecipient ? { recipient: parseRecipient(body.recipient) } : {}),
         text: body.text,
         ...(typeof body.title === 'string' && body.title.trim().length > 0 ? { title: body.title.trim() } : {}),
         ...(optionalReference(body.runId, 'runId') ? { runId: body.runId as string } : {}),
         ...(optionalReference(body.taskId, 'taskId') ? { taskId: body.taskId as string } : {}),
+        ...(entrypoint ? { entrypoint } : {}),
+        ...(sourceSessionId ? { sourceSessionId } : {}),
       }
 
       const result = await sendImmediateMessage(input)
@@ -150,6 +173,7 @@ export async function handleNotificationsApi(
 function projectResult(result: ImmediateMessageResult): Record<string, unknown> {
   return {
     ok: result.ok,
+    ...(result.queued === true ? { queued: true } : {}),
     ...(result.delivery
       ? {
           delivery: {

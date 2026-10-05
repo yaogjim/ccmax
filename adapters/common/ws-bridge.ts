@@ -180,6 +180,10 @@ export class WsBridge {
     if (this.localAccessToken) {
       url.searchParams.set('token', this.localAccessToken)
     }
+    if (this.platform === 'tg') {
+      url.searchParams.set('im_entry', 'telegram-dedicated')
+      url.searchParams.set('im_chat_id', chatId)
+    }
     const ws = new WebSocket(url)
 
     // Cancel any pending reconnect timer for this chatId

@@ -71,16 +71,14 @@ class ControllableTranscriptionProvider implements TranscriptionProvider {
 }
 
 /**
- * Module specifier for the entrypoint under test.
+ * Module specifier for the exclusive-session bot under test.
  *
- * The query string is what forces bun to evaluate `index.ts` again for this
- * suite instead of handing back the instance another test file already loaded
- * with a different config. It is held in a variable because TypeScript cannot
- * resolve a *literal* specifier with a query string (`TS2307`) — as a
- * non-literal specifier the import stays untyped, which is what the explicit
- * `typeof import('../index.js')` annotation on `entry` is for.
+ * The query string forces bun to evaluate `dedicated.ts` again for this suite
+ * instead of handing back the instance another test file already loaded with a
+ * different config. Production `index.ts` keeps a literal `import('./dedicated.js')`
+ * so bun compile can pack it; tests isolate via this factory-style re-import.
  */
-const modulePath = '../index.js?entrypoint-voice-suite'
+const modulePath = '../dedicated.js?entrypoint-voice-suite'
 
 /**
  * Telegram voice → local transcription → bound session, driven through the
@@ -101,12 +99,12 @@ describe('Telegram entrypoint voice lifecycle', () => {
   let directory: string
   let project: string
   /**
-   * Read off the entrypoint module (already loaded inside `beforeAll`, after
+   * Read off the dedicated bot module (already loaded inside `beforeAll`, after
    * the temp config dir is in place) instead of a static import: a top-level
-   * `import '../index.js'` would run `loadConfig()` against the developer's
+   * `import '../dedicated.js'` would run `loadConfig()` against the developer's
    * real `~/.claude` before this file redirects anything.
    */
-  let entry: typeof import('../index.js')
+  let entry: typeof import('../dedicated.js')
   let pendingInputCap: number
   let server: ReturnType<typeof Bun.serve<{ sessionId: string }>>
   let store: SessionStore
@@ -337,7 +335,7 @@ describe('Telegram entrypoint voice lifecycle', () => {
       return previousFetch(input, init)
     }) as typeof fetch
 
-    entry = await import(modulePath) as typeof import('../index.js')
+    entry = await import(modulePath) as typeof import('../dedicated.js')
     pendingInputCap = entry.MAX_PENDING_INPUTS_PER_CHAT
     entry.bot.botInfo = { id: 12345, is_bot: true, first_name: 'Fixture', username: 'fixture_bot', can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false, can_manage_bots: false, can_connect_to_business: false, has_main_web_app: false, has_topics_enabled: false, allows_users_to_create_topics: false }
     entry.bot.api.config.use(async (_previous, method, payload) => {

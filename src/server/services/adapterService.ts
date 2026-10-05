@@ -9,6 +9,7 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
+import { generatePairingCode } from '../../../adapters/common/pairing.js'
 import { ApiError } from '../middleware/errorHandler.js'
 
 export type PairedUser = {
@@ -23,6 +24,15 @@ export type PairingState = {
   createdAt?: number | null
 }
 
+export type TelegramPublicFileConfig = {
+  enabled?: boolean
+  botToken?: string
+  ownerUserId?: number
+  pairing?: PairingState
+  allowedProjectRoots?: string[]
+  generation?: number
+}
+
 export type AdapterFileConfig = {
   serverUrl?: string
   defaultProjectDir?: string
@@ -34,6 +44,7 @@ export type AdapterFileConfig = {
     pairedUsers?: PairedUser[]
     defaultWorkDir?: string
     allowedProjectRoots?: string[]
+    public?: TelegramPublicFileConfig
   }
   feishu?: {
     appId?: string
@@ -116,8 +127,25 @@ function isMasked(value: string | undefined): boolean {
   return !!value && value.startsWith('****')
 }
 
+const CLEARED_PAIRING: PairingState = { code: null, expiresAt: null, createdAt: null }
+const PUBLIC_PAIRING_TTL_MS = 60 * 60 * 1000
+
+function nextPublicGeneration(current: number | undefined): number {
+  return (typeof current === 'number' && Number.isSafeInteger(current) && current >= 0 ? current : 0) + 1
+}
+
+function hasOwn<T extends object>(value: T, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
 class AdapterService {
   private updateQueue: Promise<void> = Promise.resolve()
+
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.updateQueue.then(task)
+    this.updateQueue = run.then(() => {}, () => {})
+    return run
+  }
 
   /** 读取原始配置（不脱敏） */
   async getRawConfig(): Promise<AdapterFileConfig> {
@@ -138,6 +166,12 @@ class AdapterService {
     const config = await this.getRawConfig()
     if (config.telegram?.botToken) {
       config.telegram.botToken = maskSecret(config.telegram.botToken)
+    }
+    if (config.telegram?.public?.botToken) {
+      config.telegram.public.botToken = maskSecret(config.telegram.public.botToken)
+    }
+    if (config.telegram?.public?.pairing?.code) {
+      config.telegram.public.pairing.code = '******'
     }
     if (config.feishu) {
       if (config.feishu.appSecret) config.feishu.appSecret = maskSecret(config.feishu.appSecret)
@@ -168,9 +202,104 @@ class AdapterService {
 
   /** 更新配置（浅合并，敏感字段如果是脱敏值则保留原值） */
   async updateConfig(patch: Partial<AdapterFileConfig>): Promise<void> {
-    const update = this.updateQueue.then(() => this.applyConfigPatch(patch))
-    this.updateQueue = update.catch(() => {})
-    return update
+    return this.enqueue(() => this.applyConfigPatch(patch))
+  }
+
+  /**
+   * Generate a public-entry pairing code. Independent of the legacy shared
+   * `pairing` field. Refuses to mint a code while an owner is already set.
+   */
+  async generateTelegramPublicPairing(): Promise<{ code: string; expiresAt: number; createdAt: number }> {
+    return this.enqueue(async () => {
+      const current = await this.getRawConfig()
+      const publicConfig = { ...current.telegram?.public }
+      if (typeof publicConfig.ownerUserId === 'number') {
+        throw ApiError.conflict('Telegram public owner is already set; reset pairing first')
+      }
+      const code = generatePairingCode()
+      const createdAt = Date.now()
+      const expiresAt = createdAt + PUBLIC_PAIRING_TTL_MS
+      await this.writeConfig({
+        ...current,
+        telegram: {
+          ...current.telegram,
+          public: {
+            ...publicConfig,
+            pairing: { code, expiresAt, createdAt },
+          },
+        },
+      })
+      return { code, expiresAt, createdAt }
+    })
+  }
+
+  /**
+   * Clear the public owner. Increments generation and invalidates any
+   * outstanding pairing code so old buttons / mappings can be dropped.
+   */
+  async resetTelegramPublicPairing(): Promise<void> {
+    return this.enqueue(async () => {
+      const current = await this.getRawConfig()
+      const publicConfig = { ...current.telegram?.public }
+      delete publicConfig.ownerUserId
+      await this.writeConfig({
+        ...current,
+        telegram: {
+          ...current.telegram,
+          public: {
+            ...publicConfig,
+            pairing: { ...CLEARED_PAIRING },
+            generation: nextPublicGeneration(current.telegram?.public?.generation),
+          },
+        },
+      })
+    })
+  }
+
+  /**
+   * Atomically occupy the single public owner slot. Requires a private-chat
+   * positive integer userId, an unexpired code, and no owner yet.
+   */
+  async claimTelegramPublicPairing(
+    code: string,
+    userId: number,
+  ): Promise<{ ownerUserId: number; generation: number }> {
+    return this.enqueue(async () => {
+      if (!Number.isSafeInteger(userId) || userId <= 0) {
+        throw ApiError.badRequest('userId must be a positive integer')
+      }
+      const input = code.trim().toUpperCase()
+      if (!input) {
+        throw ApiError.badRequest('Pairing code expired or invalid')
+      }
+      const current = await this.getRawConfig()
+      const publicConfig = current.telegram?.public ?? {}
+      if (typeof publicConfig.ownerUserId === 'number') {
+        throw ApiError.conflict('Telegram public owner is already set')
+      }
+      const pairing = publicConfig.pairing ?? {}
+      const storedCode = typeof pairing.code === 'string' ? pairing.code.trim().toUpperCase() : ''
+      if (!storedCode || typeof pairing.expiresAt !== 'number' || Date.now() > pairing.expiresAt) {
+        throw ApiError.badRequest('Pairing code expired or invalid')
+      }
+      if (input !== storedCode) {
+        throw ApiError.badRequest('Pairing code expired or invalid')
+      }
+      const generation = nextPublicGeneration(publicConfig.generation)
+      await this.writeConfig({
+        ...current,
+        telegram: {
+          ...current.telegram,
+          public: {
+            ...publicConfig,
+            ownerUserId: userId,
+            pairing: { ...CLEARED_PAIRING },
+            generation,
+          },
+        },
+      })
+      return { ownerUserId: userId, generation }
+    })
   }
 
   private async applyConfigPatch(patch: Partial<AdapterFileConfig>): Promise<void> {
@@ -179,6 +308,9 @@ class AdapterService {
     // 保留已存储的密钥（如果前端传回的是脱敏值）
     if (patch.telegram && isMasked(patch.telegram.botToken)) {
       patch.telegram.botToken = current.telegram?.botToken
+    }
+    if (patch.telegram?.public && isMasked(patch.telegram.public.botToken)) {
+      patch.telegram.public.botToken = current.telegram?.public?.botToken
     }
     if (patch.feishu) {
       if (isMasked(patch.feishu.appSecret)) patch.feishu.appSecret = current.feishu?.appSecret
@@ -205,10 +337,52 @@ class AdapterService {
       patch.pairing.code = current.pairing?.code
     }
 
+    const patchPublic = patch.telegram?.public
+    if (patchPublic) {
+      if (hasOwn(patchPublic, 'ownerUserId')) {
+        throw ApiError.badRequest('telegram.public.ownerUserId can only be set via public pairing')
+      }
+      if (hasOwn(patchPublic, 'pairing')) {
+        throw ApiError.badRequest('telegram.public.pairing can only be changed via public pairing endpoints')
+      }
+      if (hasOwn(patchPublic, 'generation')) {
+        throw ApiError.badRequest('telegram.public.generation is managed by the server')
+      }
+    }
+
+    const exclusiveToken = patch.telegram && hasOwn(patch.telegram, 'botToken')
+      ? patch.telegram.botToken
+      : current.telegram?.botToken
+    const publicToken = patchPublic && hasOwn(patchPublic, 'botToken')
+      ? patchPublic.botToken
+      : current.telegram?.public?.botToken
+    if (exclusiveToken && publicToken && exclusiveToken === publicToken) {
+      throw ApiError.badRequest('telegram.public.botToken must differ from telegram.botToken')
+    }
+
+    const mergedTelegram = patch.telegram
+      ? {
+          ...current.telegram,
+          ...patch.telegram,
+          ...(patchPublic
+            ? { public: { ...current.telegram?.public, ...patchPublic } }
+            : {}),
+        }
+      : current.telegram
+
+    if (patchPublic && mergedTelegram?.public) {
+      const previousToken = current.telegram?.public?.botToken
+      const nextToken = mergedTelegram.public.botToken
+      if (previousToken !== nextToken) {
+        mergedTelegram.public.generation = nextPublicGeneration(current.telegram?.public?.generation)
+        mergedTelegram.public.pairing = { ...CLEARED_PAIRING }
+      }
+    }
+
     const merged: AdapterFileConfig = {
       ...current,
       ...patch,
-      telegram: patch.telegram ? { ...current.telegram, ...patch.telegram } : current.telegram,
+      telegram: mergedTelegram,
       feishu: patch.feishu ? { ...current.feishu, ...patch.feishu } : current.feishu,
       wechat: patch.wechat ? { ...current.wechat, ...patch.wechat } : current.wechat,
       dingtalk: patch.dingtalk ? { ...current.dingtalk, ...patch.dingtalk } : current.dingtalk,

@@ -21,7 +21,10 @@ import { handleNotificationsApi } from '../api/notifications.js'
 import { handleApiRequest } from '../router.js'
 import { LOCAL_ACCESS_TOKEN_ENV } from '../localAccessAuth.js'
 import { NotificationDeliveryStore } from '../services/notificationDeliveryStore.js'
-import { resetNotificationRecoveryStateForTests } from '../services/notificationService.js'
+import {
+  resetNotificationRecoveryStateForTests,
+  setSendPublicSessionReportForTests,
+} from '../services/notificationService.js'
 
 const ANTHROPIC_API_KEY_ENV = 'ANTHROPIC_API_KEY'
 const FIXTURE_TOKEN = 'fixture-local-desktop-token'
@@ -33,6 +36,9 @@ let originalConfigDir: string | undefined
 let originalToken: string | undefined
 let originalAnthropicKey: string | undefined
 let originalFetch: typeof globalThis.fetch
+let originalHome: string | undefined
+let originalXdg: string | undefined
+let originalTmpdir: string | undefined
 let calls: FetchCall[]
 
 function stubFetch(handler: (call: FetchCall) => Response = () => Response.json({ ok: true, result: { message_id: 123 } })): void {
@@ -89,11 +95,19 @@ beforeEach(async () => {
   originalToken = process.env[LOCAL_ACCESS_TOKEN_ENV]
   originalAnthropicKey = process.env[ANTHROPIC_API_KEY_ENV]
   originalFetch = globalThis.fetch
+  originalHome = process.env.HOME
+  originalXdg = process.env.XDG_CONFIG_HOME
+  originalTmpdir = process.env.TMPDIR
 
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'notifications-api-'))
   process.env.CLAUDE_CONFIG_DIR = tmpDir
+  process.env.HOME = tmpDir
+  process.env.XDG_CONFIG_HOME = path.join(tmpDir, 'xdg')
+  process.env.TMPDIR = path.join(tmpDir, 'tmp')
   process.env[LOCAL_ACCESS_TOKEN_ENV] = FIXTURE_TOKEN
   process.env[ANTHROPIC_API_KEY_ENV] = 'anthropic-fixture-key'
+  await fs.mkdir(process.env.XDG_CONFIG_HOME, { recursive: true })
+  await fs.mkdir(process.env.TMPDIR, { recursive: true })
   calls = []
   stubFetch()
   await writeAdapters()
@@ -103,6 +117,9 @@ afterEach(async () => {
   globalThis.fetch = originalFetch
   resetNotificationRecoveryStateForTests()
   restoreEnv('CLAUDE_CONFIG_DIR', originalConfigDir)
+  restoreEnv('HOME', originalHome)
+  restoreEnv('XDG_CONFIG_HOME', originalXdg)
+  restoreEnv('TMPDIR', originalTmpdir)
   restoreEnv(LOCAL_ACCESS_TOKEN_ENV, originalToken)
   restoreEnv(ANTHROPIC_API_KEY_ENV, originalAnthropicKey)
   await fs.rm(tmpDir, { recursive: true, force: true })
@@ -267,5 +284,96 @@ describe('POST /api/notifications/send', () => {
     const onDisk = await fs.readFile(recordPath, 'utf-8')
     expect(onDisk).not.toContain(FIXTURE_TOKEN)
     expect(onDisk).not.toContain('fixture-bot-token')
+  })
+
+  test('public send requires sourceSessionId and does not use the dedicated bot token', async () => {
+    const reports: Array<{ sessionId: string; eventId: string; text: string }> = []
+    setSendPublicSessionReportForTests(async (sessionId, eventId, text) => {
+      reports.push({ sessionId, eventId, text })
+      if (sessionId !== 'sess-sub') throw new Error('未订阅该会话')
+      return { queued: true }
+    })
+
+    const missing = await callSend({
+      channel: 'telegram',
+      entrypoint: 'public',
+      text: 'hello sess-sub',
+    })
+    expect(missing.status).toBe(200)
+    expect(await missing.json()).toMatchObject({
+      ok: false,
+      issues: [{ code: 'source_session_required' }],
+    })
+    expect(calls).toHaveLength(0)
+    expect(reports).toHaveLength(0)
+
+    const unsubscribed = await callSend({
+      channel: 'telegram',
+      entrypoint: 'public',
+      text: 'hello',
+      sourceSessionId: 'sess-other',
+    })
+    expect(await unsubscribed.json()).toMatchObject({
+      ok: false,
+      issues: [{ code: 'public_route_rejected' }],
+    })
+    expect(calls).toHaveLength(0)
+
+    const ok = await callSend({
+      channel: 'telegram',
+      entrypoint: 'public',
+      text: 'hello',
+      sourceSessionId: 'sess-sub',
+    })
+    const body = await ok.json() as Record<string, unknown>
+    expect(body).toMatchObject({
+      ok: true,
+      queued: true,
+      delivery: { outcome: 'pending', attempts: 0, recipientId: 'sess-sub' },
+    })
+    expect(String(body.recordPath)).toContain('telegram-public.json')
+    expect(String(body.recordPath)).not.toContain('notification-deliveries.json')
+    expect(reports.map(item => item.sessionId)).toEqual(['sess-other', 'sess-sub'])
+    expect(calls).toHaveLength(0)
+  })
+
+  test('dedicated send cannot bypass the current SessionStore binding when public is enabled', async () => {
+    await fs.writeFile(
+      path.join(tmpDir, 'adapters.json'),
+      JSON.stringify({
+        telegram: {
+          botToken: 'fixture-bot-token',
+          pairedUsers: [{ userId: 111, displayName: 'Alice', pairedAt: 1 }],
+          public: { enabled: true, botToken: 'public-token' },
+        },
+      }),
+    )
+    await fs.writeFile(
+      path.join(tmpDir, 'adapter-sessions.json'),
+      JSON.stringify({
+        '111': { sessionId: 'sess-bound', workDir: '/tmp', updatedAt: 1 },
+      }),
+    )
+
+    const mismatch = await callSend({
+      channel: 'telegram',
+      recipient: 111,
+      text: 'hello',
+      sourceSessionId: 'sess-other',
+    })
+    expect(await mismatch.json()).toMatchObject({
+      ok: false,
+      delivery: { outcome: 'failed', errorCode: 'dedicated_binding_mismatch' },
+    })
+    expect(calls).toHaveLength(0)
+
+    const match = await callSend({
+      channel: 'telegram',
+      recipient: 111,
+      text: 'hello',
+      sourceSessionId: 'sess-bound',
+    })
+    expect(await match.json()).toMatchObject({ ok: true, delivery: { outcome: 'delivered' } })
+    expect(calls).toHaveLength(1)
   })
 })

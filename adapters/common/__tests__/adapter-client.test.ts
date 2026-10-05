@@ -156,7 +156,14 @@ describe('createAdapterClient', () => {
 describe('IM adapter entrypoint wiring', () => {
   for (const platform of PLATFORMS) {
     it(`${platform} builds its client through createAdapterClient`, () => {
-      const source = fs.readFileSync(path.join(ADAPTERS_DIR, platform, 'index.ts'), 'utf-8')
+      // Telegram's index is now a two-entry launcher; the legacy session
+      // client still belongs to the dedicated runtime, not the public Bot.
+      const entryFile = platform === 'telegram' ? 'dedicated.ts' : 'index.ts'
+      if (platform === 'telegram') {
+        const launcher = fs.readFileSync(path.join(ADAPTERS_DIR, platform, 'index.ts'), 'utf-8')
+        expect(launcher).toMatch(/import\(['"]\.\/dedicated\.js['"]\)/)
+      }
+      const source = fs.readFileSync(path.join(ADAPTERS_DIR, platform, entryFile), 'utf-8')
         // Strip comments so a mention in prose cannot satisfy the assertions.
         .replace(/\/\*[\s\S]*?\*\//g, '')
         .replace(/(^|[^:])\/\/.*$/gm, '$1')

@@ -20,6 +20,7 @@
 
 import { parseLauncherArgs, resolveSidecarInvocation } from './launcherRouting'
 import { runCli } from './sidecarEntrypoints'
+import { isTelegramAdapterConfigured } from './adapterConfigured'
 
 // The compiled Computer Use runtime relaunches this executable directly. Its
 // isolated worker has no app-root and must not load preload, CLI configuration,
@@ -65,8 +66,8 @@ const ADAPTERS: ReadonlyArray<{
   {
     flag: '--telegram',
     label: 'Telegram',
-    missingCredentials: 'TELEGRAM_BOT_TOKEN missing',
-    isConfigured: (config) => Boolean(config.telegram.botToken),
+    missingCredentials: 'TELEGRAM_BOT_TOKEN / telegram.public missing',
+    isConfigured: (config) => isTelegramAdapterConfigured(config),
     start: () => import('../../adapters/telegram/index.ts'),
   },
   {

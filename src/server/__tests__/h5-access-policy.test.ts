@@ -281,6 +281,21 @@ describe('h5AccessPolicy', () => {
     expect(isLocalCredentialOnlyPath('/api/settings/session-cleanup-extra')).toBe(false)
   })
 
+  test('keeps Telegram public control paths behind the local credential', () => {
+    const context = { ...remoteContext, localAccessTokenConfigured: true, localAccessAuthorized: false }
+    for (const pathname of [
+      '/api/telegram/public/status', '/api/telegram/public/runtime', '/api/telegram//public/update/',
+      '/api/telegram/public/subscriptions/session-1', '/api/adapters/telegram/public/pairing',
+      '/api/adapters/telegram//public/pairing/claim/',
+    ]) {
+      expect(isLocalCredentialOnlyPath(pathname)).toBe(true)
+      expect(requiresLocalAccessCredential(pathname, context)).toBe(true)
+      expect(requiresLocalAccessCredential(pathname, { ...context, localAccessAuthorized: true })).toBe(false)
+    }
+    expect(isLocalCredentialOnlyPath('/api/telegram/publicity/status')).toBe(false)
+    expect(isLocalCredentialOnlyPath('/api/adapters')).toBe(false)
+  })
+
   test('keeps ordinary loopback capabilities usable without the desktop process token', () => {
     // The desktop shell injects a process token, but the OAuth success page the
     // system browser opens, a `/preview-fs` link and plain `curl` can never

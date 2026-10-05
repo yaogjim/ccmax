@@ -7,6 +7,7 @@ import { LoadingState } from '@/components/ui/LoadingState'
 import { DirectoryPicker } from '@/components/composite/DirectoryPicker'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import QRCode from 'qrcode'
+import { TelegramPublicSettings } from './TelegramPublicSettings'
 
 type ImTab = 'telegram' | 'feishu' | 'wechat' | 'dingtalk' | 'whatsapp' | 'wecom' | 'qq' | 'slack'
 type ImPlatform = ImTab
@@ -536,6 +537,8 @@ export function AdapterSettings() {
         .map(Number)
         .filter((n) => !isNaN(n))
 
+      // Dedicated Telegram fields only. Public Bot is saved by TelegramPublicSettings
+      // so a masked exclusive token cannot wipe public, and vice versa.
       patch.telegram = {
         botToken: tgBotToken,
         allowedUsers: tgUsers.length ? tgUsers : [],
@@ -1323,6 +1326,14 @@ export function AdapterSettings() {
 
         {activeIm === 'telegram' && (
           <div className="p-4 space-y-4">
+            <div className="space-y-1">
+              <h3 className="text-sm font-semibold text-[var(--color-text-primary)]">
+                {t('settings.adapters.telegramExclusive')}
+              </h3>
+              <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
+                {t('settings.adapters.telegramExclusiveHint')}
+              </p>
+            </div>
             <Input
               label={t('settings.adapters.botToken')}
               type="password"
@@ -1339,6 +1350,7 @@ export function AdapterSettings() {
               />
               <p className="text-xs text-[var(--color-text-tertiary)]">{t('settings.adapters.allowedUsersHint')}</p>
             </div>
+            <TelegramPublicSettings />
           </div>
         )}
 

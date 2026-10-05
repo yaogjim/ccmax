@@ -10,6 +10,15 @@ export type PairingState = {
   createdAt: number | null
 }
 
+export type TelegramPublicConfig = {
+  enabled?: boolean
+  botToken?: string
+  ownerUserId?: number
+  pairing?: PairingState
+  generation?: number
+  allowedProjectRoots?: string[]
+}
+
 export type AdapterFileConfig = {
   serverUrl?: string
   defaultProjectDir?: string
@@ -21,6 +30,7 @@ export type AdapterFileConfig = {
     pairedUsers?: PairedUser[]
     defaultWorkDir?: string
     allowedProjectRoots?: string[]
+    public?: TelegramPublicConfig
   }
   feishu?: {
     appId?: string

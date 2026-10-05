@@ -274,6 +274,57 @@ afterEach(async () => {
 })
 
 describe('remote H5 auth and CORS integration', () => {
+  test('keeps Telegram public controls local while allowing the authenticated desktop renderer', async () => {
+    process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'fixture-desktop-token'
+    process.env.CC_HAHA_TRUSTED_RENDERER_ORIGIN = 'http://localhost:1420'
+    await restartRemoteServer()
+    const phoneToken = await enableH5Access({ allowedOrigins: [PHONE_ORIGIN] })
+    const endpoints = [
+      ['/api/telegram/public/status', 'GET'],
+      ['/api/telegram/public/runtime', 'POST'],
+      ['/api/telegram/public/update', 'POST'],
+      ['/api/telegram/public/subscriptions', 'POST'],
+      ['/api/adapters/telegram/public/pairing', 'POST'],
+    ]
+    for (const [endpoint, method] of endpoints) {
+      const phone = await fetch(`${baseUrl}${endpoint}`, {
+        method, headers: { Origin: PHONE_ORIGIN, Authorization: `Bearer ${phoneToken}` },
+      })
+      expect(phone.status).toBe(403)
+      const tokenless = await fetch(`${baseUrl}${endpoint}`, { method })
+      expect(tokenless.status).toBe(403)
+      const preflight = await fetch(`${baseUrl}${endpoint}`, {
+        method: 'OPTIONS', headers: {
+          Origin: 'http://localhost:1420',
+          'Access-Control-Request-Method': method,
+          'Access-Control-Request-Headers': 'authorization,content-type',
+        },
+      })
+      expect(preflight.status).toBe(204)
+    }
+    const desktop = await fetch(`${baseUrl}/api/telegram/public/status`, {
+      headers: { Origin: 'http://localhost:1420', Authorization: 'Bearer fixture-desktop-token' },
+    })
+    expect(desktop.status).toBe(200)
+    const publicPatch = { telegram: { public: { enabled: true, botToken: '42:fixture-token' } } }
+    const rejectedConfig = await fetch(`${baseUrl}/api/adapters`, {
+      method: 'PUT', headers: {
+        Origin: PHONE_ORIGIN, Authorization: `Bearer ${phoneToken}`, 'Content-Type': 'application/json',
+      }, body: JSON.stringify(publicPatch),
+    })
+    expect(rejectedConfig.status).toBe(403)
+    const acceptedConfig = await fetch(`${baseUrl}/api/adapters`, {
+      method: 'PUT', headers: {
+        Authorization: 'Bearer fixture-desktop-token', 'Content-Type': 'application/json',
+      }, body: JSON.stringify(publicPatch),
+    })
+    expect(acceptedConfig.status).toBe(200)
+    const spoofedEntry = await fetch(`${baseUrl}/ws/telegram-fixture?im_entry=telegram-dedicated&im_chat_id=7&token=${phoneToken}`, {
+      headers: makeUpgradeHeaders(PHONE_ORIGIN),
+    })
+    expect(spoofedEntry.status).toBe(403)
+  })
+
   test('allows configured dev renderer H5 preflight but requires the process token for requests', async () => {
     process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'fixture-desktop-token'
     process.env.CC_HAHA_TRUSTED_RENDERER_ORIGIN = 'http://localhost:1420'

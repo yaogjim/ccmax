@@ -20,12 +20,22 @@ export type PairingState = {
   createdAt: number | null
 }
 
+export type TelegramPublicConfig = {
+  enabled: boolean
+  botToken: string
+  ownerUserId: number | null
+  pairing: PairingState
+  allowedProjectRoots: string[]
+  generation: number
+}
+
 export type TelegramConfig = {
   botToken: string
   allowedUsers: number[]
   pairedUsers: PairedUser[]
   defaultWorkDir: string
   allowedProjectRoots: string[]
+  public: TelegramPublicConfig
 }
 
 export type FeishuConfig = {
@@ -216,6 +226,7 @@ export function loadConfig(): AdapterConfig {
       pairedUsers: tg.pairedUsers ?? [],
       defaultWorkDir: tg.defaultWorkDir || fallbackWorkDir,
       allowedProjectRoots: readProjectRoots(tg.allowedProjectRoots),
+      public: readTelegramPublic(tg.public),
     },
     feishu: {
       appId: process.env.FEISHU_APP_ID || fs_.appId || '',
@@ -476,6 +487,39 @@ function readProjectRoots(value: unknown): string[] {
     .filter((item): item is string => typeof item === 'string')
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function readNonNegativeInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+function readPositiveInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
+/**
+ * Public Telegram entry. Absent or malformed `telegram.public` resolves to
+ * disabled-in-memory defaults and never writes the config file.
+ */
+function readTelegramPublic(value: unknown): TelegramPublicConfig {
+  const pub = isPlainObject(value) ? value : {}
+  const pairing = isPlainObject(pub.pairing) ? pub.pairing : {}
+  return {
+    enabled: pub.enabled === true,
+    botToken: typeof pub.botToken === 'string' ? pub.botToken : '',
+    ownerUserId: readPositiveInteger(pub.ownerUserId),
+    pairing: {
+      code: typeof pairing.code === 'string' ? pairing.code : null,
+      expiresAt: pairing.expiresAt === null ? null : readNonNegativeInteger(pairing.expiresAt),
+      createdAt: pairing.createdAt === null ? null : readNonNegativeInteger(pairing.createdAt),
+    },
+    allowedProjectRoots: readProjectRoots(pub.allowedProjectRoots),
+    generation: readNonNegativeInteger(pub.generation) ?? 0,
+  }
 }
 
 function readEnvProjectRoots(): string[] | null {

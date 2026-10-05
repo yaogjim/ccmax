@@ -313,6 +313,115 @@ describe('resolveAllowedProjectRoots', () => {
   })
 })
 
+describe('telegram public entry config', () => {
+  const originalHome = process.env.HOME
+  const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+  const originalXdg = process.env.XDG_CONFIG_HOME
+  const originalTmpdir = process.env.TMPDIR
+  const originalTelegramToken = process.env.TELEGRAM_BOT_TOKEN
+  let root = ''
+
+  function isolate(): { configDir: string; configPath: string } {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-public-config-'))
+    const home = path.join(root, 'home')
+    const configDir = path.join(root, 'claude')
+    fs.mkdirSync(home, { recursive: true })
+    fs.mkdirSync(configDir, { recursive: true })
+    fs.mkdirSync(path.join(root, 'xdg'), { recursive: true })
+    fs.mkdirSync(path.join(root, 'tmp'), { recursive: true })
+    process.env.HOME = home
+    process.env.CLAUDE_CONFIG_DIR = configDir
+    process.env.XDG_CONFIG_HOME = path.join(root, 'xdg')
+    process.env.TMPDIR = path.join(root, 'tmp')
+    delete process.env.TELEGRAM_BOT_TOKEN
+    return { configDir, configPath: path.join(configDir, 'adapters.json') }
+  }
+
+  afterEach(() => {
+    restoreEnv('HOME', originalHome)
+    restoreEnv('CLAUDE_CONFIG_DIR', originalConfigDir)
+    restoreEnv('XDG_CONFIG_HOME', originalXdg)
+    restoreEnv('TMPDIR', originalTmpdir)
+    restoreEnv('TELEGRAM_BOT_TOKEN', originalTelegramToken)
+    if (root) fs.rmSync(root, { recursive: true, force: true })
+    root = ''
+  })
+
+  it('defaults public to disabled without writing a file when config is empty', () => {
+    const { configPath } = isolate()
+    const config = loadConfig()
+    expect(config.telegram.public).toEqual({
+      enabled: false,
+      botToken: '',
+      ownerUserId: null,
+      pairing: { code: null, expiresAt: null, createdAt: null },
+      allowedProjectRoots: [],
+      generation: 0,
+    })
+    expect(fs.existsSync(configPath)).toBe(false)
+  })
+
+  it('keeps old telegram fields and does not write public into an old fixture', () => {
+    const { configPath } = isolate()
+    const fixture = {
+      pairing: { code: 'ABC234', expiresAt: 9_999_999_999_000, createdAt: 1 },
+      telegram: {
+        botToken: 'exclusive-token',
+        allowedUsers: [111],
+        pairedUsers: [{ userId: 111, displayName: 'Owner', pairedAt: 1 }],
+        defaultWorkDir: '/tmp/work',
+        allowedProjectRoots: ['/tmp/work'],
+        futureExclusive: 'keep-me',
+      },
+      futureRoot: { keep: true },
+    }
+    const raw = JSON.stringify(fixture)
+    fs.writeFileSync(configPath, raw)
+    const before = fs.statSync(configPath)
+
+    const config = loadConfig()
+
+    expect(config.telegram.botToken).toBe('exclusive-token')
+    expect(config.telegram.allowedUsers).toEqual([111])
+    expect(config.telegram.pairedUsers).toEqual([{ userId: 111, displayName: 'Owner', pairedAt: 1 }])
+    expect(config.telegram.defaultWorkDir).toBe('/tmp/work')
+    expect(config.pairing.code).toBe('ABC234')
+    expect(config.telegram.public.enabled).toBe(false)
+    expect(config.telegram.public.botToken).toBe('')
+    expect(config.telegram.public.ownerUserId).toBeNull()
+    expect(config.telegram.public.generation).toBe(0)
+    expect(fs.readFileSync(configPath, 'utf-8')).toBe(raw)
+    expect(fs.statSync(configPath).mtimeMs).toBe(before.mtimeMs)
+  })
+
+  it('loads an explicit public block without inheriting the exclusive token from env', () => {
+    const { configPath } = isolate()
+    process.env.TELEGRAM_BOT_TOKEN = 'env-exclusive-token'
+    fs.writeFileSync(configPath, JSON.stringify({
+      telegram: {
+        botToken: 'file-exclusive',
+        public: {
+          enabled: true,
+          botToken: 'public-token',
+          ownerUserId: 42,
+          generation: 3,
+          pairing: { code: 'PUB123', expiresAt: 8, createdAt: 7 },
+          allowedProjectRoots: ['/tmp/public'],
+        },
+      },
+    }))
+
+    const config = loadConfig()
+    expect(config.telegram.botToken).toBe('env-exclusive-token')
+    expect(config.telegram.public.enabled).toBe(true)
+    expect(config.telegram.public.botToken).toBe('public-token')
+    expect(config.telegram.public.ownerUserId).toBe(42)
+    expect(config.telegram.public.generation).toBe(3)
+    expect(config.telegram.public.pairing).toEqual({ code: 'PUB123', expiresAt: 8, createdAt: 7 })
+    expect(config.telegram.public.allowedProjectRoots).toEqual(['/tmp/public'])
+  })
+})
+
 function restoreEnv(key: string, value: string | undefined): void {
   if (value === undefined) {
     delete process.env[key]

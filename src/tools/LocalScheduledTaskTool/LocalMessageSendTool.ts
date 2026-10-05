@@ -1,6 +1,7 @@
 import { z } from 'zod/v4'
 import type { ValidationResult } from '../../Tool.js'
 import { buildTool, type ToolDef } from '../../Tool.js'
+import { getSessionId } from '../../bootstrap/state.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import {
   callLocalDesktopApi,
@@ -57,8 +58,8 @@ const recipientSchema = z.union([
 
 const inputSchema = lazySchema(() =>
   z.strictObject({
-    recipient: recipientSchema.describe(
-      'The single person to message right now: a platform user id (e.g. 111 or "ou_abc"), or an object like { "userId": 111 } or { "displayName": "Alice" }. Required — there is no default recipient and no broadcast. The server verifies it against the accounts paired with this app and rejects unknown or ambiguous targets.',
+    recipient: recipientSchema.optional().describe(
+      'The single person to message right now: a platform user id (e.g. 111 or "ou_abc"), or an object like { "userId": 111 } or { "displayName": "Alice" }. Required for dedicated Telegram and Feishu — there is no default recipient and no broadcast. The server verifies it against the accounts paired with this app and rejects unknown or ambiguous targets. Omit only when channel is telegram and entrypoint is public (routing is the current session\'s public subscription).',
     ),
     channel: z
       .enum(MESSAGE_CHANNELS)
@@ -68,6 +69,12 @@ const inputSchema = lazySchema(() =>
       .min(1)
       .max(MAX_TEXT_LENGTH)
       .describe('The exact message body to deliver, as the user wants it sent. Required.'),
+    entrypoint: z
+      .enum(['dedicated', 'public'])
+      .optional()
+      .describe(
+        'Telegram only. "dedicated" (default) sends through the paired dedicated bot. "public" sends a report through the public bot for the current session after the server checks the owner subscription — it does not broadcast and does not fall back to the dedicated bot. Ignore for feishu.',
+      ),
   }),
 )
 type InputSchema = ReturnType<typeof inputSchema>
@@ -79,8 +86,9 @@ const outputSchema = lazySchema(() =>
     channel: z.enum(MESSAGE_CHANNELS),
     recipientId: z.string(),
     recipientLabel: z.string(),
-    outcome: z.literal('delivered'),
+    outcome: z.enum(['delivered', 'pending']),
     attempts: z.number(),
+    queued: z.literal(true).optional(),
   }),
 )
 type OutputSchema = ReturnType<typeof outputSchema>
@@ -105,7 +113,19 @@ function validateMessageInput(input: Input): ValidationResult {
     return { result: false, message: 'The message text must not be empty.', errorCode: 1 }
   }
 
+  if (input.entrypoint === 'public' && input.channel !== 'telegram') {
+    return {
+      result: false,
+      message: 'entrypoint "public" is only valid for telegram.',
+      errorCode: 7,
+    }
+  }
+
+  const publicTelegram = input.channel === 'telegram' && input.entrypoint === 'public'
   const recipient = input.recipient
+  if (!publicTelegram && recipient === undefined) {
+    return { result: false, message: 'The recipient must not be empty.', errorCode: 2 }
+  }
   if (typeof recipient === 'string' && recipient.trim().length === 0) {
     return { result: false, message: 'The recipient must not be empty.', errorCode: 2 }
   }
@@ -161,8 +181,15 @@ type LocalSendDelivery = {
 }
 type LocalSendResponse = {
   ok?: unknown
+  queued?: unknown
   delivery?: LocalSendDelivery
   issues?: LocalSendIssue[]
+}
+
+function isQueuedPublicSuccess(response: LocalSendResponse): boolean {
+  if (response.ok !== true) return false
+  if (response.queued === true) return true
+  return response.delivery?.outcome === 'pending'
 }
 
 function firstIssueMessage(response: LocalSendResponse): string | undefined {
@@ -244,17 +271,32 @@ export const LocalMessageSendTool = buildTool({
     const prepared = parseMessageInput(rawInput)
     if ('error' in prepared) throw new Error(prepared.error)
     const input = prepared.input
+    const sourceSessionId = getSessionId()
+    if (input.channel === 'telegram' && input.entrypoint === 'public') {
+      if (typeof sourceSessionId !== 'string' || sourceSessionId.trim().length === 0) {
+        throw new Error('Public Telegram send needs the current session as source; it cannot be invented by the model.')
+      }
+    }
+
+    const body: Record<string, unknown> = {
+      channel: input.channel,
+      text: input.text,
+    }
+    if (input.recipient !== undefined) body.recipient = input.recipient
+    if (input.channel === 'telegram') {
+      body.entrypoint = input.entrypoint ?? 'dedicated'
+      // Source comes from the runtime session, never from model-supplied args.
+      if (typeof sourceSessionId === 'string' && sourceSessionId.length > 0) {
+        body.sourceSessionId = sourceSessionId
+      }
+    }
 
     let response: LocalSendResponse
     try {
       response = await callLocalDesktopApi<LocalSendResponse>({
         path: LOCAL_NOTIFICATIONS_SEND_PATH,
         method: 'POST',
-        body: {
-          channel: input.channel,
-          recipient: input.recipient,
-          text: input.text,
-        },
+        body,
       })
     } catch (error) {
       // A transport, auth, or HTTP failure stays a real error: the model is
@@ -267,6 +309,37 @@ export const LocalMessageSendTool = buildTool({
     }
 
     const delivery = response.delivery
+    if (input.channel === 'telegram' && input.entrypoint === 'public') {
+      if (!isQueuedPublicSuccess(response)) {
+        throw new Error(describeSendFailure(response))
+      }
+      const recipientId =
+        typeof delivery?.recipientId === 'string' && delivery.recipientId.length > 0
+          ? delivery.recipientId
+          : typeof sourceSessionId === 'string' && sourceSessionId.length > 0
+            ? sourceSessionId
+            : 'public'
+      const recipientLabel =
+        typeof delivery?.recipientLabel === 'string' && delivery.recipientLabel.trim().length > 0
+          ? delivery.recipientLabel
+          : 'public'
+      const attempts =
+        typeof delivery?.attempts === 'number' && Number.isFinite(delivery.attempts)
+          ? delivery.attempts
+          : 0
+      return {
+        data: {
+          message: '已加入待发队列，尚未确认送达',
+          channel: input.channel,
+          recipientId,
+          recipientLabel,
+          outcome: 'pending' as const,
+          attempts,
+          queued: true as const,
+        },
+      }
+    }
+
     if (
       !delivery ||
       delivery.outcome !== 'delivered' ||

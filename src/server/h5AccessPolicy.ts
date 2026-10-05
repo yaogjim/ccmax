@@ -361,7 +361,10 @@ function normalizeApiPath(pathname: string): string {
 }
 
 export function isLocalCredentialOnlyPath(pathname: string): boolean {
-  return LOCAL_CREDENTIAL_ONLY_PATHS.has(normalizeApiPath(pathname))
+  const normalized = normalizeApiPath(pathname)
+  return LOCAL_CREDENTIAL_ONLY_PATHS.has(normalized) ||
+    normalized === '/api/telegram/public' || normalized.startsWith('/api/telegram/public/') ||
+    normalized === '/api/adapters/telegram/public' || normalized.startsWith('/api/adapters/telegram/public/')
 }
 
 /**

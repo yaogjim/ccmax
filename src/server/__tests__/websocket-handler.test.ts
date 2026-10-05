@@ -4094,7 +4094,7 @@ describe('WebSocket handler session isolation', () => {
     const respond = spyOn(conversationService, 'respondToPermission').mockReturnValue(true)
     try {
       handleWebSocket.message(ws, JSON.stringify({ type: 'permission_response', requestId: 'approved', allowed: true }))
-      expect(events).toEqual([{ type: 'output', sessionId: 'permission-scheduler', message: { type: 'control_response', request_id: 'approved' } }])
+      expect(events).toEqual([{ type: 'output', sessionId: 'permission-scheduler', eventId: 'permission-scheduler:control_response:approved', message: { type: 'control_response', request_id: 'approved' } }])
       respond.mockReturnValue(false)
       handleWebSocket.message(ws, JSON.stringify({ type: 'permission_response', requestId: 'stale', allowed: true }))
       expect(events).toHaveLength(1)
@@ -4129,12 +4129,11 @@ describe('WebSocket handler session isolation', () => {
     } finally { unsubscribe() }
   })
 
-  it('broadcasts tool and Computer Use permission resolutions to every client', () => {
+  it('broadcasts tool and Computer Use permission resolutions to every client', async () => {
     const sessionId = `permission-resolution-${crypto.randomUUID()}`
     const first = makeClientSocket(sessionId)
     const second = makeClientSocket(sessionId)
     spyOn(conversationService, 'respondToPermission').mockReturnValue(true)
-    spyOn(computerUseApprovalService, 'resolveApproval').mockReturnValue(true)
 
     handleWebSocket.open(first)
     handleWebSocket.open(second)
@@ -4157,6 +4156,14 @@ describe('WebSocket handler session isolation', () => {
       ws.sent.length = 0
     }
 
+    // Register the real pending request: a bare successful resolver mock no
+    // longer represents the session-ownership check used by both IM and UI.
+    const approval = computerUseApprovalService.requestApproval(sessionId, {
+      requestId: 'cu-1', reason: 'Fixture approval', apps: [],
+      requestedFlags: {}, screenshotFiltering: 'none',
+    })
+    first.sent.length = 0
+    second.sent.length = 0
     handleWebSocket.message(second, JSON.stringify({
       type: 'computer_use_permission_response',
       requestId: 'cu-1',
@@ -4172,6 +4179,8 @@ describe('WebSocket handler session isolation', () => {
       },
     }))
 
+    expect((await approval).userConsented).toBe(false)
+    expect(computerUseApprovalService.getPendingRequests(sessionId)).toHaveLength(0)
     for (const ws of [first, second]) {
       expect(ws.sent.map((payload) => JSON.parse(payload))).toContainEqual({
         type: 'permission_resolved',

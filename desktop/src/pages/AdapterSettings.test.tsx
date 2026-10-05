@@ -7,6 +7,26 @@ import { useAdapterStore } from '../stores/adapterStore'
 import { useSettingsStore } from '../stores/settingsStore'
 import type { AdapterFileConfig } from '../types/adapter'
 
+vi.mock('@/api/adapters', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/adapters')>()
+  return {
+    ...actual,
+    adaptersApi: {
+      ...actual.adaptersApi,
+      getTelegramPublicStatus: vi.fn(async () => ({
+        generation: 0,
+        running: false,
+        subscriptions: [],
+        deliveries: [],
+      })),
+      generateTelegramPublicPairing: vi.fn(),
+      resetTelegramPublicPairing: vi.fn(),
+      addTelegramPublicSubscription: vi.fn(),
+      removeTelegramPublicSubscription: vi.fn(),
+    },
+  }
+})
+
 const FEISHU_CREATE_BOT_URL = 'https://open.feishu.cn/page/openclaw?form=multiAgent'
 const IM_CONFIG_DOCS_URL = 'https://yaogjim.github.io/ccmax/im/'
 
@@ -730,5 +750,40 @@ describe('AdapterSettings unbind dialog busy state', () => {
     await waitFor(() => {
       expect(screen.queryByRole('dialog', { name: buttonName })).not.toBeInTheDocument()
     })
+  })
+})
+
+describe('AdapterSettings Telegram exclusive vs public', () => {
+  it('labels the exclusive Bot and keeps dedicated save free of public fields', async () => {
+    const updateConfig = vi.fn(async (_patch: Partial<AdapterFileConfig>) => {})
+    renderAdapterSettings(
+      {
+        telegram: {
+          botToken: '****oken',
+          allowedUsers: [111],
+          public: {
+            enabled: true,
+            botToken: '****ublic',
+            ownerUserId: 42,
+            generation: 2,
+          },
+        },
+      },
+      { updateConfig },
+    )
+
+    expect(screen.getByText('Exclusive Bot')).toBeInTheDocument()
+    expect(screen.getByText('Public Bot')).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'Enable public Bot' })).toBeChecked()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(updateConfig).toHaveBeenCalledTimes(1))
+    const patch = updateConfig.mock.calls[0]![0]
+    expect(patch.telegram).toEqual({
+      botToken: '****oken',
+      allowedUsers: [111],
+    })
+    expect(patch.telegram).not.toHaveProperty('public')
   })
 })

@@ -27,6 +27,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { SessionStore } from '../../../adapters/common/session-store.js'
 import { getNetworkProxyFetchOptions, loadNetworkSettings } from './networkSettings.js'
 import { adapterService, type AdapterFileConfig, type PairedUser } from './adapterService.js'
 import type { TaskRun } from './cronScheduler.js'
@@ -38,6 +39,7 @@ import {
   type NotificationDeliveryOutcome,
   type PendingDeliveryInput,
 } from './notificationDeliveryStore.js'
+import { getTelegramPublicStorePath } from './telegramPublicStore.js'
 
 export type { NotificationChannel, NotificationDeliveryOutcome } from './notificationDeliveryStore.js'
 
@@ -52,6 +54,11 @@ export type NotificationRecipientSpec =
 /**
  * 本服务消费的通知配置。与 `TaskNotificationConfig` 结构兼容（recipients 可选），
  * `task.notification` 的正式类型扩展由主控负责。
+ *
+ * 定时任务没有公共选择：`TaskNotificationConfig` 不扩 entrypoint。任务跑在某会话上时，
+ * 若该会话已订阅公共入口，cron 结果会经 `session_turn` 事件由 telegramPublicService
+ * 自动 enqueue 报告。本服务的 telegram 渠道仍只走专属 Bot；开启公共入口后必须绑定
+ * 来源会话，不能借任务通知把其他会话内容送进专属入口。
  */
 export type TaskNotificationInput = {
   enabled: boolean
@@ -72,6 +79,25 @@ export type NotificationDeliveryFailureCode =
   | 'network_error'
   | 'timeout'
   | 'delivery_record_failed'
+  | 'source_session_required'
+  | 'dedicated_binding_mismatch'
+  | 'public_route_rejected'
+
+export type TelegramMessageEntrypoint = 'dedicated' | 'public'
+
+export type TelegramInlineKeyboardMarkup = {
+  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
+}
+
+export type TelegramChannelMessageResult = {
+  outcome: 'delivered' | 'failed' | 'indeterminate'
+  messageId?: number
+  error?: string
+  retryAfterMs?: number
+}
+
+/** `sendSessionReport` 的真实回执：只表示已写入公共 outbox，不是平台送达。 */
+export type PublicSessionReportEnqueue = { queued: true }
 
 export type NotificationDeliveryIssue = {
   channel?: NotificationChannel
@@ -121,6 +147,24 @@ export type NotificationDeliveryOptions = {
    * this only to force a specific key.
    */
   generateId?: () => string
+  /**
+   * Dedicated Telegram SessionStore lookup. Production reads the adapter
+   * session file; tests inject a fake so they never touch the developer's
+   * real bindings.
+   */
+  getDedicatedBinding?: (chatId: string) => { sessionId: string } | null
+  /**
+   * Public-channel report. Production delegates to
+   * `getTelegramPublicService().sendSessionReport`, which returns `{ queued: true }`
+   * after owner / subscription / roots checks. The public service owns outbox
+   * routing. Focused tests may inject this seam; at least one integration must
+   * use the real service.
+   */
+  sendPublicSessionReport?: (
+    sessionId: string,
+    eventId: string,
+    text: string,
+  ) => Promise<PublicSessionReportEnqueue>
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -268,6 +312,12 @@ type ResolvedDeps = {
   registerSecret: (secret: string | undefined) => void
   /** Strip every registered credential and Telegram `/bot<token>` paths. */
   redact: (text: string) => string
+  getDedicatedBinding: (chatId: string) => { sessionId: string } | null
+  sendPublicSessionReport: (
+    sessionId: string,
+    eventId: string,
+    text: string,
+  ) => Promise<PublicSessionReportEnqueue>
 }
 
 function defaultDeliveryId(parts: { runId: string; channel: NotificationChannel; recipientId: string; ordinal: number }): string {
@@ -297,7 +347,97 @@ function resolveDeps(options: NotificationDeliveryOptions): ResolvedDeps {
       }
     },
     redact: (text) => redactText(text, secrets),
+    getDedicatedBinding: options.getDedicatedBinding ?? defaultGetDedicatedBinding,
+    sendPublicSessionReport: options.sendPublicSessionReport ?? sendPublicSessionReport,
   }
+}
+
+const DEDICATED_SOURCE_REQUIRED =
+  '专属 Telegram 通知缺少来源会话；公共入口已启用，请改用公共入口并订阅该会话，或把任务绑定到当前专属会话'
+const DEDICATED_BINDING_MISMATCH =
+  '来源会话不是该收件人当前专属绑定；公共入口已启用，请改用公共入口并订阅，不能经专属通知绕过隔离'
+const PUBLIC_SOURCE_REQUIRED =
+  '公共入口发送需要来源会话（sourceSessionId）；模型自报来源不能作为授权'
+const PUBLIC_ENTRYPOINT_TELEGRAM_ONLY = 'entrypoint public 仅支持 telegram，不能用于其他渠道'
+const PUBLIC_REPORT_UNAVAILABLE = '公共入口不可用：缺少 sendSessionReport，无法验证启用、owner 与订阅路由'
+
+export function defaultGetDedicatedBinding(chatId: string): { sessionId: string } | null {
+  try {
+    const entry = new SessionStore().get(chatId)
+    if (!entry || typeof entry.sessionId !== 'string' || entry.sessionId.trim().length === 0) {
+      return null
+    }
+    return { sessionId: entry.sessionId }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Production seam for public reports. Outbox, subscription, owner and roots
+ * checks stay in `sendSessionReport`; this module must not send with the
+ * public token and must not coerce `{ queued: true }` into a delivered receipt.
+ */
+export async function sendPublicSessionReport(
+  sessionId: string,
+  eventId: string,
+  text: string,
+): Promise<PublicSessionReportEnqueue> {
+  if (publicSessionReportForTests) {
+    return publicSessionReportForTests(sessionId, eventId, text)
+  }
+  const { getTelegramPublicService } = await import('./telegramPublicService.js')
+  const service = getTelegramPublicService()
+  if (typeof service.sendSessionReport !== 'function') {
+    throw new Error(PUBLIC_REPORT_UNAVAILABLE)
+  }
+  return service.sendSessionReport(sessionId, eventId, text)
+}
+
+let publicSessionReportForTests:
+  | ((sessionId: string, eventId: string, text: string) => Promise<PublicSessionReportEnqueue>)
+  | undefined
+
+/** Test seam: intercept public reports without constructing TelegramPublicService. */
+export function setSendPublicSessionReportForTests(
+  send: ((sessionId: string, eventId: string, text: string) => Promise<PublicSessionReportEnqueue>) | null,
+): void {
+  publicSessionReportForTests = send ?? undefined
+}
+
+function isTelegramPublicEnabled(config: AdapterFileConfig): boolean {
+  return config.telegram?.public?.enabled === true
+}
+
+function dedicatedTelegramGate(
+  config: AdapterFileConfig,
+  sourceSessionId: string | undefined,
+  recipient: ResolvedRecipient,
+  getBinding: (chatId: string) => { sessionId: string } | null,
+): { errorCode: NotificationDeliveryFailureCode; error: string } | null {
+  if (!isTelegramPublicEnabled(config)) return null
+  const source = sourceSessionId?.trim()
+  if (!source) {
+    return { errorCode: 'source_session_required', error: DEDICATED_SOURCE_REQUIRED }
+  }
+  const binding = getBinding(String(recipient.chatId))
+  if (!binding || binding.sessionId !== source) {
+    return { errorCode: 'dedicated_binding_mismatch', error: DEDICATED_BINDING_MISMATCH }
+  }
+  return null
+}
+
+function validTelegramMessageId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+
+function telegramRetryAfterMs(payload: Record<string, unknown> | null): number | undefined {
+  const parameters = payload?.parameters
+  if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) return undefined
+  const raw = (parameters as Record<string, unknown>).retry_after
+  const seconds = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : Number.NaN
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined
+  return seconds * 1000
 }
 
 /**
@@ -307,6 +447,10 @@ function resolveDeps(options: NotificationDeliveryOptions): ResolvedDeps {
  * `indeterminate` exactly once per store file. Running the pass on every send
  * would race an in-flight send from another task and mislabel a delivery that
  * is still on the wire.
+ *
+ * Recovery never calls `deliverTelegram`. Leftover dedicated rows cannot bypass
+ * `dedicatedTelegramGate` by being retried; the gate only runs on live send
+ * paths (`deliverTelegramChannel` / `sendImmediateMessage`).
  */
 const recoveredStorePaths = new Set<string>()
 
@@ -349,6 +493,7 @@ async function recoverPendingOnce(
 export function resetNotificationRecoveryStateForTests(): void {
   recoveredStorePaths.clear()
   startupRecovery = undefined
+  publicSessionReportForTests = undefined
 }
 
 /**
@@ -659,49 +804,176 @@ function trimTelegramText(text: string): string {
   return text.length > TELEGRAM_TEXT_LIMIT ? text.slice(0, TELEGRAM_TEXT_LIMIT) + '…' : text
 }
 
-async function deliverTelegram(
+type TelegramSendExecution = TelegramChannelMessageResult & {
+  attempts: number
+  errorCode?: NotificationDeliveryFailureCode
+}
+
+async function executeTelegramSendMessage(
   botToken: string,
-  recipient: ResolvedRecipient,
+  chatId: string | number,
   text: string,
   deps: ResolvedDeps,
-): Promise<NotificationRecipientDelivery> {
+  replyMarkup?: TelegramInlineKeyboardMarkup,
+): Promise<TelegramSendExecution> {
+  const body: Record<string, unknown> = { chat_id: chatId, text }
+  if (replyMarkup) body.reply_markup = replyMarkup
+
   const result = await fetchWithBoundedRetry(
     `${TELEGRAM_API}/bot${botToken}/sendMessage`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       // No parse_mode: plain text survives any markdown-breaking character.
-      body: JSON.stringify({ chat_id: recipient.chatId, text: trimTelegramText(text) }),
+      body: JSON.stringify(body),
     },
     deps,
   )
 
   if (result.kind === 'aborted') {
-    return deliveryEntry('telegram', recipient, 'indeterminate', result.attempts, 'timeout', deps.redact(`sendMessage timed out after ${deps.timeoutMs}ms: ${result.error}`))
+    return {
+      outcome: 'indeterminate',
+      attempts: result.attempts,
+      errorCode: 'timeout',
+      error: deps.redact(`sendMessage timed out after ${deps.timeoutMs}ms: ${result.error}`),
+    }
   }
   if (result.kind === 'network') {
-    return deliveryEntry('telegram', recipient, 'indeterminate', result.attempts, 'network_error', deps.redact(result.error))
+    return {
+      outcome: 'indeterminate',
+      attempts: result.attempts,
+      errorCode: 'network_error',
+      error: deps.redact(result.error),
+    }
   }
 
   const { response, attempts } = result
-  if (!response.ok) {
-    return deliveryEntry('telegram', recipient, 'failed', attempts, 'http_error', deps.redact(`sendMessage returned HTTP ${response.status}: ${await readResponseText(response)}`))
+  const payload = await readJson(response)
+  const retryAfterMs = telegramRetryAfterMs(payload)
+  const retryFields = retryAfterMs !== undefined ? { retryAfterMs } : {}
+
+  if (response.status === 429 || payload?.error_code === 429) {
+    return {
+      outcome: 'failed',
+      attempts,
+      errorCode: 'http_error',
+      error: deps.redact(
+        `sendMessage returned HTTP ${response.status}: ${String(payload?.description ?? 'Too Many Requests')}`,
+      ),
+      ...retryFields,
+    }
   }
 
-  const payload = await readJson(response)
+  if (!response.ok) {
+    return {
+      outcome: 'failed',
+      attempts,
+      errorCode: 'http_error',
+      error: deps.redact(
+        `sendMessage returned HTTP ${response.status}: ${String(payload?.description ?? payload?.ok ?? response.status)}`,
+      ),
+    }
+  }
+
   if (payload && payload.ok === false) {
-    return deliveryEntry('telegram', recipient, 'failed', attempts, 'business_error', deps.redact(String(payload.description ?? 'Telegram reported ok:false')))
+    return {
+      outcome: 'failed',
+      attempts,
+      errorCode: 'business_error',
+      error: deps.redact(String(payload.description ?? 'Telegram reported ok:false')),
+      ...retryFields,
+    }
   }
 
   const receipt = payload?.result
   const messageId = receipt && typeof receipt === 'object' && !Array.isArray(receipt)
     ? (receipt as Record<string, unknown>).message_id
     : undefined
-  if (payload?.ok !== true || typeof messageId !== 'number' || !Number.isSafeInteger(messageId) || messageId <= 0) {
-    return deliveryEntry('telegram', recipient, 'indeterminate', attempts, 'invalid_receipt', 'Telegram 未返回可验证的消息回执，禁止据此认定送达')
+  if (payload?.ok !== true || !validTelegramMessageId(messageId)) {
+    return {
+      outcome: 'indeterminate',
+      attempts,
+      errorCode: 'invalid_receipt',
+      error: 'Telegram 未返回可验证的消息回执，禁止据此认定送达',
+    }
   }
 
-  return { ...deliveryEntry('telegram', recipient, 'delivered', attempts), messageId }
+  return { outcome: 'delivered', attempts, messageId }
+}
+
+/**
+ * One Telegram sendMessage attempt for the public channel (and any other
+ * caller that already owns outbox). Does not write the task-notification
+ * delivery store, does not retry timeout/network/429, and does not silently
+ * truncate the body — the public service shards, so this primitive refuses
+ * anything over 4000 characters. `delivered` requires a positive integer
+ * `message_id`.
+ */
+export async function sendTelegramChannelMessage(
+  botToken: string,
+  chatId: string,
+  text: string,
+  options?: {
+    fetch?: typeof fetch
+    replyMarkup?: TelegramInlineKeyboardMarkup
+  },
+): Promise<TelegramChannelMessageResult> {
+  const deps = resolveDeps({
+    fetchImpl: options?.fetch,
+    maxAttempts: 1,
+  })
+  deps.registerSecret(botToken)
+
+  if (typeof text !== 'string' || text.length === 0) {
+    return { outcome: 'failed', error: '消息内容为空，未发送' }
+  }
+  if (text.length > TELEGRAM_TEXT_LIMIT) {
+    return {
+      outcome: 'failed',
+      error: `Telegram 消息超过 ${TELEGRAM_TEXT_LIMIT} 字符，拒绝截断发送`,
+    }
+  }
+
+  const sent = await executeTelegramSendMessage(
+    botToken,
+    chatId,
+    text,
+    deps,
+    options?.replyMarkup,
+  )
+  return {
+    outcome: sent.outcome,
+    ...(sent.messageId !== undefined ? { messageId: sent.messageId } : {}),
+    ...(sent.error !== undefined ? { error: sent.error } : {}),
+    ...(sent.retryAfterMs !== undefined ? { retryAfterMs: sent.retryAfterMs } : {}),
+  }
+}
+
+async function deliverTelegram(
+  botToken: string,
+  recipient: ResolvedRecipient,
+  text: string,
+  deps: ResolvedDeps,
+): Promise<NotificationRecipientDelivery> {
+  // HTTP send only. Dedicated isolation (`dedicatedTelegramGate`) is the
+  // caller's job; startup recovery must not reach this function.
+  const sent = await executeTelegramSendMessage(
+    botToken,
+    recipient.chatId,
+    trimTelegramText(text),
+    deps,
+  )
+  if (sent.outcome === 'delivered') {
+    return { ...deliveryEntry('telegram', recipient, 'delivered', sent.attempts), messageId: sent.messageId }
+  }
+  return deliveryEntry(
+    'telegram',
+    recipient,
+    sent.outcome,
+    sent.attempts,
+    sent.errorCode,
+    sent.error,
+  )
 }
 
 // ─── Feishu ───────────────────────────────────────────────────────────────────
@@ -880,6 +1152,13 @@ async function deliverTelegramChannel(
     await deliverWithRecord(run, 'telegram', recipient, ordinal++, deps, report, async () => failure)
   }
   for (const recipient of resolved) {
+    const gate = dedicatedTelegramGate(config, run.sessionId, recipient, deps.getDedicatedBinding)
+    if (gate) {
+      await deliverWithRecord(run, 'telegram', recipient, ordinal++, deps, report, async () =>
+        deliveryEntry('telegram', recipient, 'failed', 0, gate.errorCode, gate.error),
+      )
+      continue
+    }
     await deliverWithRecord(run, 'telegram', recipient, ordinal++, deps, report, () =>
       deliverTelegram(botToken, recipient, text, deps),
     )
@@ -959,6 +1238,11 @@ function pushEntry(report: NotificationDeliveryReport, entry: NotificationRecipi
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
+/**
+ * 定时任务专属 IM 通知。telegram 渠道始终走专属 Bot 与旧投递日志；没有 public
+ * 入口选择。已订阅公共入口的任务会话完成报告由 session_turn → telegramPublicService
+ * 复用，不经本函数、不改 TaskNotificationConfig。
+ */
 export async function sendTaskNotification(
   run: TaskRun,
   notification: TaskNotificationInput,
@@ -1028,26 +1312,101 @@ export async function sendTaskNotification(
  * Send one message immediately, outside a task run.
  *
  * This is the service behind the local-only "send a message" API the tool uses.
- * It shares the recipient resolution and the sender with task notifications, so
- * a destination is only ever a paired account and the same pending/settle log
- * records the attempt. `runId`/`taskId` are optional and only used to link the
- * record back to a conversation or run.
+ * Dedicated Telegram / Feishu still share recipient resolution and the
+ * pending/settle log with task notifications. Public Telegram is a separate
+ * entry: it requires a real source session and delegates to
+ * `sendSessionReport`, which owns outbox and subscription routing. The public
+ * bot token is never used here, and a public send never falls back to the
+ * dedicated bot or the old delivery store.
+ *
+ * `sourceSessionId` is a claimed source for verification, not an authorization
+ * grant — a model-supplied value cannot bypass subscription or dedicated
+ * binding checks, and the message body is never parsed as a source.
  */
 export type ImmediateMessageInput = {
   channel: NotificationChannel
-  recipient: NotificationRecipientSpec
+  recipient?: NotificationRecipientSpec
   text: string
   /** Optional Feishu card header; Telegram ignores it. */
   title?: string
   runId?: string
   taskId?: string
+  /** Telegram only. Default `dedicated`. */
+  entrypoint?: TelegramMessageEntrypoint
+  /**
+   * Trusted source session from the tool/runtime context (e.g. `getSessionId()`
+   * or `run.sessionId`). Not treated as authorization by itself.
+   */
+  sourceSessionId?: string
 }
 
 export type ImmediateMessageResult = {
   ok: boolean
+  /** 公共入口入队成功。不是平台送达；此时 `delivery.outcome` 为 `pending`。 */
+  queued?: true
   delivery?: NotificationRecipientDelivery
   issues: NotificationDeliveryIssue[]
   recordPath: string
+}
+
+function publicRecordPath(): string {
+  return getTelegramPublicStorePath()
+}
+
+function publicImmediateQueued(sourceSessionId: string): ImmediateMessageResult {
+  return {
+    ok: true,
+    queued: true,
+    delivery: {
+      channel: 'telegram',
+      recipientId: sourceSessionId,
+      recipientLabel: 'public',
+      outcome: 'pending',
+      attempts: 0,
+    },
+    issues: [],
+    recordPath: publicRecordPath(),
+  }
+}
+
+function publicImmediateFailure(
+  code: NotificationDeliveryFailureCode,
+  message: string,
+  channel: NotificationChannel = 'telegram',
+): ImmediateMessageResult {
+  return {
+    ok: false,
+    issues: [{ channel, code, message }],
+    recordPath: publicRecordPath(),
+  }
+}
+
+async function sendImmediatePublic(
+  input: ImmediateMessageInput,
+  text: string,
+  deps: ResolvedDeps,
+): Promise<ImmediateMessageResult> {
+  if (input.channel !== 'telegram') {
+    return publicImmediateFailure('public_route_rejected', PUBLIC_ENTRYPOINT_TELEGRAM_ONLY, input.channel)
+  }
+  const sourceSessionId = input.sourceSessionId?.trim()
+  if (!sourceSessionId) {
+    return publicImmediateFailure('source_session_required', PUBLIC_SOURCE_REQUIRED)
+  }
+
+  const eventId = (input.runId?.trim() || randomUUID())
+  try {
+    const enqueued = await deps.sendPublicSessionReport(sourceSessionId, eventId, text)
+    if (enqueued?.queued !== true) {
+      return publicImmediateFailure('public_route_rejected', '公共入口未确认入队，禁止据此认定送达')
+    }
+    return publicImmediateQueued(sourceSessionId)
+  } catch (error) {
+    return publicImmediateFailure(
+      'public_route_rejected',
+      deps.redact(`公共入口发送失败：${describeError(error)}`),
+    )
+  }
 }
 
 export async function sendImmediateMessage(
@@ -1065,6 +1424,10 @@ export async function sendImmediateMessage(
     }
   }
 
+  if (input.entrypoint === 'public') {
+    return sendImmediatePublic(input, text, deps)
+  }
+
   await recoverPendingOnce(deps)
 
   let config: AdapterFileConfig
@@ -1074,6 +1437,14 @@ export async function sendImmediateMessage(
     return {
       ok: false,
       issues: [{ channel: input.channel, code: 'adapter_config_unreadable', message: `读取 adapter 配置失败：${describeError(error)}` }],
+      recordPath: deps.store.filePath,
+    }
+  }
+
+  if (input.recipient === undefined) {
+    return {
+      ok: false,
+      issues: [{ channel: input.channel, code: 'invalid_recipient', message: '收件人不能为空，未发送' }],
       recordPath: deps.store.filePath,
     }
   }
@@ -1099,6 +1470,7 @@ export async function sendImmediateMessage(
     startedAt: deps.now().toISOString(),
     status: 'completed',
     prompt: '',
+    ...(input.sourceSessionId?.trim() ? { sessionId: input.sourceSessionId.trim() } : {}),
   }
 
   const report: NotificationDeliveryReport = {
@@ -1131,6 +1503,13 @@ export async function sendImmediateMessage(
     const botToken = config.telegram?.botToken
     if (!botToken) {
       issues.push({ channel: 'telegram', code: 'credentials_missing', message: 'telegram.botToken 未配置，消息无法送出' })
+      return finalizeImmediate(report, deps)
+    }
+    const gate = dedicatedTelegramGate(config, input.sourceSessionId, recipient, deps.getDedicatedBinding)
+    if (gate) {
+      await deliverWithRecord(run, 'telegram', recipient, 0, deps, report, async () =>
+        deliveryEntry('telegram', recipient, 'failed', 0, gate.errorCode, gate.error),
+      )
       return finalizeImmediate(report, deps)
     }
     deps.registerSecret(botToken)

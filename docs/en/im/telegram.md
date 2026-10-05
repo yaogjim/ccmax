@@ -1,7 +1,7 @@
 ---
 title: Telegram Integration
 nav_title: Telegram
-description: Get a Bot Token from BotFather, paste it into Desktop, and approve permissions with native buttons.
+description: Use the original Bot for one exclusive session, or add a second Bot for yourself to subscribe to multiple sessions.
 order: 2
 ---
 
@@ -68,9 +68,11 @@ When the model asks through `AskUserQuestion`, Telegram sends a card with option
 
 `/answer` can omit the request id: `/answer Axios` is enough when only one question is waiting. For several questions, send JSON keyed either by the full question text or by 1-based numbers, for example `/answer {"1":"React","2":"SQLite"}`. The older `/answer <id> {...}` form still works. Drafts stay in memory for this process only and are not written to the session file. `/stop` invalidates the current question without sending a deny; `/deny` is what returns a rejection to the same Desktop session. `/allow` and `/always` cannot answer a question. Failed sends can be retried from the latest card; submitted, Desktop-resolved, or expired requests cannot be answered again.
 
-Replies pass through a streaming buffer: a placeholder can be sent while Claude is thinking, text deltas accumulate in place, and completed text is split into platform-sized messages.
+Exclusive-Bot replies pass through a streaming buffer: a placeholder can be sent while Claude is thinking, text deltas accumulate in place, and completed text is split into platform-sized messages. The public entry does not edit messages in place.
 
 ## Sending voice, images, and files
+
+The capabilities below belong to the exclusive Bot. The public entry currently accepts text only; images, voice notes, and attachments are refused.
 
 Beyond typing, you can send images, voice notes, and files straight from Telegram. They reach the session differently:
 
@@ -124,6 +126,41 @@ Then **add only** an `stt` block to `~/.claude/adapters.json`, leaving existing 
 You can use environment variables instead: `CC_STT_PROVIDER`, `CC_STT_WHISPER_PATH`, `CC_STT_FFMPEG_PATH`, `CC_STT_WHISPER_MODEL`, `CC_STT_LANGUAGE`, `CC_STT_WHISPER_PROMPT`. Priority is environment > `adapters.json` > defaults. When `CLAUDE_CONFIG_DIR` is set, the configuration lives there instead of the default `~/.claude`.
 
 **Restart the adapter** after changing the configuration. Desktop Settings has no dedicated transcription panel, so you install the dependencies and model yourself. On limits: a single voice note is capped at 5 minutes (judged by real duration, refused rather than truncated), and one transcription times out after 60 seconds by default.
+
+## Exclusive Bot and public Bot
+
+Telegram can use two private-chat bots at once. Their configuration and pairing are independent. Neither is a group entry, and neither is open to other people.
+
+- **The original Bot is the exclusive entry.** It still binds one session and keeps the pairing, commands, streaming replies, media, and permission buttons described above.
+- **The new Bot is a public entry for you only.** It accepts private chat from the one paired operator, so you can subscribe to multiple sessions, receive reports with a source header, and send text back with a reply or `/to`. "Public" here means several sessions share this entry. It is not a Telegram group and is not a bot opened to other people.
+
+Saving the exclusive token does not change public settings; saving public settings does not change the exclusive token. The public entry is off by default. An existing install keeps the original exclusive Bot and does not need to pair again. Project access for the public entry uses the global **Allowed project directories** list; there is no separate directory form.
+
+### Turn on the public Bot
+
+1. Ask `@BotFather` for a second token, different from the exclusive Bot.
+2. Open **Settings → IM Adapters → Telegram**, paste the token under **Public Bot**, enable it, and save. Saving writes the config and restarts the adapter.
+3. Select **Generate public pairing code** and send that code in a private chat with the public Bot (or send `/pair` plus the code). Only the first valid pairing becomes the operator. Changing the operator requires a confirmed reset in Desktop.
+
+### Subscribe and target a session
+
+The public entry has no implicit current session. Join, leave, and targeting are always explicit:
+
+- Send `/sessions` in the public Bot. The list includes the full `sessionId`.
+- `/subscribe <full sessionId or short id>` joins, `/unsubscribe <full sessionId or short id>` leaves, and `/subscriptions` lists subscriptions and recent deliveries.
+- Desktop can also paste a full `sessionId` to subscribe. **Subscribe** stays disabled until an operator is bound.
+- Reports look like `[ccmax · project · session title · S7K2] completed: ...`. Titles may change; the short id stays stable.
+- Reply to that report, or send `/to S7K2 add another test`, and the text goes only to that session. Ordinary text with no reply and no target is not broadcast and does not guess the latest report.
+
+The same session can be bound exclusively and also subscribed publicly. Joining a public subscription does not steal the exclusive binding. The exclusive Bot still shows replies, questions, and approvals only for its bound session. Other sessions do not mix into that entry.
+
+### What it does, and what it does not
+
+The public entry currently supports targeted text plus that session's questions and approval buttons. Images, voice notes, and attachments are refused outright; leftover caption text is not executed. Exclusive-Bot media behavior is unchanged. Public reports are sent as new messages and are not edited in place.
+
+Public reports are queued before send. Queued, sending, confirmed, failed, and indeterminate are distinct states. A timeout or missing receipt is indeterminate, not success. Telegram `429` responses back off using `retry_after`, with a retry limit. After you turn the public entry off or change the operator, replies and buttons on old reports stop working and are not redirected to a new Bot.
+
+The public entry does not delegate work across sessions, share context between Agents, or let Agents negotiate with each other. Public user messages are not disguised as Agent-to-Agent messages.
 
 ## Development
 

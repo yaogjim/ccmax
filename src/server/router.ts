@@ -167,6 +167,9 @@ async function routeApiRequest(req: Request, url: URL): Promise<Response> {
     case 'haha-grok-oauth':
       return handleHahaGrokOAuthApi(req, url, segments)
 
+    case 'telegram':
+      return (await import('./api/telegramPublic.js')).handleTelegramPublicApi(req, url, segments)
+
     case 'adapters':
       // Adapter protocols pull in platform SDKs that are unnecessary for the
       // core server path. Load them only when this API is actually used.

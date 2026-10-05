@@ -16,6 +16,7 @@ import { requireAuth, requireH5Token } from './middleware/auth.js'
 import { teamWatcher } from './services/teamWatcher.js'
 import { cronScheduler } from './services/cronScheduler.js'
 import { startPendingDeliveryRecovery } from './services/notificationService.js'
+import { getTelegramPublicService } from './services/telegramPublicService.js'
 import { handleProxyRequest } from './proxy/handler.js'
 import { ProviderService } from './services/providerService.js'
 import { handleHahaOAuthCallback } from './api/haha-oauth.js'
@@ -219,12 +220,12 @@ function isH5AccessControlRequest(
     return false
   }
 
-  // Chromium omits Authorization from preflight. Let only the configured dev
-  // renderer's local H5 control-plane preflight reach CORS; the real request
-  // still passes the process-credential check below. Other credential-only
-  // endpoints keep their existing policy.
+  // Chromium omits Authorization from preflight. Only the configured local
+  // renderer may preflight the H5 or Telegram public control plane; each real
+  // request still requires the process credential. Bulk deletion stays gated.
   if (
-    isH5AccessControlPath(url.pathname) &&
+    (isH5AccessControlPath(url.pathname) ||
+      (isLocalCredentialOnlyPath(url.pathname) && url.pathname.includes('/public'))) &&
     req.method === 'OPTIONS' &&
     context.trustedRendererOrigin &&
     req.headers.get('Origin') === context.trustedRendererOrigin &&
@@ -429,7 +430,17 @@ export function startServer(port = PORT, host = HOST) {
           explicitAuthRequired: forceAuth,
           context: h5RequestContext,
         })
-        const h5AccessControlBlocked = isH5AccessControlRequest(req, url, h5RequestContext)
+        // The legacy settings endpoint also accepts the new nested public
+        // config. Apply the same local-only boundary without changing access
+        // to unrelated adapter settings.
+        let controlUrl = url
+        if (req.method === 'PUT' && url.pathname.split('/').filter(Boolean).join('/') === 'api/adapters') {
+          const patch = await req.clone().json().catch(() => null)
+          if (patch?.telegram && Object.prototype.hasOwnProperty.call(patch.telegram, 'public')) {
+            controlUrl = new URL('/api/telegram/public/config', url)
+          }
+        }
+        const h5AccessControlBlocked = isH5AccessControlRequest(req, controlUrl, h5RequestContext)
 
         // The configured dev renderer's preflight is classified as local-trusted.
         // All other browser origins still pass through these capability gates.
@@ -475,11 +486,22 @@ export function startServer(port = PORT, host = HOST) {
           if (!sessionId || !/^[0-9a-zA-Z_-]{1,64}$/.test(sessionId)) {
             return new Response('Invalid session ID', { status: 400 })
           }
+          const imEntry = url.searchParams.get('im_entry')
+          const imChatId = url.searchParams.get('im_chat_id')
+          if (imEntry && (imEntry !== 'telegram-dedicated' || !imChatId ||
+            !/^[1-9]\d*$/.test(imChatId) || !Number.isSafeInteger(Number(imChatId)) ||
+            petAccessAuthorized || classifyH5Request(req, url, h5RequestContext) !== 'local-trusted' ||
+            (h5RequestContext.localAccessTokenConfigured && !h5RequestContext.localAccessAuthorized))) {
+            return new Response('Invalid IM entry credential', { status: 403 })
+          }
           const upgraded = server.upgrade(req, {
             data: {
               sessionId,
               connectedAt: Date.now(),
               channel: 'client',
+              ...(imEntry === 'telegram-dedicated' && imChatId
+                ? { imOrigin: { entrypoint: 'telegram-dedicated' as const, chatId: imChatId } }
+                : {}),
               clientKind: petAccessAuthorized ? 'pet' : 'full',
               sdkToken: null,
               serverPort,
@@ -678,9 +700,18 @@ export function startServer(port = PORT, host = HOST) {
       websocket: handleWebSocket,
     })
     const disposeCollaboration = configureSessionCollaborationHost(localConnectHost, server.port)
+    const telegramPublic = getTelegramPublicService()
+    telegramPublic.configure({ serverHost: localConnectHost, serverPort: server.port })
+    void telegramPublic.start().catch(error => {
+      console.error(
+        '[Server] Telegram public channel failed to start',
+        error instanceof Error ? error.message : error,
+      )
+    })
     const stop = server.stop.bind(server)
     server.stop = (closeActiveConnections?: boolean) => {
       apiPerformanceMonitor.stop()
+      telegramPublic.stop()
       disposeCollaboration()
       publicAccess.disable()
       publicAccessServers.delete(publicAccess)
@@ -731,6 +762,7 @@ export async function stopServerRuntimeForShutdown(
   publicAccessServers.clear()
   teamWatcher.stop()
   cronScheduler.stop()
+  getTelegramPublicService().stop()
   backgroundIndexStartupController?.abort()
   const pendingIndexStartup = backgroundIndexStartup
   await Promise.all([

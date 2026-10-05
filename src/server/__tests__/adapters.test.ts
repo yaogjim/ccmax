@@ -606,3 +606,167 @@ describe('Adapters API — Feishu tenant domain', () => {
     expect(raw.feishu.domain).toBeUndefined()
   })
 })
+
+describe('Adapters API — Telegram public pairing', () => {
+  let root = ''
+  const previous = {
+    HOME: process.env.HOME,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+    XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+    TMPDIR: process.env.TMPDIR,
+  }
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-public-api-'))
+    const home = path.join(root, 'home')
+    tmpDir = path.join(root, 'claude')
+    await fs.mkdir(home, { recursive: true })
+    await fs.mkdir(tmpDir, { recursive: true })
+    await fs.mkdir(path.join(root, 'xdg'), { recursive: true })
+    await fs.mkdir(path.join(root, 'tmp'), { recursive: true })
+    process.env.HOME = home
+    process.env.CLAUDE_CONFIG_DIR = tmpDir
+    process.env.XDG_CONFIG_HOME = path.join(root, 'xdg')
+    process.env.TMPDIR = path.join(root, 'tmp')
+  })
+
+  afterEach(async () => {
+    if (previous.HOME === undefined) delete process.env.HOME
+    else process.env.HOME = previous.HOME
+    if (previous.CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous.CLAUDE_CONFIG_DIR
+    if (previous.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = previous.XDG_CONFIG_HOME
+    if (previous.TMPDIR === undefined) delete process.env.TMPDIR
+    else process.env.TMPDIR = previous.TMPDIR
+    await fs.rm(root, { recursive: true, force: true })
+  })
+
+  it('masks public tokens, preserves masked saves, and keeps exclusive/public patches independent', async () => {
+    const put = makeRequest('PUT', '/api/adapters', {
+      telegram: {
+        botToken: 'exclusive-secret-token',
+        public: { enabled: true, botToken: 'public-secret-token' },
+      },
+      pairing: { code: 'OLD123', expiresAt: Date.now() + 60_000, createdAt: 1 },
+    })
+    expect((await handleAdaptersApi(put.req, put.url, put.segments)).status).toBe(200)
+
+    const get = makeRequest('GET', '/api/adapters')
+    const masked = await (await handleAdaptersApi(get.req, get.url, get.segments)).json() as any
+    expect(masked.telegram.botToken).toBe('****oken')
+    expect(masked.telegram.public.botToken).toBe('****oken')
+
+    const exclusiveSave = makeRequest('PUT', '/api/adapters', {
+      telegram: { botToken: masked.telegram.botToken, allowedUsers: [111] },
+    })
+    expect((await handleAdaptersApi(exclusiveSave.req, exclusiveSave.url, exclusiveSave.segments)).status).toBe(200)
+
+    const publicSave = makeRequest('PUT', '/api/adapters', {
+      telegram: { public: { botToken: masked.telegram.public.botToken, enabled: true } },
+    })
+    expect((await handleAdaptersApi(publicSave.req, publicSave.url, publicSave.segments)).status).toBe(200)
+
+    const stored = JSON.parse(await fs.readFile(path.join(tmpDir, 'adapters.json'), 'utf-8'))
+    expect(stored.telegram.botToken).toBe('exclusive-secret-token')
+    expect(stored.telegram.public.botToken).toBe('public-secret-token')
+    expect(stored.telegram.allowedUsers).toEqual([111])
+    expect(stored.telegram.public.enabled).toBe(true)
+    expect(stored.pairing.code).toBe('OLD123')
+  })
+
+  it('rejects PATCH ownerUserId and a public token that matches the exclusive token', async () => {
+    const owner = makeRequest('PUT', '/api/adapters', {
+      telegram: { public: { ownerUserId: 9 } },
+    })
+    const ownerRes = await handleAdaptersApi(owner.req, owner.url, owner.segments)
+    expect(ownerRes.status).toBe(400)
+    expect(((await ownerRes.json()) as any).message).toMatch(/ownerUserId/)
+
+    const generation = makeRequest('PUT', '/api/adapters', {
+      telegram: { public: { generation: 9 } },
+    })
+    const generationRes = await handleAdaptersApi(generation.req, generation.url, generation.segments)
+    expect(generationRes.status).toBe(400)
+    expect(((await generationRes.json()) as any).message).toMatch(/generation/)
+
+    const same = makeRequest('PUT', '/api/adapters', {
+      telegram: { botToken: 'same-token', public: { botToken: 'same-token' } },
+    })
+    const sameRes = await handleAdaptersApi(same.req, same.url, same.segments)
+    expect(sameRes.status).toBe(400)
+    expect(((await sameRes.json()) as any).message).toMatch(/must differ/)
+  })
+
+  it('generates, claims, and resets public pairing without touching the legacy pairing field', async () => {
+    await writeRawConfig({
+      pairing: { code: 'OLD123', expiresAt: Date.now() + 60_000, createdAt: 1 },
+      telegram: { botToken: 'exclusive-token', public: { botToken: 'public-token' } },
+    })
+
+    const generate = makeRequest('POST', '/api/adapters/telegram/public/pairing')
+    const generated = await (await handleAdaptersApi(generate.req, generate.url, generate.segments)).json() as any
+    expect(generated.code).toMatch(/^[A-Z2-9]{6}$/)
+    expect(generated.expiresAt).toBeGreaterThan(Date.now())
+
+    const storedAfterGenerate = JSON.parse(await fs.readFile(path.join(tmpDir, 'adapters.json'), 'utf-8'))
+    expect(storedAfterGenerate.pairing.code).toBe('OLD123')
+    expect(storedAfterGenerate.telegram.public.pairing.code).toBe(generated.code)
+
+    const first = makeRequest('POST', '/api/adapters/telegram/public/pairing/claim', {
+      code: generated.code,
+      userId: 1001,
+    })
+    const second = makeRequest('POST', '/api/adapters/telegram/public/pairing/claim', {
+      code: generated.code,
+      userId: 1002,
+    })
+    const raced = await Promise.all([
+      handleAdaptersApi(first.req, first.url, first.segments),
+      handleAdaptersApi(second.req, second.url, second.segments),
+    ])
+    const statuses = raced.map((response) => response.status).sort()
+    expect(statuses).toEqual([200, 409])
+    const winner = await raced[raced.findIndex((response) => response.status === 200)]!.json() as any
+    expect(winner.ownerUserId === 1001 || winner.ownerUserId === 1002).toBe(true)
+
+    const repeat = makeRequest('POST', '/api/adapters/telegram/public/pairing/claim', {
+      code: generated.code,
+      userId: 1003,
+    })
+    expect((await handleAdaptersApi(repeat.req, repeat.url, repeat.segments)).status).toBe(409)
+    const storedAfterClaim = JSON.parse(await fs.readFile(path.join(tmpDir, 'adapters.json'), 'utf-8'))
+    expect(storedAfterClaim.telegram.public.ownerUserId).toBe(winner.ownerUserId)
+    expect(storedAfterClaim.pairing.code).toBe('OLD123')
+
+    const reset = makeRequest('DELETE', '/api/adapters/telegram/public/pairing')
+    expect((await handleAdaptersApi(reset.req, reset.url, reset.segments)).status).toBe(200)
+    const storedAfterReset = JSON.parse(await fs.readFile(path.join(tmpDir, 'adapters.json'), 'utf-8'))
+    expect(storedAfterReset.telegram.public.ownerUserId).toBeUndefined()
+    expect(storedAfterReset.telegram.public.pairing.code).toBeNull()
+    expect(storedAfterReset.telegram.public.generation).toBeGreaterThan(storedAfterClaim.telegram.public.generation)
+    expect(storedAfterReset.pairing.code).toBe('OLD123')
+  })
+
+  it('rejects expired public pairing codes and non-positive userIds', async () => {
+    await writeRawConfig({
+      telegram: {
+        public: {
+          botToken: 'public-token',
+          pairing: { code: 'EXPIRE', expiresAt: Date.now() - 5, createdAt: 1 },
+        },
+      },
+    })
+    const expired = makeRequest('POST', '/api/adapters/telegram/public/pairing/claim', {
+      code: 'EXPIRE',
+      userId: 9,
+    })
+    expect((await handleAdaptersApi(expired.req, expired.url, expired.segments)).status).toBe(400)
+
+    const group = makeRequest('POST', '/api/adapters/telegram/public/pairing/claim', {
+      code: 'EXPIRE',
+      userId: -100,
+    })
+    expect((await handleAdaptersApi(group.req, group.url, group.segments)).status).toBe(400)
+  })
+})

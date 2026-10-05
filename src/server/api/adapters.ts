@@ -1,8 +1,11 @@
 /**
  * Adapters API — IM Adapter 配置读写
  *
- * GET  /api/adapters  → 返回配置（敏感字段脱敏）
- * PUT  /api/adapters  → 更新配置（浅合并），返回更新后的脱敏配置
+ * GET    /api/adapters  → 返回配置（敏感字段脱敏）
+ * PUT    /api/adapters  → 更新配置（浅合并），返回更新后的脱敏配置
+ * POST   /api/adapters/telegram/public/pairing → 生成公共入口配对码
+ * POST   /api/adapters/telegram/public/pairing/claim → 占用唯一操作者
+ * DELETE /api/adapters/telegram/public/pairing → 重置操作者并作废配对码
  */
 
 import { adapterService, type AdapterFileConfig, type PairedUser } from '../services/adapterService.js'
@@ -206,6 +209,28 @@ function readOptionalStringListField(
   if (key in source) target[key] = readStringList(source[key], label)
 }
 
+function parseTelegramPublicPatch(value: unknown): NonNullable<NonNullable<AdapterFileConfig['telegram']>['public']> {
+  const source = requireRecord(value, 'telegram.public')
+  if ('ownerUserId' in source) {
+    throw ApiError.badRequest('telegram.public.ownerUserId can only be set via public pairing')
+  }
+  if ('pairing' in source) {
+    throw ApiError.badRequest('telegram.public.pairing can only be changed via public pairing endpoints')
+  }
+  if ('generation' in source) {
+    throw ApiError.badRequest('telegram.public.generation is managed by the server')
+  }
+  assertKnownKeys(source, ['enabled', 'botToken', 'allowedProjectRoots'], 'telegram.public')
+  const publicPatch: NonNullable<NonNullable<AdapterFileConfig['telegram']>['public']> = {}
+  if ('enabled' in source) {
+    if (typeof source.enabled !== 'boolean') throw ApiError.badRequest('telegram.public.enabled must be a boolean')
+    publicPatch.enabled = source.enabled
+  }
+  readOptionalStringField(source, publicPatch, 'botToken', 'telegram.public.botToken')
+  readOptionalStringListField(source, publicPatch, 'allowedProjectRoots', 'telegram.public.allowedProjectRoots')
+  return publicPatch
+}
+
 function parseAdapterConfigPatch(value: unknown): Partial<AdapterFileConfig> {
   const body = requireRecord(value, 'request body')
   for (const key of Object.keys(body)) {
@@ -244,13 +269,14 @@ function parseAdapterConfigPatch(value: unknown): Partial<AdapterFileConfig> {
 
   if ('telegram' in body) {
     const source = requireRecord(body.telegram, 'telegram')
-    assertKnownKeys(source, ['botToken', 'allowedUsers', 'pairedUsers', 'defaultWorkDir', 'allowedProjectRoots'], 'telegram')
+    assertKnownKeys(source, ['botToken', 'allowedUsers', 'pairedUsers', 'defaultWorkDir', 'allowedProjectRoots', 'public'], 'telegram')
     const telegram: NonNullable<AdapterFileConfig['telegram']> = {}
     readOptionalStringField(source, telegram, 'botToken', 'telegram.botToken')
     if ('allowedUsers' in source) telegram.allowedUsers = readTelegramUsers(source.allowedUsers)
     if ('pairedUsers' in source) telegram.pairedUsers = readPairedUsers(source.pairedUsers, 'telegram.pairedUsers')
     readOptionalStringField(source, telegram, 'defaultWorkDir', 'telegram.defaultWorkDir', MAX_PATH_LENGTH)
     readOptionalStringListField(source, telegram, 'allowedProjectRoots', 'telegram.allowedProjectRoots')
+    if ('public' in source) telegram.public = parseTelegramPublicPatch(source.public)
     patch.telegram = telegram
   }
 
@@ -501,6 +527,36 @@ async function pollDingtalkRegistration(deviceCode: string): Promise<Response> {
   })
 }
 
+async function handleTelegramPublicPairingApi(req: Request, tail: string[]): Promise<Response> {
+  if (tail[0] !== 'public' || tail[1] !== 'pairing') {
+    throw new ApiError(404, 'Unknown Telegram adapter endpoint', 'NOT_FOUND')
+  }
+
+  if (req.method === 'POST' && tail[2] === 'claim' && tail.length === 3) {
+    const body = await req.json().catch(() => {
+      throw ApiError.badRequest('Request body must be valid JSON')
+    })
+    const record = requireRecord(body, 'request body')
+    assertKnownKeys(record, ['code', 'userId'], 'request body')
+    const code = readString(record.code, 'code', 64)
+    if (!Number.isSafeInteger(record.userId) || Number(record.userId) <= 0) {
+      throw ApiError.badRequest('userId must be a positive integer')
+    }
+    return Response.json(await adapterService.claimTelegramPublicPairing(code, Number(record.userId)))
+  }
+
+  if (req.method === 'POST' && tail.length === 2) {
+    return Response.json(await adapterService.generateTelegramPublicPairing())
+  }
+
+  if (req.method === 'DELETE' && tail.length === 2) {
+    await adapterService.resetTelegramPublicPairing()
+    return Response.json(await adapterService.getConfig())
+  }
+
+  throw new ApiError(405, `Method ${req.method} not allowed`, 'METHOD_NOT_ALLOWED')
+}
+
 export async function handleAdaptersApi(
   req: Request,
   _url: URL,
@@ -508,6 +564,9 @@ export async function handleAdaptersApi(
 ): Promise<Response> {
   try {
     const tail = _segments.slice(2)
+    if (tail[0] === 'telegram') {
+      return await handleTelegramPublicPairingApi(req, tail.slice(1))
+    }
     if (tail[0] === 'wechat') {
       return await handleWechatAdaptersApi(req, tail.slice(1))
     }

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { getEmptyToolPermissionContext, type ToolUseContext } from '../../Tool.js'
+import { getSessionId, switchSession } from '../../bootstrap/state.js'
+import type { SessionId } from '../../types/ids.js'
 import {
   DESKTOP_SERVER_URL_ENV,
   LOCAL_ACCESS_TOKEN_ENV,
@@ -177,7 +179,13 @@ describe('LocalMessageSend protocol', () => {
     expect(requests[0]!.method).toBe('POST')
     expect(requests[0]!.authorization).toBe(`Bearer ${FIXTURE_TOKEN}`)
     expect(requests[0]!.contentType).toBe('application/json')
-    expect(requests[0]!.body).toEqual({ channel: 'telegram', recipient: 111, text: 'hello there' })
+    expect(requests[0]!.body).toEqual({
+      channel: 'telegram',
+      recipient: 111,
+      text: 'hello there',
+      entrypoint: 'dedicated',
+      sourceSessionId: getSessionId(),
+    })
 
     expect(result.data.message).toContain('Alice')
     expect(result.data.channel).toBe('telegram')
@@ -279,6 +287,7 @@ describe('LocalMessageSend input validation', () => {
       { channel: 'telegram', recipient: 'x'.repeat(200), text: 'hi' }, // oversized recipient
       { channel: 'telegram', recipient: 111, text: 'hi', url: 'http://evil.test' }, // unknown field
       { channel: 'telegram', recipient: 111, text: 'hi', token: 'leak' }, // credential-looking field
+      { channel: 'telegram', recipient: 111, text: 'hi', sourceSessionId: 'forged-session' }, // model cannot supply source
     ]
     for (const input of cases) {
       requests = []
@@ -353,5 +362,138 @@ describe('LocalMessageSend model-facing description', () => {
     )
     expect(JSON.stringify(block)).not.toContain(FIXTURE_TOKEN)
     expect(String(block.content)).not.toContain(FIXTURE_TOKEN)
+  })
+})
+
+describe('LocalMessageSend telegram entrypoint', () => {
+  test('defaults telegram sends to dedicated and stamps the runtime session, not a model field', async () => {
+    const original = getSessionId()
+    switchSession('runtime-session-a' as SessionId)
+    try {
+      await callTool({ channel: 'telegram', recipient: 111, text: 'hello' })
+      const body = requests[0]!.body as Record<string, unknown>
+      expect(body.entrypoint).toBe('dedicated')
+      expect(body.sourceSessionId).toBe('runtime-session-a')
+      expect(body).not.toHaveProperty('source')
+    } finally {
+      switchSession(original)
+    }
+  })
+
+  test('public telegram send uses the runtime session even if the user named a recipient', async () => {
+    const original = getSessionId()
+    switchSession('runtime-session-b' as SessionId)
+    responder = () => jsonResponse({
+      ok: true,
+      queued: true,
+      delivery: {
+        channel: 'telegram',
+        recipientId: 'runtime-session-b',
+        recipientLabel: 'public',
+        outcome: 'pending',
+        attempts: 0,
+      },
+      issues: [],
+      recordPath: '/tmp/telegram-public.json',
+    })
+    try {
+      const result = await callTool({
+        channel: 'telegram',
+        entrypoint: 'public',
+        text: 'report done',
+      })
+      expect(requests[0]!.body).toEqual({
+        channel: 'telegram',
+        text: 'report done',
+        entrypoint: 'public',
+        sourceSessionId: 'runtime-session-b',
+      })
+      expect(result.data).toMatchObject({
+        message: '已加入待发队列，尚未确认送达',
+        outcome: 'pending',
+        queued: true,
+        recipientId: 'runtime-session-b',
+      })
+      expect(String(result.data.message).toLowerCase()).not.toMatch(/delivered|sent/)
+    } finally {
+      switchSession(original)
+    }
+  })
+
+  test('public queued without a delivery object is still a non-delivered success', async () => {
+    const original = getSessionId()
+    switchSession('runtime-session-c' as SessionId)
+    responder = () => jsonResponse({
+      ok: true,
+      queued: true,
+      issues: [],
+      recordPath: '/tmp/telegram-public.json',
+    })
+    try {
+      const result = await callTool({
+        channel: 'telegram',
+        entrypoint: 'public',
+        text: 'queued only',
+      })
+      expect(result.data.outcome).toBe('pending')
+      expect(result.data.queued).toBe(true)
+      expect(String(result.data.message)).toContain('待发队列')
+    } finally {
+      switchSession(original)
+    }
+  })
+
+  test('public delivered receipts are not treated as sent', async () => {
+    const original = getSessionId()
+    switchSession('runtime-session-d' as SessionId)
+    responder = () => jsonResponse(deliveredFixture({
+      delivery: {
+        channel: 'telegram',
+        recipientId: 'runtime-session-d',
+        recipientLabel: 'public',
+        outcome: 'delivered',
+        attempts: 1,
+      },
+    }))
+    try {
+      const message = await callToolError({
+        channel: 'telegram',
+        entrypoint: 'public',
+        text: 'must not look delivered',
+      })
+      expect(message.length).toBeGreaterThan(0)
+      expect(message.toLowerCase()).not.toContain('delivered a telegram')
+    } finally {
+      switchSession(original)
+    }
+  })
+
+  test('dedicated send still requires a delivered receipt even if queued is present', async () => {
+    responder = () => jsonResponse({
+      ok: true,
+      queued: true,
+      delivery: {
+        channel: 'telegram',
+        recipientId: '111',
+        recipientLabel: 'Alice',
+        outcome: 'pending',
+        attempts: 0,
+      },
+      issues: [],
+      recordPath: '/tmp/notification-deliveries.json',
+    })
+    const message = await callToolError({ channel: 'telegram', recipient: 111, text: 'hi' })
+    expect(message.length).toBeGreaterThan(0)
+  })
+
+  test('rejects public entrypoint on feishu before any request', async () => {
+    const message = await callToolError({
+      channel: 'feishu',
+      recipient: 'ou_1',
+      text: 'hi',
+      entrypoint: 'public',
+    })
+    expect(message.toLowerCase()).toContain('telegram')
+    expect(requests).toHaveLength(0)
   })
 })
