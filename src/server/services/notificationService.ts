@@ -809,18 +809,41 @@ type TelegramSendExecution = TelegramChannelMessageResult & {
   errorCode?: NotificationDeliveryFailureCode
 }
 
+/**
+ * Telegram answers `editMessageText` with HTTP 400 / `ok:false` and a
+ * "message is not modified" description when the new text equals the current
+ * text. The requested state already holds, so it must not be classified as a
+ * failed edit.
+ */
+function isNotModifiedResponse(
+  response: Response,
+  payload: Record<string, unknown> | null,
+): boolean {
+  if (response.status !== 400 && payload?.error_code !== 400) return false
+  const description = typeof payload?.description === 'string' ? payload.description : ''
+  return /message is not modified/i.test(description)
+}
+
 async function executeTelegramSendMessage(
   botToken: string,
   chatId: string | number,
   text: string,
   deps: ResolvedDeps,
-  replyMarkup?: TelegramInlineKeyboardMarkup,
+  options?: {
+    replyMarkup?: TelegramInlineKeyboardMarkup
+    method?: 'sendMessage' | 'editMessageText'
+    messageId?: number
+  },
 ): Promise<TelegramSendExecution> {
+  const method = options?.method ?? 'sendMessage'
   const body: Record<string, unknown> = { chat_id: chatId, text }
-  if (replyMarkup) body.reply_markup = replyMarkup
+  if (method === 'editMessageText' && options?.messageId !== undefined) {
+    body.message_id = options.messageId
+  }
+  if (options?.replyMarkup) body.reply_markup = options.replyMarkup
 
   const result = await fetchWithBoundedRetry(
-    `${TELEGRAM_API}/bot${botToken}/sendMessage`,
+    `${TELEGRAM_API}/bot${botToken}/${method}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -835,7 +858,7 @@ async function executeTelegramSendMessage(
       outcome: 'indeterminate',
       attempts: result.attempts,
       errorCode: 'timeout',
-      error: deps.redact(`sendMessage timed out after ${deps.timeoutMs}ms: ${result.error}`),
+      error: deps.redact(`${method} timed out after ${deps.timeoutMs}ms: ${result.error}`),
     }
   }
   if (result.kind === 'network') {
@@ -852,13 +875,20 @@ async function executeTelegramSendMessage(
   const retryAfterMs = telegramRetryAfterMs(payload)
   const retryFields = retryAfterMs !== undefined ? { retryAfterMs } : {}
 
+  // Telegram reports "message is not modified" as HTTP 400 / ok:false when an
+  // edit resends identical text. The requested state already holds, so this is
+  // a delivered edit of the message being edited, never a failure.
+  if (method === 'editMessageText' && options?.messageId !== undefined && isNotModifiedResponse(response, payload)) {
+    return { outcome: 'delivered', attempts, messageId: options.messageId }
+  }
+
   if (response.status === 429 || payload?.error_code === 429) {
     return {
       outcome: 'failed',
       attempts,
       errorCode: 'http_error',
       error: deps.redact(
-        `sendMessage returned HTTP ${response.status}: ${String(payload?.description ?? 'Too Many Requests')}`,
+        `${method} returned HTTP ${response.status}: ${String(payload?.description ?? 'Too Many Requests')}`,
       ),
       ...retryFields,
     }
@@ -870,7 +900,7 @@ async function executeTelegramSendMessage(
       attempts,
       errorCode: 'http_error',
       error: deps.redact(
-        `sendMessage returned HTTP ${response.status}: ${String(payload?.description ?? payload?.ok ?? response.status)}`,
+        `${method} returned HTTP ${response.status}: ${String(payload?.description ?? payload?.ok ?? response.status)}`,
       ),
     }
   }
@@ -939,13 +969,63 @@ export async function sendTelegramChannelMessage(
     chatId,
     text,
     deps,
-    options?.replyMarkup,
+    options?.replyMarkup ? { replyMarkup: options.replyMarkup } : undefined,
   )
   return {
     outcome: sent.outcome,
     ...(sent.messageId !== undefined ? { messageId: sent.messageId } : {}),
     ...(sent.error !== undefined ? { error: sent.error } : {}),
     ...(sent.retryAfterMs !== undefined ? { retryAfterMs: sent.retryAfterMs } : {}),
+  }
+}
+
+/**
+ * One `editMessageText` attempt for a Telegram chat message. Shares
+ * `executeTelegramSendMessage` so timeout / 429 / redaction / positive-receipt
+ * semantics stay identical to a send. Plain text only (no `parse_mode`), and
+ * anything over 4000 characters is refused rather than truncated. Telegram's
+ * "message is not modified" 400 is treated as `delivered` for the edited
+ * `message_id`, because the requested state already holds.
+ */
+export async function editTelegramChannelMessage(
+  botToken: string,
+  chatId: string,
+  messageId: number,
+  text: string,
+  options?: {
+    fetch?: typeof fetch
+    replyMarkup?: TelegramInlineKeyboardMarkup
+  },
+): Promise<TelegramChannelMessageResult> {
+  const deps = resolveDeps({
+    fetchImpl: options?.fetch,
+    maxAttempts: 1,
+  })
+  deps.registerSecret(botToken)
+
+  if (!validTelegramMessageId(messageId)) {
+    return { outcome: 'failed', error: 'Telegram message_id 无效，未编辑' }
+  }
+  if (typeof text !== 'string' || text.length === 0) {
+    return { outcome: 'failed', error: '消息内容为空，未编辑' }
+  }
+  if (text.length > TELEGRAM_TEXT_LIMIT) {
+    return {
+      outcome: 'failed',
+      error: `Telegram 消息超过 ${TELEGRAM_TEXT_LIMIT} 字符，拒绝截断发送`,
+    }
+  }
+
+  const edited = await executeTelegramSendMessage(botToken, chatId, text, deps, {
+    method: 'editMessageText',
+    messageId,
+    ...(options?.replyMarkup ? { replyMarkup: options.replyMarkup } : {}),
+  })
+  return {
+    outcome: edited.outcome,
+    ...(edited.messageId !== undefined ? { messageId: edited.messageId } : {}),
+    ...(edited.error !== undefined ? { error: edited.error } : {}),
+    ...(edited.retryAfterMs !== undefined ? { retryAfterMs: edited.retryAfterMs } : {}),
   }
 }
 

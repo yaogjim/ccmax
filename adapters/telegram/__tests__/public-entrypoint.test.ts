@@ -179,6 +179,8 @@ describe('Telegram public forwarder', () => {
   let updateStatus = 200
   let updateBody: Record<string, unknown> | ((count: number) => Record<string, unknown> | Response) = { ok: true }
   let updateDelayMs = 0
+  let updateGate: Promise<void> | null = null
+  let releaseUpdateGate: (() => void) | null = null
   let concurrentUpdates = 0
   let maxConcurrentUpdates = 0
   let order: string[] = []
@@ -261,6 +263,7 @@ describe('Telegram public forwarder', () => {
           maxConcurrentUpdates = Math.max(maxConcurrentUpdates, concurrentUpdates)
           try {
             if (updateDelayMs > 0) await Bun.sleep(updateDelayMs)
+            if (updateGate) await updateGate
             if (typeof updateBody === 'function') {
               const next = updateBody(updateCount)
               if (next instanceof Response) return next
@@ -287,6 +290,8 @@ describe('Telegram public forwarder', () => {
     updateStatus = 200
     updateBody = { ok: true }
     updateDelayMs = 0
+    updateGate = null
+    releaseUpdateGate = null
     concurrentUpdates = 0
     maxConcurrentUpdates = 0
     updateCount = 0
@@ -564,16 +569,56 @@ describe('Telegram public forwarder', () => {
     await stopPublicTelegramAdapter()
   })
 
-  it('answers callback queries after forwarding and keeps the result if answer fails', async () => {
+  it('answers a callback before the serial forward settles so a slow server cannot hold the spinner', async () => {
     const callbacks: Array<Record<string, unknown>> = []
+    setPublicTelegramBotHook((bot) => interceptPublicBot(bot, { callbacks }))
+    expect(await startPublicTelegramAdapter()).toBe(true)
+    updateGate = new Promise<void>((resolve) => { releaseUpdateGate = resolve })
+    const handling = getPublicTelegramBot()!.handleUpdate(
+      callbackUpdate(7, { updateId: 61, queryId: 'cb-slow' }) as any,
+    )
+    // The HTTP forward is still blocked on the gate, yet the ACK already ran.
+    await eventually(() => expect(callbacks).toHaveLength(1))
+    expect(posts.filter((post) => post.path === '/api/telegram/public/update')).toHaveLength(1)
+    releaseUpdateGate!()
+    await handling
+    expect(posts.filter((post) => post.path === '/api/telegram/public/update')).toHaveLength(1)
+    // Exactly one answer: the early ACK, never a second one after forwarding.
+    expect(callbacks).toHaveLength(1)
+    await stopPublicTelegramAdapter()
+  })
+
+  it('reports a failed callback forward with a reply instead of a second answer', async () => {
+    const callbacks: Array<Record<string, unknown>> = []
+    const sent: string[] = []
+    updateBody = { ok: false, error: '公共入口未启用' }
+    setPublicTelegramBotHook((bot) => interceptPublicBot(bot, { callbacks, sent }))
+    expect(await startPublicTelegramAdapter()).toBe(true)
+    await getPublicTelegramBot()!.handleUpdate(callbackUpdate(7, { updateId: 62, queryId: 'cb-fail' }) as any)
+    expect(callbacks).toHaveLength(1)
+    expect(sent.some((text) => text.includes('公共入口未启用'))).toBe(true)
+    await stopPublicTelegramAdapter()
+  })
+
+  it('keeps forwarding when the early callback answer fails', async () => {
+    const callbacks: Array<Record<string, unknown>> = []
+    const errors: string[] = []
+    const errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(' '))
+    })
     setPublicTelegramBotHook((bot) => interceptPublicBot(bot, {
       callbacks,
       answerError: new Error('answer failed'),
     }))
-    expect(await startPublicTelegramAdapter()).toBe(true)
-    await getPublicTelegramBot()!.handleUpdate(callbackUpdate(7, { updateId: 51, queryId: 'cb-1' }) as any)
-    expect(posts.filter((post) => post.path === '/api/telegram/public/update')).toHaveLength(1)
-    expect(callbacks).toHaveLength(1)
+    try {
+      expect(await startPublicTelegramAdapter()).toBe(true)
+      await getPublicTelegramBot()!.handleUpdate(callbackUpdate(7, { updateId: 51, queryId: 'cb-1' }) as any)
+      expect(posts.filter((post) => post.path === '/api/telegram/public/update')).toHaveLength(1)
+      expect(callbacks).toHaveLength(1)
+      expect(errors.some((line) => line.includes('callback ack failed'))).toBe(true)
+    } finally {
+      errorSpy.mockRestore()
+    }
     await stopPublicTelegramAdapter()
   })
 

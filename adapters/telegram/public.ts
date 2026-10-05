@@ -78,7 +78,14 @@ export async function startPublicTelegramAdapter(options?: {
     console.error('[Telegram public]', sanitizeTelegramError(err))
   })
   bot.on('message', (ctx) => enqueuePublicUpdate(ctx))
-  bot.on('callback_query', (ctx) => enqueuePublicUpdate(ctx))
+  bot.on('callback_query', (ctx) => {
+    // Answer before the serial forward queue: the queue can wait on another
+    // update, and a slow server would otherwise leave the client spinner
+    // running until the HTTP call settles. Best-effort and non-blocking, so a
+    // failed ACK never delays or aborts forwarding.
+    void acknowledgeCallbackQueryImmediately(ctx)
+    return enqueuePublicUpdate(ctx)
+  })
 
   const publicPrefix = telegramBotIdFromToken(token)
   if (lastDedicatedBotId != null && publicPrefix != null && publicPrefix === lastDedicatedBotId) {
@@ -217,7 +224,7 @@ async function handlePublicUpdate(ctx: Context): Promise<void> {
     notice = FORWARD_FAILURE_NOTICE
     console.error('[Telegram public] update forward failed:', sanitizeTelegramError(err))
   }
-  await acknowledgePublicUpdate(ctx, notice)
+  await notifyPublicUpdateResult(ctx, notice)
 }
 
 async function forwardPublicUpdate(ctx: Context): Promise<string | undefined> {
@@ -269,19 +276,30 @@ function isUpdateAccepted(result: PublicPostResult): boolean {
   return result.json.ok === true
 }
 
-async function acknowledgePublicUpdate(ctx: Context, notice: string | undefined): Promise<void> {
+/**
+ * Best-effort ACK for a callback query, run as soon as the update arrives and
+ * before it enters the serial forward queue. Each callback is attempted exactly
+ * once; a failure is logged and must not affect the forward that follows.
+ */
+async function acknowledgeCallbackQueryImmediately(ctx: Context): Promise<void> {
+  if (!ctx.callbackQuery) return
   try {
-    if (ctx.callbackQuery) {
-      if (notice) {
-        await ctx.answerCallbackQuery({ text: notice.slice(0, 200), show_alert: true })
-      } else {
-        await ctx.answerCallbackQuery()
-      }
-      return
-    }
-    if (notice && ctx.chat) {
-      await ctx.reply(notice)
-    }
+    await ctx.answerCallbackQuery()
+  } catch (err) {
+    console.error('[Telegram public] callback ack failed:', sanitizeTelegramError(err))
+  }
+}
+
+/**
+ * Deliver a forward outcome to the user. Callback queries are already answered
+ * before the queue (see the `callback_query` handler), so this never answers a
+ * second time: a failed forward is reported with a normal reply instead, which
+ * keeps the forward result visible without a duplicate ACK.
+ */
+async function notifyPublicUpdateResult(ctx: Context, notice: string | undefined): Promise<void> {
+  if (!notice || !ctx.chat) return
+  try {
+    await ctx.reply(notice)
   } catch (err) {
     console.error('[Telegram public] user notice failed:', sanitizeTelegramError(err))
   }

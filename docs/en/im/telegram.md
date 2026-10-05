@@ -68,7 +68,7 @@ When the model asks through `AskUserQuestion`, Telegram sends a card with option
 
 `/answer` can omit the request id: `/answer Axios` is enough when only one question is waiting. For several questions, send JSON keyed either by the full question text or by 1-based numbers, for example `/answer {"1":"React","2":"SQLite"}`. The older `/answer <id> {...}` form still works. Drafts stay in memory for this process only and are not written to the session file. `/stop` invalidates the current question without sending a deny; `/deny` is what returns a rejection to the same Desktop session. `/allow` and `/always` cannot answer a question. Failed sends can be retried from the latest card; submitted, Desktop-resolved, or expired requests cannot be answered again.
 
-Exclusive-Bot replies pass through a streaming buffer: a placeholder can be sent while Claude is thinking, text deltas accumulate in place, and completed text is split into platform-sized messages. The public entry does not edit messages in place.
+Exclusive-Bot replies pass through a streaming buffer: a placeholder can be sent while Claude is thinking, text deltas accumulate in place, and completed text is split into platform-sized messages. Public reports remain new messages; subscription-management lists update their own buttons and text.
 
 ## Sending voice, images, and files
 
@@ -146,8 +146,12 @@ Saving the exclusive token does not change public settings; saving public settin
 
 The public entry has no implicit current session. Join, leave, and targeting are always explicit:
 
-- Send `/sessions` in the public Bot. The list includes the full `sessionId`.
-- `/subscribe <full sessionId or short id>` joins, `/unsubscribe <full sessionId or short id>` leaves, and `/subscriptions` lists subscriptions and recent deliveries.
+- Send `/sessions` in the public Bot to open a clickable list showing each title, project and unselected / selected / subscribed state, without copying a full `sessionId`. Use `/sessions keyword` to search.
+- Select multiple unsubscribed sessions; clicking a selected item again only removes that selection. Only **Subscribe selected (N)** creates subscriptions. Selection alone receives no reports, and clicking a subscribed item never unsubscribes it.
+- Each page contains 20 items, with selections retained across previous / next pages. **Clear selection** leaves real subscriptions unchanged. A new `/sessions` command, including a new search, starts a fresh selection round and invalidates the old list. Reopen lists after service or Bot runtime identity restarts, or after their 14-day expiry.
+- Batch confirmation reports success, already subscribed or failure for each item, with short ids for successful items. Failed items stay selected for retry; successes are not rolled back. Only subsequent events are reported; historical reports are not replayed.
+- `/subscriptions` shows paginated real subscriptions, short ids and recent deliveries. Each **Unsubscribe** opens a confirmation. **Back** changes nothing; only **Confirm unsubscribe** stops future reports for that session. Queued reports, associated replies and buttons become invalid under the existing rules, without affecting other subscriptions.
+- Text commands remain available: `/subscribe <full sessionId or short id>` joins, and `/unsubscribe <full sessionId or short id>` leaves immediately. Lists read real state on their next action after text-command changes. Subscription management never injects a session message, starts an Agent turn or changes the `/to` target.
 - Desktop can also paste a full `sessionId` to subscribe. **Subscribe** stays disabled until an operator is bound.
 - Reports look like `[ccmax · project · session title · S7K2] completed: ...`. Titles may change; the short id stays stable.
 - Reply to that report, or send `/to S7K2 add another test`, and the text goes only to that session. Ordinary text with no reply and no target is not broadcast and does not guess the latest report.

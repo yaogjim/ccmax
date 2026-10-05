@@ -20,6 +20,7 @@ import {
   type SessionTurnEvent,
   type SessionTurnOrigin,
 } from './sessionTurnEvents.js'
+import { TelegramSubscriptionLists, type SubscriptionListActor } from './telegramSubscriptionLists.js'
 import { ApiError } from '../middleware/errorHandler.js'
 import {
   TelegramPublicEventLog,
@@ -122,12 +123,19 @@ export type TelegramPublicServiceDeps = {
   claimPairing: (code: string, userId: number) => Promise<{ ownerUserId: number; generation: number }>
   listSessions: (options?: { limit?: number; offset?: number }) => Promise<{ sessions: SessionListItem[]; total: number }>
   getSessionSummary: (sessionId: string) => Promise<TelegramPublicSessionSummary | null>
-  searchSessionMetadata: (query: string) => Promise<{ sessions: TelegramPublicSessionSummary[] }>
+  searchSessionMetadata: (query: string, options?: { limit?: number; offset?: number }) => Promise<{ sessions: TelegramPublicSessionSummary[]; total?: number }>
   observeSessionTurns: (listener: (event: SessionTurnEvent) => void) => () => void
   getSessionPermissionOrigin: (sessionId: string, requestId: string) => SessionTurnOrigin | undefined
   sendTelegramChannelMessage: (
     botToken: string,
     chatId: string,
+    text: string,
+    options?: { replyMarkup?: TelegramInlineMarkup },
+  ) => Promise<TelegramChannelSendResult>
+  editTelegramChannelMessage: (
+    botToken: string,
+    chatId: string,
+    messageId: number,
     text: string,
     options?: { replyMarkup?: TelegramInlineMarkup },
   ) => Promise<TelegramChannelSendResult>
@@ -447,6 +455,41 @@ export class TelegramPublicService {
   private defaultEventLog: TelegramPublicEventLog | undefined
   private dedicatedStore: { get(chatId: string): { sessionId: string } | null } | undefined
   private eventLogError: string | undefined
+  private readonly subscriptionRevisions = new Map<string, number>()
+  private readonly subscriptionLists = new TelegramSubscriptionLists({
+    now: () => this.now(),
+    valid: actor => this.runtimeStillMatches(actor.botId, actor.generation, actor.userId),
+    sessions: query => this.subscriptionListSessions(query),
+    subscriptions: async () => (await this.readState()).subscriptions,
+    subscribe: (id, actor) => this.subscribe(id, actor),
+    revision: id => this.subscriptionRevisions.get(id) ?? 0,
+    unsubscribe: (id, actor, revision) => this.unsubscribe(id, actor, revision),
+    deliveries: async () => {
+      const recent = (await this.getStatus()).deliveries.slice(0, 5)
+      return recent.length ? '\n最近投递：\n' + recent.map(item => `  ${item.id}: ${item.status}${item.error ? ` (${item.error.slice(0, 180)})` : ''}`).join('\n') : ''
+    },
+    present: async (actor, text, replyMarkup, messageId) => {
+      const snapshot = await this.snapshot()
+      if (!await this.runtimeStillMatches(actor.botId, actor.generation, actor.userId)) throw new Error('列表已失效，请重新打开。')
+      let result: TelegramChannelSendResult
+      if (messageId) {
+        const edit = this.deps.editTelegramChannelMessage
+          ?? (await import('./notificationService.js')).editTelegramChannelMessage
+        result = await edit(snapshot.botToken, actor.chatId, messageId, text, { replyMarkup })
+      } else {
+        result = await (await this.sender())(snapshot.botToken, actor.chatId, text, { replyMarkup })
+      }
+      if (result.outcome !== 'delivered' || !result.messageId) {
+        throw new Error(`列表更新失败；订阅状态请用 /subscriptions 核对。${result.error || result.outcome}`)
+      }
+      return result.messageId
+    },
+    notice: async (actor, text) => {
+      if (!await this.runtimeStillMatches(actor.botId, actor.generation, actor.userId)) throw new Error('列表已失效，请重新打开。')
+      const result = await (await this.sender())((await this.snapshot()).botToken, actor.chatId, text)
+      if (result.outcome !== 'delivered') throw new Error(`操作结果发送失败，请用 /subscriptions 核对。${result.error || result.outcome}`)
+    },
+  })
   private eligibility: EligibilityCache = {
     present: false,
     enabled: false,
@@ -501,6 +544,7 @@ export class TelegramPublicService {
     this.liveRuntime = null
     this.eligibility.live = false
     this.eligibility.botId = null
+    this.subscriptionLists.reset()
     this.runtimeEpoch += 1
     if (this.retryTimer !== undefined) {
       clearTimeout(this.retryTimer)
@@ -537,6 +581,7 @@ export class TelegramPublicService {
     if (existing.runtime && existing.runtime.generation === generation && existing.runtime.botId !== botId) {
       throw ApiError.badRequest('botId does not match registered runtime identity')
     }
+    this.subscriptionLists.reset()
     this.runtimeEpoch += 1
     const now = this.isoNow()
     await this.mutate(current => {
@@ -578,6 +623,7 @@ export class TelegramPublicService {
       throw ApiError.badRequest('runtime is not registered')
     }
     this.liveRuntime = null
+    this.subscriptionLists.reset()
     this.runtimeEpoch += 1
     this.eligibility.live = false
     this.eligibility.botId = null
@@ -675,7 +721,8 @@ export class TelegramPublicService {
     }
   }
 
-  async subscribe(sessionId: string): Promise<TelegramPublicSubscription> {
+  async subscribe(sessionId: string, actor?: SubscriptionListActor): Promise<TelegramPublicSubscription> {
+    const epoch = this.runtimeEpoch
     const id = sessionId.trim()
     if (!id) throw ApiError.badRequest('sessionId is required')
     const snapshot = await this.requireEnabled()
@@ -689,9 +736,21 @@ export class TelegramPublicService {
     if (!await this.sessionAllowed(summary, snapshot.allowedProjectRoots)) {
       throw ApiError.badRequest('Session is outside allowed project roots')
     }
+    if (actor && !await this.runtimeStillMatches(actor.botId, actor.generation, actor.userId)) {
+      throw ApiError.badRequest('列表已失效，请重新打开。')
+    }
+    const latest = await this.requireEnabled()
+    if (latest.ownerUserId !== snapshot.ownerUserId || latest.generation !== snapshot.generation
+      || latest.botToken !== snapshot.botToken
+      || !await this.sessionAllowed(summary, latest.allowedProjectRoots)) {
+      throw ApiError.badRequest('订阅权限已变化，请重新打开列表。')
+    }
     const subscribedAt = this.isoNow()
     let created: TelegramPublicSubscription | undefined
     await this.mutate(current => {
+      if (actor && (epoch !== this.runtimeEpoch || !this.liveRuntime
+        || this.liveRuntime.botId !== actor.botId || this.liveRuntime.generation !== actor.generation
+        || this.liveRuntime.ownerUserId !== actor.userId)) throw ApiError.badRequest('列表已失效，请重新打开。')
       const existing = current.subscriptions[resolved.sessionId]
       if (existing) {
         existing.title = summary.title
@@ -711,6 +770,7 @@ export class TelegramPublicService {
         project: subscriptionProject(summary),
       }
       current.subscriptions[resolved.sessionId] = created
+      this.subscriptionRevisions.set(resolved.sessionId, (this.subscriptionRevisions.get(resolved.sessionId) ?? 0) + 1)
     })
     if (!created) throw ApiError.internal('Failed to persist subscription')
     this.eligibility.subscriptions.add(created.sessionId)
@@ -759,16 +819,25 @@ export class TelegramPublicService {
     return { queued: true }
   }
 
-  async unsubscribe(sessionId: string): Promise<void> {
+  async unsubscribe(sessionId: string, actor?: SubscriptionListActor, expectedRevision?: number): Promise<void> {
+    const epoch = this.runtimeEpoch
     const id = sessionId.trim()
     if (!id) throw ApiError.badRequest('sessionId is required')
     await this.requireEnabled()
     const resolved = await this.resolveSessionRef(id)
     const target = 'sessionId' in resolved ? resolved.sessionId : id
+    if (actor && !await this.runtimeStillMatches(actor.botId, actor.generation, actor.userId)) throw ApiError.badRequest('列表已失效，请重新打开。')
     await this.mutate(current => {
+      if (actor && (epoch !== this.runtimeEpoch || !this.liveRuntime
+        || this.liveRuntime.botId !== actor.botId || this.liveRuntime.generation !== actor.generation
+        || this.liveRuntime.ownerUserId !== actor.userId)) throw ApiError.badRequest('列表已失效，请重新打开。')
+      if (expectedRevision !== undefined && expectedRevision !== (this.subscriptionRevisions.get(target) ?? 0)) {
+        throw ApiError.badRequest('订阅状态已变化，取消确认已失效。')
+      }
       const existing = current.subscriptions[target]
       if (!existing && !('sessionId' in resolved)) throw ApiError.notFound('Subscription not found')
       delete current.subscriptions[target]
+      this.subscriptionRevisions.set(target, (this.subscriptionRevisions.get(target) ?? 0) + 1)
       this.revokeSessionInteraction(current, target, '已取消订阅')
     })
     this.eligibility.subscriptions.delete(target)
@@ -1223,49 +1292,32 @@ export class TelegramPublicService {
     }
   }
 
-  private async commandSessions(snapshot: PublicSnapshot, chat: OwnerChat, query: string): Promise<void> {
+  private async subscriptionListSessions(query: string): Promise<TelegramPublicSessionSummary[]> {
+    const snapshot = await this.requireEnabled()
     const rows: TelegramPublicSessionSummary[] = []
-    if (query) {
-      const search = this.deps.searchSessionMetadata
-        ?? (async (needle: string) => {
-          const result = await sessionService.searchSessionMetadata(needle)
-          return { sessions: result.sessions.map(item => ({
-            id: item.id,
-            title: item.title,
-            projectPath: item.projectPath,
-            workDir: item.workDir,
-          })) }
-        })
-      const found = await search(query)
-      rows.push(...found.sessions)
-    } else {
-      const list = this.deps.listSessions
-        ?? ((options?: { limit?: number }) => sessionService.listSessions(options))
-      const found = await list({ limit: 20 })
-      rows.push(...found.sessions.map(item => ({
-        id: item.id,
-        title: item.title,
-        projectPath: item.projectPath,
-        projectRoot: item.projectRoot,
-        workDir: item.workDir,
-      })))
+    const seen = new Set<string>()
+    const search = this.deps.searchSessionMetadata
+      ?? ((needle: string, options?: { limit?: number; offset?: number }) => sessionService.searchSessionMetadata(needle, options))
+    const list = this.deps.listSessions ?? (options => sessionService.listSessions(options))
+    for (let offset = 0; ; ) {
+      const found = query ? await search(query, { limit: 100, offset }) : await list({ limit: 100, offset })
+      if (found.sessions.length === 0) break
+      let added = 0
+      for (const row of found.sessions) {
+        if (seen.has(row.id)) continue
+        seen.add(row.id)
+        added += 1
+        if (await this.sessionAllowed(row, snapshot.allowedProjectRoots)) rows.push(row)
+      }
+      offset += found.sessions.length
+      if (added === 0 || found.total === undefined || offset >= found.total) break
     }
-    const allowed: TelegramPublicSessionSummary[] = []
-    for (const row of rows) {
-      if (await this.sessionAllowed(row, snapshot.allowedProjectRoots)) allowed.push(row)
-    }
-    if (allowed.length === 0) {
-      await this.replyRaw(snapshot, String(chat.chatId), '没有可订阅的会话（受项目根目录限制）。')
-      return
-    }
-    const state = await this.readState()
-    const lines = allowed.slice(0, 20).map(row => {
-      const short = Object.entries(state.shortIds).find(([, sessionId]) => sessionId === row.id)?.[0]
-      const marker = state.subscriptions[row.id] ? '已订阅' : '未订阅'
-      const label = short ? `${short} · ${row.title}` : row.title
-      return `• ${marker} ${label}\n  ${row.id}`
-    })
-    await this.replyRaw(snapshot, String(chat.chatId), `最近会话：\n${lines.join('\n')}`)
+    return rows
+  }
+
+  private async commandSessions(snapshot: PublicSnapshot, chat: OwnerChat, query: string): Promise<void> {
+    const runtime = this.liveRuntime!
+    await this.subscriptionLists.open({ botId: runtime.botId, generation: runtime.generation, userId: snapshot.ownerUserId!, chatId: String(chat.chatId) }, 'sessions', query)
   }
 
   private async commandSubscribe(snapshot: PublicSnapshot, chat: OwnerChat, arg: string): Promise<void> {
@@ -1295,15 +1347,8 @@ export class TelegramPublicService {
   }
 
   private async commandSubscriptions(snapshot: PublicSnapshot, chat: OwnerChat): Promise<void> {
-    const status = await this.getStatus()
-    if (status.subscriptions.length === 0) {
-      await this.replyRaw(snapshot, String(chat.chatId), '当前没有公共订阅。')
-      return
-    }
-    const lines = status.subscriptions.map(entry => `• ${entry.shortId} · ${entry.title || entry.sessionId}\n  ${entry.sessionId}`)
-    const deliveries = status.deliveries.slice(0, 5).map(entry => `  ${entry.id}: ${entry.status}${entry.error ? ` (${entry.error})` : ''}`)
-    const deliveryBlock = deliveries.length > 0 ? `\n最近投递：\n${deliveries.join('\n')}` : ''
-    await this.replyRaw(snapshot, String(chat.chatId), `当前订阅：\n${lines.join('\n')}${deliveryBlock}`)
+    const runtime = this.liveRuntime!
+    await this.subscriptionLists.open({ botId: runtime.botId, generation: runtime.generation, userId: snapshot.ownerUserId!, chatId: String(chat.chatId) }, 'subscriptions')
   }
 
   private async commandTo(
@@ -1548,7 +1593,11 @@ export class TelegramPublicService {
     update: Record<string, unknown>,
   ): Promise<void> {
     const parsed = parseCallback(update, snapshot.ownerUserId)
-    if (!parsed.ok) return
+    if (!parsed.ok || snapshot.ownerUserId == null) return
+    if (parsed.data.startsWith('tgsub:')) {
+      await this.subscriptionLists.handle({ botId, generation, userId: parsed.userId, chatId: String(parsed.chatId) }, parsed.data, parsed.messageId)
+      return
+    }
     if (!parsed.data.startsWith('tgp:')) return
     const token = parsed.data.slice(4)
     let record: TelegramPublicCallbackToken | undefined

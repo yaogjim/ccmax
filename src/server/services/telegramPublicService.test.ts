@@ -7,6 +7,7 @@ import {
   TelegramPublicEventLog,
   telegramPublicEventLogFileName,
 } from './telegramPublicEventLog.js'
+import { SUBSCRIPTION_LIST_TTL_MS } from './telegramSubscriptionLists.js'
 import { TelegramPublicStore } from './telegramPublicStore.js'
 import {
   TelegramPublicService,
@@ -109,6 +110,8 @@ describe('telegram public channel', () => {
   let publicConfig: Record<string, unknown>
   let service: TelegramPublicService
   let sleeps: number[]
+  let nowMs: number
+  let editFailure: boolean
 
   beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-public-'))
@@ -133,6 +136,8 @@ describe('telegram public channel', () => {
     nextMessageId = 10
     nextUpdateId = 1
     sleeps = []
+    nowMs = Date.parse('2026-04-04T00:00:00.000Z')
+    editFailure = false
     sendImpl = async () => {
       const messageId = ++nextMessageId
       return { outcome: 'delivered', messageId }
@@ -191,7 +196,7 @@ describe('telegram public channel', () => {
 
     service = new TelegramPublicService({
       store: new TelegramPublicStore(path.join(configDir, 'ccmax', 'telegram-public.json')),
-      now: () => Date.parse('2026-04-04T00:00:00.000Z'),
+      now: () => nowMs,
       sleep: async ms => { sleeps.push(ms) },
       serverHost: '127.0.0.1',
       serverPort: 3456,
@@ -202,7 +207,7 @@ describe('telegram public channel', () => {
         publicConfig.generation = GEN
         return { ownerUserId: userId, generation: GEN }
       },
-      listSessions: async () => ({ sessions: [...sessions.values()].map(item => ({
+      listSessions: async options => ({ sessions: [...sessions.values()].slice(options?.offset ?? 0, (options?.offset ?? 0) + (options?.limit ?? sessions.size)).map(item => ({
         id: item.id,
         title: item.title,
         createdAt: '',
@@ -221,9 +226,10 @@ describe('telegram public channel', () => {
         }
         return sessions.get(id) ?? null
       },
-      searchSessionMetadata: async query => ({
-        sessions: [...sessions.values()].filter(item => item.title.includes(query) || item.id.includes(query)),
-      }),
+      searchSessionMetadata: async (query, options) => {
+        const matches = [...sessions.values()].filter(item => item.title.includes(query) || item.id.includes(query))
+        return { sessions: matches.slice(options?.offset ?? 0, (options?.offset ?? 0) + (options?.limit ?? matches.length)), total: matches.length }
+      },
       observeSessionTurns: listener => {
         observer = listener
         return () => { observer = undefined }
@@ -232,6 +238,11 @@ describe('telegram public channel', () => {
         const result = await sendImpl()
         sent.push({ chatId, text, replyMarkup: options?.replyMarkup, messageId: result.messageId ?? -1 })
         return result
+      },
+      editTelegramChannelMessage: async (_token, chatId, messageId, text, options) => {
+        if (editFailure) return { outcome: 'failed', error: 'fixture edit failure' }
+        sent.push({ chatId, text, messageId, replyMarkup: options?.replyMarkup })
+        return { outcome: 'delivered', messageId }
       },
       getDedicatedBinding: () => dedicated,
       handler,
@@ -288,6 +299,240 @@ describe('telegram public channel', () => {
     await service.flushForTests()
     return result
   }
+
+  function listButton(label: string) {
+    const message = [...sent].reverse().find(item => (item.replyMarkup as { inline_keyboard?: unknown })?.inline_keyboard)
+    const buttons = (message?.replyMarkup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> })?.inline_keyboard.flat() ?? []
+    const button = buttons.find(item => item.text.includes(label))
+    expect(button).toBeDefined()
+    expect(Buffer.byteLength(button!.callback_data)).toBeLessThanOrEqual(64)
+    return { data: button!.callback_data, messageId: message!.messageId }
+  }
+
+  async function clickList(label: string) {
+    const button = listButton(label)
+    return inbound(callbackUpdate(button.data, { message_id: button.messageId }))
+  }
+
+  test('订阅列表：多选与取消选择确认前不改真值，批量确认与重复回调幂等', async () => {
+    await inbound(privateMessage('/sessions'))
+    expect(sent.at(-1)?.text).not.toContain('sess-a')
+    await clickList('未选择 · 修复登录')
+    await clickList('未选择 · 支付退款')
+    expect((await service.getStatus()).subscriptions).toHaveLength(0)
+    await clickList('已选择 · 修复登录')
+    listButton('订阅所选（1）')
+    await clickList('未选择 · 修复登录')
+    const submit = listButton('订阅所选（2）')
+    await Promise.all([
+      inbound(callbackUpdate(submit.data, { message_id: submit.messageId })),
+      inbound(callbackUpdate(submit.data, { message_id: submit.messageId })),
+    ])
+    const status = await service.getStatus()
+    expect(status.subscriptions).toHaveLength(2)
+    expect(new Set(status.subscriptions.map(item => item.shortId)).size).toBe(2)
+    expect(sent.some(item => item.text.includes('成功 · 修复登录') && item.text.includes('不补发历史'))).toBe(true)
+    await clickList('已订阅 · 修复登录')
+    expect((await service.getStatus()).subscriptions).toHaveLength(2)
+    expect(submitted).toHaveLength(0)
+    expect(permissionResponses).toHaveLength(0)
+  })
+
+  test('订阅列表：同项目同名或长名称截断仍能区分，特殊格式字符原样展示', async () => {
+    sessions.clear()
+    const title = '<同名> _标题_ [测试] & ' + '很长的名称'.repeat(50)
+    sessions.set('same-a', summary('same-a', title, workRoot))
+    sessions.set('same-b', summary('same-b', title, workRoot))
+    await inbound(privateMessage('/sessions'))
+    const first = listButton('#1')
+    const second = listButton('#2')
+    expect(first.data).not.toBe(second.data)
+    await inbound(callbackUpdate(first.data, { message_id: first.messageId }))
+    await clickList('订阅所选（1）')
+    expect((await service.getStatus()).subscriptions.map(item => item.sessionId)).toEqual(['same-a'])
+    expect(sent.some(item => item.text.includes('<同名> _标题_ [测试] &'))).toBe(true)
+  })
+
+  test('订阅列表：无选择、清空和已订阅条目不取消真订阅', async () => {
+    await service.subscribe('sess-a')
+    await inbound(privateMessage('/sessions'))
+    await clickList('订阅所选（0）')
+    expect(sent.at(-1)?.text).toContain('尚未选择')
+    await clickList('未选择 · 支付退款')
+    await clickList('清空选择')
+    listButton('订阅所选（0）')
+    expect((await service.getStatus()).subscriptions.map(item => item.sessionId)).toEqual(['sess-a'])
+  })
+
+  test('订阅列表：超过查询页上限、跨页选择与搜索新轮次失效', async () => {
+    sessions.clear()
+    for (let index = 0; index < 125; index++) sessions.set(`page-${index}`, summary(`page-${index}`, `标题${index}`, workRoot))
+    await inbound(privateMessage('/sessions'))
+    expect(sent.at(-1)?.text).toContain('共 125 项')
+    await clickList('未选择 · 标题0 ·')
+    await clickList('下一页')
+    await clickList('未选择 · 标题20 ·')
+    await clickList('上一页')
+    listButton('已选择 · 标题0 ·')
+    const old = listButton('订阅所选（2）')
+    await clickList('订阅所选（2）')
+    expect((await service.getStatus()).subscriptions.map(item => item.sessionId)).toEqual(['page-0', 'page-20'])
+    await inbound(privateMessage('/sessions 标题124'))
+    listButton('未选择 · 标题124')
+    listButton('订阅所选（0）')
+    await inbound(callbackUpdate(old.data, { message_id: old.messageId }))
+    expect(sent.at(-1)?.text).toContain('列表已失效')
+    expect((await service.getStatus()).subscriptions).toHaveLength(2)
+    await inbound(privateMessage('/sessions 没有这个标题'))
+    expect(sent.at(-1)?.text).toContain('没有匹配且可访问')
+  })
+
+  test('订阅列表：部分失败保留待选，重试不回滚成功，文字变更按真值处理', async () => {
+    await inbound(privateMessage('/sessions'))
+    await clickList('未选择 · 修复登录')
+    await clickList('未选择 · 支付退款')
+    publicConfig.allowedProjectRoots = [otherRoot]
+    sessions.set('sess-a', summary('sess-a', '修复登录', otherRoot))
+    await clickList('订阅所选（2）')
+    expect((await service.getStatus()).subscriptions.map(item => item.sessionId)).toEqual(['sess-a'])
+    expect(sent.some(item => item.text.includes('成功 · 修复登录') && item.text.includes('失败 · 支付退款'))).toBe(true)
+    listButton('订阅所选（1）')
+    publicConfig.allowedProjectRoots = [workRoot, otherRoot]
+    await inbound(privateMessage('/subscribe sess-b'))
+    await clickList('订阅所选（1）')
+    expect(sent.some(item => item.text.includes('已订阅 · 支付退款'))).toBe(true)
+    expect((await service.getStatus()).subscriptions).toHaveLength(2)
+    listButton('订阅所选（0）')
+    await inbound(privateMessage('/unsubscribe sess-b'))
+    await clickList('已订阅 · 支付退款')
+    expect((await service.getStatus()).subscriptions).toHaveLength(1)
+    listButton('订阅所选（1）')
+    await clickList('订阅所选（1）')
+    expect((await service.getStatus()).subscriptions).toHaveLength(2)
+  })
+
+  test('订阅列表：会话删除失败项保留，恢复后可重试', async () => {
+    await inbound(privateMessage('/sessions'))
+    await clickList('未选择 · 修复登录')
+    const row = sessions.get('sess-a')!
+    sessions.delete('sess-a')
+    await clickList('订阅所选（1）')
+    expect((await service.getStatus()).subscriptions).toHaveLength(0)
+    expect(sent.some(item => item.text.includes('失败 · 修复登录'))).toBe(true)
+    listButton('订阅所选（1）')
+    sessions.set('sess-a', row)
+    await clickList('订阅所选（1）')
+    expect((await service.getStatus()).subscriptions).toHaveLength(1)
+  })
+
+  test('订阅列表：owner 私聊、消息、伪造、过期、旧 Bot 与旧代次安全拒绝', async () => {
+    await inbound(privateMessage('/sessions'))
+    await clickList('未选择 · 修复登录')
+    const submit = listButton('订阅所选（1）')
+    for (const extra of [{ fromId: OWNER + 1 }, { chatType: 'group' }, { chatId: OWNER + 1 }, { omitMessage: true }, { message_id: submit.messageId + 1 }]) {
+      await inbound(callbackUpdate(submit.data, { message_id: submit.messageId, ...extra }))
+      expect((await service.getStatus()).subscriptions).toHaveLength(0)
+    }
+    await inbound(callbackUpdate('tgsub:forged', { message_id: submit.messageId }))
+    expect(sent.at(-1)?.text).toContain('列表已失效')
+    expect((await service.handleUpdate({ botId: BOT + 1, generation: GEN, update: callbackUpdate(submit.data) })).ok).toBe(false)
+    expect((await service.handleUpdate({ botId: BOT, generation: GEN - 1, update: callbackUpdate(submit.data) })).ok).toBe(false)
+    nowMs += SUBSCRIPTION_LIST_TTL_MS
+    await inbound(callbackUpdate(submit.data, { message_id: submit.messageId }))
+    expect(sent.at(-1)?.text).toContain('列表已失效')
+    expect((await service.getStatus()).subscriptions).toHaveLength(0)
+  })
+
+  test('订阅列表：重注册后旧按钮失效，确认过程中改变 generation 不持久化', async () => {
+    await inbound(privateMessage('/sessions'))
+    await clickList('未选择 · 修复登录')
+    const old = listButton('订阅所选（1）')
+    await service.registerRuntime({ botId: BOT, generation: GEN })
+    await inbound(callbackUpdate(old.data, { message_id: old.messageId }))
+    expect(sent.at(-1)?.text).toContain('列表已失效')
+    await inbound(privateMessage('/sessions'))
+    await clickList('未选择 · 修复登录')
+    let release!: () => void
+    summaryWait = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const gate = new Promise<void>(resolve => { entered = resolve })
+    summaryEntered = entered
+    const submit = listButton('订阅所选（1）')
+    const result = inbound(callbackUpdate(submit.data, { message_id: submit.messageId }))
+    await gate
+    publicConfig.generation = GEN + 1
+    release()
+    await expect(result).rejects.toThrow('列表已失效')
+    summaryWait = undefined
+    expect((await service.getStatus()).subscriptions).toHaveLength(0)
+  })
+
+  test('订阅列表：取消必须确认，返回或旧确认不改订阅，重复确认隔离其他订阅', async () => {
+    await service.subscribe('sess-a')
+    await service.subscribe('sess-b')
+    await inbound(privateMessage('/subscriptions'))
+    await clickList('取消订阅 · 修复登录')
+    expect(sent.at(-1)?.text).toContain('取消后不再接收')
+    const stale = listButton('确认取消')
+    await clickList('返回')
+    expect((await service.getStatus()).subscriptions).toHaveLength(2)
+    await inbound(callbackUpdate(stale.data, { message_id: stale.messageId }))
+    expect((await service.getStatus()).subscriptions).toHaveLength(2)
+    await clickList('取消订阅 · 修复登录')
+    const confirm = listButton('确认取消')
+    await clickList('确认取消')
+    expect((await service.getStatus()).subscriptions.map(item => item.sessionId)).toEqual(['sess-b'])
+    await service.subscribe('sess-a')
+    await inbound(callbackUpdate(confirm.data, { message_id: confirm.messageId }))
+    expect((await service.getStatus()).subscriptions).toHaveLength(2)
+    expect(submitted).toHaveLength(0)
+  })
+
+  test('订阅列表：未消费的取消确认不能取消文字命令新建的订阅', async () => {
+    await service.subscribe('sess-a')
+    await inbound(privateMessage('/subscriptions'))
+    await clickList('取消订阅 · 修复登录')
+    const confirm = listButton('确认取消')
+    await inbound(privateMessage('/unsubscribe sess-a'))
+    await inbound(privateMessage('/subscribe sess-a'))
+    // 固定 now 故意让 subscribedAt 相等，不能仅凭时间戳识别订阅生命周期。
+    await inbound(callbackUpdate(confirm.data, { message_id: confirm.messageId }))
+    expect((await service.getStatus()).subscriptions.map(item => item.sessionId)).toEqual(['sess-a'])
+    expect(sent.at(-1)?.text).toContain('确认已失效')
+  })
+
+  test('订阅列表：文字先取消后重复确认提示已取消，订阅管理分页与空态', async () => {
+    await service.subscribe('sess-a')
+    await inbound(privateMessage('/subscriptions'))
+    await clickList('取消订阅 · 修复登录')
+    const confirm = listButton('确认取消')
+    await inbound(privateMessage('/unsubscribe sess-a'))
+    await inbound(callbackUpdate(confirm.data, { message_id: confirm.messageId }))
+    expect(sent.at(-1)?.text).toContain('已取消订阅')
+    expect(sent.at(-1)?.text).toContain('当前没有公共订阅')
+    for (let index = 0; index < 21; index++) {
+      sessions.set(`sub-${index}`, summary(`sub-${index}`, `订阅${index}`, workRoot))
+      await service.subscribe(`sub-${index}`)
+    }
+    await inbound(privateMessage('/subscriptions'))
+    await clickList('下一页')
+    expect(sent.at(-1)?.text).toContain('第 2 / 2 页')
+    listButton('取消订阅 · 订阅20')
+  })
+
+  test('订阅列表：并发相同选择仅一次，编辑失败传播明确错误并保留订阅真值', async () => {
+    await inbound(privateMessage('/sessions'))
+    const toggle = listButton('未选择 · 修复登录')
+    await Promise.all([
+      inbound(callbackUpdate(toggle.data, { message_id: toggle.messageId })),
+      inbound(callbackUpdate(toggle.data, { message_id: toggle.messageId })),
+    ])
+    listButton('订阅所选（1）')
+    editFailure = true
+    await expect(clickList('订阅所选（1）')).rejects.toThrow('列表更新失败')
+    expect((await service.getStatus()).subscriptions).toHaveLength(1)
+    expect(submitted).toHaveLength(0)
+  })
 
   test('同 owner 多 session 隔离，未订阅 C 不报告，公共结果只投一次', async () => {
     await service.subscribe('sess-a')
@@ -617,9 +862,10 @@ describe('telegram public channel', () => {
       update: privateMessage('/sessions', { update_id: 31 }),
     })
     expect(listed).toEqual({ ok: true })
-    const text = sent.filter(item => item.text.includes('最近会话')).at(-1)?.text ?? ''
-    expect(text).toContain('sess-a')
-    expect(text).not.toContain('sess-evil')
+    const markup = sent.at(-1)?.replyMarkup as { inline_keyboard: Array<Array<{ text: string }>> }
+    const labels = markup.inline_keyboard.flat().map(item => item.text)
+    expect(labels.some(label => label.includes('修复登录'))).toBe(true)
+    expect(labels.some(label => label.includes('越界'))).toBe(false)
   })
 
   test('群组与他人拒绝；runtime 代次变化使旧待发不能改投', async () => {
@@ -1267,7 +1513,7 @@ describe('telegram public channel', () => {
     ])
     const withOrigin = new TelegramPublicService({
       store: new TelegramPublicStore(path.join(configDir, 'ccmax', 'telegram-public.json')),
-      now: () => Date.parse('2026-04-04T00:00:00.000Z'),
+      now: () => nowMs,
       getRawConfig: async () => ({ telegram: { public: publicConfig } }),
       getSessionSummary: async id => sessions.get(id) ?? null,
       getSessionPermissionOrigin: (sessionId, requestId) => origins.get(`${sessionId}:${requestId}`),
@@ -1279,6 +1525,11 @@ describe('telegram public channel', () => {
         const result = await sendImpl()
         sent.push({ chatId, text, replyMarkup: options?.replyMarkup, messageId: result.messageId ?? -1 })
         return result
+      },
+      editTelegramChannelMessage: async (_token, chatId, messageId, text, options) => {
+        if (editFailure) return { outcome: 'failed', error: 'fixture edit failure' }
+        sent.push({ chatId, text, messageId, replyMarkup: options?.replyMarkup })
+        return { outcome: 'delivered', messageId }
       },
       getDedicatedBinding: () => dedicated,
       handler: {
@@ -1322,7 +1573,7 @@ describe('telegram public channel', () => {
     withOrigin.stop()
     const reopened = new TelegramPublicService({
       store: snapStore,
-      now: () => Date.parse('2026-04-04T00:00:00.000Z'),
+      now: () => nowMs,
       getRawConfig: async () => ({ telegram: { public: publicConfig } }),
       getSessionSummary: async id => sessions.get(id) ?? null,
       observeSessionTurns: () => () => {},
@@ -1330,6 +1581,11 @@ describe('telegram public channel', () => {
         const result = await sendImpl()
         sent.push({ chatId, text, replyMarkup: options?.replyMarkup, messageId: result.messageId ?? -1 })
         return result
+      },
+      editTelegramChannelMessage: async (_token, chatId, messageId, text, options) => {
+        if (editFailure) return { outcome: 'failed', error: 'fixture edit failure' }
+        sent.push({ chatId, text, messageId, replyMarkup: options?.replyMarkup })
+        return { outcome: 'delivered', messageId }
       },
       getDedicatedBinding: () => dedicated,
       handler: {
@@ -1606,7 +1862,7 @@ describe('telegram public channel', () => {
     ])
     const withOrigin = new TelegramPublicService({
       store: new TelegramPublicStore(path.join(configDir, 'ccmax', 'telegram-public.json')),
-      now: () => Date.parse('2026-04-04T00:00:00.000Z'),
+      now: () => nowMs,
       getRawConfig: async () => ({ telegram: { public: publicConfig } }),
       getSessionSummary: async id => sessions.get(id) ?? null,
       getSessionPermissionOrigin: (sessionId, requestId) => origins.get(`${sessionId}:${requestId}`),
@@ -1618,6 +1874,11 @@ describe('telegram public channel', () => {
         const result = await sendImpl()
         sent.push({ chatId, text, replyMarkup: options?.replyMarkup, messageId: result.messageId ?? -1 })
         return result
+      },
+      editTelegramChannelMessage: async (_token, chatId, messageId, text, options) => {
+        if (editFailure) return { outcome: 'failed', error: 'fixture edit failure' }
+        sent.push({ chatId, text, messageId, replyMarkup: options?.replyMarkup })
+        return { outcome: 'delivered', messageId }
       },
       getDedicatedBinding: () => dedicated,
       handler: {
@@ -1968,5 +2229,91 @@ describe('telegram public channel', () => {
     summaryWait = undefined
     await pendingUpdate
     expect(permissionResponses.some(item => item.requestId === 'req-await-cb')).toBe(false)
+  })
+
+  test('多会话各自归属；取消一个后另一个仍报告，已取消者的待发/回复映射/审批回调按语义失效', async () => {
+    const a = await service.subscribe('sess-a')
+    const b = await service.subscribe('sess-b')
+
+    await emitResult('sess-a', 'A 独立完成', {
+      uuid: 'multi-a',
+      origin: { entrypoint: 'telegram-public', botId: BOT, generation: GEN, turnId: 'turn-a' },
+    })
+    await emitResult('sess-b', 'B 独立完成', {
+      uuid: 'multi-b',
+      origin: { entrypoint: 'telegram-public', botId: BOT, generation: GEN, turnId: 'turn-b' },
+    })
+
+    const store = new TelegramPublicStore(path.join(configDir, 'ccmax', 'telegram-public.json'))
+    const initial = await store.read()
+    const outA = initial.outbox.filter(record => record.eventId === 'multi-a')
+    const outB = initial.outbox.filter(record => record.eventId === 'multi-b')
+    expect(outA).toHaveLength(1)
+    expect(outB).toHaveLength(1)
+    expect(outA[0]?.sessionId).toBe('sess-a')
+    expect(outB[0]?.sessionId).toBe('sess-b')
+    expect(outA[0]?.chatId).toBe(String(OWNER))
+    expect(outB[0]?.chatId).toBe(String(OWNER))
+    expect(outA[0]?.status).toBe('delivered')
+    expect(outB[0]?.status).toBe('delivered')
+
+    const reportA = sent.find(item => item.text.includes('A 独立完成'))!
+    const reportB = sent.find(item => item.text.includes('B 独立完成'))!
+    expect(reportA.chatId).toBe(String(OWNER))
+    expect(reportA.messageId).toBe(outA[0]?.messageId)
+    expect(reportA.text).toContain('修复登录')
+    expect(reportA.text).toContain(a.shortId)
+    expect(reportA.text).not.toContain('支付退款')
+    expect(reportB.chatId).toBe(String(OWNER))
+    expect(reportB.messageId).toBe(outB[0]?.messageId)
+    expect(reportB.text).toContain('支付退款')
+    expect(reportB.text).toContain(b.shortId)
+    expect(reportB.text).not.toContain('修复登录')
+
+    sendImpl = async () => ({ outcome: 'failed', error: 'too many', retryAfterMs: 120_000 })
+    await emitResult('sess-a', 'A 限流待发', { uuid: 'multi-a-queued' })
+    sendImpl = async () => ({ outcome: 'delivered', messageId: ++nextMessageId })
+    await emitPermission('sess-a', 'req-multi-a', 'Bash', {
+      entrypoint: 'telegram-public', botId: BOT, generation: GEN, turnId: 'turn-a-perm',
+    })
+    await emitPermission('sess-b', 'req-multi-b', 'Bash', {
+      entrypoint: 'telegram-public', botId: BOT, generation: GEN, turnId: 'turn-b-perm',
+    })
+
+    const beforeCancel = await store.read()
+    expect(beforeCancel.outbox.some(record =>
+      record.sessionId === 'sess-a' && record.eventId === 'multi-a-queued' && record.status === 'queued',
+    )).toBe(true)
+    expect(Object.values(beforeCancel.callbackTokens).some(entry => entry.sessionId === 'sess-a')).toBe(true)
+    expect(Object.values(beforeCancel.callbackTokens).some(entry => entry.sessionId === 'sess-b')).toBe(true)
+    expect(Object.values(beforeCancel.messageMaps).some(entry => entry.sessionId === 'sess-a')).toBe(true)
+    expect(Object.values(beforeCancel.messageMaps).some(entry => entry.sessionId === 'sess-b')).toBe(true)
+
+    await service.unsubscribe('sess-a')
+
+    const afterCancel = await store.read()
+    expect(afterCancel.subscriptions['sess-a']).toBeUndefined()
+    expect(afterCancel.subscriptions['sess-b']).toBeDefined()
+    const queuedA = afterCancel.outbox.find(record => record.eventId === 'multi-a-queued')!
+    expect(queuedA.status).toBe('failed')
+    expect(queuedA.error).toContain('已取消订阅')
+    expect(Object.values(afterCancel.callbackTokens).some(entry => entry.sessionId === 'sess-a')).toBe(false)
+    expect(Object.values(afterCancel.messageMaps).some(entry => entry.sessionId === 'sess-a')).toBe(false)
+    expect(Object.values(afterCancel.callbackTokens).some(entry => entry.sessionId === 'sess-b')).toBe(true)
+    expect(Object.values(afterCancel.messageMaps).some(entry => entry.sessionId === 'sess-b')).toBe(true)
+
+    const beforeIsolated = sent.length
+    await emitResult('sess-a', 'A 取消后不应投递', { uuid: 'multi-a-after' })
+    await emitResult('sess-b', 'B 取消后仍报告', { uuid: 'multi-b-after' })
+    expect(sent.some(item => item.text.includes('A 取消后不应投递'))).toBe(false)
+    expect(sent.length).toBe(beforeIsolated + 1)
+    const isolatedB = sent.find(item => item.text.includes('B 取消后仍报告'))!
+    expect(isolatedB.chatId).toBe(String(OWNER))
+    expect(isolatedB.text).toContain('支付退款')
+    expect(isolatedB.text).not.toContain('修复登录')
+
+    const final = await store.read()
+    expect(final.outbox.some(record => record.eventId === 'multi-a-after')).toBe(false)
+    expect(final.outbox.some(record => record.eventId === 'multi-b-after' && record.status === 'delivered')).toBe(true)
   })
 })
