@@ -17,6 +17,7 @@ import {
   resolveNotificationRecipient,
   type NotificationRecipientSpec,
   type TaskNotificationInput,
+  type TelegramMessageEntrypoint,
 } from './notificationService.js'
 
 /** Recipient reference shared with the delivery service (single source of truth). */
@@ -34,6 +35,13 @@ export type TaskNotificationConfig = {
   enabled: boolean
   channels: TaskNotificationInput['channels']
   recipients?: TaskNotificationInput['recipients']
+  /**
+   * Which Telegram entries deliver this task's notification. Reuses the shared
+   * interface's field verbatim so a stored task is consumed without translation.
+   * Absent means `['dedicated']`, the pre-existing behavior, and an absent field
+   * is never written back onto an old record.
+   */
+  telegramEntrypoints?: TaskNotificationInput['telegramEntrypoints']
 }
 
 export type CronTask = {
@@ -95,8 +103,24 @@ export function isValidTaskTimeoutMs(value: unknown): value is number {
 const TASKS_FILE_WRITE_ATTEMPTS = 2
 const NOTIFICATION_CHANNELS = ['desktop', 'telegram', 'feishu'] as const
 const NOTIFICATION_IM_CHANNELS = ['telegram', 'feishu'] as const
+const NOTIFICATION_TELEGRAM_ENTRYPOINTS = ['dedicated', 'public'] as const
+const DEFAULT_TELEGRAM_ENTRYPOINTS: TelegramMessageEntrypoint[] = ['dedicated']
 
-type NotificationPairingIndex = Partial<Record<TaskNotificationImChannel, PairedUser[]>>
+/**
+ * The public Telegram entry the notification may deliver through. Present only
+ * when the public config is enabled with a valid owner; the owner is synthesized
+ * into a `PairedUser` so the existing recipient resolver can match on it. The
+ * owner is read from `adapterService.getRawConfig`, never from the notification
+ * payload, so a notification cannot declare its own owner.
+ */
+type TelegramPublicAccess = {
+  enabled: true
+  owner: PairedUser
+}
+
+type NotificationPairingIndex = Partial<Record<TaskNotificationImChannel, PairedUser[]>> & {
+  telegramPublic?: TelegramPublicAccess
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -108,6 +132,74 @@ function isNotificationChannel(value: string): boolean {
 
 function isImChannel(value: string): value is TaskNotificationImChannel {
   return value === 'telegram' || value === 'feishu'
+}
+
+function isTelegramEntrypoint(value: string): value is TelegramMessageEntrypoint {
+  return (NOTIFICATION_TELEGRAM_ENTRYPOINTS as readonly string[]).includes(value)
+}
+
+/**
+ * Parse the optional `telegramEntrypoints` field. `undefined`/`null` means "not
+ * set": the effective value is `['dedicated']` and nothing is persisted. Anything
+ * else must be a non-empty array of the two legal entries with no duplicates.
+ */
+function parseTelegramEntrypoints(
+  value: unknown,
+): TelegramMessageEntrypoint[] | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value)) {
+    throw ApiError.badRequest('notification.telegramEntrypoints must be an array')
+  }
+  if (value.length === 0) {
+    throw ApiError.badRequest(
+      'notification.telegramEntrypoints must select at least one entrypoint',
+    )
+  }
+
+  const seen = new Set<string>()
+  const parsed: TelegramMessageEntrypoint[] = []
+  for (const entrypoint of value) {
+    if (typeof entrypoint !== 'string' || !isTelegramEntrypoint(entrypoint)) {
+      throw ApiError.badRequest(
+        `notification.telegramEntrypoints contains an unknown entrypoint: ${String(entrypoint)}`,
+      )
+    }
+    if (seen.has(entrypoint)) {
+      throw ApiError.badRequest(
+        `notification.telegramEntrypoints contains a duplicate entrypoint: ${entrypoint}`,
+      )
+    }
+    seen.add(entrypoint)
+    parsed.push(entrypoint)
+  }
+  return parsed
+}
+
+/**
+ * Resolve one explicit recipient against a candidate list and throw the
+ * matching create/update error. `notVerifiedMessage` lets the public-owner check
+ * say *why* a recipient is not acceptable instead of the generic pairing text.
+ */
+function assertNotificationRecipientResolves(
+  spec: NotificationRecipientSpec,
+  candidates: PairedUser[],
+  channel: string,
+  notVerifiedMessage?: string,
+): void {
+  const resolution = resolveNotificationRecipient(spec, candidates)
+  if (resolution.kind === 'resolved') return
+  if (resolution.kind === 'ambiguous') {
+    throw ApiError.badRequest(
+      `notification recipient for ${channel} matches multiple paired users; choose one unambiguously`,
+    )
+  }
+  if (resolution.kind === 'not_verified') {
+    throw ApiError.badRequest(
+      notVerifiedMessage ??
+        `notification recipient for ${channel} is not a paired user on this machine`,
+    )
+  }
+  throw ApiError.badRequest(`notification recipient for ${channel} is invalid`)
 }
 
 /**
@@ -172,6 +264,12 @@ function assertValidRecipientSpec(spec: unknown, channel: string): void {
  * (`pairedUsers`). Arbitrary ids, duplicates, ambiguous display names, and
  * recipients for channels that are not enabled are rejected. `allowedUsers` is
  * an access allowlist and is never consulted here.
+ *
+ * `telegramEntrypoints` (default `['dedicated']`) selects which Telegram
+ * entries deliver: `dedicated` resolves the recipient against `pairedUsers`,
+ * `public` against the current public owner supplied by adapter config. When
+ * both are selected, that single recipient must satisfy both. A public-only
+ * recipient may legitimately be absent from the dedicated pairing list.
  */
 export function validateTaskNotification(
   notification: unknown,
@@ -210,6 +308,16 @@ export function validateTaskNotification(
   if (enabled && seenChannels.size === 0) {
     throw ApiError.badRequest(
       'notification.channels must select at least one channel when notifications are enabled',
+    )
+  }
+
+  // The entrypoint selection only means something for the telegram channel.
+  // Its shape is validated even when notifications are off, so a malformed
+  // stored payload cannot slip through a later enable.
+  const telegramEntrypoints = parseTelegramEntrypoints(notification.telegramEntrypoints)
+  if (telegramEntrypoints !== undefined && !seenChannels.has('telegram')) {
+    throw ApiError.badRequest(
+      'notification.telegramEntrypoints is set but the telegram channel is not enabled',
     )
   }
 
@@ -258,19 +366,33 @@ export function validateTaskNotification(
         )
       }
 
-      const resolution = resolveNotificationRecipient(specs[0]!, pairing[channel] ?? [])
-      if (resolution.kind === 'resolved') continue
-      if (resolution.kind === 'ambiguous') {
-        throw ApiError.badRequest(
-          `notification recipient for ${channel} matches multiple paired users; choose one unambiguously`,
-        )
+      if (channel === 'telegram') {
+        // The same explicit recipient must satisfy every selected entrypoint:
+        // a dedicated paired user, and/or the current public owner. `public`
+        // is only meaningful when the public config is enabled with a valid
+        // owner; the owner comes from adapter config, never from the payload.
+        for (const entrypoint of telegramEntrypoints ?? DEFAULT_TELEGRAM_ENTRYPOINTS) {
+          if (entrypoint === 'dedicated') {
+            assertNotificationRecipientResolves(specs[0]!, pairing.telegram ?? [], 'telegram')
+            continue
+          }
+          const publicAccess = pairing.telegramPublic
+          if (!publicAccess) {
+            throw ApiError.badRequest(
+              'notification.telegramEntrypoints includes public, but the public Telegram entrypoint is not enabled with a valid owner',
+            )
+          }
+          assertNotificationRecipientResolves(
+            specs[0]!,
+            [publicAccess.owner],
+            'telegram',
+            'notification recipient for telegram is not the current public Telegram owner',
+          )
+        }
+        continue
       }
-      if (resolution.kind === 'not_verified') {
-        throw ApiError.badRequest(
-          `notification recipient for ${channel} is not a paired user on this machine`,
-        )
-      }
-      throw ApiError.badRequest(`notification recipient for ${channel} is invalid`)
+
+      assertNotificationRecipientResolves(specs[0]!, pairing[channel] ?? [], channel)
     }
   }
 
@@ -278,6 +400,7 @@ export function validateTaskNotification(
     enabled,
     channels: rawChannels as TaskNotificationInput['channels'],
     ...(Object.keys(recipients).length > 0 ? { recipients } : {}),
+    ...(telegramEntrypoints !== undefined ? { telegramEntrypoints } : {}),
   }
 }
 
@@ -321,10 +444,30 @@ async function loadNotificationPairingIndex(
   if (!needsIm) return {}
 
   const config = await adapterService.getRawConfig()
-  return {
+  const index: NotificationPairingIndex = {
     telegram: config.telegram?.pairedUsers ?? [],
     feishu: config.feishu?.pairedUsers ?? [],
   }
+
+  // Synthesize the public owner as a pairing candidate so the existing
+  // recipient resolver can match against it. Only the minimal facts are read:
+  // the entry must be enabled and own a positive integer owner. `allowedUsers`
+  // is an access allowlist and is never consulted.
+  const publicConfig = config.telegram?.public
+  const ownerUserId = publicConfig?.ownerUserId
+  if (
+    publicConfig?.enabled === true &&
+    typeof ownerUserId === 'number' &&
+    Number.isSafeInteger(ownerUserId) &&
+    ownerUserId > 0
+  ) {
+    index.telegramPublic = {
+      enabled: true,
+      owner: { userId: ownerUserId, displayName: String(ownerUserId), pairedAt: 0 },
+    }
+  }
+
+  return index
 }
 
 /**

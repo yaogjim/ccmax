@@ -34,7 +34,7 @@ const enabledConfig: TaskNotificationConfig = {
 }
 
 function derive(input: {
-  channel?: 'telegram' | 'feishu'
+  channel?: 'telegram' | 'telegram-public' | 'feishu'
   records?: NotificationDeliveryRecord[]
   notification?: TaskNotificationConfig | undefined
   runStatus?: string
@@ -149,5 +149,66 @@ describe('deriveChannelNotificationStatus', () => {
   it('falls back to not sent when the task config is unknown, never to success', () => {
     expect(derive({ notification: undefined, runStatus: 'completed', loadState: 'loaded' }))
       .toEqual({ kind: 'notSent' })
+  })
+
+  // Telegram has two Bot entries over one channel. A single record set must be
+  // split per entry, and a record written before the option existed is a
+  // dedicated send.
+  describe('telegram entrypoint rows', () => {
+    it('counts only dedicated records for the dedicated row', () => {
+      expect(derive({
+        records: [
+          record('telegram', 'delivered'),
+          record('telegram', 'failed', { telegramEntrypoint: 'public', recipientId: 'user-2' }),
+        ],
+      })).toEqual({ kind: 'delivered', delivered: 1 })
+    })
+
+    it('counts only public records for the public row', () => {
+      expect(derive({
+        channel: 'telegram-public',
+        records: [
+          record('telegram', 'delivered'),
+          record('telegram', 'failed', { telegramEntrypoint: 'public', recipientId: 'user-2' }),
+        ],
+      })).toEqual({ kind: 'failed', failed: 1, indeterminate: 0 })
+    })
+
+    it('never lets one entry deliver the other: a public-only record is not sent on dedicated', () => {
+      expect(derive({
+        channel: 'telegram',
+        records: [record('telegram', 'delivered', { telegramEntrypoint: 'public' })],
+      })).toEqual({ kind: 'notSent' })
+    })
+
+    it('reports the public row not configured when the task only uses the dedicated entry', () => {
+      expect(derive({
+        channel: 'telegram-public',
+        notification: { enabled: true, channels: ['telegram'], recipients: { telegram: ['111'] } },
+      })).toEqual({ kind: 'notConfigured', reason: 'channelInactive' })
+    })
+
+    it('keeps the dedicated row not configured for a public-only task', () => {
+      expect(derive({
+        channel: 'telegram',
+        notification: {
+          enabled: true,
+          channels: ['telegram'],
+          telegramEntrypoints: ['public'],
+          recipients: { telegram: ['111'] },
+        },
+      })).toEqual({ kind: 'notConfigured', reason: 'channelInactive' })
+    })
+
+    it('reports not sent for both entries when the task selects both but nothing was queued', () => {
+      const notification: TaskNotificationConfig = {
+        enabled: true,
+        channels: ['telegram'],
+        telegramEntrypoints: ['dedicated', 'public'],
+        recipients: { telegram: ['111'] },
+      }
+      expect(derive({ channel: 'telegram', notification })).toEqual({ kind: 'notSent' })
+      expect(derive({ channel: 'telegram-public', notification })).toEqual({ kind: 'notSent' })
+    })
   })
 })

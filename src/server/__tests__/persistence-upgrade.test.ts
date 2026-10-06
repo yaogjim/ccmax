@@ -1055,6 +1055,38 @@ describe('legacy scheduled task storage compatibility', () => {
     expect((await ensurePersistentStorageUpgraded()).migratedEntries).toEqual([])
   })
 
+  test('reads a legacy notification without telegramEntrypoints as dedicated and never rewrites the file', async () => {
+    const legacy = {
+      tasks: [{
+        id: 'legacy-dedicated',
+        cron: '0 9 * * *',
+        prompt: 'legacy dedicated',
+        createdAt: 1,
+        notification: {
+          enabled: true,
+          channels: ['telegram'],
+          recipients: { telegram: [{ userId: 111, displayName: 'Alice' }] },
+          futureEntrypointField: 'keep',
+        },
+      }],
+    }
+    const tasksPath = path.join(legacyDir, 'scheduled_tasks.json')
+    await fs.writeFile(tasksPath, JSON.stringify(legacy, null, 2) + '\n', 'utf-8')
+
+    const first = await new CronService().listTasks()
+    expect(first).toHaveLength(1)
+    // An absent `telegramEntrypoints` keeps the old dedicated semantics: the
+    // stored config is returned verbatim and the field is not synthesized.
+    expect(first[0]!.notification).toEqual(legacy.tasks[0]!.notification)
+    expect(
+      first[0]!.notification && 'telegramEntrypoints' in (first[0]!.notification as object),
+    ).toBe(false)
+    expect(first[0]!.notificationNeedsRecipients).toBeUndefined()
+
+    // Loading never rewrites the record, so the new field is not added on disk.
+    expect(JSON.parse(await fs.readFile(tasksPath, 'utf-8'))).toEqual(legacy)
+  })
+
   test('never flips an explicit enabled:false, across a write and a later load', async () => {
     const tasksPath = await writeTasksFile([
       { id: 'disabled-task', cron: '0 9 * * *', prompt: 'off', createdAt: 1, enabled: false },

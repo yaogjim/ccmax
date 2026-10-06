@@ -48,7 +48,7 @@ You can also list, inspect, update, enable, disable, delete, or immediately run 
 - **Working directory** — where the task runs. You can also enable **Isolated worktree** so the task works in a separate Git worktree and never touches your main branch.
 - **Frequency** — every N minutes, every N hours, daily, weekdays (Mon–Fri), specific days, monthly, or a custom cron expression. Time-of-day options get their own picker beside the frequency. Custom cron is "minute hour day month weekday" and invalid expressions are flagged as you type.
 - **Timeout per run (seconds)** — optional. Leave blank to inherit the default: the `CC_HAHA_TASK_TIMEOUT_MS` environment variable when set, otherwise 600 seconds (10 minutes). It bounds only this task's single run — not ordinary chats or API requests.
-- **Push notification on completion** — pick channels: native desktop notifications and any IM channels you've configured (Telegram, Feishu). For each IM channel you also pick one **notification recipient** from the accounts already paired with that channel. If no IM channel is set up, the form points you to **Settings → IM Adapters**; setup steps are in [Phone (H5) and IM](./remote.md).
+- **Push notification on completion** — pick channels: native desktop notifications and any IM channels you've configured (Telegram, Feishu). Each IM channel requires one explicit **notification recipient**. Telegram can use the exclusive Bot, public Bot, or both; exclusive Telegram and Feishu use paired accounts, while public Telegram accepts only its paired owner. If no IM channel is set up, the form points you to **Settings → IM Adapters**; setup steps are in [Phone (H5) and IM](./remote.md).
 
 Desktop notifications need **System Notifications** enabled in **Settings → General** and permission granted at the OS level.
 
@@ -56,7 +56,11 @@ Tasks fire with a small random delay so a dozen jobs don't all start on the same
 
 ## Who gets the notification
 
-An IM notification must name an explicit recipient. The system does **not** broadcast a task result to every paired user. The recipients you can pick are only the accounts paired with that channel — a different thing from the access allowlist that decides who may talk to this machine.
+An IM notification must name an explicit recipient. The system does **not** broadcast a task result to every paired user. Exclusive Telegram and Feishu recipients come from their paired accounts; public Telegram requires its single paired owner. The access allowlist is not notification authorization.
+
+Telegram's **Delivery route** selects the exclusive Bot, public Bot, or both. Existing tasks without an entry selection keep the exclusive Bot. Public task notifications need no session subscription or exclusive pairing. Both Bots share one explicit recipient, who must satisfy both entry identities. Select the recipient explicitly; editing never silently replaces a saved, no-longer-valid owner. Public Bot setup and pairing are described in [Telegram](../im/telegram.md#turn-on-the-public-bot).
+
+Before every public send or retry, the local service re-checks task registration, the real terminal run, notification settings, recipient, public Bot identity and allowed project directories. Deleted or unregistered tasks, forged runs, non-owners and tampered recipients fail visibly; changed identities never redirect to a new Bot. Task notifications are read-only and create no session-reply or approval association. The two entries are journalled independently; failure on one does not suppress the other. History separates exclusive and public delivery and shows delivered, failed or indeterminate outcomes.
 
 If a recipient is unpaired, does not resolve to exactly one account, or does not exist, the delivery is recorded as a failure and sent to no one, rather than quietly going to everyone. The same applies when a task is created in conversation: if the user has not said who to notify, don't guess a target.
 

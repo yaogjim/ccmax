@@ -28,6 +28,14 @@ export const NOTIFICATION_DELIVERY_MAX_RECORDS = 500
 
 export type NotificationChannel = 'telegram' | 'feishu'
 
+/**
+ * Which Telegram bot an entrypoint-scoped record belongs to. Optional and
+ * forward-compatible: old records written before this field existed read back
+ * as `undefined` and are treated as `dedicated` by consumers, so a legacy
+ * message can never be re-attributed to the public entrypoint.
+ */
+export type NotificationDeliveryEntrypoint = 'dedicated' | 'public'
+
 export type NotificationDeliveryOutcome = 'pending' | 'delivered' | 'failed' | 'indeterminate'
 
 /** 重启后仍未结算的 pending 记录被归因为该错误码，区别于发送时的 timeout。 */
@@ -46,6 +54,8 @@ export type NotificationDeliveryRecord = {
   error?: string
   errorCode?: string
   messageId?: number
+  /** Optional entrypoint tag for tracking; absent on legacy records. */
+  telegramEntrypoint?: NotificationDeliveryEntrypoint
   createdAt: string
   [key: string]: unknown
 }
@@ -58,6 +68,7 @@ export type PendingDeliveryInput = {
   channel: NotificationChannel
   recipientId: string
   recipientDisplayName?: string
+  telegramEntrypoint?: NotificationDeliveryEntrypoint
   createdAt: string
   [key: string]: unknown
 }
@@ -120,6 +131,12 @@ function normalizeOptionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
+function normalizeEntrypoint(value: unknown): NotificationDeliveryEntrypoint | undefined {
+  // An unknown or malformed value is dropped (never guessed): a record that
+  // cannot prove it was public is treated as dedicated by consumers.
+  return value === 'dedicated' || value === 'public' ? value : undefined
+}
+
 function normalizeRecord(value: unknown): NotificationDeliveryRecord | null {
   if (!isRecord(value)) return null
   const deliveryId = value.deliveryId
@@ -144,6 +161,7 @@ function normalizeRecord(value: unknown): NotificationDeliveryRecord | null {
     recipientDisplayName: normalizeOptionalString(value.recipientDisplayName),
     error: normalizeOptionalString(value.error),
     errorCode: normalizeOptionalString(value.errorCode),
+    telegramEntrypoint: normalizeEntrypoint(value.telegramEntrypoint),
   }
 }
 

@@ -499,6 +499,15 @@ async function updateRun(
 
 const MAX_RUNS_PER_TASK = 100
 
+/**
+ * A run is settled once it is no longer `running`. Only settled runs may back a
+ * public task notification: a `running` record has no truthful terminal summary
+ * and its output is still being written.
+ */
+function isSettledRunStatus(status: TaskRun['status']): boolean {
+  return status === 'completed' || status === 'failed' || status === 'timeout'
+}
+
 /** Keep only the latest MAX_RUNS_PER_TASK entries per task. */
 function trimRuns(data: RunsFile): void {
   const countByTask = new Map<string, number>()
@@ -1154,7 +1163,7 @@ export class CronScheduler {
 
     await this.persistScheduledSessionPermission(sessionId, workDir)
     await updateRun(settled, runLogTarget)
-    await this.finalizeTaskRun(task, settled, runLogTarget)
+    await this.finalizeTaskRun(task, settled, runLogTarget, workDir)
     this.stoppedRunIds.delete(runId)
 
     return settled
@@ -1205,11 +1214,19 @@ export class CronScheduler {
    * synthetic failure from a throwing spawn — so a one-shot task cannot stay
    * enabled and retry forever. The run's terminal record is already persisted by
    * the caller, so a failing or slow notification never holds it at `running`.
+   *
+   * `trustedWorkDir` is the directory the run actually executed in, resolved by
+   * `runTask` before the spawn (canonical work dir, or the raw requested dir).
+   * It is only a hint for the public authorization; the delivery service
+   * re-validates it against the allowed project roots, so an omitted value
+   * (a run whose work dir could not be resolved) simply denies a root-restricted
+   * public send.
    */
   private async finalizeTaskRun(
     task: CronTask,
     run: TaskRun,
     runLogTarget: RunsFileMutationTarget,
+    trustedWorkDir?: string,
   ): Promise<void> {
     // An enabled notification with a malformed stored channel list (a record
     // written before the API validated it) must not read `.length` here: that
@@ -1217,7 +1234,14 @@ export class CronScheduler {
     // the throw would escape `executeTask` even though the run itself finished.
     if (task.notification?.enabled) {
       try {
-        const report = await sendTaskNotification(run, task.notification)
+        const report = await sendTaskNotification(run, task.notification, {
+          getTaskNotificationContext: this.buildTaskNotificationContextProvider(
+            task.id,
+            run.id,
+            runLogTarget.sourcePath,
+            trustedWorkDir,
+          ),
+        })
         if (report) {
           run.notificationReport = summarizeNotificationReport(report)
           await updateRun(run, runLogTarget).catch(() => {
@@ -1238,6 +1262,47 @@ export class CronScheduler {
       await this.cronService.updateTask(task.id, { enabled: false }).catch(() => {
         // Task may have been deleted
       })
+    }
+  }
+
+  /**
+   * The trusted task-notification context for the public Telegram entrypoint.
+   *
+   * The public send is authorized only by server-side truth, never by the
+   * caller's run/task fields:
+   * - the run id/task id are pinned at closure creation (`original task/run`),
+   *   so a different run cannot reuse this provider;
+   * - the task must still be registered when `listTasks()` is read — a deleted
+   *   task rejects, but a task auto-disabled after a one-shot run (still
+   *   registered, just `enabled: false`) keeps its already-settled run valid;
+   * - the run is re-read from the real source file (`scheduled_tasks_log.json`
+   *   via `readRunsFile`, never a SQLite-derived projection) and must still
+   *   match id + taskId and be settled (`completed` / `failed` / `timeout`).
+   *
+   * `trustedWorkDir` is passed through as-is; the delivery service realpath-checks
+   * it against the configured allowed project roots.
+   */
+  private buildTaskNotificationContextProvider(
+    taskId: string,
+    runId: string,
+    runLogPath: string,
+    trustedWorkDir: string | undefined,
+  ): (run: Pick<TaskRun, 'id' | 'taskId'>) => Promise<{ task: CronTask; run: TaskRun; workDir: string } | null> {
+    return async (requested) => {
+      if (requested.id !== runId || requested.taskId !== taskId) return null
+
+      const tasks = await this.cronService.listTasks()
+      const task = tasks.find((candidate) => candidate.id === taskId)
+      if (!task) return null
+
+      const data = await readRunsFile(runLogPath)
+      const settledRun = data.runs.find(
+        (candidate) => candidate.id === runId && candidate.taskId === taskId,
+      )
+      if (!settledRun) return null
+      if (!isSettledRunStatus(settledRun.status)) return null
+
+      return { task, run: settledRun, workDir: trustedWorkDir ?? '' }
     }
   }
 

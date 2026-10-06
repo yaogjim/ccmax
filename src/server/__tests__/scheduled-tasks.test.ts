@@ -1310,6 +1310,404 @@ describe('CronService notification validation', () => {
   })
 })
 
+// ─── CronService: telegram notification entrypoints ─────────────────────────
+//
+// A task notification may deliver through the dedicated Telegram bot, the
+// public one, or both. `recipients.telegram` stays the single explicit
+// recipient: it must be a dedicated paired user when `dedicated` is selected,
+// and the current public owner when `public` is selected. Selecting both
+// requires that one recipient to satisfy both. The public owner legitimately
+// may not be in the dedicated pairing list, so a public-only selection is
+// allowed. The owner is read from adapterService.getRawConfig — a notification
+// may never declare its own owner. An absent field means `['dedicated']` and is
+// never written back onto an old record.
+
+describe('CronService telegram notification entrypoints', () => {
+  let service: CronService
+  let adaptersPath: string
+  const tasksPath = () => path.join(tmpDir, 'scheduled_tasks.json')
+
+  function adaptersConfig(publicConfig?: Record<string, unknown>): Record<string, unknown> {
+    return {
+      telegram: {
+        botToken: 'fixture-token',
+        pairedUsers: [{ userId: 111, displayName: 'Alice', pairedAt: 1 }],
+        ...(publicConfig ? { public: publicConfig } : {}),
+      },
+      feishu: {
+        appId: 'cli_fixture',
+        appSecret: 'fixture-secret',
+        pairedUsers: [{ userId: 'ou_1', displayName: 'Fei One', pairedAt: 1 }],
+      },
+    }
+  }
+
+  async function writeAdapters(config: Record<string, unknown>): Promise<void> {
+    await fs.writeFile(adaptersPath, JSON.stringify(config), 'utf-8')
+  }
+
+  async function rawNotification(
+    taskId: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    const raw = JSON.parse(await fs.readFile(tasksPath(), 'utf-8')) as {
+      tasks: Array<{ id: string; notification?: Record<string, unknown> }>
+    }
+    return raw.tasks.find((task) => task.id === taskId)?.notification
+  }
+
+  function publicTask(recipient: number = 111) {
+    return {
+      cron: '0 9 * * *',
+      prompt: 'public entrypoint',
+      notification: {
+        enabled: true,
+        channels: ['telegram'] as ('telegram')[],
+        recipients: { telegram: [recipient] },
+        telegramEntrypoints: ['public'] as ('public')[],
+      },
+    }
+  }
+
+  beforeEach(async () => {
+    tmpDir = await createTmpDir()
+    process.env.CLAUDE_CONFIG_DIR = tmpDir
+    adaptersPath = path.join(tmpDir, 'adapters.json')
+    // Owner 111 is both the dedicated paired user and the public owner here;
+    // individual tests rewrite the config to separate the two.
+    await writeAdapters(
+      adaptersConfig({ enabled: true, botToken: 'public-token', ownerUserId: 111, generation: 1 }),
+    )
+    service = new CronService()
+  })
+
+  afterEach(async () => {
+    if (originalConfigDir) {
+      process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+    } else {
+      delete process.env.CLAUDE_CONFIG_DIR
+    }
+    await cleanupTmpDir(tmpDir)
+  })
+
+  it('accepts a public-only recipient who is the public owner but not a dedicated paired user', async () => {
+    await writeAdapters(
+      adaptersConfig({ enabled: true, botToken: 'public-token', ownerUserId: 4242, generation: 1 }),
+    )
+
+    const created = await service.createTask(publicTask(4242))
+
+    expect(created.notification).toEqual({
+      enabled: true,
+      channels: ['telegram'],
+      recipients: { telegram: [4242] },
+      telegramEntrypoints: ['public'],
+    })
+    expect(await rawNotification(created.id)).toMatchObject({ telegramEntrypoints: ['public'] })
+    expect((await new CronService().listTasks())[0]?.notification).toEqual(created.notification)
+  })
+
+  it('rejects a public recipient that is not the current public owner', async () => {
+    await writeAdapters(
+      adaptersConfig({ enabled: true, botToken: 'public-token', ownerUserId: 4242, generation: 1 }),
+    )
+
+    await expect(
+      service.createTask({
+        cron: '0 9 * * *',
+        prompt: 'not the owner',
+        notification: {
+          enabled: true,
+          channels: ['telegram'],
+          recipients: { telegram: [{ userId: 111, displayName: 'Alice' }] },
+          telegramEntrypoints: ['public'],
+        },
+      }),
+    ).rejects.toThrow(/owner/i)
+    expect(await service.listTasks()).toHaveLength(0)
+  })
+
+  it('rejects a recipient the notification claims as owner when the config has no such owner', async () => {
+    await writeAdapters(
+      adaptersConfig({ enabled: true, botToken: 'public-token', ownerUserId: 4242, generation: 1 }),
+    )
+
+    await expect(
+      service.createTask({
+        cron: '0 9 * * *',
+        prompt: 'tampered owner',
+        notification: {
+          enabled: true,
+          channels: ['telegram'],
+          recipients: { telegram: [999] },
+          telegramEntrypoints: ['public'],
+        },
+      }),
+    ).rejects.toThrow(/owner/i)
+  })
+
+  it('accepts both entrypoints when the single recipient is owner and dedicated paired user', async () => {
+    const created = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'both entrypoints',
+      notification: {
+        enabled: true,
+        channels: ['telegram'],
+        recipients: { telegram: [111] },
+        telegramEntrypoints: ['dedicated', 'public'],
+      },
+    })
+    expect(created.notification?.telegramEntrypoints).toEqual(['dedicated', 'public'])
+  })
+
+  it('rejects both entrypoints when the public owner is not a dedicated paired user', async () => {
+    await writeAdapters(
+      adaptersConfig({ enabled: true, botToken: 'public-token', ownerUserId: 4242, generation: 1 }),
+    )
+
+    await expect(
+      service.createTask({
+        cron: '0 9 * * *',
+        prompt: 'owner not paired',
+        notification: {
+          enabled: true,
+          channels: ['telegram'],
+          recipients: { telegram: [4242] },
+          telegramEntrypoints: ['dedicated', 'public'],
+        },
+      }),
+    ).rejects.toThrow(/paired/i)
+  })
+
+  it('rejects the public entrypoint when the public config is absent, disabled, or ownerless', async () => {
+    await writeAdapters(adaptersConfig())
+    await expect(service.createTask(publicTask())).rejects.toThrow(/public|owner/i)
+
+    await writeAdapters(
+      adaptersConfig({ enabled: false, botToken: 'public-token', ownerUserId: 111, generation: 1 }),
+    )
+    await expect(service.createTask(publicTask())).rejects.toThrow(/public|owner/i)
+
+    await writeAdapters(
+      adaptersConfig({ enabled: true, botToken: 'public-token', ownerUserId: 0, generation: 1 }),
+    )
+    await expect(service.createTask(publicTask())).rejects.toThrow(/public|owner/i)
+
+    expect(await service.listTasks()).toHaveLength(0)
+  })
+
+  it('defaults to the dedicated entrypoint when the field is absent and never writes it', async () => {
+    const created = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'legacy default',
+      notification: {
+        enabled: true,
+        channels: ['telegram'],
+        recipients: { telegram: [{ userId: 111, displayName: 'Alice' }] },
+      },
+    })
+
+    expect(created.notification).toEqual({
+      enabled: true,
+      channels: ['telegram'],
+      recipients: { telegram: [{ userId: 111, displayName: 'Alice' }] },
+    })
+    const stored = await rawNotification(created.id)
+    expect(stored && 'telegramEntrypoints' in stored).toBe(false)
+  })
+
+  it('rejects an empty, non-array, unknown, or duplicated telegramEntrypoints value', async () => {
+    const base = {
+      cron: '0 9 * * *',
+      prompt: 'bad entrypoints',
+      notification: {
+        enabled: true,
+        channels: ['telegram'] as ('telegram')[],
+        recipients: { telegram: [111] },
+      },
+    }
+    const badValues: unknown[] = [[], 'dedicated', ['sms'], ['dedicated', 'dedicated'], {}]
+    for (const value of badValues) {
+      await expect(
+        service.createTask({
+          ...base,
+          notification: { ...base.notification, telegramEntrypoints: value },
+        } as unknown as Omit<CronTask, 'id' | 'createdAt'>),
+      ).rejects.toThrow(/telegramEntrypoints|entrypoint/i)
+    }
+    expect(await service.listTasks()).toHaveLength(0)
+  })
+
+  it('rejects telegramEntrypoints when the telegram channel is not selected', async () => {
+    await expect(
+      service.createTask({
+        cron: '0 9 * * *',
+        prompt: 'desktop only',
+        notification: {
+          enabled: true,
+          channels: ['desktop'],
+          telegramEntrypoints: ['dedicated'],
+        },
+      } as unknown as Omit<CronTask, 'id' | 'createdAt'>),
+    ).rejects.toThrow(/telegram/i)
+
+    await expect(
+      service.createTask({
+        cron: '0 9 * * *',
+        prompt: 'feishu only',
+        notification: {
+          enabled: true,
+          channels: ['feishu'],
+          recipients: { feishu: ['ou_1'] },
+          telegramEntrypoints: ['dedicated'],
+        },
+      } as unknown as Omit<CronTask, 'id' | 'createdAt'>),
+    ).rejects.toThrow(/telegram/i)
+
+    expect(await service.listTasks()).toHaveLength(0)
+  })
+
+  it('still validates telegramEntrypoints structurally when notifications are disabled', async () => {
+    await expect(
+      service.createTask({
+        cron: '0 9 * * *',
+        prompt: 'disabled but malformed',
+        notification: {
+          enabled: false,
+          channels: ['telegram'],
+          telegramEntrypoints: [],
+        },
+      } as unknown as Omit<CronTask, 'id' | 'createdAt'>),
+    ).rejects.toThrow(/entrypoint/i)
+  })
+
+  it('round-trips, modifies, and clears the telegramEntrypoints field', async () => {
+    const created = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'round trip',
+      notification: {
+        enabled: true,
+        channels: ['telegram'],
+        recipients: { telegram: [111] },
+        telegramEntrypoints: ['public'],
+      },
+    })
+    expect(await rawNotification(created.id)).toMatchObject({ telegramEntrypoints: ['public'] })
+
+    const modified = await service.updateTask(created.id, {
+      notification: {
+        enabled: true,
+        channels: ['telegram'],
+        recipients: { telegram: [111] },
+        telegramEntrypoints: ['dedicated', 'public'],
+      },
+    })
+    expect(modified.notification?.telegramEntrypoints).toEqual(['dedicated', 'public'])
+
+    const cleared = await service.updateTask(created.id, {
+      notification: {
+        enabled: true,
+        channels: ['telegram'],
+        recipients: { telegram: [111] },
+        telegramEntrypoints: null as unknown as ('dedicated' | 'public')[],
+      },
+    })
+    expect(cleared.notification?.telegramEntrypoints).toBeUndefined()
+    const stored = await rawNotification(created.id)
+    expect(stored && 'telegramEntrypoints' in stored).toBe(false)
+  })
+
+  it('rejects an invalid entrypoint update and keeps the stored config', async () => {
+    const created = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'keep entrypoints',
+      notification: {
+        enabled: true,
+        channels: ['telegram'],
+        recipients: { telegram: [111] },
+        telegramEntrypoints: ['public'],
+      },
+    })
+
+    await expect(
+      service.updateTask(created.id, {
+        notification: {
+          enabled: true,
+          channels: ['telegram'],
+          recipients: { telegram: [999] },
+          telegramEntrypoints: ['public'],
+        },
+      }),
+    ).rejects.toThrow(/owner/i)
+
+    expect((await service.listTasks())[0]?.notification).toEqual(created.notification)
+  })
+
+  it('preserves unknown notification fields across an unrelated update and adds no entrypoints', async () => {
+    await fs.writeFile(
+      tasksPath(),
+      JSON.stringify(
+        {
+          tasks: [
+            {
+              id: 'legacy-unknown',
+              cron: '0 9 * * *',
+              prompt: 'legacy',
+              createdAt: 1,
+              notification: {
+                enabled: true,
+                channels: ['telegram'],
+                recipients: { telegram: [111] },
+                futureEntrypointField: 'keep',
+              },
+            },
+          ],
+        },
+        null,
+        2,
+      ) + '\n',
+      'utf-8',
+    )
+
+    const loaded = await service.listTasks()
+    expect(loaded[0]?.notification).toEqual({
+      enabled: true,
+      channels: ['telegram'],
+      recipients: { telegram: [111] },
+      futureEntrypointField: 'keep',
+    })
+
+    await service.updateTask('legacy-unknown', { prompt: 'renamed' })
+    const stored = await rawNotification('legacy-unknown')
+    expect(stored?.futureEntrypointField).toBe('keep')
+    expect(stored && 'telegramEntrypoints' in stored).toBe(false)
+  })
+
+  it('does not apply telegram entrypoint rules to feishu or desktop', async () => {
+    const feishu = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'feishu unaffected',
+      notification: { enabled: true, channels: ['feishu'], recipients: { feishu: ['ou_1'] } },
+    })
+    expect(feishu.notification).toEqual({
+      enabled: true,
+      channels: ['feishu'],
+      recipients: { feishu: ['ou_1'] },
+    })
+    expect(await rawNotification(feishu.id)).toEqual({
+      enabled: true,
+      channels: ['feishu'],
+      recipients: { feishu: ['ou_1'] },
+    })
+
+    const desktop = await service.createTask({
+      cron: '0 9 * * *',
+      prompt: 'desktop unaffected',
+      notification: { enabled: true, channels: ['desktop'] },
+    })
+    expect(desktop.notification).toEqual({ enabled: true, channels: ['desktop'] })
+  })
+})
+
 // ─── CronService: legacy notification read-back ─────────────────────────────
 //
 // Files written before `recipients` existed must keep loading. A channel that

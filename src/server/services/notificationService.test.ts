@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { adapterService, type AdapterFileConfig, type PairedUser } from './adapterService.js'
+import type { CronTask } from './cronService.js'
 import type { TaskRun } from './cronScheduler.js'
 import {
   NOTIFICATION_DELIVERY_UNCONFIRMED_AFTER_RESTART,
@@ -79,6 +80,97 @@ function restoreEnv(key: string, value: string | undefined): void {
   } else {
     process.env[key] = value
   }
+}
+
+/** A telegram config with the public bot enabled and `owner` as its operator. */
+function publicTelegramConfig(options: {
+  owner?: number
+  token?: string
+  dedicatedToken?: string | null
+  generation?: number
+  roots?: string[]
+  enabled?: boolean
+  extraPaired?: number[]
+  pairedOwner?: boolean
+} = {}): AdapterFileConfig {
+  const owner = options.owner ?? 4242
+  const paired: PairedUser[] = []
+  if (options.pairedOwner !== false) paired.push(telegramUser(owner))
+  for (const id of options.extraPaired ?? []) paired.push(telegramUser(id))
+  return {
+    telegram: {
+      ...(options.dedicatedToken === null ? {} : { botToken: options.dedicatedToken ?? 'dedicated-token' }),
+      pairedUsers: paired,
+      public: {
+        enabled: options.enabled ?? true,
+        botToken: options.token ?? 'public-token',
+        ownerUserId: owner,
+        generation: options.generation ?? 3,
+        ...(options.roots ? { allowedProjectRoots: options.roots } : {}),
+      },
+    },
+  }
+}
+
+/** A telegram task notification that selects the public entrypoint. */
+function publicTaskNotification(
+  owner = 4242,
+  overrides: Partial<TaskNotificationInput> = {},
+): TaskNotificationInput {
+  return {
+    enabled: true,
+    channels: ['telegram'],
+    recipients: { telegram: [owner] },
+    telegramEntrypoints: ['public'],
+    ...overrides,
+  }
+}
+
+/** A server-side trusted context, as `CronScheduler.finalizeTaskRun` would build. */
+function trustedTaskContext(options: {
+  runId?: string
+  taskId?: string
+  status?: TaskRun['status']
+  output?: string
+  error?: string
+  sessionId?: string
+  workDir: string
+  notification?: unknown
+  omitNotification?: boolean
+}): { task: CronTask; run: TaskRun; workDir: string } {
+  const runId = options.runId ?? 'run-1'
+  const taskId = options.taskId ?? 'task-1'
+  const run: TaskRun = {
+    id: runId,
+    taskId,
+    taskName: 'Nightly task',
+    startedAt: '2026-09-26T00:00:00.000Z',
+    completedAt: '2026-09-26T00:00:02.000Z',
+    status: options.status ?? 'completed',
+    prompt: 'do the thing',
+    output: options.output ?? 'trusted source output',
+    ...(options.error ? { error: options.error } : {}),
+    ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+  }
+  const task: CronTask = {
+    id: taskId,
+    name: 'Nightly task',
+    cron: '* * * * *',
+    prompt: 'do the thing',
+    createdAt: 1,
+    recurring: true,
+    ...(options.omitNotification
+      ? {}
+      : {
+          notification: (options.notification ?? {
+            enabled: true,
+            channels: ['telegram'],
+            recipients: { telegram: [4242] },
+            telegramEntrypoints: ['public'],
+          }) as CronTask['notification'],
+        }),
+  }
+  return { task, run, workDir: options.workDir }
 }
 
 describe('notificationService', () => {
@@ -1394,6 +1486,709 @@ describe('notificationService', () => {
         service.stop()
         setTelegramPublicServiceForTests(null)
       }
+    })
+  })
+
+  // ─── Public-entrypoint task notification (no subscription required) ─────────
+
+  describe('public task notification', () => {
+    const owner = 4242
+
+    function freshStore(name: string): NotificationDeliveryStore {
+      return new NotificationDeliveryStore(path.join(tmpDir, name))
+    }
+
+    async function workDirs(): Promise<{ root: string; work: string }> {
+      const root = path.join(tmpDir, 'proj')
+      const work = path.join(root, 'repo')
+      await fs.mkdir(work, { recursive: true })
+      return { root, work }
+    }
+
+    test('delivers to the public owner without any subscription, using true-source content', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root] })
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 55 } }))
+      const publicReportCalls: string[] = []
+      const storePath = path.join(tmpDir, 'public-task.json')
+
+      const report = await sendTaskNotification(
+        // The caller's own output must never be the body.
+        runFixture({ output: 'CALLER FORGED BODY' }),
+        publicTaskNotification(owner),
+        options(fake, {
+          store: new NotificationDeliveryStore(storePath),
+          getTaskNotificationContext: async () =>
+            trustedTaskContext({ status: 'completed', output: 'true source output', sessionId: 'sess-abc', workDir: work }),
+          sendPublicSessionReport: async () => { publicReportCalls.push('called'); return { queued: true } },
+        }),
+      )
+
+      expect(fake.calls).toHaveLength(1)
+      expect(fake.calls[0]!.url).toBe('https://api.telegram.org/botpublic-token/sendMessage')
+      expect(fake.calls[0]!.body.chat_id).toBe(owner)
+      const body = String(fake.calls[0]!.body.text)
+      expect(body.startsWith('[ccmax · 定时任务 · ')).toBe(true)
+      expect(body).toContain('· repo · Nightly task · Ttask-1] 已完成：')
+      expect(body).toContain('Run: run-1')
+      expect(body).toContain('会话: sess-abc')
+      expect(body).toContain('true source output')
+      expect(body).not.toContain('CALLER FORGED BODY')
+      // The task-notification entry does not touch subscription/outbox routing.
+      expect(publicReportCalls).toHaveLength(0)
+      await expect(fs.access(getTelegramPublicStorePath())).rejects.toMatchObject({ code: 'ENOENT' })
+
+      expect(report.ok).toBe(true)
+      expect(report.delivered).toHaveLength(1)
+      expect(report.delivered[0]!.telegramEntrypoint).toBe('public')
+      expect(report.recordPath).toBe(storePath)
+
+      const onDisk = JSON.parse(await fs.readFile(storePath, 'utf-8')) as {
+        records: Array<Record<string, unknown>>
+      }
+      expect(onDisk.records).toHaveLength(1)
+      expect(onDisk.records[0]!.telegramEntrypoint).toBe('public')
+      expect(String(onDisk.records[0]!.deliveryId)).toMatch(/::public$/)
+      expect(onDisk.records[0]!.outcome).toBe('delivered')
+      expect(onDisk.records[0]!.messageId).toBe(55)
+    })
+
+    test('rejects without a trusted context (no seam, null, forged ids or unsettled run)', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root] })
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+
+      // No seam at all: the default provider returns null.
+      const noSeam = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, { store: freshStore('pub-noseam.json') }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(noSeam.failed[0]!.errorCode).toBe('task_context_unavailable')
+
+      // Deleted / unregistered task: the provider returns null.
+      const deleted = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, { store: freshStore('pub-deleted.json'), getTaskNotificationContext: async () => null }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(deleted.failed[0]!.errorCode).toBe('task_context_unavailable')
+
+      // Forged run/task ids: the pinned provider refuses them.
+      const forged = await sendTaskNotification(
+        runFixture({ id: 'forged-run', taskId: 'forged-task' }),
+        publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-forged.json'),
+          getTaskNotificationContext: async (requested) =>
+            requested.id === 'run-1' && requested.taskId === 'task-1'
+              ? trustedTaskContext({ workDir: work })
+              : null,
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(forged.failed[0]!.errorCode).toBe('task_context_unavailable')
+
+      // Trusted context that does not match the requested run.
+      const mismatched = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-mismatch.json'),
+          getTaskNotificationContext: async () => trustedTaskContext({ runId: 'other-run', workDir: work }),
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(mismatched.failed[0]!.errorCode).toBe('task_context_unavailable')
+
+      // A run still in flight has no truthful terminal summary.
+      const running = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-running.json'),
+          getTaskNotificationContext: async () => trustedTaskContext({ status: 'running', workDir: work }),
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(running.failed[0]!.errorCode).toBe('task_context_unavailable')
+    })
+
+    test('rejects a non-owner recipient and a re-targeted trusted recipient', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root], extraPaired: [111] })
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+
+      const nonOwner = await sendTaskNotification(
+        runFixture(), publicTaskNotification(111),
+        options(fake, {
+          store: freshStore('pub-nonowner.json'),
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(nonOwner.failed[0]!.errorCode).toBe('public_route_rejected')
+      expect(nonOwner.failed[0]!.error).toContain('owner')
+
+      // The task's true source now names a different recipient; the caller's
+      // matching spec must not be trusted over it.
+      const tampered = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-tampered.json'),
+          getTaskNotificationContext: async () => trustedTaskContext({
+            workDir: work,
+            notification: {
+              enabled: true,
+              channels: ['telegram'],
+              recipients: { telegram: [111] },
+              telegramEntrypoints: ['public'],
+            },
+          }),
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(tampered.failed[0]!.errorCode).toBe('public_route_rejected')
+    })
+
+    test('rejects when the true source no longer selects the public entry', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root] })
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+
+      const report = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-unselected.json'),
+          getTaskNotificationContext: async () => trustedTaskContext({
+            workDir: work,
+            notification: { enabled: true, channels: ['telegram'], recipients: { telegram: [owner] } },
+          }),
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(report.failed[0]!.errorCode).toBe('task_context_unavailable')
+    })
+
+    test('rejects when public is disabled, the owner is unpaired, or the work dir is outside every root', async () => {
+      const { root, work } = await workDirs()
+      const outside = path.join(tmpDir, 'outside')
+      await fs.mkdir(outside, { recursive: true })
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+
+      rawConfig = publicTelegramConfig({ enabled: false, roots: [root] })
+      const disabled = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-disabled.json'),
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(disabled.failed[0]!.errorCode).toBe('public_route_rejected')
+
+      rawConfig = publicTelegramConfig({ owner: 999, extraPaired: [owner], roots: [root] })
+      const ownerChanged = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-owner-changed.json'),
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(ownerChanged.failed[0]!.errorCode).toBe('public_route_rejected')
+
+      rawConfig = {
+        telegram: {
+          pairedUsers: [telegramUser(owner)],
+          public: { enabled: true, botToken: 'public-token', generation: 3 },
+        },
+      }
+      const unpairedOwner = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-unpaired.json'),
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(unpairedOwner.failed[0]!.errorCode).toBe('public_route_rejected')
+
+      rawConfig = publicTelegramConfig({ roots: [root] })
+      const outsideRoots = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-roots.json'),
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: outside }),
+        }),
+      )
+      expect(fake.calls).toHaveLength(0)
+      expect(outsideRoots.failed[0]!.errorCode).toBe('public_route_rejected')
+      expect(outsideRoots.failed[0]!.error).toContain('项目根')
+    })
+
+    test('honours 429 retry_after, re-verifies before the retry, and stops when authority is revoked', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root] })
+      let networkCalls = 0
+      const fake = createFakeFetch(() => {
+        networkCalls += 1
+        return Response.json(
+          { ok: false, error_code: 429, description: 'Too Many Requests', parameters: { retry_after: 7 } },
+          { status: 429 },
+        )
+      })
+      const sleeps: number[] = []
+      let contextCalls = 0
+
+      const report = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-429-revoke.json'),
+          maxAttempts: 3,
+          sleep: async (ms: number) => { sleeps.push(ms) },
+          getTaskNotificationContext: async () => {
+            contextCalls += 1
+            // Revoke the owner between the first attempt and its retry.
+            if (contextCalls > 1) return null
+            return trustedTaskContext({ workDir: work })
+          },
+        }),
+      )
+
+      expect(sleeps).toEqual([7_000])
+      expect(networkCalls).toBe(1)
+      expect(contextCalls).toBe(2)
+      expect(report.failed[0]!.attempts).toBe(1)
+      expect(report.failed[0]!.errorCode).toBe('task_context_unavailable')
+    })
+
+    test('fails visibly when the pinned token/generation changes before a retry', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root], token: 'public-token' })
+      let networkCalls = 0
+      const fake = createFakeFetch(() => {
+        networkCalls += 1
+        return Response.json({ ok: false, description: 'upstream down' }, { status: 503 })
+      })
+
+      const report = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-token-change.json'),
+          maxAttempts: 3,
+          sleep: async () => {
+            // Rotate the public bot token between the first attempt and its retry.
+            rawConfig = publicTelegramConfig({ roots: [root], token: 'rotated-token' })
+          },
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+
+      expect(networkCalls).toBe(1)
+      expect(report.failed[0]!.attempts).toBe(1)
+      expect(report.failed[0]!.errorCode).toBe('public_route_rejected')
+      expect(report.failed[0]!.error).toContain('变更')
+    })
+
+    test('rejects a Bot change made while the pending row is being written, before the first attempt', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root], token: 'public-token' })
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+      const storePath = path.join(tmpDir, 'pub-pending-rotation.json')
+      const store = new NotificationDeliveryStore(storePath)
+      const originalEnqueue = store.enqueuePending.bind(store)
+      spyOn(store, 'enqueuePending').mockImplementation(async (inputs) => {
+        const result = await originalEnqueue(inputs)
+        // Rotate the Bot after the pending row exists but before the first send:
+        // the pin from `sendTaskNotification`'s initial config must still hold.
+        rawConfig = publicTelegramConfig({ roots: [root], token: 'rotated-token' })
+        return result
+      })
+
+      const report = await sendTaskNotification(
+        runFixture(),
+        publicTaskNotification(owner),
+        options(fake, {
+          store,
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+
+      expect(fake.calls).toHaveLength(0)
+      expect(report.failed[0]!.errorCode).toBe('public_route_rejected')
+      expect(report.failed[0]!.error).toContain('变更')
+      const records = await store.list()
+      expect(records[0]!.outcome).toBe('failed')
+    })
+
+    test('does not resend after a timeout (indeterminate) and keeps the receipt truthful', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root] })
+      const fake = createFakeFetch(() => { throw abortError() })
+
+      const report = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store: freshStore('pub-timeout.json'),
+          maxAttempts: 3,
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+
+      expect(fake.calls).toHaveLength(1)
+      expect(report.indeterminate).toHaveLength(1)
+      expect(report.indeterminate[0]!.attempts).toBe(1)
+      expect(report.indeterminate[0]!.telegramEntrypoint).toBe('public')
+
+      const records = await freshStore('pub-timeout.json').list()
+      expect(records[0]!.outcome).toBe('indeterminate')
+    })
+
+    test('delivers both entrypoints independently to the same chat, and isolates a one-end failure', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root], dedicatedToken: 'dedicated-token' })
+      const storePath = path.join(tmpDir, 'dual-entry.json')
+      const store = new NotificationDeliveryStore(storePath)
+
+      // First: both entrypoints succeed (dedicated session matches its binding).
+      const fake = createFakeFetch((call) =>
+        call.url.includes('botdedicated-token')
+          ? Response.json({ ok: true, result: { message_id: 11 } })
+          : Response.json({ ok: true, result: { message_id: 22 } }),
+      )
+      const bothOk = await sendTaskNotification(
+        runFixture({ sessionId: 'sess-bound' }),
+        publicTaskNotification(owner, { telegramEntrypoints: ['dedicated', 'public'] }),
+        options(fake, {
+          store,
+          getDedicatedBinding: () => ({ sessionId: 'sess-bound' }),
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+      expect(bothOk.ok).toBe(true)
+      expect(bothOk.delivered).toHaveLength(2)
+      expect(fake.calls.map((call) => call.url.includes('botdedicated-token') ? 'dedicated' : 'public').sort())
+        .toEqual(['dedicated', 'public'])
+      const dualRecords = await store.list()
+      expect(dualRecords).toHaveLength(2)
+      expect(dualRecords.map((record) => record.deliveryId).sort()).toEqual([
+        'run-1::telegram::4242::0',
+        'run-1::telegram::4242::0::public',
+      ])
+
+      // Second: the dedicated gate fails (no source session) but the public
+      // send still goes out — one endpoint never suppresses the other.
+      const isolatedStore = new NotificationDeliveryStore(path.join(tmpDir, 'dual-entry-isolated.json'))
+      const isolatedFake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 33 } }))
+      const isolated = await sendTaskNotification(
+        runFixture({ id: 'run-2' }),
+        publicTaskNotification(owner, { telegramEntrypoints: ['dedicated', 'public'] }),
+        options(isolatedFake, {
+          store: isolatedStore,
+          getDedicatedBinding: () => ({ sessionId: 'sess-bound' }),
+          getTaskNotificationContext: async () => trustedTaskContext({ runId: 'run-2', workDir: work }),
+        }),
+      )
+      expect(isolatedFake.calls).toHaveLength(1)
+      expect(isolatedFake.calls[0]!.url).toContain('botpublic-token')
+      expect(isolated.failed).toHaveLength(1)
+      expect(isolated.failed[0]!.errorCode).toBe('source_session_required')
+      expect(isolated.delivered).toHaveLength(1)
+      expect(isolated.delivered[0]!.telegramEntrypoint).toBe('public')
+      // The public send is journalled separately from the failed dedicated one.
+      expect((await isolatedStore.list()).map((record) => record.deliveryId).sort()).toEqual([
+        'run-2::telegram::4242::0',
+        'run-2::telegram::4242::0::public',
+      ])
+    })
+
+    test('keeps distinct tasks concurrent and never repeats a settled run', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root] })
+      const store = freshStore('pub-concurrent.json')
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+
+      const notification = publicTaskNotification(owner)
+      const first = runFixture({ id: 'run-1' })
+      const second = runFixture({ id: 'run-2' })
+      await Promise.all([
+        sendTaskNotification(first, notification, options(fake, {
+          store,
+          getTaskNotificationContext: async (requested) =>
+            trustedTaskContext({ runId: requested.id, workDir: work }),
+        })),
+        sendTaskNotification(second, notification, options(fake, {
+          store,
+          getTaskNotificationContext: async (requested) =>
+            trustedTaskContext({ runId: requested.id, workDir: work }),
+        })),
+      ])
+      expect(fake.calls).toHaveLength(2)
+
+      // A repeat of the already-settled run is idempotent, not a second send.
+      const repeat = await sendTaskNotification(first, notification, options(fake, {
+        store,
+        getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+      }))
+      expect(fake.calls).toHaveLength(2)
+      expect(repeat.delivered).toHaveLength(0)
+      expect(repeat.failed[0]!.errorCode).toBe('delivery_record_failed')
+      expect(await store.list()).toHaveLength(2)
+    })
+
+    test('never leaves a public delivery pending when the retry loop throws unexpectedly', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root] })
+      const store = freshStore('pub-throw.json')
+      const fake = createFakeFetch(() => Response.json({ ok: false, description: 'down' }, { status: 503 }))
+
+      const report = await sendTaskNotification(
+        runFixture(), publicTaskNotification(owner),
+        options(fake, {
+          store,
+          maxAttempts: 3,
+          sleep: async () => { throw new Error('sleep exploded') },
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+
+      expect(report.failed).toHaveLength(1)
+      expect(report.failed[0]!.outcome).toBe('failed')
+      const records = await store.list()
+      expect(records).toHaveLength(1)
+      expect(records[0]!.outcome).toBe('failed')
+      expect(await store.listPending()).toHaveLength(0)
+    })
+
+    test('leaves legacy dedicated delivery keys and entrypoint tags untouched', async () => {
+      rawConfig = publicTelegramConfig({ enabled: false, dedicatedToken: 'dedicated-token', extraPaired: [111] })
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+      const store = freshStore('legacy-dedicated.json')
+
+      const report = await sendTaskNotification(
+        runFixture(),
+        { enabled: true, channels: ['telegram'], recipients: { telegram: [111] } },
+        options(fake, { store }),
+      )
+
+      expect(fake.calls).toHaveLength(1)
+      expect(fake.calls[0]!.url).toContain('botdedicated-token')
+      expect(report.delivered[0]!.telegramEntrypoint).toBeUndefined()
+      const records = await store.list()
+      expect(records[0]!.deliveryId).toBe('run-1::telegram::111::0')
+      expect(records[0]!.telegramEntrypoint).toBeUndefined()
+    })
+
+    test('delivers to a public-only owner who is absent from the dedicated pairing list', async () => {
+      const { root, work } = await workDirs()
+      // Public-only install: no dedicated Bot, and the owner is NOT in the
+      // dedicated `pairedUsers`. The owner must be synthesized from the public
+      // config, exactly as `cronService`'s public validation does — relying on
+      // the dedicated pairing list here would reject a real public-only setup.
+      rawConfig = publicTelegramConfig({ roots: [root], pairedOwner: false, dedicatedToken: null })
+      // Guard the fixture itself: the owner must not be reachable through the
+      // dedicated pairing list, or the test could pass without synthesizing it.
+      expect(rawConfig.telegram?.botToken).toBeUndefined()
+      expect(rawConfig.telegram?.pairedUsers ?? []).toHaveLength(0)
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 71 } }))
+      const store = freshStore('pub-only-owner.json')
+
+      const report = await sendTaskNotification(
+        runFixture(),
+        publicTaskNotification(owner),
+        options(fake, {
+          store,
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+
+      expect(fake.calls).toHaveLength(1)
+      expect(fake.calls[0]!.url).toBe('https://api.telegram.org/botpublic-token/sendMessage')
+      expect(fake.calls[0]!.body.chat_id).toBe(owner)
+      expect(report.delivered).toHaveLength(1)
+      expect(report.delivered[0]!.recipientId).toBe(String(owner))
+      const records = await store.list()
+      expect(records).toHaveLength(1)
+      expect(records[0]!.recipientId).toBe(String(owner))
+      expect(records[0]!.deliveryId).toBe(`run-1::telegram::${owner}::0::public`)
+    })
+
+    test('公共任务边界：公共 Token 在业务错误、日志和投递记录中脱敏', async () => {
+      const { root, work } = await workDirs()
+      const token = 'public-secret-token'
+      rawConfig = publicTelegramConfig({ token, roots: [root], pairedOwner: false })
+      const fake = createFakeFetch(() => Response.json({ ok: false, description: `denied ${token}` }))
+      const store = freshStore('public-token-redaction.json')
+      const report = await sendTaskNotification(runFixture(), publicTaskNotification(owner), options(fake, {
+        store,
+        getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+      }))
+      expect(report.failed).toHaveLength(1)
+      expect(report.failed[0]!.error).toContain('[redacted]')
+      expect(JSON.stringify(report)).not.toContain(token)
+      expect(JSON.stringify(await store.list())).not.toContain(token)
+      expect(deliveredLogs.join('\n')).not.toContain(token)
+    })
+
+    test('公共任务边界：429 缺少 retry_after 时仍按既有有界退避重试', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root], pairedOwner: false })
+      let attempts = 0
+      let authorizations = 0
+      const sleeps: number[] = []
+      const fake = createFakeFetch(() => ++attempts === 1
+        ? Response.json({ ok: false, error_code: 429 }, { status: 429 })
+        : Response.json({ ok: true, result: { message_id: 91 } }))
+      const report = await sendTaskNotification(runFixture(), publicTaskNotification(owner), options(fake, {
+        store: freshStore('public-429-no-retry-after.json'),
+        retryDelayMs: 17,
+        sleep: async ms => { sleeps.push(ms) },
+        getTaskNotificationContext: async () => {
+          authorizations += 1
+          return trustedTaskContext({ workDir: work })
+        },
+      }))
+      expect(report.delivered).toHaveLength(1)
+      expect(report.delivered[0]!.attempts).toBe(2)
+      expect(authorizations).toBe(2)
+      expect(sleeps).toEqual([17])
+    })
+
+    test('公共任务边界：超长任务名称不会遮掉任务与运行定位', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root], pairedOwner: false })
+      const context = trustedTaskContext({ workDir: work })
+      context.task.name = '很长的任务名'.repeat(1000)
+      const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 92 } }))
+      await sendTaskNotification(runFixture(), publicTaskNotification(owner), options(fake, {
+        store: freshStore('public-long-task-name.json'),
+        getTaskNotificationContext: async () => context,
+      }))
+      expect(fake.calls).toHaveLength(1)
+      const text = String(fake.calls[0]!.body.text)
+      expect(text).toContain(`T${context.task.id}`)
+      expect(text).toContain(`Run: ${context.run.id}`)
+      expect(text.length).toBeLessThanOrEqual(4000)
+    })
+
+    test('records the real owner id, never a display name, in the key and the failure log', async () => {
+      const { root, work } = await workDirs()
+      // The owner is a dedicated paired user whose display name is a human
+      // label; the journal and the failure log must carry the numeric owner id.
+      rawConfig = publicTelegramConfig({ roots: [root] })
+      const fake = createFakeFetch(() => Response.json({ ok: false, description: 'down' }, { status: 503 }))
+      const store = freshStore('pub-owner-id.json')
+
+      const report = await sendTaskNotification(
+        runFixture(),
+        publicTaskNotification(owner),
+        options(fake, {
+          store,
+          maxAttempts: 1,
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+
+      expect(report.failed).toHaveLength(1)
+      expect(report.failed[0]!.recipientId).toBe(String(owner))
+      expect(report.failed[0]!.recipientLabel).toBe(String(owner))
+      expect(deliveredLogs.some((line) => line.includes(`(${owner})`))).toBe(true)
+      const records = await store.list()
+      expect(records[0]!.recipientId).toBe(String(owner))
+      expect(records[0]!.recipientDisplayName).toBe(String(owner))
+    })
+
+    test.each([
+      { slug: 'unknown', value: ['public', 'smtp'] },
+      { slug: 'duplicate', value: ['public', 'public'] },
+      { slug: 'empty', value: [] },
+      { slug: 'non-array', value: 'public' },
+    ] as const)(
+      'fails closed on a malformed persisted telegramEntrypoints ($slug) instead of defaulting to dedicated',
+      async ({ slug, value }) => {
+        const { root, work } = await workDirs()
+        rawConfig = publicTelegramConfig({ roots: [root], dedicatedToken: 'dedicated-token' })
+        const fake = createFakeFetch(() => Response.json({ ok: true, result: { message_id: 1 } }))
+        const store = freshStore(`pub-bad-entry-${slug}.json`)
+
+        const report = await sendTaskNotification(
+          runFixture({ sessionId: 'sess-bound' }),
+          publicTaskNotification(owner, { telegramEntrypoints: value as never }),
+          options(fake, {
+            store,
+            getDedicatedBinding: () => ({ sessionId: 'sess-bound' }),
+            getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+          }),
+        )
+
+        // Only a missing field or a canonical null may mean "dedicated". Every
+        // malformed shape must fail visibly rather than silently send through
+        // either Bot.
+        expect(fake.calls).toHaveLength(0)
+        expect(report.ok).toBe(false)
+        expect(report.delivered).toHaveLength(0)
+        const visible = [
+          ...report.failed.map((entry) => entry.errorCode),
+          ...report.issues.map((issue) => issue.code),
+        ]
+        expect(visible).toContain('invalid_telegram_entrypoints')
+      },
+    )
+
+    test('isolates a throwing dedicated entrypoint so the public one still settles', async () => {
+      const { root, work } = await workDirs()
+      rawConfig = publicTelegramConfig({ roots: [root], dedicatedToken: 'dedicated-token' })
+      const fake = createFakeFetch((call) =>
+        call.url.includes('botpublic-token')
+          ? Response.json({ ok: true, result: { message_id: 88 } })
+          : Response.json({ ok: true, result: { message_id: 11 } }),
+      )
+      const store = freshStore('pub-throw-isolated.json')
+
+      const report = await sendTaskNotification(
+        runFixture({ sessionId: 'sess-bound' }),
+        publicTaskNotification(owner, { telegramEntrypoints: ['dedicated', 'public'] }),
+        options(fake, {
+          store,
+          // The dedicated gate throws before it can send anything.
+          getDedicatedBinding: () => {
+            throw new Error('binding blew up')
+          },
+          getTaskNotificationContext: async () => trustedTaskContext({ workDir: work }),
+        }),
+      )
+
+      // A throw on one entrypoint must never suppress the other.
+      expect(report.delivered.map((entry) => entry.telegramEntrypoint)).toEqual(['public'])
+      expect(fake.calls).toHaveLength(1)
+      expect(fake.calls[0]!.url).toContain('botpublic-token')
+      expect(report.ok).toBe(false)
+      expect(await store.listPending()).toHaveLength(0)
+    })
+
+    test('settles a dedicated pending row as failed when the delivery attempt throws', async () => {
+      rawConfig = publicTelegramConfig({ enabled: false, dedicatedToken: 'dedicated-token' })
+      const fake = createFakeFetch(() => Response.json({ ok: false, description: 'down' }, { status: 503 }))
+      const store = freshStore('dedicated-throw-settle.json')
+
+      const report = await sendTaskNotification(
+        runFixture(),
+        { enabled: true, channels: ['telegram'], recipients: { telegram: [owner] } },
+        options(fake, {
+          store,
+          maxAttempts: 3,
+          sleep: async () => {
+            throw new Error('sleep exploded')
+          },
+        }),
+      )
+
+      // The attempt threw after the pending row was written: the row must be
+      // settled to a visible failure, never left pending.
+      expect(report.ok).toBe(false)
+      expect(await store.listPending()).toHaveLength(0)
+      const records = await store.list()
+      expect(records).toHaveLength(1)
+      expect(records[0]!.outcome).toBe('failed')
     })
   })
 })

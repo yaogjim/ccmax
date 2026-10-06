@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import '@testing-library/jest-dom'
 
 import { AdapterSettings } from './AdapterSettings'
@@ -38,6 +38,7 @@ function renderAdapterSettings(
   useAdapterStore.setState({
     config,
     isLoading: false,
+    hasLoaded: true,
     fetchConfig: vi.fn(async () => {}),
     updateConfig: vi.fn(async () => {}),
     startWhatsAppLogin: vi.fn(async () => ({ message: 'ok', sessionKey: 'whatsapp-session' })),
@@ -104,10 +105,24 @@ afterEach(() => {
 })
 
 describe('AdapterSettings IM setup entry', () => {
+  it('shows the initial loading state until the first configuration is available', () => {
+    renderAdapterSettings({}, { isLoading: true, hasLoaded: false })
+    expect(screen.queryByRole('tab', { name: 'Platform connections' })).not.toBeInTheDocument()
+    expect(screen.getByText('Loading...')).toBeInTheDocument()
+    act(() => useAdapterStore.setState({ isLoading: false, hasLoaded: true }))
+    expect(screen.getByRole('tab', { name: 'Platform connections' })).toBeInTheDocument()
+  })
+
   it('shows Telegram first by default and links to the unified documentation URL', () => {
     renderAdapterSettings({})
 
-    const tabs = screen.getAllByRole('tab').map((tab) => tab.textContent)
+    const sections = screen.getByRole('tablist', { name: 'IM settings sections' })
+    expect(sections).toHaveClass('overflow-x-auto', 'overflow-y-hidden')
+    expect(within(sections).getAllByRole('tab').map((tab) => tab.textContent)).toEqual([
+      'Platform connections',
+      'Public channel subscriptions',
+    ])
+    const tabs = within(screen.getByRole('tablist', { name: 'IM adapter' })).getAllByRole('tab').map((tab) => tab.textContent)
     expect(tabs).toEqual([
       'Telegram',
       'Feishu',
@@ -754,6 +769,46 @@ describe('AdapterSettings unbind dialog busy state', () => {
 })
 
 describe('AdapterSettings Telegram exclusive vs public', () => {
+  it('links both section tabs to panels and preserves drafts and platform selection across switches', () => {
+    const updateConfig = vi.fn(async () => {})
+    renderAdapterSettings({}, { updateConfig })
+
+    const platforms = screen.getByRole('tab', { name: 'Platform connections' })
+    const publicTab = screen.getByRole('tab', { name: 'Public channel subscriptions' })
+    expect(screen.getByRole('tabpanel', { name: 'Platform connections' })).toHaveAttribute('id', platforms.getAttribute('aria-controls'))
+    expect(screen.queryByRole('switch', { name: 'Enable public Bot' })).not.toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Bot Token'), { target: { value: 'exclusive-draft' } })
+    fireEvent.click(screen.getByRole('tab', { name: 'Feishu' }))
+
+    platforms.focus()
+    fireEvent.keyDown(platforms, { key: 'ArrowRight' })
+    expect(publicTab).toHaveFocus()
+    expect(publicTab).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tabpanel', { name: 'Public channel subscriptions' })).toHaveAttribute('id', publicTab.getAttribute('aria-controls'))
+    expect(screen.queryByRole('tab', { name: 'Feishu' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Public Bot Token'), { target: { value: 'public-draft' } })
+    fireEvent.click(screen.getByRole('switch', { name: 'Enable public Bot' }))
+    fireEvent.change(screen.getByLabelText('Full sessionId'), { target: { value: 'session-draft' } })
+
+    fireEvent.keyDown(publicTab, { key: 'ArrowLeft' })
+    expect(platforms).toHaveFocus()
+    expect(screen.getByRole('tab', { name: 'Feishu' })).toHaveAttribute('aria-selected', 'true')
+    fireEvent.click(screen.getByRole('tab', { name: 'Telegram' }))
+    expect(screen.getByLabelText('Bot Token')).toHaveValue('exclusive-draft')
+    fireEvent.click(publicTab)
+    expect(screen.getByLabelText('Public Bot Token')).toHaveValue('public-draft')
+    expect(screen.getByRole('switch', { name: 'Enable public Bot' })).toBeChecked()
+    expect(screen.getByLabelText('Full sessionId')).toHaveValue('session-draft')
+    // Pairing polls refresh the global config while the public panel is open.
+    // A full-page loading return used to unmount it and discard local drafts.
+    act(() => useAdapterStore.setState({ isLoading: true }))
+    expect(screen.getByLabelText('Public Bot Token')).toHaveValue('public-draft')
+    act(() => useAdapterStore.setState({ isLoading: false }))
+    expect(screen.getByLabelText('Full sessionId')).toHaveValue('session-draft')
+    expect(updateConfig).not.toHaveBeenCalled()
+  })
+
   it('labels the exclusive Bot and keeps dedicated save free of public fields', async () => {
     const updateConfig = vi.fn(async (_patch: Partial<AdapterFileConfig>) => {})
     renderAdapterSettings(
@@ -773,8 +828,11 @@ describe('AdapterSettings Telegram exclusive vs public', () => {
     )
 
     expect(screen.getByText('Exclusive Bot')).toBeInTheDocument()
+    expect(screen.queryByText('Public Bot')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: 'Public channel subscriptions' }))
     expect(screen.getByText('Public Bot')).toBeInTheDocument()
-    expect(screen.getByRole('switch', { name: 'Enable public Bot' })).toBeChecked()
+    expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: 'Platform connections' }))
 
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 

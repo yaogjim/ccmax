@@ -70,6 +70,70 @@ afterEach(() => {
 })
 
 describe('TelegramPublicSettings', () => {
+  it('prioritizes subscriptions after pairing and keeps configuration drafts when collapsed', async () => {
+    mocks.getTelegramPublicStatus.mockResolvedValue({ generation: 2, running: true, subscriptions: [{ sessionId: 'sess-1', shortId: 'S1', title: 'Subscribed session', project: '/fixture/app' }], deliveries: [] })
+    renderPublicSettings({ telegram: { public: { enabled: true, botToken: '****oken', ownerUserId: 42, generation: 2 } } })
+
+    await screen.findByText('Subscribed session')
+    const configuration = screen.getByRole('button', { name: 'Bot configuration and pairing' })
+    expect(configuration).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('button', { name: 'Save public Bot' })).not.toBeInTheDocument()
+    expect(screen.getByText(/Project access uses the saved/)).toBeVisible()
+    const subscriptions = screen.getByRole('region', { name: 'Public subscriptions' })
+    const manualInput = within(subscriptions).getByLabelText('Full sessionId')
+    expect(screen.getByText('Subscribed session').compareDocumentPosition(manualInput) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+
+    fireEvent.click(configuration)
+    expect(configuration).toHaveAttribute('aria-expanded', 'true')
+    expect(document.getElementById(configuration.getAttribute('aria-controls')!)).toBeVisible()
+    fireEvent.change(screen.getByLabelText('Public Bot Token'), { target: { value: 'new-token-draft' } })
+    fireEvent.click(configuration)
+    expect(screen.queryByRole('switch', { name: 'Enable public Bot' })).not.toBeInTheDocument()
+    fireEvent.click(configuration)
+    expect(screen.getByLabelText('Public Bot Token')).toHaveValue('new-token-draft')
+  })
+
+  it('refreshes runtime and subscriptions explicitly without saving configuration', async () => {
+    const { updateConfig } = renderPublicSettings({ telegram: { public: { enabled: true, botToken: '****oken', ownerUserId: 42, generation: 2 } } })
+    await waitFor(() => expect(mocks.getTelegramPublicStatus).toHaveBeenCalledTimes(1))
+    mocks.getTelegramPublicStatus.mockResolvedValue({ generation: 2, running: true, subscriptions: [{ sessionId: 'sess-2', shortId: 'S2', title: 'New subscription', project: '/fixture/app' }], deliveries: [] })
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }))
+    await screen.findByText('New subscription')
+    expect(screen.getByRole('status')).toHaveTextContent('Public Bot is running')
+    expect(mocks.getTelegramPublicStatus).toHaveBeenCalledTimes(2)
+    expect(updateConfig).not.toHaveBeenCalled()
+  })
+
+  it('hides the previous operator subscriptions while the new identity status is loading', async () => {
+    mocks.getTelegramPublicStatus.mockResolvedValueOnce({ generation: 2, running: true, subscriptions: [{ sessionId: 'old-session', shortId: 'S1', title: 'Previous operator session', project: '/fixture/app' }], deliveries: [{ id: 'old-delivery', status: 'failed', error: 'Previous operator delivery' }] })
+    let resolveNew!: (value: unknown) => void
+    mocks.getTelegramPublicStatus.mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve }))
+    renderPublicSettings({ telegram: { public: { enabled: true, botToken: '****oken', ownerUserId: 42, generation: 2 } } })
+    await screen.findByText('Previous operator session')
+    act(() => useAdapterStore.setState({ config: { telegram: { public: { enabled: true, botToken: '****oken', ownerUserId: 43, generation: 3 } } } }))
+    expect(screen.queryByText('Previous operator session')).not.toBeInTheDocument()
+    expect(screen.queryByText('Previous operator delivery')).not.toBeInTheDocument()
+    await act(async () => resolveNew({ generation: 3, running: true, subscriptions: [{ sessionId: 'new-session', shortId: 'S2', title: 'New operator session', project: '/fixture/app' }], deliveries: [] }))
+    expect(await screen.findByText('New operator session')).toBeInTheDocument()
+  })
+
+  it('refreshes with the saved identity after saving changes the configuration generation', async () => {
+    // 保存后的异步回调不能用旧闭包标记新状态，否则刚刷新出的订阅会被隐藏。
+    const oldConfig = { telegram: { public: { enabled: true, botToken: '****oken', ownerUserId: 42, generation: 2 } } }
+    const updateConfig = vi.fn(async () => {
+      useAdapterStore.setState({ config: { telegram: { public: { ...oldConfig.telegram.public, generation: 3 } } } })
+    })
+    mocks.getTelegramPublicStatus.mockResolvedValueOnce({ generation: 2, running: true, subscriptions: [], deliveries: [] })
+    mocks.getTelegramPublicStatus.mockResolvedValue({ generation: 3, running: true, subscriptions: [{ sessionId: 'saved-session', shortId: 'S3', title: 'Subscription after save', project: '/fixture/app' }], deliveries: [] })
+    renderPublicSettings(oldConfig, { updateConfig })
+    await screen.findByText('Public Bot is running')
+    fireEvent.click(screen.getByRole('button', { name: 'Bot configuration and pairing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save public Bot' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Public Bot saved' })).not.toBeDisabled())
+    expect(await screen.findByText('Subscription after save')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Public Bot is running')
+  })
+
   it('defaults public Bot off with no owner and does not claim it is running', () => {
     renderPublicSettings({})
 
@@ -193,6 +257,7 @@ describe('TelegramPublicSettings', () => {
       },
     })
 
+    fireEvent.click(screen.getByRole('button', { name: 'Bot configuration and pairing' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save public Bot' }))
 
     await waitFor(() => expect(updateConfig).toHaveBeenCalledTimes(1))
@@ -309,6 +374,7 @@ describe('TelegramPublicSettings', () => {
     })
     await waitFor(() => expect(mocks.getTelegramPublicStatus).toHaveBeenCalledTimes(1))
 
+    fireEvent.click(screen.getByRole('button', { name: 'Bot configuration and pairing' }))
     fireEvent.click(screen.getByRole('button', { name: 'Reset operator' }))
     expect(mocks.resetTelegramPublicPairing).not.toHaveBeenCalled()
     const dialog = await screen.findByRole('dialog')
@@ -414,7 +480,7 @@ describe('TelegramPublicSettings', () => {
   it('names controls and announces runtime status without duplicating it on the dot', () => {
     renderPublicSettings({})
 
-    expect(screen.getByRole('region', { name: 'Public Bot' })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'Public channel subscriptions' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Public Bot' })).toBeInTheDocument()
     expect(screen.getByRole('switch', { name: 'Enable public Bot' })).toBeInTheDocument()
     expect(screen.getByLabelText('Public Bot Token')).toBeInTheDocument()
@@ -475,6 +541,7 @@ describe('TelegramPublicSettings', () => {
     )
     await screen.findByText('Fix login')
 
+    fireEvent.click(screen.getByRole('button', { name: 'Bot configuration and pairing' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save public Bot' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('disk full')
 

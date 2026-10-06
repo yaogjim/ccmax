@@ -6,7 +6,6 @@ import { useTranslation, type TranslationKey } from '../../i18n'
 import { parseRunOutput } from '../../lib/parseRunOutput'
 import { tasksApi } from '../../api/tasks'
 import type {
-  NotificationDeliveryChannel,
   NotificationDeliveryRecord,
   TaskNotificationConfig,
   TaskRun,
@@ -16,6 +15,7 @@ import {
   NOTIFICATION_CHANNEL_IDS,
   type ChannelNotificationStatus,
   type DeliveriesLoadState,
+  type DeliveryChannelId,
 } from './runNotificationStatus'
 import { MarkdownRenderer } from '../markdown/MarkdownRenderer'
 import { Badge, type Tone } from '@/components/ui/Badge'
@@ -82,8 +82,9 @@ const STATUS_CONFIG: Record<string, { icon: string; color: string }> = {
   timeout:   { icon: 'timer_off',    color: 'var(--color-error)' },
 }
 
-const CHANNEL_LABEL_KEY: Record<NotificationDeliveryChannel, TranslationKey> = {
+const CHANNEL_LABEL_KEY: Record<DeliveryChannelId, TranslationKey> = {
   telegram: 'settings.adapters.platform.telegram',
+  'telegram-public': 'tasks.delivery.channel.telegramPublic',
   feishu: 'settings.adapters.platform.feishu',
 }
 
@@ -233,7 +234,7 @@ function RunNotificationStatus({
           const counts = statusCounts(status)
           return (
             <div key={channel} className="flex flex-wrap items-center gap-2">
-              <span className="w-16 shrink-0 text-[13px] text-[var(--color-text-primary)]">
+              <span className="w-28 shrink-0 text-[13px] text-[var(--color-text-primary)]">
                 {t(CHANNEL_LABEL_KEY[channel])}
               </span>
               <Badge

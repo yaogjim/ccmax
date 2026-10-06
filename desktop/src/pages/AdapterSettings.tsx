@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useId } from 'react'
 import { useAdapterStore } from '../stores/adapterStore'
 import { useTranslation } from '../i18n'
 import { Input } from '@/components/ui/Input'
@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/Button'
 import { LoadingState } from '@/components/ui/LoadingState'
 import { DirectoryPicker } from '@/components/composite/DirectoryPicker'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+import { SegmentedControl } from '@/components/ui/SegmentedControl'
 import QRCode from 'qrcode'
 import { TelegramPublicSettings } from './TelegramPublicSettings'
 
@@ -188,6 +189,7 @@ export function AdapterSettings() {
   const {
     config,
     isLoading,
+    hasLoaded,
     fetchConfig,
     updateConfig,
     generatePairingCode,
@@ -214,6 +216,11 @@ export function AdapterSettings() {
     getSlackManifest,
     unbindSlackApp,
   } = useAdapterStore()
+
+  const sectionId = useId()
+  const [activeSection, setActiveSection] = useState<'platforms' | 'public'>('platforms')
+  // Lazy-mount the public panel, then retain drafts and subscription filters.
+  const [publicVisited, setPublicVisited] = useState(false)
 
   // Active IM tab
   const [activeIm, setActiveIm] = useState<ImTab>('telegram')
@@ -881,7 +888,7 @@ export function AdapterSettings() {
   const minutesLeft = pairingExpiry ? Math.max(0, Math.ceil((pairingExpiry - Date.now()) / 60000)) : 0
   const hasSavedFeishuCredentials = Boolean(config.feishu?.appId && config.feishu?.appSecret)
 
-  if (isLoading) {
+  if (isLoading && !hasLoaded) {
     return (
       <div className="flex items-center justify-center py-12">
         <LoadingState label={t('common.loading')} variant="inline" size="md" />
@@ -915,6 +922,30 @@ export function AdapterSettings() {
         </p>
       </div>
 
+      <SegmentedControl
+        as="tablist"
+        appearance="underline"
+        label={t('settings.adapters.sections')}
+        value={activeSection}
+        items={[
+          { value: 'platforms', label: t('settings.adapters.platformConnections'), id: `${sectionId}-platforms-tab`, controls: `${sectionId}-platforms-panel` },
+          { value: 'public', label: t('settings.adapters.publicSubscriptionsTab'), id: `${sectionId}-public-tab`, controls: `${sectionId}-public-panel` },
+        ]}
+        onChange={(section) => {
+          setActiveSection(section)
+          if (section === 'public') setPublicVisited(true)
+        }}
+        className="max-w-full overflow-x-auto overflow-y-hidden"
+      />
+
+      <div
+        role="tabpanel"
+        id={`${sectionId}-platforms-panel`}
+        aria-labelledby={`${sectionId}-platforms-tab`}
+        hidden={activeSection !== 'platforms'}
+        tabIndex={0}
+        className="space-y-8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
+      >
       {/* Pairing */}
       <section className="rounded-[var(--radius-xl)] border border-[var(--color-border)] overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-3 bg-[var(--color-surface-hover)] border-b border-[var(--color-border)]">
@@ -1350,7 +1381,6 @@ export function AdapterSettings() {
               />
               <p className="text-xs text-[var(--color-text-tertiary)]">{t('settings.adapters.allowedUsersHint')}</p>
             </div>
-            <TelegramPublicSettings />
           </div>
         )}
 
@@ -1600,6 +1630,18 @@ export function AdapterSettings() {
         confirmVariant="danger"
         loading={adapterUnbind?.loading ?? false}
       />
+      </div>
+
+      <div
+        role="tabpanel"
+        id={`${sectionId}-public-panel`}
+        aria-labelledby={`${sectionId}-public-tab`}
+        hidden={activeSection !== 'public'}
+        tabIndex={0}
+        className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
+      >
+        {publicVisited && <TelegramPublicSettings />}
+      </div>
     </div>
   )
 }

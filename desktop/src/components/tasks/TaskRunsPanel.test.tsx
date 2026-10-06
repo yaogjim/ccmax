@@ -118,6 +118,7 @@ describe('TaskRunsPanel notifications', () => {
       'tasks.delivery.partial',
       'tasks.delivery.failed',
       'tasks.delivery.indeterminate',
+      'tasks.delivery.channel.telegramPublic',
     ] as const
     for (const locale of ['en', 'zh', 'zh-TW', 'jp', 'kr'] as const) {
       for (const key of keys) {
@@ -132,6 +133,61 @@ describe('TaskRunsPanel notifications', () => {
         expect(translate(locale, key, { count: 2 }), `${locale} drops the count for ${key}`).toContain('2')
       }
     }
+  })
+
+  it('separates dedicated and public Telegram deliveries for a both-entry task', async () => {
+    useSettingsStore.setState({ locale: 'en' })
+    useTaskStore.setState({
+      tasks: [{
+        id: 'task-1',
+        name: 'Daily summary',
+        cron: '0 9 * * *',
+        prompt: 'Summarize',
+        enabled: true,
+        createdAt: 0,
+        notification: {
+          enabled: true,
+          channels: ['telegram'],
+          telegramEntrypoints: ['dedicated', 'public'],
+          recipients: { telegram: ['111'] },
+        },
+      }],
+      fetchTaskRuns: vi.fn(async () => [terminalRun]),
+    } as Partial<ReturnType<typeof useTaskStore.getState>>)
+
+    vi.mocked(tasksApi.getRunDeliveries).mockResolvedValue({
+      deliveries: [
+        delivery('telegram', 'delivered'),
+        delivery('telegram', 'failed', {
+          telegramEntrypoint: 'public',
+          recipientId: 'user-2',
+          error: 'HTTP 400',
+        }),
+      ],
+    })
+
+    render(<TaskRunsPanel taskId="task-1" onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Summary' }))
+
+    await waitFor(() => expect(screen.getByTestId('run-delivery-telegram')).toHaveTextContent('Delivered'))
+    expect(screen.getByTestId('run-delivery-telegram-public')).toHaveTextContent('Delivery failed')
+  })
+
+  it('counts a Telegram record without an entrypoint as dedicated, not public', async () => {
+    useSettingsStore.setState({ locale: 'en' })
+    useTaskStore.setState({
+      tasks: [configuredTask],
+      fetchTaskRuns: vi.fn(async () => [terminalRun]),
+    } as Partial<ReturnType<typeof useTaskStore.getState>>)
+
+    vi.mocked(tasksApi.getRunDeliveries).mockResolvedValue({
+      deliveries: [delivery('telegram', 'delivered')],
+    })
+
+    render(<TaskRunsPanel taskId="task-1" onClose={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Summary' }))
+
+    await waitFor(() => expect(screen.getByTestId('run-delivery-telegram')).toHaveTextContent('Delivered'))
   })
 
   it('shows Telegram and Feishu delivery outcomes separately from the run status', async () => {

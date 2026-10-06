@@ -25,6 +25,12 @@ describe('SegmentedControl', () => {
     expect(screen.getAllByRole('tab')).toHaveLength(3)
   })
 
+  it('associates named tabs with their panels', () => {
+    render(<SegmentedControl items={[{ value: 'all', label: 'All', id: 'all-tab', controls: 'all-panel' }]} value="all" onChange={() => {}} label="View" as="tablist" />)
+    expect(screen.getByRole('tab', { name: 'All' })).toHaveAttribute('id', 'all-tab')
+    expect(screen.getByRole('tab', { name: 'All' })).toHaveAttribute('aria-controls', 'all-panel')
+  })
+
   it('marks the selected segment', () => {
     render(<SegmentedControl items={ITEMS} value="active" onChange={() => {}} label="Filter" />)
     expect(screen.getByRole('radio', { name: 'Active' })).toHaveAttribute('aria-checked', 'true')

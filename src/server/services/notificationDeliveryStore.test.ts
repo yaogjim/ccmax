@@ -109,6 +109,48 @@ describe('notificationDeliveryStore migration', () => {
     expect(normalizeNotificationDeliveryStore('{not json').records).toEqual([])
     expect(normalizeNotificationDeliveryStore(null).schemaVersion).toBe(NOTIFICATION_DELIVERY_SCHEMA_VERSION)
   })
+
+  // Regression: the public task notification adds an optional
+  // `telegramEntrypoint` tag. A record written before it existed must still
+  // load and be treated as dedicated (undefined) — never guessed as public.
+  test('reads a legacy record without telegramEntrypoint as dedicated and keeps a valid tag', () => {
+    const migrated = normalizeNotificationDeliveryStore([
+      {
+        deliveryId: 'legacy-entry',
+        runId: 'r',
+        taskId: 't',
+        channel: 'telegram',
+        recipientId: '111',
+        outcome: 'delivered',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      {
+        deliveryId: 'public-entry',
+        runId: 'r',
+        taskId: 't',
+        channel: 'telegram',
+        recipientId: '111',
+        outcome: 'delivered',
+        telegramEntrypoint: 'public',
+        createdAt: '2026-01-01T00:00:01.000Z',
+      },
+      {
+        deliveryId: 'bogus-entry',
+        runId: 'r',
+        taskId: 't',
+        channel: 'telegram',
+        recipientId: '111',
+        outcome: 'delivered',
+        telegramEntrypoint: 'nonsense',
+        createdAt: '2026-01-01T00:00:02.000Z',
+      },
+    ])
+
+    const byId = new Map(migrated.records.map((record) => [record.deliveryId, record]))
+    expect(byId.get('legacy-entry')!.telegramEntrypoint).toBeUndefined()
+    expect(byId.get('public-entry')!.telegramEntrypoint).toBe('public')
+    expect(byId.get('bogus-entry')!.telegramEntrypoint).toBeUndefined()
+  })
 })
 
 describe('notificationDeliveryStore persistence', () => {

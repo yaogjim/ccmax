@@ -273,6 +273,22 @@ function resultText(message: Record<string, unknown>): string {
   return message.is_error === true ? '执行失败' : '已完成'
 }
 
+function splitResultReport(text: string, shortId: string, category: string): string[] {
+  const parts: string[] = []
+  let offset = 0
+  while (offset < text.length) {
+    const prefix = parts.length === 0 ? '' : `[ccmax · 订阅会话 · ${shortId} · ${category} · 续 ${parts.length + 1}]：\n`
+    let end = Math.min(text.length, offset + TELEGRAM_PUBLIC_TEXT_LIMIT - prefix.length)
+    // 保留分片边界的空白，且不能拆开 UTF-16 代理对（例如 emoji）。
+    if (end < text.length
+      && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff
+      && text.charCodeAt(end) >= 0xdc00 && text.charCodeAt(end) <= 0xdfff) end -= 1
+    parts.push(prefix + text.slice(offset, end))
+    offset = end
+  }
+  return parts
+}
+
 function toolNameOf(message: Record<string, unknown>): string {
   const request = isRecord(message.request) ? message.request : {}
   return typeof request.tool_name === 'string' && request.tool_name.trim()
@@ -415,7 +431,7 @@ function headerPrefix(
 ): string {
   const trimmedProject = project.trim() || '未命名项目'
   const trimmedTitle = title.trim() || '未命名会话'
-  const parts = ['ccmax', trimmedProject, trimmedTitle]
+  const parts = ['ccmax', '订阅会话', trimmedProject, trimmedTitle]
   if (extras?.team?.trim()) parts.push(extras.team.trim())
   if (extras?.member?.trim()) parts.push(extras.member.trim())
   parts.push(shortId)
@@ -1821,15 +1837,15 @@ export class TelegramPublicService {
     const project = String(subscription.project ?? '')
     const title = String(subscription.title ?? '')
     const extras = headerExtras(subscription)
-    const text = publicTurn
-      ? `${headerPrefix(project, title, subscription.shortId, category, extras)}：\n${body}`
-      : `${headerPrefix(project, title, subscription.shortId, category, extras)}：${body.length > 280 ? `${body.slice(0, 280)}…` : body}`
+    const header = headerPrefix(project, title, subscription.shortId, category, extras)
+    const text = `${header}：${publicTurn ? '\n' : ''}${body}`
     await this.enqueueReport({
       snapshot,
       runtime: state.runtime!,
       subscription,
       eventId: stableId,
       text,
+      parts: splitResultReport(text, subscription.shortId, category),
       kind: 'report',
       turnId: origin?.turnId ?? event.turnId,
       originEntrypoint: origin?.entrypoint,
@@ -1954,6 +1970,7 @@ export class TelegramPublicService {
     subscription: TelegramPublicSubscription
     eventId: string
     text: string
+    parts?: string[]
     kind: TelegramPublicMessageMap['kind']
     turnId?: string
     requestId?: string
@@ -1964,7 +1981,7 @@ export class TelegramPublicService {
     tokens?: TelegramPublicCallbackToken[]
   }): Promise<void> {
     const chatId = String(params.snapshot.ownerUserId)
-    const parts = splitMessage(params.text, TELEGRAM_PUBLIC_TEXT_LIMIT)
+    const parts = params.parts ?? splitMessage(params.text, TELEGRAM_PUBLIC_TEXT_LIMIT)
     const createdAt = this.isoNow()
     const expiresAt = new Date(this.now() + TELEGRAM_PUBLIC_REPLY_TTL_MS).toISOString()
     await this.mutate(current => {

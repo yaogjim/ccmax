@@ -111,6 +111,16 @@ For exact request and response shapes, use the current handlers under `src/serve
 
 `/proxy/*` is the provider protocol-translation boundary and depends on runtime authentication and model-routing state. Do not expose it as a general-purpose stateless OpenAI proxy.
 
+## Public authorization for scheduled-task notifications
+
+`TaskNotificationConfig.telegramEntrypoints` in `src/server/services/cronService.ts` is an optional array selecting `dedicated`, `public`, or both, with dedicated as the default. It affects only Telegram. Create and update share the same validation and still require one explicit recipient. Public selection verifies against the owner in adapter configuration; dedicated selection verifies pairing records. The same person must satisfy both when both are selected.
+
+Public task notifications are a restricted path separate from ordinary public session reports. They do not relax `sourceSessionId`, subscription or Telegram-only requirements on `/api/notifications/send` or `LocalMessageSend`. Only `CronScheduler.finalizeTaskRun` supplies the internal `getTaskNotificationContext` closure, pinned to the original task/run. Each call re-reads the registered task in `scheduled_tasks.json` and the terminal run in the current `scheduled_tasks_log.json`, rather than using a derived SQLite view or caller-supplied body. The task must remain registered with enabled public notification settings. A one-shot task's automatic disablement is not deletion and does not invalidate its completed run.
+
+Before the first send and every retry, `notificationService.ts` re-checks this context, the explicit recipient against the current owner, public enablement and the realpath of the actual execution directory against allowed project roots. Bot token, owner and generation are pinned to the configuration read at delivery start; changes cause refusal, not redirection. Missing trusted context, deleted tasks, forged runs and tampered recipients fail visibly. This branch reuses HTTP transport without requiring the public polling process online and creates no subscription, session-reply map or approval credential.
+
+Tasks retain `NotificationDeliveryStore` pending/settle, confirmed/failed/indeterminate and restart-recovery semantics instead of the session-report outbox. The public idempotency key only appends `::public`; dedicated legacy keys are unchanged. An optional `telegramEntrypoint` distinguishes records. Existing normalization reads legacy records as dedicated without rewriting old task configuration. The two entries settle independently and one failure cannot suppress the other. Telegram 429 honors `retry_after`, 5xx has bounded retries, and each attempt re-authorizes; timeout or uncertain network results are not blindly resent. Headers distinguish subscribed sessions from tasks, tasks identify task/run, and the body retains existing task-summary limits. See [Scheduled tasks](../desktop/schedule.md) for usage.
+
 ## Chat WebSocket
 
 Clients connect to:

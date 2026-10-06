@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useTaskStore } from '../../stores/taskStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useAdapterStore } from '../../stores/adapterStore'
@@ -21,12 +21,38 @@ import {
   parseCronTaskTimeoutSeconds,
 } from '../../lib/cronTaskTimeout'
 import { getSessionSeedWorkDir } from '../../lib/sessionWorkspace'
-import type { CronTask, NotificationRecipientSpec } from '../../types/task'
+import type { CronTask, NotificationRecipientSpec, TelegramEntrypoint } from '@/types/task'
 import type { PairedUser } from '../../types/adapter'
 
 type NotificationChannel = 'desktop' | 'telegram' | 'feishu'
 
 type ImChannel = 'telegram' | 'feishu'
+
+/**
+ * The desktop owner picks one of three Telegram routes; the stored value is the
+ * list `notification.telegramEntrypoints`.
+ */
+type TelegramRoute = 'dedicated' | 'public' | 'both'
+
+/**
+ * Map a stored entrypoint list onto the single route control. An absent list
+ * means the original dedicated-only behavior, so a task stored before the
+ * option existed opens as dedicated.
+ */
+function telegramRouteOf(entrypoints: TelegramEntrypoint[] | undefined): TelegramRoute {
+  const set = new Set(entrypoints ?? ['dedicated'])
+  const dedicated = set.has('dedicated')
+  const isPublic = set.has('public')
+  if (dedicated && isPublic) return 'both'
+  if (isPublic) return 'public'
+  return 'dedicated'
+}
+
+function entrypointsForRoute(route: TelegramRoute): TelegramEntrypoint[] {
+  if (route === 'both') return ['dedicated', 'public']
+  if (route === 'public') return ['public']
+  return ['dedicated']
+}
 
 /** Stable reference so the recipient-sync effect does not rerun every render. */
 const NO_PAIRED_USERS: PairedUser[] = []
@@ -35,6 +61,8 @@ const NO_PAIRED_USERS: PairedUser[] = []
  * Map a stored recipient spec back to a paired user id. The server matches
  * `{ userId }`, `{ displayName }` or a bare id, so an edit form has to try all
  * three before deciding the old recipient no longer exists.
+ *
+ * This is the original resolution, kept for the dedicated route and for Feishu.
  */
 function recipientIdOf(
   spec: NotificationRecipientSpec | undefined,
@@ -58,10 +86,53 @@ function recipientIdOf(
   return ''
 }
 
+/**
+ * Read the identifier a stored recipient spec carries, if any. The server
+ * accepts a bare id or `{ userId }`, so this is the only part of a stored spec
+ * that identifies an account.
+ *
+ * This is for the public/both routes only. A spec that carries just a
+ * `displayName` has no identity, and on those routes matching it against the
+ * current pairings by name would silently re-point an old task at whoever bears
+ * that name now — the current owner, on the public route. Such a task therefore
+ * opens with no recipient selected and the save is refused until the owner is
+ * picked explicitly. The dedicated route keeps `recipientIdOf`'s original
+ * id-or-name resolution.
+ */
+function storedRecipientId(spec: NotificationRecipientSpec | undefined): string {
+  if (spec === undefined) return ''
+  if (typeof spec === 'string' || typeof spec === 'number') return String(spec)
+  if (typeof spec.userId === 'string' || typeof spec.userId === 'number') return String(spec.userId)
+  return ''
+}
+
+/** The name a stored spec displays, used only to label an unavailable option. */
+function storedRecipientDisplayName(spec: NotificationRecipientSpec | undefined): string {
+  if (spec && typeof spec === 'object' && typeof spec.displayName === 'string') {
+    return spec.displayName
+  }
+  return ''
+}
+
 /** Build the explicit one-element recipient list the server expects. */
 function recipientSpecFor(id: string, pairedUsers: PairedUser[]): NotificationRecipientSpec[] {
   const match = pairedUsers.find((user) => String(user.userId) === id)
-  return match ? [{ userId: match.userId, displayName: match.displayName }] : []
+  if (!match) return []
+  // The server rejects a recipient whose `displayName` is empty, and the
+  // synthesized public owner has no name unless it is also dedicated-paired, so
+  // the field is written only when there is a name to write.
+  return typeof match.displayName === 'string' && match.displayName.trim().length > 0
+    ? [{ userId: match.userId, displayName: match.displayName }]
+    : [{ userId: match.userId }]
+}
+
+/**
+ * A recipient only counts as chosen when it is one of the channel's current
+ * candidates, so a stale or hand-edited id can never be saved back as an empty
+ * recipient list.
+ */
+function isCurrentRecipient(id: string, candidates: PairedUser[]): boolean {
+  return id.length > 0 && candidates.some((user) => String(user.userId) === id)
 }
 
 function recipientOptions(pairedUsers: PairedUser[], placeholder: string) {
@@ -72,6 +143,30 @@ function recipientOptions(pairedUsers: PairedUser[], placeholder: string) {
       label: user.displayName ? `${user.displayName} (${String(user.userId)})` : String(user.userId),
     })),
   ]
+}
+
+/**
+ * The public/both routes add the stored target to the shared option list when it
+ * is no longer a current candidate, labelled as unavailable. It is shown rather
+ * than replaced — the edit form never hides what the task actually sends to —
+ * and it is never auto-replaced: re-picking the recipient is the user's explicit
+ * authorization for a new target.
+ */
+function publicRouteRecipientOptions(
+  candidates: PairedUser[],
+  placeholder: string,
+  selected: string,
+  storedDisplayName: string,
+  unavailableLabel: string,
+) {
+  const options = recipientOptions(candidates, placeholder)
+  if (selected.length > 0 && !isCurrentRecipient(selected, candidates)) {
+    const label = storedDisplayName
+      ? `${storedDisplayName} (${selected}) · ${unavailableLabel}`
+      : `${selected} · ${unavailableLabel}`
+    options.splice(1, 0, { value: selected, label })
+  }
+  return options
 }
 
 type Props = {
@@ -131,14 +226,30 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
 
   const telegramPairedUsers = adapterConfig.telegram?.pairedUsers ?? NO_PAIRED_USERS
   const feishuPairedUsers = adapterConfig.feishu?.pairedUsers ?? NO_PAIRED_USERS
+  const publicConfig = adapterConfig.telegram?.public
+  const publicEnabled = publicConfig?.enabled === true
+  const publicHasToken =
+    typeof publicConfig?.botToken === 'string' && publicConfig.botToken.trim().length > 0
+  const publicOwnerId =
+    typeof publicConfig?.ownerUserId === 'number'
+    && Number.isSafeInteger(publicConfig.ownerUserId)
+    && publicConfig.ownerUserId > 0
+      ? publicConfig.ownerUserId
+      : null
+  const publicAvailable = publicEnabled && publicHasToken && publicOwnerId !== null
+  const dedicatedTelegramAvailable = !!(
+    adapterConfig.telegram?.botToken && telegramPairedUsers.length > 0
+  )
 
   // Notification targets are resolved server-side against `pairedUsers` only —
   // `allowedUsers` is an access allowlist, not a send-to list. A channel with no
-  // paired user can never deliver, so it is not offered.
+  // paired user can never deliver, so it is not offered. Telegram also counts as
+  // configured when the public Bot is enabled with its own token and a valid
+  // owner, because a public-only task sends to that owner without the dedicated
+  // Bot being configured at all.
   const isFeishuConfigured = !!(adapterConfig.feishu?.appId && adapterConfig.feishu?.appSecret
     && feishuPairedUsers.length > 0)
-  const isTelegramConfigured = !!(adapterConfig.telegram?.botToken
-    && telegramPairedUsers.length > 0)
+  const isTelegramConfigured = dedicatedTelegramAvailable || publicAvailable
 
   const isEdit = !!editTask
   const parsed = editTask ? parseCron(editTask.cron) : null
@@ -164,8 +275,15 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
   const [useWorktree, setUseWorktree] = useState(editTask?.useWorktree || false)
   const [notifyEnabled, setNotifyEnabled] = useState(editTask?.notification?.enabled || false)
   const [notifyChannels, setNotifyChannels] = useState<NotificationChannel[]>(editTask?.notification?.channels || [])
+  const [telegramRoute, setTelegramRoute] = useState<TelegramRoute>(
+    telegramRouteOf(editTask?.notification?.telegramEntrypoints),
+  )
   const [telegramRecipient, setTelegramRecipient] = useState('')
   const [feishuRecipient, setFeishuRecipient] = useState('')
+  // Set once the user picks or clears the Telegram recipient on a public/both
+  // task: from then on no refresh may change the value behind them. The
+  // dedicated route and Feishu keep their original fill-in behavior.
+  const [telegramRecipientTouched, setTelegramRecipientTouched] = useState(false)
   const [recipientError, setRecipientError] = useState(false)
   // Blank means "no explicit per-task value": the server falls back to
   // CC_HAHA_TASK_TIMEOUT_MS, then the 600s default. A task stored without the
@@ -175,23 +293,99 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
   )
   const [isSubmitting, setIsSubmitting] = useState(false)
 
+  // Whether the *stored* task uses one of the new public/both routes. Only then
+  // does the recipient handling below depart from the original dedicated path.
+  const storedTelegramUsesPublicRoute =
+    telegramRouteOf(editTask?.notification?.telegramEntrypoints) !== 'dedicated'
+
   // Older tasks stored a channel without any recipient (the server used to
   // broadcast). The pairing list loads asynchronously, so resolve the stored
   // recipient into a select value once it is available instead of silently
   // starting blank and dropping the old target on save.
+  //
+  // A task stored on the dedicated route keeps that original resolution and the
+  // original fill-in. The public/both routes are new and stricter: only the
+  // stored id counts, and once the user has touched the select nothing re-applies
+  // it. Feishu is unchanged.
   useEffect(() => {
     if (!open) return
     const storedTelegram = editTask?.notification?.recipients?.telegram?.[0]
     if (storedTelegram !== undefined) {
-      const resolved = recipientIdOf(storedTelegram, telegramPairedUsers)
-      setTelegramRecipient((current) => current || resolved)
+      if (storedTelegramUsesPublicRoute) {
+        if (!telegramRecipientTouched) {
+          const stored = storedRecipientId(storedTelegram)
+          if (stored) setTelegramRecipient(stored)
+        }
+      } else {
+        const resolved = recipientIdOf(storedTelegram, telegramPairedUsers)
+        setTelegramRecipient((current) => current || resolved)
+      }
     }
     const storedFeishu = editTask?.notification?.recipients?.feishu?.[0]
     if (storedFeishu !== undefined) {
       const resolved = recipientIdOf(storedFeishu, feishuPairedUsers)
       setFeishuRecipient((current) => current || resolved)
     }
-  }, [open, editTask, telegramPairedUsers, feishuPairedUsers])
+  }, [
+    open,
+    editTask,
+    telegramPairedUsers,
+    feishuPairedUsers,
+    storedTelegramUsesPublicRoute,
+    telegramRecipientTouched,
+  ])
+
+  // The public Bot has no separate recipient: its target is the single public
+  // owner. For a public-only route the owner need not appear in the dedicated
+  // `pairedUsers`, so the owner record is built independently; for the both
+  // routes the owner must also be dedicated-paired, and only then is it offered.
+  const publicOwnerUser = useMemo<PairedUser | null>(() => {
+    if (publicOwnerId === null) return null
+    const paired = telegramPairedUsers.find((user) => String(user.userId) === String(publicOwnerId))
+    return {
+      userId: publicOwnerId,
+      displayName: paired?.displayName ?? '',
+      pairedAt: paired?.pairedAt ?? 0,
+    }
+  }, [publicOwnerId, telegramPairedUsers])
+
+  const telegramRecipientUsers = useMemo<PairedUser[]>(() => {
+    if (telegramRoute === 'dedicated') return telegramPairedUsers
+    const owner = publicOwnerUser
+    if (!owner) return []
+    if (telegramRoute === 'public') return [owner]
+    const ownerPaired = telegramPairedUsers.find(
+      (user) => String(user.userId) === String(owner.userId),
+    )
+    return ownerPaired ? [ownerPaired] : []
+  }, [telegramRoute, publicOwnerUser, telegramPairedUsers])
+
+  // The dedicated route keeps the original option list. The public/both routes
+  // keep a stored target that is no longer a current candidate visible, marked
+  // unavailable. Feishu is unchanged.
+  const telegramRecipientOptions = telegramRoute === 'dedicated'
+    ? recipientOptions(telegramRecipientUsers, t('newTask.recipientPlaceholder'))
+    : publicRouteRecipientOptions(
+        telegramRecipientUsers,
+        t('newTask.recipientPlaceholder'),
+        telegramRecipient,
+        storedRecipientDisplayName(editTask?.notification?.recipients?.telegram?.[0]),
+        t('newTask.recipientUnavailable'),
+      )
+
+  // A public route that cannot deliver right now is called out rather than
+  // silently retargeted: disabled Bot or missing token, no owner, or (for the
+  // both routes) an owner who is not also dedicated-paired.
+  const telegramRouteIssue: 'publicDisabled' | 'noOwner' | 'ownerRequired' | null =
+    !notifyEnabled || !notifyChannels.includes('telegram') || telegramRoute === 'dedicated'
+      ? null
+      : !publicEnabled || !publicHasToken
+        ? 'publicDisabled'
+        : publicOwnerId === null
+          ? 'noOwner'
+          : telegramRecipientUsers.length === 0
+            ? 'ownerRequired'
+            : null
 
   // Enhanced scheduling state
   const [minuteInterval, setMinuteInterval] = useState(parsed?.minuteInterval || 15)
@@ -221,12 +415,19 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
     (frequency !== 'customCron' || isValidCron(customCron)) &&
     (frequency !== 'specificDays' || selectedDays.length > 0) &&
     (!notifyEnabled || notifyChannels.length > 0) &&
+    telegramRouteIssue === null &&
     timeoutParse.kind !== 'invalid'
 
   // Every selected IM channel needs an explicit target. A missing one is
-  // reported on save, never silently sent to everyone.
+  // reported on save, never silently sent to everyone. The public/both routes
+  // additionally require the chosen target to still be a current candidate, so a
+  // stale stored id cannot be saved back as an empty recipient list. The
+  // dedicated route and Feishu keep their original check.
   const missingRecipient = notifyEnabled && (
-    (notifyChannels.includes('telegram') && !telegramRecipient) ||
+    (notifyChannels.includes('telegram')
+      && (telegramRoute === 'dedicated'
+        ? !telegramRecipient
+        : !isCurrentRecipient(telegramRecipient, telegramRecipientUsers))) ||
     (notifyChannels.includes('feishu') && !feishuRecipient)
   )
 
@@ -241,12 +442,17 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
     try {
       const recipients: Partial<Record<ImChannel, NotificationRecipientSpec[]>> = {}
       if (notifyChannels.includes('telegram')) {
-        recipients.telegram = recipientSpecFor(telegramRecipient, telegramPairedUsers)
+        recipients.telegram = recipientSpecFor(telegramRecipient, telegramRecipientUsers)
       }
       if (notifyChannels.includes('feishu')) {
         recipients.feishu = recipientSpecFor(feishuRecipient, feishuPairedUsers)
       }
       const hasRecipients = Object.keys(recipients).length > 0
+      // The default dedicated route is written as an absent field, so a saved
+      // task serializes exactly like a file that predates the option.
+      const telegramEntrypoints = notifyChannels.includes('telegram') && telegramRoute !== 'dedicated'
+        ? entrypointsForRoute(telegramRoute)
+        : undefined
       const basePayload = {
         name: name.trim(),
         description: description.trim(),
@@ -258,7 +464,12 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
         folderPath: folderPath.trim() || undefined,
         useWorktree: useWorktree || undefined,
         notification: notifyEnabled && notifyChannels.length > 0
-          ? { enabled: true, channels: notifyChannels, ...(hasRecipients ? { recipients } : {}) }
+          ? {
+              enabled: true,
+              channels: notifyChannels,
+              ...(telegramEntrypoints ? { telegramEntrypoints } : {}),
+              ...(hasRecipients ? { recipients } : {}),
+            }
           : undefined,
       }
       if (isEdit) {
@@ -545,13 +756,51 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
                 />
               )}
               {notifyChannels.includes('telegram') && (
+                <SelectField<TelegramRoute>
+                  containerClassName="max-w-sm"
+                  label={t('newTask.telegramRouteLabel')}
+                  value={telegramRoute}
+                  onChange={setTelegramRoute}
+                  options={[
+                    { value: 'dedicated', label: t('newTask.telegramRouteDedicated') },
+                    { value: 'public', label: t('newTask.telegramRoutePublic') },
+                    { value: 'both', label: t('newTask.telegramRouteBoth') },
+                  ]}
+                />
+              )}
+              {notifyChannels.includes('telegram') && (
                 <SelectField
                   containerClassName="max-w-sm"
                   label={`${t('settings.adapters.telegram')} · ${t('newTask.recipientLabel')}`}
                   value={telegramRecipient}
-                  onChange={setTelegramRecipient}
-                  options={recipientOptions(telegramPairedUsers, t('newTask.recipientPlaceholder'))}
+                  onChange={(value) => {
+                    // Only the public/both routes record that the user has made a
+                    // choice; the dedicated route keeps its original fill-in.
+                    if (telegramRoute !== 'dedicated') setTelegramRecipientTouched(true)
+                    setTelegramRecipient(value)
+                  }}
+                  options={telegramRecipientOptions}
                 />
+              )}
+
+              {telegramRouteIssue && (
+                <Badge
+                  tone="warning"
+                  size="sm"
+                  wrap
+                  bordered
+                  pill={false}
+                  role="alert"
+                  icon={<span aria-hidden="true" className="material-symbols-outlined text-[13px]">warning</span>}
+                >
+                  {t(
+                    telegramRouteIssue === 'publicDisabled'
+                      ? 'newTask.telegramRoutePublicDisabled'
+                      : telegramRouteIssue === 'noOwner'
+                        ? 'newTask.telegramRouteNoOwner'
+                        : 'newTask.telegramRouteOwnerRequired',
+                  )}
+                </Badge>
               )}
 
               {recipientError && missingRecipient && (

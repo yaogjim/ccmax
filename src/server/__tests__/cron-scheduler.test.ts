@@ -711,6 +711,262 @@ describe('Execution log trimming', () => {
   })
 })
 
+// ─── Public task notification integration (real scheduler → service → fetch) ──
+//
+// Exercises the real chain: CronScheduler executes a task, settles the run in
+// the real `scheduled_tasks_log.json`, and `finalizeTaskRun` supplies the
+// trusted context closure to `sendTaskNotification`. Only the HTTP transport is
+// mocked, so this proves the authorization path is wired end-to-end without a
+// subscription and without touching a live provider.
+
+describe('CronScheduler public task notification integration', () => {
+  let tmpDir: string
+  let cronService: CronService
+  let scheduler: CronScheduler
+  let originalFetch: typeof globalThis.fetch
+  let originalConfigDir: string | undefined
+  let originalClaudeCliPath: string | undefined
+  let originalDisableTerminalShellEnv: string | undefined
+
+  beforeEach(async () => {
+    tmpDir = await createTmpDir()
+    originalFetch = globalThis.fetch
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+    originalClaudeCliPath = process.env.CLAUDE_CLI_PATH
+    originalDisableTerminalShellEnv = process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV
+    process.env.CLAUDE_CONFIG_DIR = tmpDir
+    process.env.CLAUDE_CLI_PATH = await createFakeCronCli(tmpDir)
+    process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV = '1'
+    cronService = new CronService()
+    scheduler = new CronScheduler(cronService)
+  })
+
+  afterEach(async () => {
+    scheduler.stop()
+    globalThis.fetch = originalFetch
+    if (originalConfigDir) process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+    else delete process.env.CLAUDE_CONFIG_DIR
+    if (originalClaudeCliPath) process.env.CLAUDE_CLI_PATH = originalClaudeCliPath
+    else delete process.env.CLAUDE_CLI_PATH
+    if (originalDisableTerminalShellEnv) process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV = originalDisableTerminalShellEnv
+    else delete process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV
+    await cleanupTmpDir(tmpDir)
+  })
+
+  it('delivers a public notification for a real settled run, using the true run content', async () => {
+    const owner = 5150
+    const work = path.join(tmpDir, 'work')
+    await fs.mkdir(work, { recursive: true })
+
+    await fs.writeFile(
+      path.join(tmpDir, 'adapters.json'),
+      JSON.stringify({
+        telegram: {
+          pairedUsers: [{ userId: owner, displayName: 'Owner', pairedAt: 1 }],
+          public: {
+            enabled: true,
+            botToken: 'public-token',
+            ownerUserId: owner,
+            generation: 7,
+            allowedProjectRoots: [work],
+          },
+        },
+      }, null, 2) + '\n',
+      'utf-8',
+    )
+
+    const taskFixture = {
+      id: 'task-public',
+      name: 'Public task',
+      cron: '* * * * *',
+      prompt: 'do the public thing',
+      createdAt: Date.now(),
+      recurring: true,
+      folderPath: work,
+      notification: {
+        enabled: true,
+        channels: ['telegram'],
+        recipients: { telegram: [owner] },
+        telegramEntrypoints: ['public'],
+      },
+    }
+    await fs.writeFile(
+      path.join(tmpDir, 'scheduled_tasks.json'),
+      JSON.stringify({ tasks: [taskFixture] }, null, 2) + '\n',
+      'utf-8',
+    )
+
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = []
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({
+        url: String(input),
+        body: init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {},
+      })
+      return Response.json({ ok: true, result: { message_id: 909 } })
+    }) as typeof fetch
+
+    const task = (await cronService.listTasks()).find((candidate) => candidate.id === 'task-public')
+    expect(task).toBeTruthy()
+    // The persisted field survives the task-file round trip the closure reads.
+    expect((task!.notification as { telegramEntrypoints?: string[] }).telegramEntrypoints).toEqual(['public'])
+
+    const run = await scheduler.executeTask(task!)
+
+    expect(run.status).toBe('completed')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe('https://api.telegram.org/botpublic-token/sendMessage')
+    expect(calls[0]!.body.chat_id).toBe(owner)
+    const body = String(calls[0]!.body.text)
+    // The header carries the trustworthy task locator and the real run id.
+    expect(body.startsWith('[ccmax · 定时任务 · ')).toBe(true)
+    expect(body).toContain('Ttask-public')
+    expect(body).toContain('已完成：')
+    expect(body).toContain(`Run: ${run.id}`)
+    // Body comes from the settled run's real output, not a caller claim.
+    expect(body).toContain('fake cron output')
+    expect(body).toContain('fake cron result')
+
+    const onDisk = JSON.parse(
+      await fs.readFile(path.join(tmpDir, 'ccmax', 'notification-deliveries.json'), 'utf-8'),
+    ) as { records: Array<Record<string, unknown>> }
+    expect(onDisk.records).toHaveLength(1)
+    expect(onDisk.records[0]!.telegramEntrypoint).toBe('public')
+    expect(onDisk.records[0]!.outcome).toBe('delivered')
+    expect(String(onDisk.records[0]!.deliveryId)).toBe(`${run.id}::telegram::${owner}::0::public`)
+  })
+
+  it('delivers a public-only notification when the owner is not a dedicated paired user', async () => {
+    const owner = 7373
+    const work = path.join(tmpDir, 'work-only-public')
+    await fs.mkdir(work, { recursive: true })
+
+    // Public-only install: no dedicated Bot and no dedicated pairing list at
+    // all. The owner exists only in the public config, so the shared recipient
+    // resolver must be fed a synthesized owner candidate, not `pairedUsers`.
+    await fs.writeFile(
+      path.join(tmpDir, 'adapters.json'),
+      JSON.stringify({
+        telegram: {
+          public: {
+            enabled: true,
+            botToken: 'public-only-token',
+            ownerUserId: owner,
+            generation: 2,
+            allowedProjectRoots: [work],
+          },
+        },
+      }, null, 2) + '\n',
+      'utf-8',
+    )
+
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = []
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({
+        url: String(input),
+        body: init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {},
+      })
+      return Response.json({ ok: true, result: { message_id: 314 } })
+    }) as typeof fetch
+
+    await fs.writeFile(
+      path.join(tmpDir, 'scheduled_tasks.json'),
+      JSON.stringify({
+        tasks: [{
+          id: 'task-public-only',
+          name: 'Public only task',
+          cron: '* * * * *',
+          prompt: 'public only',
+          createdAt: Date.now(),
+          recurring: true,
+          folderPath: work,
+          notification: {
+            enabled: true,
+            channels: ['telegram'],
+            recipients: { telegram: [owner] },
+            telegramEntrypoints: ['public'],
+          },
+        }],
+      }, null, 2) + '\n',
+      'utf-8',
+    )
+
+    const task = (await cronService.listTasks()).find((candidate) => candidate.id === 'task-public-only')
+    expect(task).toBeTruthy()
+
+    const run = await scheduler.executeTask(task!)
+
+    expect(run.status).toBe('completed')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe('https://api.telegram.org/botpublic-only-token/sendMessage')
+    expect(calls[0]!.body.chat_id).toBe(owner)
+    const onDisk = JSON.parse(
+      await fs.readFile(path.join(tmpDir, 'ccmax', 'notification-deliveries.json'), 'utf-8'),
+    ) as { records: Array<Record<string, unknown>> }
+    expect(onDisk.records).toHaveLength(1)
+    expect(onDisk.records[0]!.telegramEntrypoint).toBe('public')
+    expect(String(onDisk.records[0]!.recipientId)).toBe(String(owner))
+    expect(String(onDisk.records[0]!.deliveryId)).toBe(`${run.id}::telegram::${owner}::0::public`)
+  })
+
+  it('records a visible failure and sends nothing when public is revoked before delivery', async () => {
+    const owner = 6161
+    const work = path.join(tmpDir, 'work')
+    await fs.mkdir(work, { recursive: true })
+    // Public entry is present but NOT enabled: the run still settles, and the
+    // notification must fail visibly instead of sending through the dedicated
+    // bot or silently succeeding.
+    await fs.writeFile(
+      path.join(tmpDir, 'adapters.json'),
+      JSON.stringify({
+        telegram: {
+          botToken: 'dedicated-token',
+          pairedUsers: [{ userId: owner, displayName: 'Owner', pairedAt: 1 }],
+          public: { enabled: false, botToken: 'public-token', ownerUserId: owner, generation: 1, allowedProjectRoots: [work] },
+        },
+      }, null, 2) + '\n',
+      'utf-8',
+    )
+
+    const calls: string[] = []
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls.push(String(input))
+      return Response.json({ ok: true, result: { message_id: 1 } })
+    }) as typeof fetch
+
+    await fs.writeFile(
+      path.join(tmpDir, 'scheduled_tasks.json'),
+      JSON.stringify({
+        tasks: [{
+          id: 'task-revoked',
+          name: 'Revoked task',
+          cron: '* * * * *',
+          prompt: 'revoked',
+          createdAt: Date.now(),
+          recurring: true,
+          folderPath: work,
+          notification: {
+            enabled: true,
+            channels: ['telegram'],
+            recipients: { telegram: [owner] },
+            telegramEntrypoints: ['public'],
+          },
+        }],
+      }, null, 2) + '\n',
+      'utf-8',
+    )
+
+    const task = (await cronService.listTasks()).find((candidate) => candidate.id === 'task-revoked')!
+    const run = await scheduler.executeTask(task)
+
+    expect(run.status).toBe('completed')
+    expect(calls).toHaveLength(0)
+    expect(run.notificationReport).toBeTruthy()
+    expect(run.notificationReport!.delivered).toBe(0)
+    expect(run.notificationReport!.failed).toBe(1)
+    expect(run.notificationReport!.ok).toBe(false)
+  })
+})
+
 // ─── Scheduled Tasks API with runs endpoints ──────────────────────────────
 
 describe('Scheduled Tasks API — runs endpoints', () => {

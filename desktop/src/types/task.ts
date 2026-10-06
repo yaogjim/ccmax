@@ -15,12 +15,26 @@ export type TaskNotificationConfig = {
   enabled: boolean
   channels: ('desktop' | 'telegram' | 'feishu')[]
   /**
+   * Which Telegram Bot(s) a task notification is delivered through. Absent
+   * means `['dedicated']` — the original single-Bot behavior — so a file that
+   * predates this field keeps working untouched. Only meaningful when
+   * `telegram` is one of `channels`.
+   */
+  telegramEntrypoints?: TelegramEntrypoint[]
+  /**
    * Explicit per-channel recipients. Optional so files written before this
    * field existed still load; the server refuses to broadcast when a channel
    * has no entry here.
+   *
+   * There is one `recipients.telegram` value regardless of entrypoint: the
+   * dedicated Bot sends to that paired user, and the public Bot requires it to
+   * be the public owner. A route therefore never carries its own recipient.
    */
   recipients?: Partial<Record<'telegram' | 'feishu', NotificationRecipientSpec[]>>
 }
+
+/** Telegram Bot an entry can be delivered through. */
+export type TelegramEntrypoint = 'dedicated' | 'public'
 
 export type CronTask = {
   id: string
@@ -96,6 +110,12 @@ export type NotificationDeliveryRecord = {
   channel: NotificationDeliveryChannel
   recipientId: string
   recipientDisplayName?: string
+  /**
+   * Which Telegram Bot this attempt went through. Absent means `dedicated`:
+   * records written before the public Bot existed were all dedicated sends.
+   * Only ever set for the `telegram` channel.
+   */
+  telegramEntrypoint?: TelegramEntrypoint
   outcome: NotificationDeliveryOutcome
   attempts: number
   error?: string

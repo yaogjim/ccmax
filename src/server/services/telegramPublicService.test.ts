@@ -552,6 +552,106 @@ describe('telegram public channel', () => {
     expect(sent.filter(item => item.text.includes('A 完成全文'))).toHaveLength(1)
   })
 
+  test('来源标识：订阅会话报告保留定位信息且不会伪装成定时任务', async () => {
+    const subscription = await service.subscribe('sess-a')
+    await emitResult('sess-a', '订阅结果正文', { uuid: 'subscription-source-label' })
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.text).toBe(`[ccmax · 订阅会话 · ${workRoot} · 修复登录 · ${subscription.shortId}] 已完成：订阅结果正文`)
+    expect(sent[0]!.text).not.toContain('定时任务')
+    await inbound(privateMessage('仍可回复订阅报告', { reply_to_message_id: sent[0]!.messageId }))
+    expect(submitted).toEqual([expect.objectContaining({ sessionId: 'sess-a', content: '仍可回复订阅报告' })])
+  })
+
+  const reportOrigins = ['desktop', 'telegram-dedicated', 'unknown', 'telegram-public'] as const
+
+  function reportOrigin(entrypoint: typeof reportOrigins[number]): TelegramPublicOrigin | undefined {
+    if (entrypoint === 'unknown') return undefined
+    return entrypoint === 'telegram-public'
+      ? { entrypoint, botId: BOT, generation: GEN, turnId: 'report-turn' }
+      : { entrypoint, turnId: 'report-turn' }
+  }
+
+  test.each(reportOrigins)('完整报告：%s 的完成与失败正文超过 280 字符仍逐轮完整发送', async entrypoint => {
+    const sub = await service.subscribe('sess-a')
+    const body = `${'正文'.repeat(650)}尾部保留`.padEnd(1318, '完')
+    for (const isError of [false, true]) {
+      const uuid = `complete-${entrypoint}-${isError}`
+      const before = sent.length
+      await emitResult('sess-a', body, { uuid, isError, origin: reportOrigin(entrypoint) })
+      const messages = sent.slice(before)
+      expect(messages).toHaveLength(1)
+      const header = `[ccmax · 订阅会话 · ${workRoot} · 修复登录 · ${sub.shortId}] ${isError ? '失败' : '已完成'}：`
+      // 原缺陷在非公共入口来源入队时截为 280 字符；保留两路既有拼接格式。
+      expect(messages[0]!.text).toBe(`${header}${entrypoint === 'telegram-public' ? '\n' : ''}${body}`)
+      expect(messages[0]!.text).not.toContain('…')
+      expect(messages[0]!.chatId).toBe(String(OWNER))
+      await emitResult('sess-a', body, { uuid, isError, origin: reportOrigin(entrypoint) })
+      expect(sent.length).toBe(before + 1)
+    }
+  })
+
+  test.each(reportOrigins)('完整报告：%s 的超长正文无损分片并保留顺序、归属和幂等', async entrypoint => {
+    const sub = await service.subscribe('sess-a')
+    const body = `${'首段 🧪 '.repeat(900)}\n\n  缩进\t与换行\n${'末段 🚀\n'.repeat(900)}终点`
+    const uuid = `lossless-${entrypoint}`
+    await emitResult('sess-a', body, { uuid, origin: reportOrigin(entrypoint) })
+    const messages = [...sent]
+    expect(messages.length).toBeGreaterThan(2)
+    const header = `[ccmax · 订阅会话 · ${workRoot} · 修复登录 · ${sub.shortId}] 已完成：`
+    const prefixes = messages.map((_, index) => index === 0
+      ? `${header}${entrypoint === 'telegram-public' ? '\n' : ''}`
+      : `[ccmax · 订阅会话 · ${sub.shortId} · 已完成 · 续 ${index + 1}]：\n`)
+    const reconstructed = messages.map((message, index) => {
+      expect(message.text.startsWith(prefixes[index]!)).toBe(true)
+      expect(message.text.length).toBeLessThanOrEqual(4000)
+      expect(message.text.isWellFormed()).toBe(true)
+      expect(message.chatId).toBe(String(OWNER))
+      return message.text.slice(prefixes[index]!.length)
+    }).join('')
+    expect(reconstructed).toBe(body)
+    const state = await new TelegramPublicStore(path.join(configDir, 'ccmax', 'telegram-public.json')).read()
+    const fragments = state.outbox.filter(record => record.eventId === uuid)
+    expect(fragments.map(record => record.part)).toEqual(messages.map((_, index) => index))
+    expect(fragments.map(record => record.text)).toEqual(messages.map(message => message.text))
+    expect(fragments.every(record => record.status === 'delivered')).toBe(true)
+    for (const message of messages) {
+      expect(state.messageMaps[`${GEN}:${BOT}:${OWNER}:${message.messageId}`]).toMatchObject({
+        sessionId: 'sess-a', shortId: sub.shortId, eventId: uuid,
+        turnId: entrypoint === 'unknown' ? undefined : 'report-turn', kind: 'report',
+      })
+    }
+    await emitResult('sess-a', body, { uuid, origin: reportOrigin(entrypoint) })
+    expect(sent).toHaveLength(messages.length)
+    await inbound(privateMessage('回复续片仍定向原会话', { reply_to_message_id: messages.at(-1)!.messageId }))
+    expect(submitted).toEqual([expect.objectContaining({ sessionId: 'sess-a', content: '回复续片仍定向原会话' })])
+  })
+
+  test.each(['desktop', 'telegram-public'] as const)('完整报告：%s 在长度与 emoji 边界不丢字符', async entrypoint => {
+    const sub = await service.subscribe('sess-a')
+    const header = `[ccmax · 订阅会话 · ${workRoot} · 修复登录 · ${sub.shortId}] 已完成：${entrypoint === 'telegram-public' ? '\n' : ''}`
+    for (const length of [3999, 4000, 4001, 4096, 4097]) {
+      const body = '中'.repeat(length - header.length)
+      const before = sent.length
+      await emitResult('sess-a', body, { uuid: `boundary-${length}`, origin: reportOrigin(entrypoint) })
+      const messages = sent.slice(before)
+      expect(messages).toHaveLength(length <= 4000 ? 1 : 2)
+      expect(messages.every(message => message.text.length <= 4000)).toBe(true)
+      expect(messages.map((message, index) => index === 0
+        ? message.text
+        : message.text.slice(`[ccmax · 订阅会话 · ${sub.shortId} · 已完成 · 续 ${index + 1}]：\n`.length)).join('')).toBe(header + body)
+    }
+    // 强制把 emoji 的高代理项放在第一片最后一个 UTF-16 单元。
+    const body = `${'中'.repeat(3999 - header.length)}🚀${'末'.repeat(4500)}`
+    const before = sent.length
+    await emitResult('sess-a', body, { uuid: 'surrogate-boundary', origin: reportOrigin(entrypoint) })
+    const messages = sent.slice(before)
+    expect(messages[0]!.text).toHaveLength(3999)
+    expect(messages.every(message => message.text.isWellFormed())).toBe(true)
+    expect(messages.map((message, index) => index === 0
+      ? message.text
+      : message.text.slice(`[ccmax · 订阅会话 · ${sub.shortId} · 已完成 · 续 ${index + 1}]：\n`.length)).join('')).toBe(header + body)
+  })
+
   test('订阅在重启后仍然有效', async () => {
     const created = await service.subscribe('sess-a')
     service.stop()
@@ -659,7 +759,7 @@ describe('telegram public channel', () => {
     expect(sent.some(item => item.text.includes('已接收'))).toBe(true)
   })
 
-  test('a rate-limited first fragment holds later fragments without blocking unrelated reports', async () => {
+  test.each(reportOrigins)('a rate-limited %s first fragment holds later fragments without blocking unrelated reports', async entrypoint => {
     await service.subscribe('sess-a')
     await service.subscribe('sess-b')
     let attempts = 0
@@ -668,7 +768,7 @@ describe('telegram public channel', () => {
       : { outcome: 'delivered', messageId: ++nextMessageId }
     await emitResult('sess-a', '长'.repeat(8500), {
       uuid: 'fragment-order',
-      origin: { entrypoint: 'telegram-public', botId: BOT, generation: GEN, turnId: 'long-turn' },
+      origin: reportOrigin(entrypoint),
     })
     expect(sent).toHaveLength(1)
     await emitResult('sess-b', '其他会话仍可报告', { uuid: 'unrelated-report' })
@@ -682,21 +782,24 @@ describe('telegram public channel', () => {
     await service.registerRuntime({ botId: BOT, generation: GEN })
     await service.flushForTests()
     const fragments = (await store.read()).outbox.filter(record => record.eventId === 'fragment-order')
-    expect(fragments).toHaveLength(4)
+    expect(fragments).toHaveLength(3)
     expect(fragments.every(record => record.status === 'delivered')).toBe(true)
-    expect(fragments.map(record => record.messageId)).toEqual([12, 13, 14, 15])
+    expect(fragments.map(record => record.messageId)).toEqual([12, 13, 14])
   })
 
-  test.each(['failed', 'indeterminate'] as const)('a %s fragment prevents sending its remaining fragments', async outcome => {
+  test.each(reportOrigins.flatMap(entrypoint =>
+    (['failed', 'indeterminate'] as const).map(outcome => [entrypoint, outcome] as const),
+  ))('a %s report with a %s fragment prevents sending its remaining fragments', async (entrypoint, outcome) => {
     await service.subscribe('sess-a')
     sendImpl = async () => ({ outcome, error: 'fixture delivery failure' })
     await emitResult('sess-a', '长'.repeat(8500), {
       uuid: `fragment-${outcome}`,
-      origin: { entrypoint: 'telegram-public', botId: BOT, generation: GEN, turnId: 'failed-long-turn' },
+      origin: reportOrigin(entrypoint),
     })
     expect(sent).toHaveLength(1)
     const state = await new TelegramPublicStore(path.join(configDir, 'ccmax', 'telegram-public.json')).read()
     const fragments = state.outbox.filter(record => record.eventId === `fragment-${outcome}`)
+    expect(fragments).toHaveLength(3)
     expect(fragments[0]?.status).toBe(outcome)
     expect(fragments.slice(1).every(record => record.status === 'failed' && record.attempts === 0)).toBe(true)
   })

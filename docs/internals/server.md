@@ -111,6 +111,16 @@ CORS 只限制浏览器读取响应，不是身份认证。非浏览器客户端
 
 `/proxy/*` 是 Provider 的协议转换入口，包含运行时认证和模型路由状态。不要把它当成通用的、无状态 OpenAI 代理公开出去。
 
+## 定时任务通知的公共授权边界
+
+`src/server/services/cronService.ts` 的 `TaskNotificationConfig.telegramEntrypoints` 为可选数组，取值为 `dedicated`、`public`，可同时选择；缺省专属。它仅影响 Telegram，创建和更新都经同一校验，仍要求唯一显式收件人。公共选择以 adapter 配置中的 owner 验证，专属选择以配对记录验证；同时选择时同一个人必须满足两个入口条件。
+
+公共任务通知是普通公共会话报告以外的受限路径，不放宽 `/api/notifications/send` 或 `LocalMessageSend` 的 `sourceSessionId`、订阅与 Telegram-only 约束。只有 `CronScheduler.finalizeTaskRun` 提供绑定原 task/run 的内部 `getTaskNotificationContext` 闭包：每次调用重新读取 `scheduled_tasks.json` 的登记任务与当前 `scheduled_tasks_log.json` 的已结算运行，不使用 SQLite 派生视图或调用方自报正文。任务必须仍登记且通知仍启用并选择公共；一次性任务的自动禁用不等于删除，不据此否定已结束运行。
+
+`notificationService.ts` 在首次发送及每次重试前重新校验该上下文、收件人与当前 owner、公共启用状态及实际执行目录的 realpath 项目根范围。Bot token、owner 与配置代次绑定到投递开始时的快照；变更后拒绝，不改投新身份。缺少可信闭包、任务删除、运行伪造或收件人篡改都明确失败。该分支直接复用 HTTP 传输，不要求公共轮询进程在线，不创建订阅、会话回复映射或审批凭据。
+
+任务仍使用 `NotificationDeliveryStore` 的 pending/settle、已确认/失败/不确定与重启恢复规则，而非会话报告 outbox。公共幂等键仅在原任务键后增加 `::public`；专属旧键不变。可选 `telegramEntrypoint` 记录区分两端，旧记录通过既有规范化读取并解释为专属，不重写旧任务配置；两端独立结算，一端失败不抑制另一端。429 遵守 `retry_after`、5xx 有界重试，每次再次验权；超时或网络不确定不盲目重发。来源头部区分订阅会话与任务，任务标明 task/run，正文保留既有任务摘要上限。用户操作见 [定时任务](../desktop/schedule.md)。
+
 ## 聊天 WebSocket
 
 客户端连接：

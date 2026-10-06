@@ -139,7 +139,7 @@ Saving the exclusive token does not change public settings; saving public settin
 ### Turn on the public Bot
 
 1. Ask `@BotFather` for a second token, different from the exclusive Bot.
-2. Open **Settings → IM Adapters → Telegram**, paste the token under **Public Bot**, enable it, and save. Saving writes the config and restarts the adapter.
+2. Open **Settings → IM Adapters → Public channel subscriptions**, paste the token under **Bot configuration and pairing**, enable it, and save. Saving writes the config and restarts the adapter. Configuration starts expanded until the Bot is enabled and paired; afterward it starts collapsed so subscription management is immediately accessible.
 3. Select **Generate public pairing code** and send that code in a private chat with the public Bot (or send `/pair` plus the code). Only the first valid pairing becomes the operator. Changing the operator requires a confirmed reset in Desktop.
 
 ### Subscribe and target a session
@@ -152,17 +152,31 @@ The public entry has no implicit current session. Join, leave, and targeting are
 - Batch confirmation reports success, already subscribed or failure for each item, with short ids for successful items. Failed items stay selected for retry; successes are not rolled back. Only subsequent events are reported; historical reports are not replayed.
 - `/subscriptions` shows paginated real subscriptions, short ids and recent deliveries. Each **Unsubscribe** opens a confirmation. **Back** changes nothing; only **Confirm unsubscribe** stops future reports for that session. Queued reports, associated replies and buttons become invalid under the existing rules, without affecting other subscriptions.
 - Text commands remain available: `/subscribe <full sessionId or short id>` joins, and `/unsubscribe <full sessionId or short id>` leaves immediately. Lists read real state on their next action after text-command changes. Subscription management never injects a session message, starts an Agent turn or changes the `/to` target.
-- Desktop can also paste a full `sessionId` to subscribe. **Subscribe** stays disabled until an operator is bound.
-- Reports look like `[ccmax · project · session title · S7K2] completed: ...`. Titles may change; the short id stays stable.
+- Desktop manages subscriptions under **Settings → IM Adapters → Public channel subscriptions**, alongside **Platform connections**. The public Bot status appears at the top; **Refresh status** also updates subscriptions changed in Telegram. Project access remains configured through **Allowed project directories** under **Platform connections**. The subscribed list shows 10 items per page, with a project filter and search over titles, full `sessionId`, short ids and projects. Select **Choose sessions to subscribe**, choose a project and browse its paginated sessions, then select **Subscribe** to add one immediately; subscribed sessions are marked. You can still paste a full `sessionId`, or select **Unsubscribe** in the subscribed list. Save and enable the public Bot and pair an operator first. Project-directory access restrictions still apply.
+- Reports look like `[ccmax · 订阅会话 · project · session title · S7K2] 已完成: ...`. The header explicitly identifies a subscribed-session report; titles may change, while the short id stays stable.
 - Reply to that report, or send `/to S7K2 add another test`, and the text goes only to that session. Ordinary text with no reply and no target is not broadcast and does not guess the latest report.
 
 The same session can be bound exclusively and also subscribed publicly. Joining a public subscription does not steal the exclusive binding. The exclusive Bot still shows replies, questions, and approvals only for its bound session. Other sessions do not mix into that entry.
+
+### Scheduled-task notifications
+
+In the new or edit scheduled-task form, enable **Push notification on completion** and select Telegram. Choose the exclusive Bot, public Bot, or both. Existing tasks without an entry selection retain the exclusive Bot; they are never converted to public automatically.
+
+Public task notifications go only to the public Bot's paired owner, who must still be explicitly selected in the recipient control. A public-only installation works without an exclusive Bot or exclusive pairing. For delivery through both Bots, the same recipient must be both the public owner and an exclusive paired user. Changing the owner never silently changes a saved task's recipient; select the new target explicitly.
+
+**Task notifications do not require a session subscription.** Before sending and before each retry, the local service re-checks task registration, the completed run, current notification settings, the explicit recipient, public Bot identity, owner and allowed project directories. Deletion, revoked notification settings, a tampered recipient or changed Bot identity causes a visible refusal, never redirection to another Bot. Ordinary session reports still require subscription; subscription management, targeting, questions and approvals are unchanged.
+
+A task notification starts with `[ccmax · 定时任务 · project · task name · Ttask-id] 已完成:` and includes the real run id on the next line. A trustworthy session id is included when available. Automatic cron runs currently do not record a navigable session id, but their notifications can still be delivered. Task messages are read-only: they create no session-reply or approval association and cannot be replied to in order to send text into the task. The body retains the existing task-summary limits, rather than the full-session-report behavior below.
+
+The two Bots have independent delivery results and idempotency identities. A failure on one does not suppress the other, and neither is a fallback for the other. Run history shows each entry separately. Only a valid platform receipt counts as delivery; timeout or uncertain network results are not blindly resent. Telegram `429` honors `retry_after` with bounded retries and fresh authorization before each attempt.
 
 ### What it does, and what it does not
 
 The public entry currently supports targeted text plus that session's questions and approval buttons. Images, voice notes, and attachments are refused outright; leftover caption text is not executed. Exclusive-Bot media behavior is unchanged. Public reports are sent as new messages and are not edited in place.
 
-Public reports are queued before send. Queued, sending, confirmed, failed, and indeterminate are distinct states. A timeout or missing receipt is indeterminate, not success. Telegram `429` responses back off using `retry_after`, with a retry limit. After you turn the public entry off or change the operator, replies and buttons on old reports stop working and are not redirected to a new Bot.
+Turn reports deliver the full session body whether the turn starts in Desktop, the exclusive entry, or the public entry; none is shortened to 280 characters. Each turn remains one independent logical report, with no merging or change in push frequency. The first message preserves the existing project, session title, short id and header/body separator, with an added `订阅会话` (subscribed session) source label. Telegram permits 4096 characters per message; the existing transport conservatively uses 4000 UTF-16 code units, including headers. Longer reports are sent in ordered fragments, preserving body whitespace, newlines, and emoji. Continuations look like `[ccmax · 订阅会话 · S7K2 · 已完成 · 续 2]:`; every fragment maps to the same session and event, so replying to any fragment still targets that session.
+
+Public reports are queued before send. Queued, sending, confirmed, failed, and indeterminate are distinct states. A timeout or missing receipt is indeterminate, not success. Telegram `429` responses back off using `retry_after`, with a retry limit. Later fragments cannot overtake an unconfirmed earlier fragment. If an earlier fragment fails or is indeterminate, the remaining fragments are marked failed and are not sent; they are neither bypassed nor blindly retried. After you turn the public entry off or change the operator, replies and buttons on old reports stop working and are not redirected to a new Bot.
 
 The public entry does not delegate work across sessions, share context between Agents, or let Agents negotiate with each other. Public user messages are not disguised as Agent-to-Agent messages.
 

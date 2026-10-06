@@ -7,6 +7,9 @@ export type SegmentedItem<T extends string> = {
   label: ReactNode
   icon?: ReactNode
   disabled?: boolean
+  /** Associates a tab with its panel. */
+  id?: string
+  controls?: string
   /** Native tooltip, for icon-only segments. */
   title?: string
 }
@@ -110,6 +113,8 @@ export function SegmentedControl<T extends string>({
             key={item.value}
             type="button"
             role={isTabs ? 'tab' : 'radio'}
+            id={item.id}
+            aria-controls={isTabs ? item.controls : undefined}
             aria-selected={isTabs ? selected : undefined}
             aria-checked={isTabs ? undefined : selected}
             // Roving tabindex: the group is one tab stop, arrows move within it.
