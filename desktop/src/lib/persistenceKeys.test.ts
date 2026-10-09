@@ -127,4 +127,14 @@ describe('persistenceKeys registry helpers', () => {
       expect(readCanonicalFirst(window.localStorage, pair)).toBe(`next:${pair.canonical}`)
     }
   })
+
+  test('copies a legacy workspace key into the canonical ccmax key without deleting legacy', () => {
+    window.localStorage.setItem(DESKTOP_PERSISTENCE_KEYS.workspace.legacy, '{"version":2,"sessions":{}}')
+    expect(copyStage18LegacyKeysIfMissing(window.localStorage)).toContain(DESKTOP_PERSISTENCE_KEYS.workspace.canonical)
+    expect(window.localStorage.getItem(DESKTOP_PERSISTENCE_KEYS.workspace.canonical)).toBe('{"version":2,"sessions":{}}')
+    expect(window.localStorage.getItem(DESKTOP_PERSISTENCE_KEYS.workspace.legacy)).toBe('{"version":2,"sessions":{}}')
+
+    writeCanonical(window.localStorage, DESKTOP_PERSISTENCE_KEYS.workspace, '{"version":2,"sessions":{"s1":{}}}')
+    expect(window.localStorage.getItem(DESKTOP_PERSISTENCE_KEYS.workspace.legacy)).toBe('{"version":2,"sessions":{}}')
+  })
 })

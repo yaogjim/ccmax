@@ -16,8 +16,6 @@ Both require your computer to be on with the app running. Tasks execute on your 
 
 ## H5 Access
 
-![Settings → H5 Access: LAN access toggle and connection settings (Chinese interface)](../../images/app/en/settings-h5.webp)
-
 ### Turning it on
 
 1. Open **Settings → H5 Access**.
@@ -26,8 +24,6 @@ Both require your computer to be on with the app running. Tasks execute on your 
 4. Scan it with your phone, or click **Copy launch URL** and send it to your own device.
 
 The scanned link carries the server address and token. Scan with your phone camera and open it in your usual Safari, Chrome, or system browser. Successful verification stores the connection in that browser's localStorage and removes the token from the address bar. Scanning again or opening a bookmark reconnects automatically. Temporary network failures do not forget pairing; choose **Retry** to use the saved credential. A revoked or regenerated token requires a fresh QR code.
-
-![Reading a real project conversation on mobile (Chinese interface)](../../images/app/en/h5-session.webp)
 
 ### The token is the credential
 
@@ -87,8 +83,6 @@ Free accounts include an assigned development domain, with transfer and request 
 Automatic restoration on desktop startup is off by default. Enable it to reconnect on later launches. Your computer must remain running, connected, and awake. Connectivity varies by network. For authentication or quota errors, follow the settings panel guidance before retrying.
 
 ## IM Adapters
-
-![Settings → IM Adapters: platform tabs and the Slack setup form (Chinese interface)](../../images/app/en/settings-im.webp)
 
 **Settings → IM Adapters** supports eight platforms, each connected differently. These are the common setup paths; see the [messaging guide](../im/index.md) for full steps:
 

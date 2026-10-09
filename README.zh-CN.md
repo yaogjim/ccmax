@@ -20,7 +20,7 @@
 
 ccmax 是一个**桌面端 AI 编程工作台**，基于 Claude Code，把项目与多会话、代码审阅、模型接入、多 Agent 协作和本地自动化集中在一个 Electron 应用中，同时提供 CLI 和本地服务。源码支持 macOS、Windows 与 Linux。
 
-> **源码与发布包**：本文介绍当前源码的功能。**v0.7.0** 包含单个 Agent 的专属供应商与模型绑定，仅提供 macOS Apple Silicon 安装包；其他平台可从源码构建。安装范围和签名情况见下方说明。
+> **源码与发布包**：本文介绍当前源码的功能。**v0.11.3** 包含单个 Agent 的专属供应商与模型绑定，仅提供 macOS Apple Silicon 安装包；其他平台可从源码构建。安装范围和签名情况见下方说明。当前桌面布局采用上游 Porcelain 界面。
 
 <p align="center">
   <a href="#桌面端预览">桌面端预览</a> · <a href="#安装桌面端">安装桌面端</a> · <a href="#桌面端亮点">桌面端亮点</a> · <a href="#更多文档">更多文档</a>
@@ -30,52 +30,17 @@ ccmax 是一个**桌面端 AI 编程工作台**，基于 Claude Code，把项目
 
 ## 桌面端预览
 
-以下截图来自当前源码的前端生产构建，使用隔离的演示项目与配置，不展示真实账号或真实模型执行结果。中文、英文 README 分别展示对应语言的界面，点击图片可查看 2000 像素宽的完整截图。
+当前源码的桌面端把项目、权限、模型和日常工作收在同一窗口。中文、英文 README 对应同一套能力。
 
-<table>
-  <tr>
-    <td align="center" valign="top" width="33%">
-      <a href="docs/images/app/zh-CN/readme-session-new.webp"><img src="docs/images/app/zh-CN/readme-session-new.webp" width="100%" alt="会话工作台：演示项目、会话标签与权限、运行位置和模型选择"></a>
-      <br><b>01 · 会话工作台</b><br>项目、权限和模型集中选择
-    </td>
-    <td align="center" valign="top" width="33%">
-      <a href="docs/images/app/zh-CN/readme-permission-modes.webp"><img src="docs/images/app/zh-CN/readme-permission-modes.webp" width="100%" alt="会话输入框中的五档权限模式菜单"></a>
-      <br><b>02 · 选择权限</b><br>按任务选择执行权限
-    </td>
-    <td align="center" valign="top" width="33%">
-      <a href="docs/images/app/zh-CN/readme-models.webp"><img src="docs/images/app/zh-CN/readme-models.webp" width="100%" alt="模型管理页：自定义演示供应商与 Claude、ChatGPT、Grok 官方账号入口"></a>
-      <br><b>03 · 模型管理</b><br>官方账号、自定义 API 与本地端点
-    </td>
-  </tr>
-  <tr>
-    <td align="center" valign="top" width="33%">
-      <a href="docs/images/app/zh-CN/readme-team-plan.webp"><img src="docs/images/app/zh-CN/readme-team-plan.webp" width="100%" alt="团队执行前确认界面：成员、供应商、模型、任务分配与依赖"></a>
-      <br><b>04 · 确认团队计划</b><br>先检查成员和任务，再启动执行
-    </td>
-    <td align="center" valign="top" width="33%">
-      <a href="docs/images/app/zh-CN/readme-side-chat.webp"><img src="docs/images/app/zh-CN/readme-side-chat.webp" width="100%" alt="主会话旁打开的临时侧边聊天面板"></a>
-      <br><b>05 · 侧边问答</b><br>继承上下文，追问不打断主任务
-    </td>
-    <td align="center" valign="top" width="33%">
-      <a href="docs/images/app/zh-CN/readme-agent-runtime.webp"><img src="docs/images/app/zh-CN/readme-agent-runtime.webp" width="100%" alt="Agent 详情中的运行环境：绑定独立供应商与模型，并显示可用状态"></a>
-      <br><b>06 · Agent 专属模型</b><br>可选固定供应商与模型
-    </td>
-  </tr>
-  <tr>
-    <td align="center" valign="top" width="33%">
-      <a href="docs/images/app/zh-CN/readme-scheduled-tasks.webp"><img src="docs/images/app/zh-CN/readme-scheduled-tasks.webp" width="100%" alt="新建本地定时任务表单：任务提示词、执行计划与通知配置"></a>
-      <br><b>07 · 本地定时任务</b><br>计划执行、运行记录与通知
-    </td>
-    <td align="center" valign="top" width="33%">
-      <a href="docs/images/app/zh-CN/readme-mcp.webp"><img src="docs/images/app/zh-CN/readme-mcp.webp" width="100%" alt="添加 MCP 服务表单：服务名称、配置作用域与传输方式"></a>
-      <br><b>08 · MCP 管理</b><br>图形化配置外部工具服务
-    </td>
-    <td align="center" valign="top" width="33%">
-      <a href="docs/images/app/zh-CN/readme-system.webp"><img src="docs/images/app/zh-CN/readme-system.webp" width="100%" alt="系统设置页：可选设置入口的显示开关与技能市场地址配置"></a>
-      <br><b>09 · 系统设置</b><br>按需显示入口，自定义技能市场地址
-    </td>
-  </tr>
-</table>
+1. **会话工作台** — 项目、权限和模型集中选择
+2. **选择权限** — 按任务选择执行权限
+3. **模型管理** — 官方账号、自定义 API 与本地端点
+4. **确认团队计划** — 先检查成员和任务，再启动执行
+5. **侧边问答** — 继承上下文，追问不打断主任务
+6. **Agent 专属模型** — 可选固定供应商与模型
+7. **本地定时任务** — 计划执行、运行记录与通知
+8. **MCP 管理** — 图形化配置外部工具服务
+9. **系统设置** — 按需显示入口，自定义技能市场地址
 
 从 0 开始：[下载安装](docs/start/install.md) → [连接模型](docs/start/models.md) → [跑通第一条会话](docs/start/first-session.md) → [设置指南](docs/desktop/settings.md) → [实战案例](docs/cases/index.md)。跨应用操作见 [Computer Use 指南](docs/desktop/computer-use.md)。
 
@@ -83,16 +48,15 @@ ccmax 是一个**桌面端 AI 编程工作台**，基于 Claude Code，把项目
 
 ## 安装桌面端
 
-最近发布的 **v0.7.0** 仅提供 **macOS Apple Silicon（ARM64）** 安装包，要求 macOS 12.0 及以上；Computer Use 原生助手要求 macOS 14.4 及以上。该版本没有 Windows、Linux 或 Intel Mac 安装包；其他平台可参考[贡献指南](docs/internals/contributing.md)从源码构建。
+最近发布的 **v0.11.3** 仅提供 **macOS Apple Silicon（ARM64）** 安装包，要求 macOS 12.0 及以上；Computer Use 原生助手要求 macOS 14.4 及以上。该版本没有 Windows、Linux 或 Intel Mac 安装包；其他平台可参考[贡献指南](docs/internals/contributing.md)从源码构建。
 
-1. 前往 [Releases](https://github.com/yaogjim/ccmax/releases)，从 v0.7.0 的 Assets 下载 `ccmax-0.7.0-mac-arm64.dmg` 和 `install-macos-unsigned.sh`。
-2. 将脚本与 DMG 放在同一个目录，执行 `bash install-macos-unsigned.sh`。脚本会安装应用、移除隔离标记并启动。
-3. 手动安装方式：正常安装 DMG 后，执行 `xattr -dr com.apple.quarantine /Applications/ccmax.app`，再打开应用。
-4. 首次启动后，在「设置 → 模型配置」登录官方账号，或配置供应商、API Key 与默认模型。
+1. 前往 [Releases](https://github.com/yaogjim/ccmax/releases)，从 v0.11.3 的 Assets 下载 `ccmax-0.11.3-mac-arm64.dmg`。
+2. 打开 DMG，将应用拖入「应用程序」。若首次打开被 Gatekeeper 拦截，在「系统设置 → 隐私与安全性」中点「仍要打开」，或执行 `xattr -dr com.apple.quarantine /Applications/ccmax.app`。
+3. 首次启动后，在「设置 → 模型配置」登录官方账号，或配置供应商、API Key 与默认模型。
 
-**签名说明**：该分支的 v0.7.0 使用本地自签名证书，未经 Apple Developer ID 签名和公证，首次打开可能出现「已损坏」或「无法验证开发者」提示。仅在确认安装包与脚本来源可信后，使用上述方式解除隔离标记。
+**签名说明**：该分支的 v0.11.3 使用本地自签名证书，未经 Apple Developer ID 签名和公证，首次打开可能出现「已损坏」或「无法验证开发者」提示。仅在确认安装包来源可信后，使用上述方式解除隔离标记。
 
-发布说明：[v0.7.0](release-notes/v0.7.0.md) · [签名策略](docs/start/code-signing.md) · [隐私与联网说明](docs/start/privacy.md)
+发布说明：[v0.11.3](release-notes/v0.11.3.md) · [签名策略](docs/start/code-signing.md) · [隐私与联网说明](docs/start/privacy.md)
 
 ## 从源码启动 CLI
 
@@ -116,12 +80,16 @@ cp .env.example .env
 - **全局搜索**：按 Cmd+K 跨会话全文搜索，直接跳到命中位置。
 - **分支 / Worktree 启动**：新会话可选择仓库分支，在当前工作树或隔离的 Git 工作树中运行。
 - **逐文件审阅改动**：工作区列出本轮修改，支持语法高亮 Diff、行级评论与整轮撤销。详见[工作区](docs/desktop/workspace.md)。
+- **文档预览**：在工作区直接打开 PDF、Word、Excel 和图片，不必切到其他软件。
 - **内置浏览器预览**：在应用内查看正在开发的页面，使用独立浏览器的 Cookie 与登录状态。
 - **五档权限模式**：按任务选择权限，工具调用、危险操作和待回答问题在图形界面中处理。
+- **输入框「+」菜单**：本次任务的技能、连接器和文件，以及 Agent Teams、Computer Use 的运行方式开关。
+- **会话内轨迹**：会话标题旁的「对话 / 轨迹」切到轨迹后，提示词、工具和模型调用排成一行流水表。独立 Trace 标签页已移除，已保存的 Trace 标签会迁到会话标签。详见[会话、权限与审阅](docs/desktop/sessions.md)。
+- **编辑并重发**：悬停已发送的提示词可改写后从该轮重跑，确认规则与撤销后续轮次相同。
 
 ### 协作与自动化
 
-- **Agent Teams 团队计划**：执行前展示成员、Agent 预设、供应商、模型、任务归属与依赖，可逐个调整或批量设置，确认后才启动；工作台展示成员、任务和通信，支持整组停止。
+- **Agent Teams 团队计划**：执行前展示成员、Agent 预设、供应商、模型、任务归属与依赖，可逐个调整或批量设置，确认后才启动；工作台展示成员、任务和通信，支持整组停止。成员在断流或 5xx 时会自动重试；停止后，给负责人的下一条消息可以唤醒成员，不必重做已完成工作。详见[子 Agent 与任务拆分](docs/desktop/agents.md)。
 - **跨会话引用与协作**：用 `@` 引用历史会话作为上下文，也可让 Agent 分派工作、读取其他会话结果并互通消息。Agent 之间的消息不构成用户授权。
 - **侧边问答**：输入 `/btw 问题`，或选中文字后在侧边聊天提问。临时对话继承父会话的上下文与模型，独立运行，不打断主任务；关闭对应标签或退出应用后清空。
 - **可视化 Agent 管理**：浏览、创建和编辑子 Agent，配置系统提示词、工具、模型与思考强度，也可调整内置 Agent 的模型。详见[子 Agent 与任务拆分](docs/desktop/agents.md)。
@@ -135,13 +103,13 @@ cp .env.example .env
 - **模型自选**：支持 Claude / ChatGPT / Grok 官方账号登录、第三方 API 预设、自定义接口及 LM Studio / Ollama 本地端点。详见[连接模型服务](docs/start/models.md)。
 - **图片生成与编辑**：在聊天中使用已配置的图片生成服务，支持官方账号与兼容的 Images API。
 - **MCP 图形化管理**：管理 STDIO / Streamable HTTP / SSE 外部工具服务，支持项目私有、共享与全局作用域。
-- **技能与插件**：浏览、预览和安装扩展，查看来源与安全状态；技能市场入口及地址可在系统设置中调整。
-- **请求追踪与用量统计**：查看本地模型请求的状态、耗时与 Token 使用趋势，辅助定位失败调用。
-- **系统设置**：统一控制终端、IM 接入、宠物、Trace 请求追踪、诊断、关于、H5 访问和侧栏技能市场入口，默认隐藏这些可选入口，按需开启。
+- **技能与插件**：浏览、预览和安装扩展，查看来源与安全状态；技能市场是「技能·连接器」下的精选清单，入口及地址可在系统设置中调整。
+- **用量统计**：查看本机 Token 使用趋势；失败调用从会话轨迹排查。
+- **系统设置**：统一控制终端、IM 接入、宠物、诊断、关于、H5 访问和侧栏技能市场入口，默认隐藏这些可选入口，按需开启。
 - **六套主题与聊天外观**：纯白、纸墨、经典暖色、青瓷、墨夜、墨夜蓝，可跟随系统深浅色；聊天字体、字号和对话宽度单独调整。
 - **可选超时自动回答**：开启后，等待用户回答的问题超过设定时长，可由会话的小模型基于上下文决策；仍可随时人工处理。详见[设置指南](docs/desktop/settings.md)。
 - **桌面宠物**：内置宠物随任务状态切换动作，也支持自定义形象，默认关闭。详见[桌面宠物](docs/desktop/pets.md)。
-- **手机与 IM 接力**：H5 手机浏览器访问，以及 Telegram / 飞书 / 微信 / 钉钉 / WhatsApp / 企业微信 / QQ / Slack 远程对话、项目切换和权限审批。详见[远程访问](docs/desktop/remote.md)与 [IM 接入](docs/im/index.md)。
+- **手机与 IM 接力**：H5 手机浏览器访问（触屏优先的会话列表和输入面板），以及 Telegram / 飞书 / 微信 / 钉钉 / WhatsApp / 企业微信 / QQ / Slack 远程对话、项目切换和权限审批。详见[远程访问](docs/desktop/remote.md)与 [IM 接入](docs/im/index.md)。
 
 ---
 

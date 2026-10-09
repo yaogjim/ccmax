@@ -31,6 +31,16 @@ if (process.argv[2] === '--computer-use-repl-worker') {
   process.exit(0)
 }
 
+// Local speech recognition runs in this same executable, relaunched by the
+// server's voice recognizer. Like the worker above it must stay isolated: it
+// reads its private configuration from the environment, loads the downloaded
+// sherpa-onnx runtime by absolute path, and needs none of the desktop modes.
+if (process.argv[2] === '--voice-worker') {
+  const { runVoiceWorker } = await import('../../src/server/services/voice/sensevoice/worker')
+  await runVoiceWorker()
+  process.exit(0)
+}
+
 type AdapterConfigShape = Awaited<
   ReturnType<typeof import('../../adapters/common/config.ts')['loadConfig']>
 >
@@ -207,13 +217,22 @@ async function runAdapters(rawArgs: string[]): Promise<void> {
   }
 
   if (started === 0) {
+    if (process.env.CC_HAHA_MIGRATION_CONTROL === '1') {
+      // No platform module was imported, so this process owns no adapter writes.
+      // Publish that fact before exit: the host may already be requesting drain.
+      process.stdout.write(JSON.stringify({ type: 'migration_adapter_inactive' }) + '\n', () => process.exit(0))
+      return
+    }
     console.error(
       '[claude-sidecar] no adapter could be started — check credentials in env or ~/.claude/adapters.json',
     )
     process.exit(1)
   }
 
-  // 让进程保持存活：每个 adapter 都通过 long-lived WebSocket（Lark WSClient
-  // / grammY long-polling / Socket Mode 等）持有 event loop，自然不会退出。
-  // 这里不需要额外 setInterval 兜底。adapter 自己注册的 SIGINT handler 都会触发。
+  if (process.env.CC_HAHA_MIGRATION_CONTROL === '1' && process.env.CC_HAHA_LOCAL_ACCESS_TOKEN) {
+    const { installAdapterMigrationControl } = await import('../../adapters/common/migration-control.js')
+    installAdapterMigrationControl({ token: process.env.CC_HAHA_LOCAL_ACCESS_TOKEN })
+  }
+
+  // 每个 adapter 的 WebSocket / long-polling 持有 event loop，自然保持进程存活。
 }

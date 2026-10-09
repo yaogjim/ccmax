@@ -28,6 +28,27 @@ const teamApiMocks = vi.hoisted(() => ({
   sendMemberMessage: vi.fn(),
 }))
 
+const browserHostMocks = vi.hoisted(() => ({
+  available: false,
+  create: vi.fn(async () => ({ ok: true as const })),
+  setVisible: vi.fn(async () => ({ ok: true as const })),
+  message: vi.fn(async () => ({ ok: true as const })),
+}))
+
+vi.mock('../lib/workspace/browserHost', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/workspace/browserHost')>()
+  return {
+    ...actual,
+    isWorkspaceBrowserAvailable: () => browserHostMocks.available,
+    workspaceBrowserHost: {
+      ...actual.workspaceBrowserHost,
+      create: browserHostMocks.create,
+      setVisible: browserHostMocks.setVisible,
+      message: browserHostMocks.message,
+    },
+  }
+})
+
 vi.mock('../api/sessions', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api/sessions')>()
   return {
@@ -46,6 +67,12 @@ vi.mock('../hooks/useMobileViewport', () => ({
 vi.mock('../components/chat/MessageList', () => ({
   MessageList: ({ compact, sessionId }: { compact?: boolean; sessionId?: string }) => (
     <div data-testid="message-list" data-compact={compact ? 'true' : 'false'} data-session-id={sessionId} />
+  ),
+}))
+
+vi.mock('../components/trajectory/TrajectoryView', () => ({
+  default: ({ sessionId, visible, running }: { sessionId: string; visible: boolean; running: boolean }) => (
+    <div data-testid="trajectory-view" data-session-id={sessionId} data-visible={visible ? 'true' : 'false'} data-running={running ? 'true' : 'false'} />
   ),
 }))
 
@@ -98,6 +125,7 @@ vi.mock('./TerminalSettings', () => ({
 }))
 
 import { ActiveSession } from './ActiveSession'
+import { installFakeBrowserGuests, isBrowserPageShown } from '../test/fakeBrowserGuests'
 import { createDefaultSessionState, useChatStore } from '../stores/chatStore'
 import { useCLITaskStore } from '../stores/cliTaskStore'
 import { useSessionStore } from '../stores/sessionStore'
@@ -105,6 +133,7 @@ import { useSettingsStore } from '../stores/settingsStore'
 import { useTabStore } from '../stores/tabStore'
 import { useTeamStore } from '../stores/teamStore'
 import { useActivityPanelStore } from '../stores/activityPanelStore'
+import { useTrajectoryViewStore } from '../stores/trajectoryViewStore'
 import {
   WORKSPACE_BOTTOM_DEFAULT_HEIGHT,
   WORKSPACE_BOTTOM_MAX_HEIGHT,
@@ -133,9 +162,18 @@ beforeEach(() => {
   teamApiMocks.sendMemberMessage.mockReset()
 })
 
+let disposeGuests: (() => void) | null = null
+
 afterEach(() => {
   cleanup()
+  disposeGuests?.()
+  disposeGuests = null
   vi.useRealTimers()
+  vi.unstubAllGlobals()
+  browserHostMocks.available = false
+  for (const mock of [browserHostMocks.create, browserHostMocks.setVisible, browserHostMocks.message]) {
+    mock.mockClear()
+  }
   viewportMocks.isMobile = false
   useTabStore.setState({ tabs: [], activeTabId: null })
   useSessionStore.setState({ sessions: [], activeSessionId: null, isLoading: false, error: null })
@@ -146,6 +184,60 @@ afterEach(() => {
   useWorkspaceStore.setState(useWorkspaceStore.getInitialState(), true)
   useActivityPanelStore.setState(useActivityPanelStore.getInitialState(), true)
   useCLITaskStore.setState(useCLITaskStore.getInitialState(), true)
+  useTrajectoryViewStore.setState({ modes: {}, opened: {}, nav: null })
+})
+
+describe('ActiveSession trajectory view', () => {
+  function seedSession(id: string) {
+    useSettingsStore.setState({ locale: 'en' })
+    useTabStore.setState({ activeTabId: id, tabs: [{ sessionId: id, title: 'Main', type: 'session', status: 'idle' }] })
+    useSessionStore.setState({ sessions: [{ id, title: 'Main', messageCount: 1, createdAt: '', modifiedAt: '', projectPath: '/repo', workDir: '/repo', workDirExists: true }] })
+    useChatStore.setState({ sessions: { [id]: { ...createDefaultSessionState(), connectionState: 'connected', historyStatus: 'ready', historyHydrated: true, messages: [{ id: 'm', type: 'assistant_text', content: 'main', timestamp: 1 }] } } })
+  }
+
+  it('swaps the chat body for the trajectory while keeping the chat and composer mounted', async () => {
+    const id = 'trajectory-session'
+    seedSession(id)
+    render(<ActiveSession sessionId={id} />)
+    const list = screen.getByTestId('message-list')
+    const input = screen.getByTestId('chat-input')
+    // Never mounted (so never fetched) until the user opens it.
+    expect(screen.queryByTestId('trajectory-view')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Trajectory' }))
+    const trajectory = await screen.findByTestId('trajectory-view')
+    expect(trajectory).toHaveAttribute('data-visible', 'true')
+    expect(trajectory).toHaveAttribute('data-session-id', id)
+    expect(screen.getByTestId('message-list')).toBe(list)
+    expect(list.parentElement).toHaveClass('hidden')
+    expect(screen.getByTestId('chat-input')).toBe(input)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Chat' }))
+    expect(screen.getByTestId('trajectory-view')).toBe(trajectory)
+    expect(trajectory).toHaveAttribute('data-visible', 'false')
+    expect(screen.getByTestId('session-trajectory-panel')).toHaveClass('hidden')
+    expect(list.parentElement).not.toHaveClass('hidden')
+  })
+
+  it('opens the trajectory when a chat tool card asks to reveal a row there', async () => {
+    const id = 'reveal-session'
+    seedSession(id)
+    render(<ActiveSession sessionId={id} />)
+    act(() => useTrajectoryViewStore.getState().revealInTrajectory(id, 't:toolu_1'))
+    expect(await screen.findByTestId('trajectory-view')).toHaveAttribute('data-visible', 'true')
+    expect(screen.getByRole('tab', { name: 'Trajectory' })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('offers no trajectory switch on mobile', () => {
+    viewportMocks.isMobile = true
+    const id = 'mobile-trajectory'
+    seedSession(id)
+    useTrajectoryViewStore.setState({ modes: { [id]: 'trajectory' }, opened: { [id]: true }, nav: null })
+    render(<ActiveSession sessionId={id} />)
+    expect(screen.queryByRole('tab', { name: 'Trajectory' })).not.toBeInTheDocument()
+    expect(screen.queryByTestId('trajectory-view')).not.toBeInTheDocument()
+    expect(screen.getByTestId('message-list').parentElement).not.toHaveClass('hidden')
+  })
 })
 
 describe('ActiveSession task polling', () => {
@@ -164,6 +256,34 @@ describe('ActiveSession task polling', () => {
     expect(screen.getByTestId('workbench-panel')).toBe(workbench)
     expect(workbench).not.toHaveClass('hidden')
     expect(screen.getByTestId('message-list')).toBe(main)
+  })
+
+  it.each([false, true])('offers no side chat in a blank session until it has a conversation (mobile: %s)', (isMobile) => {
+    viewportMocks.isMobile = isMobile
+    const id = `blank-side-parent-${isMobile ? 'mobile' : 'desktop'}`
+    useSettingsStore.setState({ locale: 'en' })
+    useTabStore.setState({ activeTabId: id, tabs: [{ sessionId: id, title: 'Untitled Session', type: 'session', status: 'idle' }] })
+    useSessionStore.setState({ sessions: [{ id, title: 'Untitled Session', messageCount: 0, createdAt: '', modifiedAt: '', projectPath: '/repo', workDir: '/repo', workDirExists: true }] })
+    useChatStore.setState({ sessions: { [id]: { ...createDefaultSessionState(), connectionState: 'connected', historyStatus: 'ready', historyHydrated: true } } })
+    if (!isMobile) useWorkspaceStore.getState().setLayout(id, 'split')
+    render(<ActiveSession sessionId={id} />)
+
+    expect(screen.getByTestId('empty-session-hero')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Side chat' })).not.toBeInTheDocument()
+    if (!isMobile) {
+      expect(screen.getByTestId('workspace-launcher-review')).toBeInTheDocument()
+      expect(screen.queryByTestId('workspace-launcher-side-chat')).not.toBeInTheDocument()
+    }
+
+    act(() => useChatStore.setState(state => ({ sessions: { ...state.sessions, [id]: { ...state.sessions[id]!, messages: [{ id: 'u', type: 'user_text', content: 'hi', timestamp: 1 }] } } })))
+
+    expect(screen.queryByTestId('empty-session-hero')).not.toBeInTheDocument()
+    const launcherEntry = screen.queryByTestId('workspace-launcher-side-chat')
+    expect(Boolean(launcherEntry)).toBe(!isMobile)
+    const headerEntry = screen.getAllByRole('button', { name: 'Side chat' }).filter(button => button !== launcherEntry)
+    expect(headerEntry).toHaveLength(1)
+    fireEvent.click(headerEntry[0]!)
+    expect(openSideChat).toHaveBeenCalledWith(id)
   })
 
   it('can hide a mobile side chat without destroying its temporary tab', () => {
@@ -228,6 +348,47 @@ describe('ActiveSession task polling', () => {
     expect(chatInput).toHaveAttribute('data-session-id', sessionId)
     expect(chatInput).toHaveAttribute('data-visible', 'false')
     expect(useChatStore.getState().sessions['__settings__']).toBeUndefined()
+  })
+
+  it('parks the workspace browser page while another page covers the retained session', async () => {
+    // ContentRouter hides a retained session with opacity only. The old native
+    // page ignored CSS and kept painting over the market page; the page must
+    // also stop acting as browser chrome (shortcuts) while it is off screen.
+    disposeGuests = installFakeBrowserGuests()
+    browserHostMocks.available = true
+    const sessionId = 'browser-retained-session'
+    useSessionStore.setState({
+      sessions: [{ id: sessionId, title: 'Browser', createdAt: '', modifiedAt: '', messageCount: 1, projectPath: '/repo', workDir: '/repo', workDirExists: true }],
+      activeSessionId: sessionId,
+    })
+    useTabStore.setState({
+      tabs: [
+        { sessionId, title: 'Browser', type: 'session', status: 'idle' },
+        { sessionId: '__market__', title: 'Market', type: 'market', status: 'idle' },
+      ],
+      activeTabId: sessionId,
+    })
+    useChatStore.setState({ sessions: { [sessionId]: { ...createDefaultSessionState(), connectionState: 'connected', historyStatus: 'ready', historyHydrated: true } } })
+    const tabId = useWorkspaceStore.getState().openTarget(sessionId, { kind: 'browser', url: 'https://example.test/' })!
+    const tab = useWorkspaceStore.getState().getTab(sessionId, tabId)
+    if (tab?.kind !== 'browser') throw new Error('expected a browser tab')
+    useWorkspaceStore.getState().setLayout(sessionId, 'split')
+
+    const { rerender } = render(<ActiveSession sessionId={sessionId} active />)
+    await waitFor(() => expect(browserHostMocks.setVisible).toHaveBeenLastCalledWith(tab.browserTabId, true))
+    expect(isBrowserPageShown(tab.browserTabId)).toBe(true)
+
+    act(() => useTabStore.getState().setActiveTab('__market__'))
+    rerender(<ActiveSession sessionId={sessionId} active={false} />)
+    expect(browserHostMocks.setVisible).toHaveBeenLastCalledWith(tab.browserTabId, false)
+    expect(isBrowserPageShown(tab.browserTabId)).toBe(false)
+
+    act(() => useTabStore.getState().setActiveTab(sessionId))
+    rerender(<ActiveSession sessionId={sessionId} active />)
+    expect(browserHostMocks.setVisible).toHaveBeenLastCalledWith(tab.browserTabId, true)
+    expect(isBrowserPageShown(tab.browserTabId)).toBe(true)
+    // Hiding is presentation only; the page itself must survive the round trip.
+    expect(browserHostMocks.create).toHaveBeenCalledTimes(1)
   })
 
   it('shows cleaned worktrees as retained history and uses the source project for tools', () => {
@@ -393,6 +554,64 @@ describe('ActiveSession task polling', () => {
     expect(screen.getByTestId('chat-input')).toHaveAttribute('data-variant', 'default')
   })
 
+  it('turns a blank session into the new-session page: project question, starters and recent threads', () => {
+    const sessionId = 'blank-new-session'
+    const base = Date.now()
+    const listItem = (id: string, title: string, messageCount: number, minutesAgo: number, workDir = '/workspace/project') => ({
+      id,
+      title,
+      createdAt: new Date(base - minutesAgo * 60_000).toISOString(),
+      modifiedAt: new Date(base - minutesAgo * 60_000).toISOString(),
+      messageCount,
+      projectPath: workDir,
+      workDir,
+      workDirExists: true,
+    })
+    useSessionStore.setState({
+      sessions: [
+        listItem(sessionId, 'New Session', 0, 0),
+        listItem('older', 'Older thread', 4, 120),
+        listItem('newer', 'Newer thread', 2, 5),
+        listItem('elsewhere', 'Other project thread', 3, 1, '/workspace/other'),
+      ],
+      activeSessionId: sessionId,
+      isLoading: false,
+      error: null,
+    })
+    useTabStore.setState({
+      tabs: [{ sessionId, title: 'New Session', type: 'session', status: 'idle' }],
+      activeTabId: sessionId,
+    })
+    useChatStore.setState({
+      sessions: {
+        [sessionId]: {
+          ...useChatStore.getState().getSession(sessionId),
+          connectionState: 'connected',
+          historyStatus: 'ready',
+        },
+      },
+    })
+
+    render(<ActiveSession />)
+
+    const hero = screen.getByTestId('empty-session-hero')
+    expect(within(hero).getByRole('heading', { level: 1 })).toHaveTextContent('project')
+    // Only this project's threads with something in them, newest first; the
+    // blank session itself is not "recent".
+    const starter = screen.getByTestId('new-session-starter')
+    const recentTitles = within(starter).getAllByRole('listitem').map((item) => item.textContent ?? '')
+    expect(recentTitles).toHaveLength(2)
+    expect(recentTitles[0]).toContain('Newer thread')
+    expect(recentTitles[1]).toContain('Older thread')
+
+    // A starter chip goes through the composer's insertion queue, so it lands
+    // at the cursor without wiping attachments a replace would clear.
+    const chips = within(within(starter).getByRole('group')).getAllByRole('button')
+    expect(chips).toHaveLength(4)
+    fireEvent.click(chips[1]!)
+    expect(useChatStore.getState().sessions[sessionId]?.composerInsertion?.text).toBe(chips[1]!.textContent)
+  })
+
   it('labels result usage that includes cache tokens without implying the Trace input/output total', async () => {
     const sessionId = 'deepseek-cache-token-session'
 
@@ -440,7 +659,7 @@ describe('ActiveSession task polling', () => {
     })
 
     const tokenBadge = screen.getByTitle(/cache read 4,971,000.*cache write 10,000/i)
-    expect(tokenBadge).toHaveTextContent('5.1m tokens incl. cache')
+    expect(tokenBadge).toHaveTextContent('5.1M tokens incl. cache')
   })
 
   it('shows the worktree name in the header and reveals its directory on focus', async () => {
@@ -980,6 +1199,81 @@ describe('ActiveSession task polling', () => {
     await waitFor(() => {
       expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
     }, { timeout: 4000 })
+  })
+
+  it('on a phone, publishes the activity to the top bar pill instead of throwing the sheet over the chat', async () => {
+    viewportMocks.isMobile = true
+    const sessionId = 'activity-phone-session'
+    useCLITaskStore.setState({ fetchSessionTasks: vi.fn().mockResolvedValue(undefined) })
+    useSessionStore.setState({
+      sessions: [{
+        id: sessionId,
+        title: 'Phone Activity Session',
+        createdAt: '2026-05-07T00:00:00.000Z',
+        modifiedAt: '2026-05-07T00:00:00.000Z',
+        messageCount: 1,
+        projectPath: '/workspace/project',
+        workDir: '/workspace/project',
+        workDirExists: true,
+      }],
+      activeSessionId: sessionId,
+      isLoading: false,
+      error: null,
+    })
+    useTabStore.setState({
+      tabs: [{ sessionId, title: 'Phone Activity Session', type: 'session', status: 'idle' }],
+      activeTabId: sessionId,
+    })
+    useChatStore.setState({
+      sessions: {
+        [sessionId]: {
+          messages: [],
+          chatState: 'thinking',
+          connectionState: 'connected',
+          streamingText: '',
+          streamingToolInput: '',
+          activeToolUseId: null,
+          activeToolName: null,
+          activeThinkingId: null,
+          pendingPermission: null,
+          pendingComputerUsePermission: null,
+          tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
+          elapsedSeconds: 0,
+          statusVerb: '',
+          slashCommands: [],
+          backgroundAgentTasks: {},
+          agentTaskNotifications: {},
+          elapsedTimer: null,
+        },
+      },
+    })
+
+    render(<ActiveSession />)
+    act(() => {
+      useCLITaskStore.setState({
+        sessionId,
+        tasks: [{
+          id: 'task-1',
+          subject: 'Draft implementation plan',
+          description: 'Create the first activity row',
+          status: 'in_progress',
+          blocks: [],
+          blockedBy: [],
+          taskListId: sessionId,
+        }],
+        completedAndDismissed: false,
+      })
+    })
+
+    await waitFor(() => {
+      expect(useActivityPanelStore.getState().mobileSummaryBySession[sessionId]).toEqual({ visible: true, count: 1 })
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
+
+    act(() => useActivityPanelStore.getState().open(sessionId))
+    expect(await screen.findByTestId('session-activity-sheet')).toBeInTheDocument()
+    act(() => useActivityPanelStore.getState().close())
   })
 
   it('auto-opens for current activity and seals unfinished tasks when the turn becomes idle', async () => {
@@ -2066,7 +2360,14 @@ describe('ActiveSession task polling', () => {
     const resizeHandle = screen.getByTestId('workspace-resize-handle')
 
     const workbenchPanel = screen.getByTestId('workbench-panel')
-    expect(workbenchPanel.style.maxWidth).toBe('70%')
+    // A bare 70% cap ignored the chat column's 400px floor plus the 1px
+    // handle: at 1160px of row a persisted 860px panel was clamped to 812px and
+    // ran 53px past the window edge. Both bounds now deduct that 401px.
+    expect(workbenchPanel.style.maxWidth).toBe('')
+    expect(workbenchPanel).toHaveClass('max-w-[min(70%,calc(100%_-_401px))]')
+    expect(workbenchPanel).toHaveClass('min-w-[min(420px,54%,calc(100%_-_401px))]')
+    expect(resizeHandle).toHaveClass('w-px')
+    expect(chatColumn).toHaveClass('min-w-[400px]')
 
     expect(within(contentRow).getByTestId('message-list')).toBeInTheDocument()
     expect(within(contentRow).getByTestId('message-list')).toHaveAttribute('data-compact', 'true')
@@ -2570,7 +2871,27 @@ describe('ActiveSession header', () => {
     expect(within(titleRow).queryByText('2 messages')).not.toBeInTheDocument()
     expect(within(meta).getByText('2 messages')).toBeInTheDocument()
     expect(within(meta).getByText('15k API tokens')).toBeInTheDocument()
-    expect(header).toHaveClass('py-3')
+    expect(header).toHaveClass('py-3.5')
+  })
+
+  it('leads the metadata with where the session runs: project folder, then branch', async () => {
+    const sessionId = 'header-place-session'
+    mountSessionWithLongTitle(sessionId)
+
+    render(<ActiveSession />)
+
+    const project = screen.getByTestId('session-header-project')
+    expect(project).toHaveTextContent('project')
+    expect(project.querySelector('svg.lucide-folder')).toHaveAttribute('aria-hidden', 'true')
+    // The branch arrives with the git info request.
+    const branch = await screen.findByTestId('session-header-branch')
+    expect(branch).toHaveTextContent('main')
+    expect(branch.querySelector('svg.lucide-git-branch')).toHaveAttribute('aria-hidden', 'true')
+
+    const metaRow = project.parentElement as HTMLElement
+    const order = [...metaRow.children].map((child) => child.getAttribute('data-testid'))
+    expect(order.indexOf('session-header-project')).toBe(0)
+    expect(order.indexOf('session-header-branch')).toBeGreaterThan(0)
   })
 
   it('keeps the separators between metadata items, never in front of them', () => {
@@ -2582,10 +2903,13 @@ describe('ActiveSession header', () => {
     const heading = within(screen.getByTestId('session-header')).getByRole('heading', { level: 1 })
     const meta = (heading.parentElement as HTMLElement).nextElementSibling as HTMLElement
 
-    // 空闲会话只有三项元数据（tokens / 更新时间 / 消息数），之间两个「·」，开头不该有。
-    // 分隔符是纯装饰，读屏时不该被念出来。
-    expect(meta.textContent?.trimStart().startsWith('·')).toBe(false)
-    expect(meta.querySelectorAll('[aria-hidden="true"]')).toHaveLength(2)
+    // 分隔符（3px 圆点）只出现在两项之间，开头不该有；它是纯装饰，读屏时不该被念出来。
+    // 图标也带 aria-hidden，所以这里只数元数据行的直接子元素。
+    const children = [...meta.children]
+    const separators = children.filter((child) => child.getAttribute('aria-hidden') === 'true')
+    expect(children[0]?.getAttribute('aria-hidden')).not.toBe('true')
+    expect(separators.length).toBeGreaterThan(0)
+    expect(separators).toHaveLength(children.length - separators.length - 1)
   })
 })
 

@@ -152,6 +152,8 @@ describe('settingsNavigationStore', () => {
     expect(updateSettingsNavigationPreferences).toHaveBeenLastCalledWith({ trace: true })
     expect(useSettingsNavigationStore.getState().preferences.trace).toBe(true)
     expect(useSettingsNavigationStore.getState().saveError).toBeNull()
+    expect(useSettingsNavigationStore.getState().isSettingsTabVisible('trace')).toBe(false)
+    expect(useSettingsNavigationStore.getState().resolveVisibleSettingsTab('trace')).toBe(FALLBACK_SETTINGS_TAB)
   })
 
   it('persists skill market visibility and URL, and closes the market tab when hidden', async () => {

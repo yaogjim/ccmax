@@ -134,6 +134,22 @@ describe('TelegramPublicSettings', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Public Bot is running')
   })
 
+  it('cancels the saved-status timeout when the panel unmounts', async () => {
+    // A live 2s timeout after jsdom teardown throws `window is not defined`.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const updateConfig = vi.fn(async () => {})
+    renderPublicSettings(
+      { telegram: { public: { enabled: true, botToken: '****oken', ownerUserId: 42, generation: 2 } } },
+      { updateConfig },
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Bot configuration and pairing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save public Bot' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Public Bot saved' })).toBeInTheDocument())
+    cleanup()
+    await act(async () => { vi.advanceTimersByTime(2000) })
+    expect(updateConfig).toHaveBeenCalled()
+  })
+
   it('defaults public Bot off with no owner and does not claim it is running', () => {
     renderPublicSettings({})
 

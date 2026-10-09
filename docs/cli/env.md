@@ -88,7 +88,7 @@ CC_HAHA_TASK_TIMEOUT_MS=1800000 /Applications/ccmax.app/Contents/MacOS/ccmax
 
 ### 桌面端 Provider
 
-桌面端把 Provider 索引保存到：
+桌面端把 Provider 索引保存到（ccmax 沿用的遗留目录名，不是产品名）：
 
 ```text
 ~/.claude/cc-haha/providers.json

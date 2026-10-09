@@ -33,6 +33,13 @@ const DEFAULT_SKILL_MARKET_PREFERENCES = {
   url: '',
 }
 
+const DEFAULT_VOICE_INPUT_PREFERENCES = {
+  enabled: true,
+  providerId: 'sensevoice-local',
+  language: 'auto',
+  downloadSource: 'auto',
+}
+
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'desktop-ui-preferences-'))
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
@@ -89,6 +96,7 @@ describe('DesktopUiPreferencesService', () => {
         avatarUpdatedAt: null,
       },
       pet: DEFAULT_PET_PREFERENCES,
+      voiceInput: DEFAULT_VOICE_INPUT_PREFERENCES,
       projectDisplayNames: {},
       settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
       skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
@@ -146,6 +154,7 @@ describe('DesktopUiPreferencesService', () => {
         avatarUpdatedAt: null,
       },
       pet: DEFAULT_PET_PREFERENCES,
+      voiceInput: DEFAULT_VOICE_INPUT_PREFERENCES,
       projectDisplayNames: {
         '/workspace/alpha': 'Alpha project',
       },
@@ -169,6 +178,7 @@ describe('DesktopUiPreferencesService', () => {
         avatarUpdatedAt: null,
       },
       pet: DEFAULT_PET_PREFERENCES,
+      voiceInput: DEFAULT_VOICE_INPUT_PREFERENCES,
       projectDisplayNames: {
         '/workspace/alpha': 'Alpha project',
       },
@@ -720,6 +730,7 @@ describe('DesktopUiPreferencesService', () => {
         avatarUpdatedAt: null,
       },
       pet: DEFAULT_PET_PREFERENCES,
+      voiceInput: DEFAULT_VOICE_INPUT_PREFERENCES,
       projectDisplayNames: {},
       settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
       skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
@@ -815,6 +826,7 @@ describe('desktop UI preferences API', () => {
           avatarUpdatedAt: null,
         },
         pet: DEFAULT_PET_PREFERENCES,
+        voiceInput: DEFAULT_VOICE_INPUT_PREFERENCES,
         projectDisplayNames: {},
         settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
         skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
@@ -844,6 +856,7 @@ describe('desktop UI preferences API', () => {
           avatarUpdatedAt: null,
         },
         pet: DEFAULT_PET_PREFERENCES,
+        voiceInput: DEFAULT_VOICE_INPUT_PREFERENCES,
         projectDisplayNames: {},
         settingsNavigation: DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
         skillMarket: DEFAULT_SKILL_MARKET_PREFERENCES,
@@ -1219,6 +1232,157 @@ describe('desktop UI preferences API', () => {
           url: 'https://market.example/skills',
         },
       },
+    })
+  })
+})
+
+describe('DesktopUiPreferencesService voiceInput section', () => {
+  beforeEach(setup)
+  afterEach(teardown)
+
+  async function writeDesktopUiFile(contents: Record<string, unknown>) {
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.writeFile(path.join(tmpDir, 'cc-haha', 'desktop-ui.json'), JSON.stringify(contents), 'utf-8')
+  }
+
+  test('normalizes old schema files without voiceInput and preserves unknown fields', async () => {
+    await writeDesktopUiFile({
+      schemaVersion: 5,
+      futureField: { keep: true },
+      pet: { ...DEFAULT_PET_PREFERENCES, enabled: true },
+      sidebar: { projectOrder: ['/workspace/alpha'] },
+    })
+
+    const service = new DesktopUiPreferencesService()
+    const read = await service.readPreferences()
+    expect(read.exists).toBe(true)
+    expect(read.preferences).toMatchObject({
+      schemaVersion: 6,
+      futureField: { keep: true },
+      pet: { enabled: true },
+      voiceInput: DEFAULT_VOICE_INPUT_PREFERENCES,
+    })
+
+    const after = await service.updateVoiceInputPreferences({ enabled: true, language: 'zh' })
+
+    expect(after.voiceInput).toEqual({ enabled: true, providerId: 'sensevoice-local', language: 'zh', downloadSource: 'auto' })
+    expect(await readDesktopUiFile()).toMatchObject({
+      schemaVersion: 6,
+      futureField: { keep: true },
+      pet: { enabled: true },
+      sidebar: { projectOrder: ['/workspace/alpha'] },
+      voiceInput: { enabled: true, providerId: 'sensevoice-local', language: 'zh', downloadSource: 'auto' },
+    })
+  })
+
+  test('turns voice input on only where enabled was never saved; a saved false stays off', async () => {
+    // v0.6.8 shipped voice input off by default, and every write since then
+    // stores `enabled` explicitly. The new default must not override that.
+    await writeDesktopUiFile({
+      schemaVersion: 6,
+      sidebar: { projectOrder: ['/workspace/alpha'] },
+      voiceInput: { enabled: false, providerId: 'sensevoice-local', language: 'zh', downloadSource: 'auto' },
+    })
+    const service = new DesktopUiPreferencesService()
+    expect((await service.readPreferences()).preferences.voiceInput.enabled).toBe(false)
+
+    await service.updateSidebarPreferences({ pinnedProjects: ['/workspace/alpha'] })
+    await service.updateVoiceInputPreferences({ language: 'en' })
+    expect((await readDesktopUiFile()).voiceInput).toMatchObject({ enabled: false, language: 'en' })
+
+    // A section saved without the field, and a file with no section at all.
+    await writeDesktopUiFile({ schemaVersion: 6, voiceInput: { providerId: 'sensevoice-local', language: 'zh' } })
+    expect((await service.readPreferences()).preferences.voiceInput.enabled).toBe(true)
+    await writeDesktopUiFile({ schemaVersion: 5, sidebar: { projectOrder: [] } })
+    expect((await service.readPreferences()).preferences.voiceInput.enabled).toBe(true)
+  })
+
+  test('applies partial voice updates and keeps unknown voiceInput fields', async () => {
+    await writeDesktopUiFile({
+      schemaVersion: 6,
+      voiceInput: {
+        enabled: true,
+        providerId: 'cloud-x',
+        language: 'ja',
+        futureVoiceField: { keep: 'voice' },
+      },
+    })
+
+    const service = new DesktopUiPreferencesService()
+    const after = await service.updateVoiceInputPreferences({ language: 'ko' })
+
+    expect(after.voiceInput).toEqual({
+      enabled: true,
+      providerId: 'cloud-x',
+      language: 'ko',
+      downloadSource: 'auto',
+      futureVoiceField: { keep: 'voice' },
+    } as typeof after.voiceInput)
+    expect((await service.readPreferences()).preferences.voiceInput).toEqual(after.voiceInput)
+  })
+
+  test('reads a voiceInput section saved before the download source existed as auto', async () => {
+    await writeDesktopUiFile({
+      schemaVersion: 6,
+      voiceInput: { enabled: true, providerId: 'sensevoice-local', language: 'zh' },
+    })
+
+    const service = new DesktopUiPreferencesService()
+    expect((await service.readPreferences()).preferences.voiceInput).toEqual({
+      enabled: true,
+      providerId: 'sensevoice-local',
+      language: 'zh',
+      downloadSource: 'auto',
+    })
+
+    const after = await service.updateVoiceInputPreferences({ downloadSource: 'mirror' })
+    expect(after.voiceInput).toEqual({ enabled: true, providerId: 'sensevoice-local', language: 'zh', downloadSource: 'mirror' })
+    expect((await readDesktopUiFile()).voiceInput).toEqual(after.voiceInput)
+  })
+
+  test('replaces malformed voiceInput values with defaults', async () => {
+    await writeDesktopUiFile({
+      schemaVersion: 6,
+      voiceInput: { enabled: 'yes', providerId: '   ', language: 'fr', downloadSource: 'npmmirror' },
+    })
+
+    const service = new DesktopUiPreferencesService()
+    expect((await service.readPreferences()).preferences.voiceInput).toEqual(DEFAULT_VOICE_INPUT_PREFERENCES)
+
+    await writeDesktopUiFile({ schemaVersion: 6, voiceInput: 'garbage' })
+    expect((await service.readPreferences()).preferences.voiceInput).toEqual(DEFAULT_VOICE_INPUT_PREFERENCES)
+
+    const after = await service.updateVoiceInputPreferences({ enabled: 1, providerId: 'x'.repeat(200), language: 'zh' })
+    expect(after.voiceInput).toEqual({ ...DEFAULT_VOICE_INPUT_PREFERENCES, language: 'zh' })
+  })
+
+  test('other preference updates keep the saved voiceInput section', async () => {
+    const service = new DesktopUiPreferencesService()
+    await service.updateVoiceInputPreferences({ enabled: true, language: 'en' })
+
+    await service.updatePetPreferences({ enabled: true })
+    await service.updateSidebarPreferences({ pinnedProjects: ['/workspace/alpha'] })
+    await service.updateProfilePreferences({ displayName: 'Operator' })
+    await service.updateProjectDisplayName({ projectKey: '/workspace/alpha', displayName: 'Alpha' })
+    await service.clearProfileAvatar()
+
+    expect((await readDesktopUiFile()).voiceInput).toEqual({
+      enabled: true,
+      providerId: 'sensevoice-local',
+      language: 'en',
+      downloadSource: 'auto',
+    })
+  })
+
+  test('keeps a newer schemaVersion while filling in voiceInput defaults', async () => {
+    await writeDesktopUiFile({ schemaVersion: 99, futureField: 1 })
+
+    const read = await new DesktopUiPreferencesService().readPreferences()
+
+    expect(read.preferences).toMatchObject({
+      schemaVersion: 99,
+      futureField: 1,
+      voiceInput: DEFAULT_VOICE_INPUT_PREFERENCES,
     })
   })
 })

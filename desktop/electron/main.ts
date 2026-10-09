@@ -1,5 +1,5 @@
 import { PublicAccessManager } from './services/publicAccess'
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, WebContentsView } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, systemPreferences, WebContentsView, webContents } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import path from 'node:path'
 import { ELECTRON_EVENT_CHANNELS, ELECTRON_INTERNAL_CHANNELS, ELECTRON_IPC_CHANNELS, type ElectronIpcChannel } from './ipc/channels'
@@ -9,6 +9,9 @@ import {
   validateElectronIpcPayload,
 } from './ipc/capabilities'
 import { ElectronServerRuntime } from './services/serverRuntime'
+import { DataMigration } from './services/dataMigration'
+import { areStorageWritesFrozen, setStorageWritesFrozen } from './services/storageMaintenance'
+import { resolveRelocatedAttachmentPath } from '../../src/utils/storageRelocations'
 import { appendHostDiagnostic, electronHostDiagnosticsFile, sanitizeHostDiagnostic } from './services/sidecarManager'
 import { openDialog, saveDialog } from './services/dialogs'
 import { openExternalUrl, openSystemPath, openSystemSettingsUrl } from './services/shell'
@@ -32,11 +35,15 @@ import { ElectronPreviewService, type PreviewBounds } from './services/preview'
 import {
   ElectronWorkspaceBrowserService,
   WORKSPACE_BROWSER_PARTITION,
-  type WorkspaceBrowserBounds,
   type WorkspaceBrowserCaptureKind,
   type WorkspaceBrowserCreateOptions,
   type WorkspaceBrowserFindOptions,
+  type WorkspaceBrowserWebContentsLike,
 } from './services/workspaceBrowser'
+import {
+  installWorkspaceBrowserGuestPolicy,
+  resolveWorkspaceBrowserGuest,
+} from './services/workspaceBrowserGuest'
 import {
   configureLocalServerRequestAuth,
   configurePreviewSessionPermissions,
@@ -46,6 +53,7 @@ import {
 } from './services/previewSession'
 import {
   applyStartupPortableMode,
+  clearAppManagedPortableEnv,
   getAppMode,
   setAppMode,
 } from './services/appMode'
@@ -63,6 +71,7 @@ import {
   startupWindowBackground,
   type AppliedAppearance,
 } from './services/nativeAppearance'
+import { createRendererUrlMatcher, installMicrophonePermissions } from './services/microphonePermissions'
 import { resolveRendererEntry } from './services/rendererEntry'
 import { installRendererLifecycle } from './services/rendererLifecycle'
 import { writeWindowSmokeSnapshot } from './services/windowSmoke'
@@ -103,13 +112,15 @@ import {
 
 let mainWindow: BrowserWindow | null = null
 let serverRuntime: ElectronServerRuntime | null = null
+let dataMigration: DataMigration | null = null
+const hostOperations = new Set<Promise<unknown>>()
 let publicAccessManager: PublicAccessManager | null = null
 let updaterService: ElectronUpdaterService | null = null
 let terminalService: ElectronTerminalService | null = null
 let previewService: ElectronPreviewService | null = null
 let workspaceBrowserService: ElectronWorkspaceBrowserService | null = null
+let workspaceBrowserSessionConfigured = false
 let petWindowController: PetWindowController | null = null
-const traceWindows = new Map<string, BrowserWindow>()
 let isQuitting = false
 let quitCleanupStarted = false
 let quitCleanupFinished = false
@@ -187,10 +198,7 @@ function installSystemAppearanceWatch() {
     const current = currentAppearance()
     if (current && !current.followSystem) return
     const background = startupWindowBackground(current, nativeTheme.shouldUseDarkColors)
-    for (const window of [mainWindow, ...traceWindows.values()]) {
-      if (!window || window.isDestroyed()) continue
-      window.setBackgroundColor(background)
-    }
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setBackgroundColor(background)
   })
 }
 
@@ -210,41 +218,6 @@ async function loadRendererEntry(
   }
 }
 
-async function openTraceWindow(sessionId: string) {
-  const existing = traceWindows.get(sessionId)
-  if (existing && !existing.isDestroyed()) {
-    showMainWindow(existing, app)
-    return
-  }
-
-  const traceWindow = new BrowserWindow({
-    width: 1180,
-    height: 780,
-    minWidth: 860,
-    minHeight: 560,
-    title: 'Trace',
-    autoHideMenuBar: true,
-    show: false,
-    backgroundColor: resolveStartupWindowBackground(),
-    webPreferences: {
-      preload: preloadPath(),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  })
-  traceWindows.set(sessionId, traceWindow)
-  traceWindow.on('closed', () => {
-    traceWindows.delete(sessionId)
-  })
-  installMainWindowNavigationGuards(traceWindow.webContents, { openExternal: openExternalUrl })
-  await loadRendererEntry(traceWindow, {
-    traceWindow: '1',
-    traceSessionId: sessionId,
-  })
-  showMainWindow(traceWindow, app)
-}
-
 function getServerRuntime() {
   serverRuntime ??= new ElectronServerRuntime({
     onServerUnavailable: () => { void publicAccessManager?.serverUnavailable() },
@@ -256,6 +229,38 @@ function getServerRuntime() {
     resolveSystemProxy: (url) => session.defaultSession.resolveProxy(url),
   })
   return serverRuntime
+}
+
+function getDataMigration() {
+  dataMigration ??= new DataMigration(app, {
+    preview: () => getServerRuntime().getMigrationPreview(),
+    async quiesce() {
+      await Promise.allSettled([...hostOperations])
+      if (mainWindow && !mainWindow.isDestroyed()) saveWindowState(app, mainWindow)
+      petWindowController?.dispose()
+      petWindowController = null
+      await publicAccessManager?.dispose()
+      publicAccessManager = null
+      setStorageWritesFrozen(true)
+      await getServerRuntime().quiesceForMigration()
+    },
+    async resume() {
+      setStorageWritesFrozen(false)
+      await getServerRuntime().resumeAfterMigration()
+      await getPublicAccessManager().restore().catch(() => {})
+    },
+    restart() {
+      isQuitting = true
+      app.relaunch()
+      app.quit()
+    },
+    progress(status) {
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed()) window.webContents.send(ELECTRON_EVENT_CHANNELS.migrationProgress, status)
+      }
+    },
+  })
+  return dataMigration
 }
 
 function getPublicAccessManager() {
@@ -408,10 +413,6 @@ function getWorkspaceBrowserService() {
     emit: event => {
       mainWindow?.webContents.send(ELECTRON_EVENT_CHANNELS.workspaceBrowserEvent, event)
     },
-    resolveScaleFactor: parent => {
-      const bounds = parent.getBounds?.()
-      return bounds ? screen.getDisplayMatching(bounds).scaleFactor : 1
-    },
     writePdf: async ({ data, filename }) => {
       return saveWorkspaceBrowserPdf(data, async () => {
         if (!mainWindow || mainWindow.isDestroyed()) return null
@@ -422,29 +423,35 @@ function getWorkspaceBrowserService() {
         return result.canceled ? null : result.filePath ?? null
       })
     },
-    createView: () => {
-      const view = new WebContentsView({
-        webPreferences: {
-          preload: previewPreloadPath(),
-          // One shared persistent partition for every workspace page: a login in
-          // one tab has to still be there in the next one. Per-tab partitions
-          // would turn every new tab into a fresh, logged-out browser.
-          partition: WORKSPACE_BROWSER_PARTITION,
-          contextIsolation: true,
-          nodeIntegration: false,
-          sandbox: true,
-        },
-      })
-      // Same boundary as the singleton preview: OS permissions are denied, and
-      // `configureLocalServerRequestAuth` is deliberately NOT installed here.
-      // These pages render arbitrary remote sites, so attaching the desktop's
-      // local access token to their loopback requests would hand any visited
-      // site the local API.
-      configurePreviewSessionPermissions(view.webContents.session)
-      return view
-    },
+    // Pages are `<webview>` guests the renderer creates; their preferences are
+    // fixed by `installWorkspaceBrowserGuestPolicy` on the main window. The id
+    // the renderer reports is only adopted if it names one of those guests.
+    resolveGuest: webContentsId => resolveWorkspaceBrowserGuest<Electron.WebContents>(webContentsId, {
+      fromId: id => webContents.fromId(id),
+      host: mainWindow?.webContents,
+      session: workspaceBrowserSession(),
+    }) as WorkspaceBrowserWebContentsLike,
   })
   return workspaceBrowserService
+}
+
+/**
+ * One shared persistent partition for every workspace page: a login in one
+ * tab has to still be there in the next one. Per-tab partitions would turn
+ * every new tab into a fresh, logged-out browser.
+ */
+function workspaceBrowserSession() {
+  const browserSession = session.fromPartition(WORKSPACE_BROWSER_PARTITION)
+  // Same boundary as the singleton preview: OS permissions are denied, and
+  // `configureLocalServerRequestAuth` is deliberately NOT installed here.
+  // These pages render arbitrary remote sites, so attaching the desktop's
+  // local access token to their loopback requests would hand any visited
+  // site the local API.
+  if (!workspaceBrowserSessionConfigured) {
+    workspaceBrowserSessionConfigured = true
+    configurePreviewSessionPermissions(browserSession)
+  }
+  return browserSession
 }
 
 async function listCustomPets() {
@@ -472,6 +479,13 @@ function registerHandler<T>(
       throw new Error(`Invalid Electron IPC payload for ${channel}`)
     }
     const senderWindow = BrowserWindow.fromWebContents(event.sender)
+    const migrationControl = channel.startsWith('desktop:app-mode:migration:')
+    if (migrationControl && (senderWindow !== mainWindow || event.senderFrame !== event.sender.mainFrame)) {
+      throw new Error('Data migration requires the main desktop window')
+    }
+    if ((dataMigration?.running || areStorageWritesFrozen()) && !migrationControl && channel !== ELECTRON_IPC_CHANNELS.shellOpenPath) {
+      throw new Error('Data migration is in progress')
+    }
     if (channel.startsWith('desktop:public-access:') && (senderWindow !== mainWindow || event.senderFrame !== event.sender.mainFrame)) {
       throw new Error('Public access management requires the main desktop window')
     }
@@ -481,7 +495,10 @@ function registerHandler<T>(
     ) {
       throw new Error(`Electron IPC channel ${channel} is not available to the pet window`)
     }
-    return handler(event, payload)
+    if (migrationControl) return handler(event, payload)
+    const operation = Promise.resolve().then(() => handler(event, payload))
+    hostOperations.add(operation)
+    try { return await operation } finally { hostOperations.delete(operation) }
   })
 }
 
@@ -570,8 +587,7 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardReadText, () => clipboard.readText())
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardWriteText, (_event, payload) => clipboard.writeText(String(payload)))
   registerHandler(ELECTRON_IPC_CHANNELS.shellOpen, (_event, payload) => openExternalUrl(String(payload)))
-  registerHandler(ELECTRON_IPC_CHANNELS.shellOpenPath, (_event, payload) => openSystemPath(String(payload)))
-  registerHandler(ELECTRON_IPC_CHANNELS.traceOpenWindow, (_event, payload) => openTraceWindow(String(payload)))
+  registerHandler(ELECTRON_IPC_CHANNELS.shellOpenPath, (_event, payload) => openSystemPath(resolveRelocatedAttachmentPath(String(payload))))
   registerHandler(ELECTRON_IPC_CHANNELS.petsList, () => listCustomPets())
   registerHandler(ELECTRON_IPC_CHANNELS.petsCreateFromImage, async (event, payload) => {
     const input = payload as {
@@ -783,11 +799,10 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.previewClose, () => getPreviewService().close())
   registerHandler(ELECTRON_IPC_CHANNELS.previewMessage, (event, payload) => getPreviewService().message(payload, event.sender))
   registerHandler(ELECTRON_IPC_CHANNELS.workspaceBrowserCreate, (event, payload) => {
-    // The service keeps a single parent window, so whichever renderer calls
-    // `create` last owns where every page is attached and detached. Trace and
-    // pet windows load the same preload, so without this a secondary window
-    // could adopt the pages and strand them as unremovable children of the main
-    // window. Same guard shape as `appSetLocalePreference`.
+    // Pages are guests of the main window's renderer. Trace and pet windows
+    // load the same preload, so without this a secondary window could register
+    // pages it does not host — and own the menu parent of every page. Same
+    // guard shape as `appSetLocalePreference`.
     if (!mainWindow || currentWindow(event) !== mainWindow) {
       throw new Error('Only the main window can host workspace browser pages')
     }
@@ -817,10 +832,6 @@ function registerIpcHandlers() {
   })
   registerHandler(ELECTRON_IPC_CHANNELS.workspaceBrowserStop, (_event, payload) =>
     getWorkspaceBrowserService().stop((payload as { tabId: string }).tabId))
-  registerHandler(ELECTRON_IPC_CHANNELS.workspaceBrowserSetBounds, (_event, payload) => {
-    const { tabId, bounds } = payload as { tabId: string, bounds: WorkspaceBrowserBounds }
-    return getWorkspaceBrowserService().setBounds(tabId, bounds)
-  })
   registerHandler(ELECTRON_IPC_CHANNELS.workspaceBrowserSetVisible, (_event, payload) => {
     const { tabId, visible } = payload as { tabId: string, visible: boolean }
     return getWorkspaceBrowserService().setVisible(tabId, visible)
@@ -843,8 +854,6 @@ function registerIpcHandlers() {
     const { tabId, kind } = payload as { tabId: string, kind: WorkspaceBrowserCaptureKind }
     return getWorkspaceBrowserService().capture(tabId, kind)
   })
-  registerHandler(ELECTRON_IPC_CHANNELS.workspaceBrowserSnapshot, (_event, payload) =>
-    getWorkspaceBrowserService().snapshot((payload as { tabId: string }).tabId))
   registerHandler(ELECTRON_IPC_CHANNELS.workspaceBrowserMessage, (_event, payload) => {
     const { tabId, payload: message } = payload as { tabId: string, payload: unknown }
     return getWorkspaceBrowserService().message(tabId, message)
@@ -854,6 +863,10 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.workspaceBrowserClose, (_event, payload) =>
     getWorkspaceBrowserService().close((payload as { tabId: string }).tabId))
   registerHandler(ELECTRON_IPC_CHANNELS.appModeGet, () => getAppMode(app))
+  registerHandler(ELECTRON_IPC_CHANNELS.migrationPrepare, (_event, payload) => getDataMigration().prepare((payload as { targetDir: string }).targetDir))
+  registerHandler(ELECTRON_IPC_CHANNELS.migrationStart, (_event, payload) => getDataMigration().start((payload as { id: string }).id))
+  registerHandler(ELECTRON_IPC_CHANNELS.migrationStatus, () => getDataMigration().status)
+  registerHandler(ELECTRON_IPC_CHANNELS.migrationCancel, (_event, payload) => getDataMigration().cancel((payload as { id: string }).id))
   registerHandler(ELECTRON_IPC_CHANNELS.appModeSet, (_event, payload) => setAppMode(app, payload as Parameters<typeof setAppMode>[1]))
   registerHandler(ELECTRON_IPC_CHANNELS.appModePrepareRestart, () => getServerRuntime().stopAll(true))
   registerHandler(ELECTRON_IPC_CHANNELS.appModeRestart, () => {
@@ -862,14 +875,20 @@ function registerIpcHandlers() {
     app.quit()
   })
   registerHandler(ELECTRON_IPC_CHANNELS.adaptersRestartSidecar, () => getServerRuntime().restartAdaptersSidecars())
-  registerHandler(ELECTRON_IPC_CHANNELS.zoomSet, (event, payload) => currentWindow(event).webContents.setZoomFactor(normalizeZoomFactor(payload)))
+  registerHandler(ELECTRON_IPC_CHANNELS.zoomSet, (event, payload) => {
+    const window = currentWindow(event)
+    window.webContents.setZoomFactor(normalizeZoomFactor(payload))
+    // Electron pushes the embedder's zoom into every browser guest; app zoom
+    // must not change the pages' own zoom.
+    if (window === mainWindow) workspaceBrowserService?.restorePageZoom()
+  })
   registerHandler(ELECTRON_IPC_CHANNELS.appearanceSetApplied, (_event, payload) => {
     if (!isAppliedAppearance(payload)) return
     lastAppliedAppearance = payload
     applyAppliedAppearance(payload, {
       app,
       // The pet window is deliberately transparent, so it stays out of this.
-      windows: () => [mainWindow, ...traceWindows.values()].filter((window): window is BrowserWindow => !!window),
+      windows: () => mainWindow ? [mainWindow] : [],
     })
   })
 }
@@ -891,8 +910,15 @@ async function createMainWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Only for the workspace browser, whose pages must be composited with
+      // the DOM. Every attach is decided by the guest policy installed below.
+      webviewTag: true,
     },
   })
+  // Before any guest can exist: its session denies OS permissions, and its
+  // preferences are replaced with the sandboxed set the policy pins.
+  workspaceBrowserSession()
+  installWorkspaceBrowserGuestPolicy(mainWindow.webContents, { preload: previewPreloadPath() })
   configureLocalServerRequestAuth(
     mainWindow.webContents.session.webRequest,
     resolveMainRendererServerAccess,
@@ -901,6 +927,18 @@ async function createMainWindow() {
       mainWindow!.webContents.id,
     ),
   )
+  // Audio capture (dictation) is limited to application windows showing the app
+  // entry: the main window and the detached trace window, which renders the same
+  // chat input. Preview and workspace pages use their own partitions. Other
+  // permissions stay as before.
+  installMicrophonePermissions(mainWindow.webContents.session, {
+    isAppContents: contents => {
+      const owner = BrowserWindow.fromWebContents(contents)
+      return !!owner && !owner.isDestroyed()
+    },
+    isAppUrl: createRendererUrlMatcher(rendererEntry()),
+    systemPreferences,
+  })
   installMainWindowNavigationGuards(mainWindow.webContents, { openExternal: openExternalUrl })
   await installRendererContextMenu(mainWindow)
   installPreviewCleanupOnRendererNavigation(mainWindow.webContents, () => {
@@ -994,17 +1032,51 @@ async function bootstrap() {
 
   await app.whenReady()
   applyWindowsAppUserModelId(app)
-  applyStartupPortableMode(app)
+  clearAppManagedPortableEnv()
+  let validation = false
+  try {
+    validation = await getDataMigration().recover() === 'validate'
+    applyStartupPortableMode(app)
+  } catch (error) {
+    setStorageWritesFrozen(true)
+    dialog.showErrorBox('数据目录不可用 / Data directory unavailable', error instanceof Error ? error.message : 'Migration recovery failed')
+    await createMainWindow()
+    return
+  }
+  if (validation) process.env.CC_HAHA_MIGRATION_VALIDATION = '1'
   installSystemAppearanceWatch()
   screen.on('display-metrics-changed', (_event, _display, changedMetrics) => {
     if (changedMetrics.includes('scaleFactor') || changedMetrics.includes('bounds')) {
       previewService?.refreshBounds()
-      workspaceBrowserService?.refreshBounds()
     }
   })
-  await getServerRuntime().startServer().catch(error => {
-    console.error('[desktop] failed to start Electron server sidecar', error)
-  })
+  try {
+    await getServerRuntime().startServer()
+    if (validation) {
+      await getServerRuntime().validateMigrationStartup()
+      await getDataMigration().completeValidation()
+      validation = false
+      await getServerRuntime().activateAfterMigrationValidation()
+      delete process.env.CC_HAHA_MIGRATION_VALIDATION
+    }
+  } catch (error) {
+    if (validation) {
+      try {
+        await getServerRuntime().stopAllAndWait()
+        await getDataMigration().failValidation(error)
+        delete process.env.CC_HAHA_MIGRATION_VALIDATION
+        clearAppManagedPortableEnv()
+        applyStartupPortableMode(app)
+        serverRuntime = null
+        await getServerRuntime().startServer().catch(startError => console.error('[desktop] original directory restart failed', startError))
+      } catch (recoveryError) {
+        setStorageWritesFrozen(true)
+        dialog.showErrorBox('数据目录不可用 / Data directory unavailable', recoveryError instanceof Error ? recoveryError.message : 'Migration recovery failed')
+        await createMainWindow()
+        return
+      }
+    } else console.error('[desktop] failed to start Electron server sidecar', error)
+  }
   await getPublicAccessManager().restore().catch(() => {})
   await installApplicationMenu(app, () => mainWindow)
   if (shouldInstallTray(process.platform)) {
@@ -1045,6 +1117,12 @@ void bootstrap().catch(error => {
 
 app.on('before-quit', event => {
   isQuitting = true
+  if (dataMigration?.running) {
+    event.preventDefault()
+    dataMigration.cancelActive()
+    void dataMigration.wait().then(() => app.quit())
+    return
+  }
   if (quitCleanupFinished) return
   event.preventDefault()
   if (quitCleanupStarted) return

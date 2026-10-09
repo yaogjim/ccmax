@@ -88,7 +88,7 @@ See [Local Server](../internals/server.md) for `SERVER_HOST`, `SERVER_PORT`, `SE
 
 ### Desktop providers
 
-Desktop stores the provider index at:
+Desktop stores the provider index at the legacy on-disk folder name used by ccmax (not the product name):
 
 ```text
 ~/.claude/cc-haha/providers.json

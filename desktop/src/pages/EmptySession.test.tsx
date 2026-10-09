@@ -29,6 +29,15 @@ const mocks = vi.hoisted(() => ({
   webviewUnlisten: vi.fn(),
   isMobile: false,
   isTauriRuntime: false,
+  voiceSupported: vi.fn(() => false),
+  voiceStartRecording: vi.fn(),
+  voiceTranscribe: vi.fn(),
+  voiceCatalog: vi.fn(async () => ({
+    supported: false,
+    providers: [],
+    preferences: { enabled: false, providerId: 'sensevoice-local', language: 'auto', downloadSource: 'auto' },
+    limits: { maxAudioSeconds: 60, maxAudioBytes: 1_000_000 },
+  })),
 }))
 
 vi.mock('../api/sessions', () => ({
@@ -41,13 +50,32 @@ vi.mock('../api/sessions', () => ({
   },
 }))
 
+vi.mock('@/api/voice', () => ({
+  voiceApi: {
+    catalog: mocks.voiceCatalog,
+    transcribe: mocks.voiceTranscribe,
+    providerStatus: vi.fn(),
+    updatePreferences: vi.fn(),
+    prepare: vi.fn(),
+    cancelPrepare: vi.fn(),
+    removeAssets: vi.fn(),
+  },
+}))
+
+vi.mock('@/features/voiceInput/recorder', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/features/voiceInput/recorder')>()),
+  isVoiceCaptureSupported: mocks.voiceSupported,
+  startRecording: mocks.voiceStartRecording,
+}))
+
 vi.mock('../api/skills', () => ({
   skillsApi: {
     list: mocks.listSkills,
   },
 }))
 
-vi.mock('../api/composerReferences', () => ({
+vi.mock('../api/composerReferences', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../api/composerReferences')>(),
   composerReferencesApi: { list: mocks.listReferences },
 }))
 
@@ -172,7 +200,8 @@ import { usePluginStore } from '../stores/pluginStore'
 import { useWorkflowStore } from '../stores/workflowStore'
 import type { RepositoryContextResult } from '../api/sessions'
 import { browserHost } from '../lib/desktopHost/browserHost'
-import { getComposerElement, getComposerText, setComposerText } from '../components/chat/composerTestUtils'
+import { getComposerElement, getComposerText, getComposerView, setComposerSelection, setComposerText } from '../components/chat/composerTestUtils'
+import { useVoiceInputStore } from '../stores/voiceInputStore'
 
 function okRepositoryContext(overrides: Partial<RepositoryContextResult> = {}): RepositoryContextResult {
   return {
@@ -260,6 +289,8 @@ describe('EmptySession', () => {
     mocks.webviewDragHandlers.length = 0
     mocks.isMobile = false
     mocks.isTauriRuntime = false
+    mocks.voiceSupported.mockReturnValue(false)
+    useVoiceInputStore.setState({ catalog: null, loading: false, error: null })
     useSettingsStore.setState({ locale: 'en', activeProviderName: null, permissionMode: 'default' })
     useSessionStore.setState(initialSessionState, true)
     useChatStore.setState(initialChatState, true)
@@ -325,6 +356,75 @@ describe('EmptySession', () => {
     useWorkflowStore.setState(initialWorkflowState, true)
   })
 
+  it('drops a starter into the draft and keeps what was already typed', async () => {
+    render(<EmptySession />)
+
+    const starters = screen.getByRole('group', { name: 'Suggestions' })
+    fireEvent.click(within(starters).getByRole('button', { name: 'Fix the failing tests' }))
+    await waitFor(() => expect(getComposerText()).toBe('Fix the failing tests'))
+
+    // A second pick appends on a new line rather than replacing the draft.
+    fireEvent.click(within(starters).getByRole('button', { name: 'Build a new feature' }))
+    await waitFor(() => expect(getComposerText()).toBe('Fix the failing tests\nBuild a new feature'))
+  })
+
+  it('keeps the starter row off the phone layout, where the composer docks to the bottom', () => {
+    mocks.isMobile = true
+
+    render(<EmptySession />)
+
+    expect(screen.queryByTestId('new-session-starter')).not.toBeInTheDocument()
+    expect(screen.getByTestId('empty-session-composer-shell')).toHaveClass('absolute', 'bottom-0')
+  })
+
+  it('puts the project above the hero on a phone, where the keyboard cannot cover it', async () => {
+    mocks.isMobile = true
+
+    render(<EmptySession />)
+
+    const launch = screen.getByTestId('empty-session-mobile-launch')
+    const pill = await within(launch).findByRole('button', { name: /^Location:/ })
+    expect(pill).toHaveClass('h-10')
+    // Read before the hero and outside the docked composer.
+    expect(launch.compareDocumentPosition(screen.getByRole('heading', { level: 1 })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.getByTestId('empty-session-composer-shell')).not.toContainElement(pill)
+    expect(screen.getAllByRole('button', { name: /^Location:/ })).toHaveLength(1)
+  })
+
+  it('starts in the folder it is given, holding Run until that repository is read', async () => {
+    mocks.isMobile = true
+    // Its own id: the session store keeps per-id bookkeeping across tests.
+    mocks.createSession.mockResolvedValue({ sessionId: 'phone-session' })
+    let resolveContext: (context: RepositoryContextResult) => void = () => {}
+    mocks.getRepositoryContext.mockReturnValue(new Promise<RepositoryContextResult>((resolve) => {
+      resolveContext = resolve
+    }))
+
+    render(<EmptySession initialWorkDir="/workspace/project" />)
+    setComposerText('draft question', 14)
+
+    const runButton = screen.getByRole('button', { name: /Run/i })
+    expect(mocks.getRepositoryContext).toHaveBeenCalledWith('/workspace/project')
+    expect(runButton).toBeDisabled()
+
+    await act(async () => { resolveContext(okRepositoryContext()) })
+    expect(await screen.findByRole('button', { name: 'Location: project / main' })).toBeInTheDocument()
+    await waitFor(() => expect(runButton).not.toBeDisabled())
+
+    fireEvent.click(runButton)
+
+    await waitFor(() => {
+      expect(mocks.createSession).toHaveBeenCalledWith({
+        workDir: '/workspace/project',
+        repository: { branch: 'main', worktree: false },
+        permissionMode: 'default',
+      })
+    })
+    await waitFor(() => {
+      expect(mocks.wsSend).toHaveBeenCalledWith('phone-session', expect.objectContaining({ content: 'draft question' }))
+    })
+  })
+
   it('uses compact composer controls on phone-sized H5 browsers', async () => {
     mocks.isMobile = true
 
@@ -336,7 +436,7 @@ describe('EmptySession', () => {
     expect(screen.getByTestId('model-selector')).toHaveAttribute('data-compact', 'true')
     expect(screen.getByRole('button', { name: 'Run' })).toHaveClass('h-11', 'w-11')
     expect(screen.getByTestId('empty-session-composer-shell')).toHaveClass('px-3')
-    expect(screen.getByTestId('empty-session-composer-panel')).toHaveClass('rounded-[var(--radius-2xl)]')
+    expect(screen.getByTestId('empty-session-composer-panel')).toHaveClass('rounded-[var(--radius-xl)]')
   })
 
   it.each(['@', '/', '/empty', '+'] as const)('hides withdrawn bundled capabilities in %s while keeping personal skills and other plugins', async (entry) => {
@@ -359,7 +459,7 @@ describe('EmptySession', () => {
     render(<EmptySession />)
     if (entry === '+') {
       fireEvent.click(screen.getByLabelText('Open composer tools'))
-      fireEvent.change(screen.getByRole('combobox', { name: 'Search skills, plugins, files…' }), { target: { value: 'design' } })
+      fireEvent.change(screen.getByRole('combobox', { name: 'Search skills, connectors, files…' }), { target: { value: 'design' } })
     } else if (entry === '/empty') setComposerText('/', 1)
     else setComposerText(`${entry}design`, 7)
     expect(await screen.findByRole('option', { name: 'Personal frontend design' })).toBeInTheDocument()
@@ -394,6 +494,7 @@ describe('EmptySession', () => {
     fireEvent.click(screen.getByLabelText('Open composer tools'))
     await waitFor(() => expect(mocks.listReferences.mock.calls.length).toBeGreaterThan(initialCalls))
     fireEvent.click(await screen.findByRole('option', { name: /^Skills/ }))
+    fireEvent.click(await screen.findByRole('option', { name: /^All skills/ }))
     expect(screen.queryByRole('option', { name: 'Old skill' })).not.toBeInTheDocument()
 
     await act(async () => resolveRefresh({ plugins: [], skills: result === 'replacement' ? [newSkill] : [] }))
@@ -411,7 +512,7 @@ describe('EmptySession', () => {
     await pickProject()
     setComposerText('Please review ', 14)
     fireEvent.click(screen.getByLabelText('Open composer tools'))
-    fireEvent.change(screen.getByRole('combobox', { name: 'Search skills, plugins, files…' }), { target: { value: 'README' } })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Search skills, connectors, files…' }), { target: { value: 'README' } })
     fireEvent.click(await screen.findByRole('option', { name: 'README.md' }))
 
     await waitFor(() => {
@@ -420,7 +521,7 @@ describe('EmptySession', () => {
     expect(document.querySelector('.composer-mention')).toHaveTextContent('@README.md')
     expect(getComposerText()).toContain('Please review @README.md')
     expect(mocks.search).toHaveBeenCalledWith('README', '/workspace/project', { signal: expect.any(AbortSignal) })
-    expect(screen.queryByRole('combobox', { name: 'Search skills, plugins, files…' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Search skills, connectors, files…' })).not.toBeInTheDocument()
     expect(mocks.wsSend).not.toHaveBeenCalled()
     expect(mocks.createSession).not.toHaveBeenCalled()
   })
@@ -722,17 +823,17 @@ describe('EmptySession', () => {
     render(<EmptySession />)
 
     const panel = screen.getByTestId('empty-session-composer-panel')
-    // 20px corner and the middle shadow step — the composer's own place on the
-    // handoff's scale. The repository controls live inside this panel, so it
+    // 16px corner and the composer shadow step — the same floating card as
+    // ChatInput's. The repository controls live inside this panel, so it
     // must stay a single rounded block rather than a split top/bottom pair.
-    expect(panel).toHaveClass('rounded-[var(--radius-2xl)]', 'p-0', 'glass-panel--composer')
+    expect(panel).toHaveClass('rounded-[var(--radius-xl)]', 'p-2', 'glass-panel--composer')
     expect(panel).not.toHaveClass('rounded-b-none')
 
     await pickProject()
 
     const pill = await screen.findByRole('button', { name: 'Location: project / main' })
     expect(panel).toContainElement(pill)
-    expect(pill).toHaveClass('h-9')
+    expect(pill).toHaveClass('h-7')
 
     // Same toolbar row as Run — that row is the whole point of the change.
     const toolbarRow = pill.closest('.justify-between')
@@ -834,6 +935,30 @@ describe('EmptySession', () => {
     })
   })
 
+  it('carries the global effort into the first draft selection for ChatGPT Official', async () => {
+    useSettingsStore.setState({ effortLevel: 'low' })
+    useProviderStore.setState({
+      providers: [],
+      activeId: 'openai-official',
+      providerOrder: ['claude-official', 'openai-official', 'grok-official'],
+      hasLoadedProviders: true,
+    })
+
+    render(<EmptySession />)
+
+    setComposerText('draft question', 14)
+    fireEvent.click(screen.getByRole('button', { name: /Run/i }))
+
+    await waitFor(() => {
+      expect(mocks.createSession).toHaveBeenCalledWith({ permissionMode: 'default' })
+    })
+
+    expect(useSessionRuntimeStore.getState().selections['draft-session']).toMatchObject({
+      providerId: 'openai-official',
+      effortLevel: 'low',
+    })
+  })
+
   it.each([true, false])('materializes raw provider models with 1M=%s before the first draft message', async (enabled) => {
     useProviderStore.setState({
       providers: [{
@@ -871,7 +996,7 @@ describe('EmptySession', () => {
     expect(useSessionRuntimeStore.getState().selections['draft-session']).toEqual({
       providerId: 'provider-minimax',
       modelId: enabled ? 'MiniMax-M3[1m]' : 'MiniMax-M3',
-      effortLevel: 'max',
+      effortLevel: 'low',
     })
     expect(mocks.wsSend.mock.calls.slice(0, 3)).toEqual([
       [
@@ -880,7 +1005,7 @@ describe('EmptySession', () => {
           type: 'set_runtime_config',
           providerId: 'provider-minimax',
           modelId: enabled ? 'MiniMax-M3[1m]' : 'MiniMax-M3',
-          effortLevel: 'max',
+          effortLevel: 'low',
         },
       ],
       ['draft-session', { type: 'prewarm_session' }],
@@ -1451,4 +1576,150 @@ describe('EmptySession', () => {
       })
     })
   })
+
+  describe('voice input', () => {
+    let finishTranscription: (text: string) => void
+    let activeRecording: { getLevel: () => number; stop: ReturnType<typeof vi.fn>; cancel: ReturnType<typeof vi.fn> }
+
+    beforeEach(() => {
+      activeRecording = {
+        getLevel: () => 0,
+        stop: vi.fn(async () => ({ wav: new Blob(['wav']), seconds: 2 })),
+        cancel: vi.fn(),
+      }
+      mocks.voiceSupported.mockReturnValue(true)
+      useVoiceInputStore.setState({
+        catalog: {
+          supported: true,
+          providers: [{
+            info: { id: 'sensevoice-local', name: 'SenseVoice', location: 'local', languages: ['auto', 'zh'] },
+            preparation: { phase: 'ready' },
+          }],
+          preferences: { enabled: true, providerId: 'sensevoice-local', language: 'zh', downloadSource: 'auto' },
+          limits: { maxAudioSeconds: 60, maxAudioBytes: 1_000_000 },
+        },
+      })
+      mocks.voiceStartRecording.mockImplementation(async () => activeRecording)
+      mocks.voiceTranscribe.mockImplementation(() => new Promise((resolve) => {
+        finishTranscription = (text) => resolve({ text, audioSeconds: 2, inferenceSeconds: 0.1 })
+      }))
+      // Voice input exists only in the desktop app (the outer beforeEach resets this).
+      mocks.isTauriRuntime = true
+      // jsdom has no canvas; the recording bar's trace draws nothing without one.
+      vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null)
+    })
+
+    async function dictate() {
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Dictate' }))
+      })
+      await act(async () => {
+        fireEvent.click(await screen.findByRole('button', { name: 'Stop recording and transcribe' }))
+      })
+      await screen.findByRole('button', { name: 'Transcribing…' })
+    }
+
+    it('puts the microphone between the model picker and the send button', () => {
+      render(<EmptySession />)
+
+      const model = screen.getByTestId('model-selector')
+      const voice = screen.getByTestId('voice-input')
+      const run = screen.getByRole('button', { name: 'Run' })
+      expect(model.nextElementSibling).toBe(voice)
+      expect(voice.nextElementSibling).toBe(run)
+    })
+
+    it('does not render the microphone until dictation is ready', () => {
+      mocks.voiceSupported.mockReturnValue(false)
+      render(<EmptySession />)
+      expect(screen.queryByTestId('voice-input')).toBeNull()
+    })
+
+    it('does not render the microphone in the browser (H5)', () => {
+      mocks.isTauriRuntime = false
+      render(<EmptySession />)
+      expect(screen.queryByTestId('voice-input')).toBeNull()
+    })
+
+    it('writes dictated text at the caret without starting a session', async () => {
+      render(<EmptySession />)
+      setComposerText('ab', 1)
+      vi.spyOn(getComposerView(), 'hasFocus').mockReturnValue(true)
+      setComposerSelection(1)
+
+      await dictate()
+      await act(async () => {
+        finishTranscription('你好')
+      })
+
+      expect(getComposerText()).toBe('a你好b')
+      expect(mocks.createSession).not.toHaveBeenCalled()
+    })
+
+    it('starts the session with the dictated text when sent from the recording bar', async () => {
+      render(<EmptySession />)
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Dictate' }))
+      })
+      // The bar takes the toolbar's row: its controls, Run included, are hidden.
+      expect(screen.getByTestId('voice-recording-bar')).toBeVisible()
+      expect(screen.queryByRole('button', { name: 'Run' })).toBeNull()
+
+      await act(async () => {
+        fireEvent.click(await screen.findByRole('button', { name: 'Transcribe and send' }))
+      })
+      expect(mocks.createSession).not.toHaveBeenCalled()
+      await act(async () => {
+        finishTranscription('你好')
+      })
+
+      await waitFor(() => {
+        expect(mocks.wsSend).toHaveBeenCalledWith('draft-session', {
+          type: 'user_message',
+          content: '你好',
+          attachments: [],
+        })
+      })
+    })
+
+    it('keeps the text aside when the draft was edited while it was being recognised', async () => {
+      render(<EmptySession />)
+      setComposerText('hello', 5)
+
+      await dictate()
+      setComposerText('hello there', 11)
+      await act(async () => {
+        finishTranscription('dictated')
+      })
+
+      expect(getComposerText()).toBe('hello there')
+      expect(screen.getByTestId('voice-input-pending-text')).toHaveTextContent('dictated')
+    })
+
+    it('holds a result that arrives during an IME composition in the composer', async () => {
+      render(<EmptySession />)
+      await dictate()
+
+      fireEvent.compositionStart(getComposerElement())
+      await act(async () => {
+        finishTranscription('你好')
+      })
+
+      expect(getComposerText()).toBe('')
+      expect(screen.getByTestId('voice-input-pending-text')).toHaveTextContent('你好')
+    })
+
+    it('releases the microphone when the page is left mid-recording', async () => {
+      const { unmount } = render(<EmptySession />)
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Dictate' }))
+      })
+      await screen.findByRole('button', { name: 'Stop recording and transcribe' })
+
+      unmount()
+
+      expect(activeRecording.cancel).toHaveBeenCalledTimes(1)
+    })
+  })
+
 })

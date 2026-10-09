@@ -7,6 +7,7 @@
 
 import { Bot, type Context } from 'grammy'
 import { loadConfig, type AdapterConfig } from '../common/config.js'
+import { adapterMigrationLifecycle } from '../common/migration-lifecycle.js'
 import { telegramBotIdFromToken } from './bot-identity.js'
 import { sanitizeTelegramError } from './sanitize-error.js'
 
@@ -57,6 +58,7 @@ export function getPublicTelegramBot(): Bot | undefined {
 export async function startPublicTelegramAdapter(options?: {
   dedicatedBotId?: number
 }): Promise<boolean> {
+  adapterMigrationLifecycle.registerShutdown(stopPublicTelegramAdapter)
   const config = loadConfig()
   if (!isTelegramPublicConfigured(config)) return false
 
@@ -206,10 +208,11 @@ export async function stopPublicTelegramAdapter(): Promise<void> {
 }
 
 function enqueuePublicUpdate(ctx: Context): Promise<void> {
-  const task = publicUpdateTail.then(
+  if (adapterMigrationLifecycle.isQuiescing) return Promise.resolve()
+  const task = adapterMigrationLifecycle.track(publicUpdateTail.then(
     () => handlePublicUpdate(ctx),
     () => handlePublicUpdate(ctx),
-  )
+  ))
   publicUpdateTail = task.then(() => undefined, () => undefined)
   inflight.add(task)
   void task.finally(() => inflight.delete(task))

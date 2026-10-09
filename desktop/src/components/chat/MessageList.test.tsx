@@ -26,6 +26,7 @@ import { ApiError } from '../../api/client'
 import { subagentsApi, type SubagentRunResponse } from '../../api/subagents'
 import { teamsApi } from '../../api/teams'
 import { resetAgentRunActivityCache } from './useAgentRunActivity'
+import { resetWorkspaceFileStatsForTests } from '../../lib/workspaceFileStats'
 import { useChatStore } from '../../stores/chatStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
@@ -34,7 +35,9 @@ import { initializeChatAppearance, useChatAppearanceStore } from '../../stores/c
 import { CHAT_APPEARANCE_STORAGE_KEY } from '../../lib/chatAppearance'
 import { dispatchStorageEvent } from '../../test/webStorage'
 import { useSessionStore } from '../../stores/sessionStore'
+import { useSideChatStore } from '../../stores/sideChatStore'
 import { useTabStore } from '../../stores/tabStore'
+import { useTrajectoryViewStore } from '../../stores/trajectoryViewStore'
 import { useUIStore } from '../../stores/uiStore'
 import { useTeamStore } from '../../stores/teamStore'
 import { formatExactMessageTimestamp, formatMessageHoverTime } from '../../lib/formatMessageTimestamp'
@@ -43,6 +46,7 @@ import type { MessageEntry } from '../../types/session'
 import type { PerSessionState } from '../../stores/chatStore'
 import { FindInPageModal } from '../search/FindInPageModal'
 import { getConversationFindController } from '../search/conversationFindBridge'
+import { workspaceOpen } from '@/lib/workspace/openTarget'
 
 vi.mock('@/lib/workspace/openSideChat', () => ({ openSideChat: vi.fn(async () => 'tab-side') }))
 
@@ -1221,6 +1225,103 @@ describe('MessageList nested tool calls', () => {
     expect(container.querySelector('[data-chat-render-item-key="user-0"]')?.className).toContain('chat-render-item--navigation-target')
   })
 
+  it('scrolls to and highlights the message a trajectory row asks to locate', async () => {
+    const messages: UIMessage[] = Array.from({ length: 220 }, (_, index) => ({
+      id: `${index % 2 === 0 ? 'user' : 'assistant'}-${index}`,
+      type: index % 2 === 0 ? 'user_text' : 'assistant_text',
+      content: `${index % 2 === 0 ? 'Prompt' : 'Answer'} ${index}`,
+      timestamp: index,
+    })) as UIMessage[]
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages }) } })
+    useTrajectoryViewStore.setState({ nav: null, modes: {}, opened: {} })
+
+    const { container } = render(<MessageList />)
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLElement
+    let scrollTop = 24_000
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 500 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 25_000 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value },
+    })
+
+    // An unknown uuid first, then the real one: any listed uuid identifies the item.
+    act(() => useTrajectoryViewStore.getState().revealInChat(ACTIVE_TAB, { uuids: ['not-loaded', 'assistant-1'] }))
+
+    await waitFor(() => expect(container.querySelector('[data-chat-render-item-key="assistant-1"]')?.className).toContain('chat-render-item--navigation-target'))
+    expect(scrollTop).toBeLessThan(1000)
+    expect(container.querySelector('[data-chat-render-item-key="user-0"]')?.className ?? '').not.toContain('chat-render-item--navigation-target')
+    expect(useTrajectoryViewStore.getState().nav).toBeNull()
+  })
+
+  it('opens a folded run onto the tool call a trajectory row locates, and marks that row', async () => {
+    // Regression: the jump only scrolled to the run and tinted it, but a settled
+    // run is folded to its summary line, so the call it was about stayed hidden.
+    const messages: UIMessage[] = [
+      { id: 'locate-user', type: 'user_text', content: 'Inspect the repo', timestamp: 1 },
+      { id: 'locate-read', type: 'tool_use', toolName: 'Read', toolUseId: 'toolu-locate-read', input: { file_path: '/repo/a.ts' }, timestamp: 2 },
+      { id: 'locate-read-result', type: 'tool_result', toolUseId: 'toolu-locate-read', content: 'a', isError: false, timestamp: 3 },
+      { id: 'locate-bash', type: 'tool_use', toolName: 'Bash', toolUseId: 'toolu-locate-bash', input: { command: 'ls' }, timestamp: 4 },
+      { id: 'locate-bash-result', type: 'tool_result', toolUseId: 'toolu-locate-bash', content: 'a.ts', isError: false, timestamp: 5 },
+      { id: 'locate-grep', type: 'tool_use', toolName: 'Grep', toolUseId: 'toolu-locate-grep', input: { pattern: 'x' }, timestamp: 6 },
+      { id: 'locate-grep-result', type: 'tool_result', toolUseId: 'toolu-locate-grep', content: '', isError: false, timestamp: 7 },
+      { id: 'locate-answer', type: 'assistant_text', content: 'Done.', timestamp: 8 },
+    ] as UIMessage[]
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages }) } })
+    useTrajectoryViewStore.setState({ nav: null, modes: {}, opened: {} })
+
+    const { container } = render(<MessageList />)
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLElement
+    const scrollWrites: number[] = []
+    let scrollTop = 0
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 500 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 4_000 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value; scrollWrites.push(value) },
+    })
+    // Only the located row has a box; the run around it measures as empty, so
+    // any correction can only have come from aligning the row itself.
+    const realRect = HTMLElement.prototype.getBoundingClientRect
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.dataset.toolUseId === 'toolu-locate-bash') return { top: 900, bottom: 920, height: 20, left: 0, right: 100, width: 100, x: 0, y: 900, toJSON: () => ({}) } as DOMRect
+      return realRect.call(this)
+    })
+
+    const group = screen.getByTestId('activity-group')
+    expect(group.getAttribute('data-expanded')).toBe('false')
+    expect(container.querySelector('[data-tool-use-id="toolu-locate-bash"]')).toBeNull()
+
+    act(() => useTrajectoryViewStore.getState().revealInChat(ACTIVE_TAB, { toolUseId: 'toolu-locate-bash' }))
+
+    await waitFor(() => expect(container.querySelector('[data-tool-use-id="toolu-locate-bash"]')?.className).toContain('chat-tool-navigation-target'))
+    expect(screen.getByTestId('activity-group').getAttribute('data-expanded')).toBe('true')
+    // Exactly the located call is marked, not its neighbours.
+    expect(container.querySelectorAll('.chat-tool-navigation-target')).toHaveLength(1)
+    expect(container.querySelector('[data-tool-use-id="toolu-locate-read"]')?.className).not.toContain('chat-tool-navigation-target')
+    // Aligned to the row: 900px down, brought to the 25% reading line of a 500px viewport.
+    await waitFor(() => expect(scrollWrites.length).toBeGreaterThanOrEqual(2))
+    expect(scrollWrites.at(-1)! - scrollWrites.at(-2)!).toBe(900 - 500 * 0.25)
+
+    // The mark is brief; the run stays open as if the reader had opened it.
+    await waitFor(
+      () => expect(container.querySelector('.chat-tool-navigation-target')).toBeNull(),
+      { timeout: 3_000 },
+    )
+    expect(screen.getByTestId('activity-group').getAttribute('data-expanded')).toBe('true')
+  })
+
+  it('ignores a locate request addressed to another session', async () => {
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages: makeConversationNavigationMessages() }) } })
+    useTrajectoryViewStore.setState({ nav: null, modes: {}, opened: {} })
+    render(<MessageList />)
+    act(() => useTrajectoryViewStore.getState().revealInChat('other-session', { uuids: ['user-0'] }))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(useTrajectoryViewStore.getState().nav).toMatchObject({ sessionId: 'other-session' })
+  })
+
   it('keeps streaming output out of the user-turn navigator after a prompt jump', async () => {
     const messages = makeConversationNavigationMessages()
     useChatStore.setState({
@@ -1967,6 +2068,19 @@ describe('MessageList nested tool calls', () => {
     expect(firstTopChunk.style.contentVisibility).toBe('auto')
     expect(firstTopChunk.style.containIntrinsicSize).toMatch(/^0 \d+px$/)
 
+    // At native 80% zoom, each chunk's layout rounding accumulates. The outer
+    // box must own the requested total, or switching a virtual boundary can
+    // change scrollHeight by ~20px and trigger another native scroll event.
+    for (const position of ['top', 'bottom']) {
+      const spacer = container.querySelector<HTMLElement>(`[data-virtual-spacer="${position}"]`)!
+      const requestedHeight = Array.from(spacer.children).reduce(
+        (total, chunk) => total + Number.parseFloat((chunk as HTMLElement).style.height),
+        0,
+      )
+      expect(Number.parseFloat(spacer.style.height)).toBeCloseTo(requestedHeight, 6)
+      expect(spacer.classList.contains('overflow-hidden')).toBe(true)
+    }
+
     // Items inside the active window must NOT carry content-visibility (this
     // is the regression guard that previous content-visibility rollout hit).
     const visibleItems = container.querySelectorAll('[data-virtual-message-item]')
@@ -2067,22 +2181,27 @@ describe('MessageList nested tool calls', () => {
     }
 
     setChatState('thinking')
-    render(<MessageList />)
+    const { container } = render(<MessageList />)
     fireEvent.click(screen.getByRole('button', { name: /dispatched 4 agents/i }))
 
+    // One pill for the group; each row carries its state on its avatar.
+    const runningRows = () => container.querySelectorAll('[data-agent-call-layout="row"][data-agent-status="running"]')
     expect(screen.queryByText('Starting')).toBeNull()
-    expect(screen.getAllByText('Running')).toHaveLength(5)
+    expect(screen.getAllByText('Running')).toHaveLength(1)
+    expect(runningRows()).toHaveLength(4)
 
     act(() => setChatState('tool_executing'))
     await waitFor(() => {
       expect(screen.queryByText('Starting')).toBeNull()
-      expect(screen.getAllByText('Running')).toHaveLength(5)
+      expect(screen.getAllByText('Running')).toHaveLength(1)
+      expect(runningRows()).toHaveLength(4)
     })
 
     act(() => setChatState('thinking'))
     await waitFor(() => {
       expect(screen.queryByText('Starting')).toBeNull()
-      expect(screen.getAllByText('Running')).toHaveLength(5)
+      expect(screen.getAllByText('Running')).toHaveLength(1)
+      expect(runningRows()).toHaveLength(4)
     })
   })
 
@@ -2475,7 +2594,8 @@ describe('MessageList nested tool calls', () => {
     render(<MessageList sessionId={ACTIVE_TAB} />)
 
     expect(screen.getByText('1 memory reference(s)')).toBeTruthy()
-    expect(screen.getByText('Bash')).toBeTruthy()
+    // Led by its verb; the raw tool name is the row's tooltip.
+    expect(screen.getByText('Run')).toBeTruthy()
     expect(screen.getByText('bun test')).toBeTruthy()
   })
 
@@ -5771,11 +5891,20 @@ describe('MessageList nested tool calls', () => {
     expect(assistantShell?.className).not.toContain('ml-10')
     expect(userActions?.getAttribute('data-align')).toBe('end')
     expect(assistantActions?.getAttribute('data-align')).toBe('start')
-    expect(userActions?.className).toContain('h-7')
-    expect(userActions?.className).toContain('mt-2')
+    // The prompt's bar hangs under the bubble out of flow: hovering never moves
+    // the transcript, and the bar holds no height of its own when hidden.
+    expect(userShell?.className).toContain('relative')
+    expect(userActions?.getAttribute('data-placement')).toBe('overlay')
+    expect(userActions?.className).toContain('absolute')
+    expect(userActions?.className).toContain('top-full')
+    expect(userActions?.className).toContain('right-0')
+    expect(userActions?.className).not.toContain('mt-2')
     expect(userActions?.className).not.toContain('h-0')
-    expect(userActions?.className).not.toContain('group-hover:h-7')
+    expect(userActions?.className).not.toContain('group-hover:h-')
     expect(userActions?.className).not.toContain('invisible')
+    // The closing reply's bar stays in flow: it is always shown.
+    expect(assistantActions?.getAttribute('data-placement')).toBe('inline')
+    expect(assistantActions?.className).not.toContain('absolute')
     expect(userTime.getAttribute('title')).toBe(formatExactMessageTimestamp(userTimestamp, 'en'))
     // The closing reply's bar is not hover-gated: it is rare and deliberate now,
     // so hiding it until hover would only make a present affordance hard to find.
@@ -6130,15 +6259,22 @@ describe('MessageList nested tool calls', () => {
     expect(screen.queryByLabelText('Turn changed files')).toBeNull()
   })
 
-  it('does not show the checkpoint preview budget as a chat error', async () => {
+  it('retains the workspace file list when a long history exceeds the checkpoint preview budget', async () => {
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockRejectedValue(new ApiError(413, {
       error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT',
       message: 'This transcript exceeds the full checkpoint preview budget. Chat history remains available in pages.',
     }))
+    let resolveStatus!: (result: Awaited<ReturnType<typeof sessionsApi.getWorkspaceStatus>>) => void
+    vi.mocked(sessionsApi.getWorkspaceStatus).mockReturnValue(new Promise((resolve) => { resolveStatus = resolve }))
+    const openFile = vi.spyOn(workspaceOpen, 'file')
+    const openReview = vi.spyOn(workspaceOpen, 'review')
+    const rewind = vi.spyOn(sessionsApi, 'rewind')
     useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({
       messages: [
         { id: 'user-1', type: 'user_text', content: 'Continue the work', timestamp: 1 },
-        { id: 'assistant-1', type: 'assistant_text', content: 'Done', timestamp: 2 },
+        { id: 'write-1', type: 'tool_use', toolUseId: 'write-1', toolName: 'Write', input: { file_path: '/tmp/example-project/qa-status.txt', content: 'QA-005 retained workspace file\n' }, timestamp: 2 },
+        { id: 'write-result', type: 'tool_result', toolUseId: 'write-1', content: 'Created file', isError: false, timestamp: 3 },
+        { id: 'assistant-1', type: 'assistant_text', content: 'Done', timestamp: 4 },
       ],
     }) } })
 
@@ -6150,6 +6286,148 @@ describe('MessageList nested tool calls', () => {
     expect(sessionsApi.getTurnCheckpoints).toHaveBeenCalledTimes(1)
     expect(screen.getByText('Done')).toBeTruthy()
     expect(screen.queryByText(/This transcript exceeds the full checkpoint preview budget/)).toBeNull()
+    expect(screen.queryByRole('region', { name: 'Workspace changed files' })).toBeNull()
+    await act(async () => resolveStatus({
+      state: 'ok', workDir: '/tmp/example-project', repoName: null, branch: null, isGitRepo: false,
+      changedFiles: [{ path: 'qa-status.txt', status: 'added', additions: 1, deletions: 0 }],
+    }))
+    const fallback = await screen.findByRole('region', { name: 'Workspace changed files' })
+    expect(fallback.closest('[data-chat-render-item-key]')).toBeNull()
+    expect(within(fallback).getByText(/too long for turn previews or file undo/)).toBeTruthy()
+    expect(within(fallback).getByText(/current workspace changes/)).toBeTruthy()
+    fireEvent.click(within(fallback).getByRole('button', { name: 'Open current content of qa-status.txt' }))
+    expect(openFile).toHaveBeenCalledWith(ACTIVE_TAB, 'qa-status.txt')
+    expect(openReview).not.toHaveBeenCalled()
+    expect(rewind).not.toHaveBeenCalled()
+    expect(screen.queryByLabelText('Turn changed files')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Undo current turn|Rewind to before this turn|Roll back conversation/ })).toBeNull()
+  })
+
+  it('explains the checkpoint preview limit even when the verified workspace has no changed files', async () => {
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockRejectedValue(new ApiError(413, { error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT' }))
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages: [
+      { id: 'user-1', type: 'user_text', content: 'Continue', timestamp: 1 },
+      { id: 'assistant-1', type: 'assistant_text', content: 'Done', timestamp: 2 },
+    ] }) } })
+    render(<MessageList />)
+    const fallback = await screen.findByRole('region', { name: 'Workspace changed files' })
+    expect(within(fallback).getByText(/too long for turn previews or file undo/)).toBeTruthy()
+    expect(within(fallback).getByText('No current workspace changes were found.')).toBeTruthy()
+    expect(within(fallback).queryByRole('button')).toBeNull()
+  })
+
+  it.each(['error', 'missing_workdir', 'not_git_repo', 'incomplete', 'rejected', 'workspace-budget'] as const)(
+    'keeps the transcript readable and withholds an unverified fallback file list when workspace status is %s', async (failure) => {
+      vi.mocked(sessionsApi.getTurnCheckpoints).mockRejectedValue(new ApiError(413, { error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT' }))
+      if (failure === 'rejected' || failure === 'workspace-budget') {
+        vi.mocked(sessionsApi.getWorkspaceStatus).mockRejectedValue(failure === 'rejected'
+          ? new Error('offline')
+          : new ApiError(413, { error: 'HISTORY_WORKSPACE_LIMIT' }))
+      } else {
+        vi.mocked(sessionsApi.getWorkspaceStatus).mockResolvedValue({
+          state: failure === 'incomplete' ? 'ok' : failure,
+          workDir: '/tmp/example-project', repoName: null, branch: null, isGitRepo: false,
+          ...(failure === 'incomplete' ? {} : { changedFiles: [{ path: 'unverified.txt', status: 'added', additions: 1, deletions: 0 }] }),
+        } as Awaited<ReturnType<typeof sessionsApi.getWorkspaceStatus>>)
+      }
+      useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages: [
+        { id: 'user-1', type: 'user_text', content: 'Continue', timestamp: 1 },
+        { id: 'assistant-1', type: 'assistant_text', content: 'Transcript remains readable', timestamp: 2 },
+      ] }) } })
+      render(<MessageList />)
+      const fallback = await screen.findByRole('region', { name: 'Workspace changed files' })
+      expect(within(fallback).getByText(/Current workspace changes could not be verified/)).toBeTruthy()
+      expect(within(fallback).queryByRole('button')).toBeNull()
+      expect(screen.queryByText('unverified.txt')).toBeNull()
+      expect(screen.getByText('Transcript remains readable')).toBeTruthy()
+    },
+  )
+
+  it.each([
+    new ApiError(500, { error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT', message: 'Checkpoint request failed' }),
+    new ApiError(413, { error: 'HISTORY_WORKSPACE_LIMIT', message: 'Workspace evidence is incomplete' }),
+    new Error('Checkpoint request failed'),
+  ])('does not replace a non-checkpoint-budget error with workspace evidence: %s', async (error) => {
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockRejectedValue(error)
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages: [
+      { id: 'user-1', type: 'user_text', content: 'Continue', timestamp: 1 },
+      { id: 'assistant-1', type: 'assistant_text', content: 'Done', timestamp: 2 },
+    ] }) } })
+    render(<MessageList />)
+    expect(await screen.findByText(error instanceof ApiError ? String((error.body as { message: string }).message) : error.message)).toBeTruthy()
+    expect(screen.queryByRole('region', { name: 'Workspace changed files' })).toBeNull()
+  })
+
+  it('does not show a stale workspace fallback after switching sessions while status is pending', async () => {
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockImplementation((sessionId) => sessionId === 'session-one'
+      ? Promise.reject(new ApiError(413, { error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT' }))
+      : Promise.resolve({ checkpoints: [] }))
+    let resolveStatus!: (result: Awaited<ReturnType<typeof sessionsApi.getWorkspaceStatus>>) => void
+    const requests: Array<AbortSignal | undefined> = []
+    vi.mocked(sessionsApi.getWorkspaceStatus).mockImplementation((sessionId, signal) => {
+      requests.push(signal)
+      return sessionId === 'session-one'
+        ? new Promise((resolve) => { resolveStatus = resolve })
+        : Promise.resolve({ state: 'ok', workDir: '/tmp/two', repoName: null, branch: null, isGitRepo: false, changedFiles: [] })
+    })
+    const messages: UIMessage[] = [
+      { id: 'user-1', type: 'user_text', content: 'Continue', timestamp: 1 },
+      { id: 'assistant-1', type: 'assistant_text', content: 'Done', timestamp: 2 },
+    ]
+    useChatStore.setState({ sessions: {
+      'session-one': makeSessionState({ messages }), 'session-two': makeSessionState({ messages }),
+    } })
+    const { rerender } = render(<MessageList sessionId="session-one" />)
+    await waitFor(() => expect(requests).toHaveLength(1))
+    rerender(<MessageList sessionId="session-two" />)
+    await waitFor(() => expect(requests).toHaveLength(2))
+    expect(requests[0]?.aborted).toBe(true)
+    await act(async () => resolveStatus({
+      state: 'ok', workDir: '/tmp/one', repoName: null, branch: null, isGitRepo: false,
+      changedFiles: [{ path: 'stale.txt', status: 'added', additions: 1, deletions: 0 }],
+    }))
+    expect(screen.queryByRole('region', { name: 'Workspace changed files' })).toBeNull()
+    expect(screen.queryByText('stale.txt')).toBeNull()
+  })
+
+  it('keeps successful turn checkpoints authoritative when workspace status also contains cumulative changes', async () => {
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockResolvedValue({ checkpoints: [{
+      target: { targetUserMessageId: 'user-1', userMessageIndex: 0, userMessageCount: 1 },
+      code: { available: true, filesChanged: ['turn-owned.ts'], insertions: 1, deletions: 0 },
+    }] })
+    vi.mocked(sessionsApi.getWorkspaceStatus).mockResolvedValue({
+      state: 'ok', workDir: '/tmp/example-project', repoName: null, branch: null, isGitRepo: false,
+      changedFiles: [{ path: 'unrelated-workspace.ts', status: 'modified', additions: 8, deletions: 2 }],
+    })
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages: [
+      { id: 'user-1', type: 'user_text', content: 'Create a file', timestamp: 1 },
+      { id: 'assistant-1', type: 'assistant_text', content: 'Done', timestamp: 2 },
+    ] }) } })
+    render(<MessageList />)
+    const turnCard = await screen.findByRole('region', { name: 'Turn changed files' })
+    fireEvent.click(within(turnCard).getByRole('button', { name: 'Show 1 changed files' }))
+    expect(within(turnCard).getByRole('button', { name: 'Open turn-owned.ts in workspace' })).toBeTruthy()
+    expect(within(turnCard).getByRole('button', { name: 'Undo current turn changes' })).toBeTruthy()
+    expect(screen.queryByRole('region', { name: 'Workspace changed files' })).toBeNull()
+    expect(screen.queryByText('unrelated-workspace.ts')).toBeNull()
+  })
+
+  it('hides workspace fallback while a new turn runs and clears it after successful checkpoint reload', async () => {
+    vi.mocked(sessionsApi.getTurnCheckpoints)
+      .mockRejectedValueOnce(new ApiError(413, { error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT' }))
+      .mockResolvedValue({ checkpoints: [] })
+    const messages: UIMessage[] = [
+      { id: 'user-1', type: 'user_text', content: 'Continue', timestamp: 1 },
+      { id: 'assistant-1', type: 'assistant_text', content: 'Done', timestamp: 2 },
+    ]
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages }) } })
+    render(<MessageList />)
+    expect(await screen.findByRole('region', { name: 'Workspace changed files' })).toBeTruthy()
+    act(() => useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages, chatState: 'thinking' }) } }))
+    expect(screen.queryByRole('region', { name: 'Workspace changed files' })).toBeNull()
+    act(() => useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages }) } }))
+    await waitFor(() => expect(sessionsApi.getTurnCheckpoints).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('region', { name: 'Workspace changed files' })).toBeNull()
   })
 
   it('renders multiple historical turn change cards across three turns', async () => {
@@ -7782,6 +8060,77 @@ describe('MessageList nested tool calls', () => {
     expect(within(turnCard).getByText('ink-survey-philosophy.md')).toBeTruthy()
   })
 
+  describe('output cards need the turn to have produced the file', () => {
+    function mockCheckpoint(unverifiedChangeSources: string[], startedAt: number) {
+      return vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
+        checkpoints: [{
+          target: { targetUserMessageId: 'transcript-user-1', userMessageIndex: 0, userMessageCount: 1 },
+          workDir: '/private/tmp',
+          code: { available: true, filesChanged: [], insertions: 0, deletions: 0 },
+          unverifiedChangeSources,
+          startedAt,
+        }],
+      })
+    }
+
+    function replyWith(text: string) {
+      const store = useChatStore.getState()
+      act(() => {
+        store.sendMessage(ACTIVE_TAB, 'Summarise the last commits')
+        store.handleServerMessage(ACTIVE_TAB, { type: 'content_start', blockType: 'text' })
+        store.handleServerMessage(ACTIVE_TAB, { type: 'content_delta', text })
+        store.handleServerMessage(ACTIVE_TAB, { type: 'status', state: 'idle' })
+      })
+    }
+
+    beforeEach(() => {
+      resetWorkspaceFileStatsForTests()
+    })
+
+    it('shows none for file names a read-only turn only quoted', async () => {
+      // The turn ran `git log`; the reply quoted names from commit messages.
+      const getTurnCheckpoints = mockCheckpoint([], Date.now())
+      const statWorkspaceFiles = vi.spyOn(sessionsApi, 'statWorkspaceFiles').mockImplementation(async (_sessionId, paths) => ({
+        files: paths.map((path) => ({ path, state: 'missing' as const })),
+      }))
+
+      render(<MessageList sessionId={ACTIVE_TAB} />)
+      replyWith('QUOTED_NAMES 修复了 `开题报告2.docx`、`D:/资料/测试文档1.docx` 被截断的问题')
+
+      await waitFor(() => expect(getTurnCheckpoints).toHaveBeenCalled())
+      await waitFor(() => expect(statWorkspaceFiles).toHaveBeenCalled())
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      })
+      const reply = screen.getByText('QUOTED_NAMES', { exact: false }).closest('[data-chat-render-item-key]')
+      expect(reply).not.toBeNull()
+      expect(within(reply as HTMLElement).queryByRole('button', { name: 'Open' })).toBeNull()
+      // Nothing there to open, so nothing looks openable either.
+      expect(within(reply as HTMLElement).queryByRole('link')).toBeNull()
+    })
+
+    it('shows only what a shell command wrote after the turn began', async () => {
+      const startedAt = Date.parse('2026-10-04T08:00:00Z')
+      mockCheckpoint(['Bash'], startedAt)
+      const statWorkspaceFiles = vi.spyOn(sessionsApi, 'statWorkspaceFiles').mockImplementation(async (_sessionId, paths) => ({
+        files: paths.map((path) => ({
+          path,
+          state: 'file' as const,
+          mtimeMs: path === 'out/report.docx' ? startedAt + 5_000 : startedAt - 86_400_000,
+        })),
+      }))
+
+      render(<MessageList sessionId={ACTIVE_TAB} />)
+      replyWith('CONVERTED 已把 `in/source.docx` 转成 `out/report.docx`')
+
+      await waitFor(() => expect(statWorkspaceFiles).toHaveBeenCalled())
+      const reply = screen.getByText('CONVERTED', { exact: false }).closest('[data-chat-render-item-key]') as HTMLElement
+      await waitFor(() => expect(within(reply).getAllByRole('button', { name: 'Open' })).toHaveLength(1))
+      expect(within(reply).getByText('report.docx', { selector: 'span' })).toBeTruthy()
+      expect(within(reply).queryByText('source.docx', { selector: 'span' })).toBeNull()
+    })
+  })
+
   it('keeps one output card per turn when separate turns generate the same path', async () => {
     const generatedPath = '/private/tmp/repeated-report.md'
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
@@ -7942,6 +8291,73 @@ describe('MessageList nested tool calls', () => {
     ).toBeTruthy()
     expect(screen.queryByText(/This model does not support images/)).toBeNull()
   })
+
+  it('blames the upstream provider for an interrupted stream and keeps the stream evidence', () => {
+    useSettingsStore.setState({ locale: 'zh' })
+    const raw =
+      'API Error: Provider stream ended before completing the response. The upstream model provider closed the stream before the reply finished; this is not a context-limit error. (retried 10 times · 412 events · last content_block_delta · stop_reason none · message_stop missing · 1 block open · 263s)'
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'error-1',
+              type: 'error',
+              code: 'unknown',
+              businessErrorCode: 'upstream_stream_interrupted',
+              message: raw,
+              timestamp: 1,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.getByText(/上游模型服务商在回复完成前断开了连接/)).toBeTruthy()
+    expect(screen.getByText(/不是上下文超限/)).toBeTruthy()
+    // The evidence is what tells a mid-block cut from a dropped message_stop
+    // when users send a screenshot; the translation alone would hide it.
+    expect(screen.getByText(raw)).toBeTruthy()
+  })
+
+  it.each([
+    ['en', /too large for your provider or relay/, /removed automatically/],
+    ['zh', /服务商或中转站允许的大小/, /自动移除/],
+  ] as const)(
+    'explains a request-too-large rejection as a provider limit and the recovery that follows (%s)',
+    (locale, limit, recovery) => {
+      useSettingsStore.setState({ locale })
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            messages: [
+              {
+                id: 'error-1',
+                type: 'error',
+                code: 'invalid_request',
+                businessErrorCode: 'request_too_large',
+                message:
+                  'Request too large: your provider or relay rejected it (HTTP 413). This conversation is about 24MB.',
+                timestamp: 1,
+              },
+            ],
+          }),
+        },
+      })
+
+      render(<MessageList />)
+
+      expect(screen.getByText(limit)).toBeTruthy()
+      expect(screen.getByText(recovery)).toBeTruthy()
+      // The old copy blamed the selected model and asked users to delete files
+      // by hand, although the limit belongs to the provider and old media is
+      // now dropped automatically.
+      expect(screen.queryByText(/selected model|当前模型/)).toBeNull()
+      expect(screen.queryByText(/Remove large files|移除大文件/)).toBeNull()
+    },
+  )
 
   it('restores opener focus without scrolling when its render item remains fully visible', async () => {
     useChatStore.setState({
@@ -9332,5 +9748,450 @@ describe('MessageList agent card activity', () => {
 
     expect(await screen.findByTestId('agent-call-activity')).toBeTruthy()
     expect(screen.getByText(/Showing the start and end of this run/)).toBeTruthy()
+  })
+})
+
+// #1343. Editing a prompt reuses the existing rewind — same targets, same
+// dry-run/`conversation`/`both` semantics — and then sends the edit. Nothing
+// may change before the rewind succeeds, and once it has, the edit must reach
+// either the model or the composer.
+describe('MessageList edit and resend', () => {
+  type Checkpoint = Awaited<ReturnType<typeof sessionsApi.getTurnCheckpoints>>['checkpoints'][number]
+  type RewindResult = Awaited<ReturnType<typeof sessionsApi.rewind>>
+
+  function checkpoint(
+    targetUserMessageId: string,
+    userMessageIndex: number,
+    userMessageCount: number,
+    overrides: Partial<Checkpoint> = {},
+  ): Checkpoint {
+    return {
+      target: { targetUserMessageId, userMessageIndex, userMessageCount },
+      code: { available: false, filesChanged: [], insertions: 0, deletions: 0 },
+      ...overrides,
+    }
+  }
+
+  function rewindResult(overrides: Partial<RewindResult> = {}): RewindResult {
+    return {
+      target: { targetUserMessageId: 'user-1', userMessageIndex: 0, userMessageCount: 1 },
+      conversation: { messagesRemoved: 2 },
+      code: { available: false, filesChanged: [], insertions: 0, deletions: 0 },
+      ...overrides,
+    }
+  }
+
+  function setup(messages: UIMessage[], checkpoints: Checkpoint[], sessionOverrides: Partial<PerSessionState> = {}) {
+    vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({ checkpoints })
+    const reloadHistory = vi.fn().mockResolvedValue(undefined)
+    const sendMessage = vi.fn()
+    const queueComposerPrefill = vi.fn()
+    const stopGeneration = vi.fn()
+    useChatStore.setState({
+      reloadHistory,
+      sendMessage,
+      queueComposerPrefill,
+      stopGeneration,
+      sessions: { [ACTIVE_TAB]: makeSessionState({ messages, ...sessionOverrides }) },
+    })
+    return { reloadHistory, sendMessage, queueComposerPrefill, stopGeneration }
+  }
+
+  const oneTurn: UIMessage[] = [
+    { id: 'user-1', type: 'user_text', content: 'Build a page', transcriptMessageId: 'user-1', timestamp: 1 },
+    { id: 'assistant-1', type: 'assistant_text', content: 'Done', timestamp: 2 },
+  ]
+
+  const threeTurns: UIMessage[] = [
+    { id: 'user-1', type: 'user_text', content: 'First prompt', timestamp: 1 },
+    { id: 'assistant-1', type: 'assistant_text', content: 'First answer', timestamp: 2 },
+    { id: 'user-2', type: 'user_text', content: 'Second prompt', timestamp: 3 },
+    { id: 'assistant-2', type: 'assistant_text', content: 'Second answer', timestamp: 4 },
+    { id: 'user-3', type: 'user_text', content: 'Third prompt', timestamp: 5 },
+    { id: 'assistant-3', type: 'assistant_text', content: 'Third answer', timestamp: 6 },
+  ]
+
+  async function enabledEditButton(bubble: HTMLElement) {
+    // The bubble renders before the turn checkpoints load; until they do the
+    // action is shown disabled, and only then is the prompt known rewindable.
+    return waitFor(() => {
+      const button = within(bubble).getByRole('button', { name: 'Edit and resend' }) as HTMLButtonElement
+      expect(button.disabled).toBe(false)
+      return button
+    })
+  }
+
+  async function openEditorFor(content: string) {
+    const bubble = (await screen.findByText(content)).closest('[data-message-shell="user"]') as HTMLElement
+    fireEvent.click(await enabledEditButton(bubble))
+    return screen.getByRole('textbox', { name: 'Edited message' }) as HTMLTextAreaElement
+  }
+
+  function editButtonIn(content: string) {
+    const bubble = screen.getByText(content).closest('[data-message-shell="user"]') as HTMLElement
+    return within(bubble).getByRole('button', { name: 'Edit and resend' }) as HTMLButtonElement
+  }
+
+  function typeAndSend(textbox: HTMLTextAreaElement, text: string) {
+    fireEvent.change(textbox, { target: { value: text } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+  }
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    resetSessionScrollSnapshotsForTests()
+    useSettingsStore.setState({ locale: 'en', chatSendBehavior: 'enter' })
+    useUIStore.setState({ toasts: [] })
+    useTabStore.setState({ activeTabId: ACTIVE_TAB, tabs: [{ sessionId: ACTIVE_TAB, title: 'Test', type: 'session' as const, status: 'idle' }] })
+    useSessionStore.setState({ sessions: [], activeSessionId: null, isLoading: false, error: null })
+    useSideChatStore.setState({ entries: {} })
+    useTeamStore.getState().clearTeam()
+    useWorkspaceStore.setState(useWorkspaceStore.getInitialState(), true)
+    vi.spyOn(sessionsApi, 'getWorkspaceStatus').mockResolvedValue({
+      state: 'ok',
+      workDir: '/tmp/example-project',
+      repoName: 'example-project',
+      branch: null,
+      isGitRepo: false,
+      changedFiles: [],
+    })
+  })
+
+  it('offers edit only on prompts the rewind API can target', async () => {
+    setup([
+      ...threeTurns.slice(0, 4),
+      { id: 'collab', type: 'user_text', content: 'Delivered from elsewhere', collaboration: { sourceSessionId: 's2' }, timestamp: 5 },
+      { id: 'assistant-c', type: 'assistant_text', content: 'Ack', timestamp: 6 },
+    ], [checkpoint('user-1', 0, 3), checkpoint('collab', 2, 3)])
+    render(<MessageList />)
+
+    const first = (await screen.findByText('First prompt')).closest('[data-message-shell="user"]') as HTMLElement
+    await enabledEditButton(first)
+    const second = screen.getByText('Second prompt').closest('[data-message-shell="user"]') as HTMLElement
+    expect(within(second).queryByRole('button', { name: 'Edit and resend' })).toBeNull()
+    const collab = screen.getByText('Delivered from elsewhere').closest('[data-message-shell="user"]') as HTMLElement
+    expect(within(collab).queryByRole('button', { name: 'Edit and resend' })).toBeNull()
+  })
+
+  it('keeps edit visible but disabled, with the reason, while a turn runs; none in a side chat', async () => {
+    setup(oneTurn, [checkpoint('user-1', 0, 1)])
+    const { unmount } = render(<MessageList />)
+    await enabledEditButton((await screen.findByText('Build a page')).closest('[data-message-shell="user"]') as HTMLElement)
+
+    act(() => {
+      const current = useChatStore.getState().sessions[ACTIVE_TAB]!
+      useChatStore.setState({ sessions: { [ACTIVE_TAB]: { ...current, chatState: 'thinking' } } })
+    })
+    const busy = editButtonIn('Build a page')
+    expect(busy.disabled).toBe(true)
+    expect(screen.getByRole('button', { name: 'Edit and resend', description: 'Editing is available once this turn finishes.' })).toBe(busy)
+    expect(busy.closest('[title]')?.getAttribute('title')).toBe('Editing is available once this turn finishes.')
+    unmount()
+
+    setup(oneTurn, [checkpoint('user-1', 0, 1)])
+    useSideChatStore.setState({ entries: { [ACTIVE_TAB]: { sessionId: ACTIVE_TAB, parentSessionId: 'parent' } as never } })
+    render(<MessageList />)
+    await screen.findByText('Build a page')
+    await waitFor(() => expect(sessionsApi.getTurnCheckpoints).toHaveBeenCalled())
+    await act(async () => { await Promise.resolve() })
+    expect(screen.queryByRole('button', { name: 'Edit and resend' })).toBeNull()
+  })
+
+  it('keeps edit disabled while a background task runs, even when the checkpoints never loaded, then enables it', async () => {
+    const runningTask = {
+      taskId: 'shell-1', status: 'running', taskType: 'local_bash', description: 'npm run dev', startedAt: 1, updatedAt: 2,
+    } as const
+    setup(oneTurn, [checkpoint('user-1', 0, 1)], { backgroundAgentTasks: { 'shell-1': runningTask } })
+    render(<MessageList />)
+    await screen.findByText('Build a page')
+
+    const blocked = editButtonIn('Build a page')
+    expect(blocked.disabled).toBe(true)
+    expect(screen.getByRole('button', {
+      name: 'Edit and resend',
+      description: 'Editing is available once the running background tasks finish or are stopped.',
+    })).toBe(blocked)
+    expect(sessionsApi.getTurnCheckpoints).not.toHaveBeenCalled()
+
+    act(() => {
+      const current = useChatStore.getState().sessions[ACTIVE_TAB]!
+      useChatStore.setState({ sessions: { [ACTIVE_TAB]: {
+        ...current, backgroundAgentTasks: { 'shell-1': { ...runningTask, status: 'completed', updatedAt: 3 } },
+      } } })
+    })
+    const bubble = screen.getByText('Build a page').closest('[data-message-shell="user"]') as HTMLElement
+    await enabledEditButton(bubble)
+  })
+
+  it('says the prompt is being checked while the checkpoints load, and why when they fail', async () => {
+    let rejectCheckpoints!: (error: Error) => void
+    setup(oneTurn, [])
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockReturnValue(new Promise((_, reject) => { rejectCheckpoints = reject }))
+    render(<MessageList />)
+    await screen.findByText('Build a page')
+    await waitFor(() => expect(editButtonIn('Build a page').disabled).toBe(true))
+    expect(screen.getByRole('button', { name: 'Edit and resend', description: 'Checking whether this prompt can be rewound…' })).toBeTruthy()
+
+    await act(async () => { rejectCheckpoints(new Error('checkpoint store offline')) })
+    await waitFor(() => expect(screen.getByRole('button', {
+      name: 'Edit and resend',
+      description: "Editing is unavailable: this session's checkpoints could not be loaded.",
+    })).toBeTruthy())
+    expect(editButtonIn('Build a page').disabled).toBe(true)
+  })
+
+  it('still edits a prompt past the checkpoint preview budget, rolling back the conversation only', async () => {
+    const { sendMessage } = setup(oneTurn, [])
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockRejectedValue(new ApiError(413, { error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT' }))
+    // The dry run finds changed files; this mode has told the user file undo
+    // is unavailable, so they must not be offered back.
+    const rewind = vi.spyOn(sessionsApi, 'rewind').mockResolvedValue(rewindResult({
+      code: { available: true, filesChanged: ['app.ts'], insertions: 1, deletions: 0 },
+    }))
+    render(<MessageList />)
+    await screen.findByRole('region', { name: 'Workspace changed files' })
+
+    typeAndSend(await openEditorFor('Build a page'), 'Build a landing page')
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledOnce())
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(rewind).toHaveBeenNthCalledWith(1, ACTIVE_TAB, {
+      targetUserMessageId: 'user-1', userMessageIndex: 0, expectedContent: 'Build a page', dryRun: true,
+    })
+    expect(rewind).toHaveBeenNthCalledWith(2, ACTIVE_TAB, {
+      targetUserMessageId: 'user-1', userMessageIndex: 0, expectedContent: 'Build a page', mode: 'conversation',
+    })
+  })
+
+  it('offers no edit past the budget for a live prompt that has no transcript id yet', async () => {
+    setup([
+      { id: 'live-user', type: 'user_text', content: 'Live prompt', timestamp: 1 },
+      { id: 'live-reply', type: 'assistant_text', content: 'Live answer', timestamp: 2 },
+    ], [])
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockRejectedValue(new ApiError(413, { error: 'HISTORY_CHECKPOINT_PREVIEW_LIMIT' }))
+    render(<MessageList />)
+    await screen.findByRole('region', { name: 'Workspace changed files' })
+    expect(screen.queryByRole('button', { name: 'Edit and resend' })).toBeNull()
+  })
+
+  it('resends the latest text-only turn straight away: dry run, conversation rewind, reload, send', async () => {
+    const { reloadHistory, sendMessage, queueComposerPrefill } = setup(oneTurn, [checkpoint('user-1', 0, 1)])
+    const rewind = vi.spyOn(sessionsApi, 'rewind').mockResolvedValue(rewindResult())
+    render(<MessageList />)
+
+    const textbox = await openEditorFor('Build a page')
+    expect(textbox.value).toBe('Build a page')
+    typeAndSend(textbox, 'Build a landing page')
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledOnce())
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(rewind).toHaveBeenCalledTimes(2)
+    expect(rewind).toHaveBeenNthCalledWith(1, ACTIVE_TAB, {
+      targetUserMessageId: 'user-1', userMessageIndex: 0, expectedContent: 'Build a page', dryRun: true,
+    })
+    expect(rewind).toHaveBeenNthCalledWith(2, ACTIVE_TAB, {
+      targetUserMessageId: 'user-1', userMessageIndex: 0, expectedContent: 'Build a page', mode: 'conversation',
+    })
+    expect(sendMessage).toHaveBeenCalledWith(ACTIVE_TAB, 'Build a landing page', [], {
+      displayContent: 'Build a landing page',
+      displayAttachments: [],
+    })
+    // The edit is sent into the rewound history, never before it is reloaded.
+    expect(reloadHistory.mock.invocationCallOrder[0]!)
+      .toBeGreaterThan(rewind.mock.invocationCallOrder[1]!)
+    expect(sendMessage.mock.invocationCallOrder[0]!)
+      .toBeGreaterThan(reloadHistory.mock.invocationCallOrder[0]!)
+    expect(queueComposerPrefill).not.toHaveBeenCalled()
+    expect(screen.queryByRole('textbox', { name: 'Edited message' })).toBeNull()
+  })
+
+  it('says how many later turns an older edit deletes, and Cancel changes nothing', async () => {
+    const { sendMessage } = setup(threeTurns, [
+      checkpoint('user-1', 0, 3), checkpoint('user-2', 1, 3), checkpoint('user-3', 2, 3),
+    ])
+    const rewind = vi.spyOn(sessionsApi, 'rewind').mockResolvedValue(rewindResult())
+    render(<MessageList />)
+
+    const textbox = await openEditorFor('First prompt')
+    typeAndSend(textbox, 'First prompt, revised')
+
+    const dialog = await screen.findByRole('dialog', { name: 'Edit and resend?' })
+    expect(within(dialog).getByText('The 2 later turn(s) after this message will be deleted, then the edited message is sent.')).toBeTruthy()
+    expect(within(dialog).getByText('Files on disk will not be changed.')).toBeTruthy()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(rewind).toHaveBeenCalledOnce()
+    expect(rewind.mock.calls[0]![1]).toMatchObject({ dryRun: true })
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect((screen.getByRole('textbox', { name: 'Edited message' }) as HTMLTextAreaElement).value)
+      .toBe('First prompt, revised')
+    expect(screen.getByText('Second prompt')).toBeTruthy()
+  })
+
+  it('restores code and conversation through the authoritative checkpoint when chosen', async () => {
+    // The live bubble has a local id; the server's checkpoint names the
+    // transcript message, and that is the one the rewind must address.
+    const { sendMessage } = setup([
+      { id: 'local-1', type: 'user_text', content: 'Edit the file', timestamp: 1 },
+      { id: 'assistant-1', type: 'assistant_text', content: 'Edited', timestamp: 2 },
+    ], [checkpoint('transcript-1', 0, 1, {
+      code: { available: true, filesChanged: ['src/a.ts'], insertions: 1, deletions: 0 },
+    })])
+    const rewind = vi.spyOn(sessionsApi, 'rewind')
+      .mockResolvedValueOnce(rewindResult({
+        code: { available: true, filesChanged: ['src/a.ts'], insertions: 1, deletions: 0 },
+      }))
+      .mockResolvedValueOnce(rewindResult({
+        code: { available: true, filesChanged: ['src/a.ts'], insertions: 1, deletions: 0 },
+        mode: 'both',
+      }))
+    render(<MessageList />)
+
+    const textbox = await openEditorFor('Edit the file')
+    typeAndSend(textbox, 'Edit the other file')
+
+    const dialog = await screen.findByRole('dialog', { name: 'Edit and resend?' })
+    expect(within(dialog).getByText('The reply to this turn will be deleted, then the edited message is sent.')).toBeTruthy()
+    expect(within(dialog).getByRole('button', { name: 'Roll back conversation only and send' })).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Roll back code and conversation and send' }))
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledOnce())
+    expect(rewind).toHaveBeenCalledTimes(2)
+    expect(rewind).toHaveBeenNthCalledWith(1, ACTIVE_TAB, {
+      targetUserMessageId: 'transcript-1', userMessageIndex: 0, expectedContent: 'Edit the file', dryRun: true,
+    })
+    expect(rewind).toHaveBeenNthCalledWith(2, ACTIVE_TAB, {
+      targetUserMessageId: 'transcript-1', userMessageIndex: 0, expectedContent: 'Edit the file', mode: 'both',
+    })
+    expect(useUIStore.getState().toasts).toEqual([
+      expect.objectContaining({ type: 'success', message: 'Rewound 2 messages and restored tracked files.' }),
+    ])
+  })
+
+  it('offers only the conversation rollback when the files cannot be restored', async () => {
+    const { sendMessage } = setup(oneTurn, [checkpoint('user-1', 0, 1, {
+      code: { available: true, filesChanged: ['src/a.ts'], insertions: 1, deletions: 0 },
+      restoreAvailable: false,
+    })])
+    const rewind = vi.spyOn(sessionsApi, 'rewind').mockResolvedValue(rewindResult({
+      code: { available: true, filesChanged: ['src/a.ts'], insertions: 1, deletions: 0 },
+      restoreAvailable: false,
+    }))
+    render(<MessageList />)
+
+    typeAndSend(await openEditorFor('Build a page'), 'Build a smaller page')
+
+    const dialog = await screen.findByRole('dialog', { name: 'Edit and resend?' })
+    expect(within(dialog).queryByRole('button', { name: 'Roll back code and conversation and send' })).toBeNull()
+    expect(within(dialog).getByText(/incomplete file checkpoint/)).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Roll back conversation only and send' }))
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledOnce())
+    expect(rewind).toHaveBeenLastCalledWith(ACTIVE_TAB, expect.objectContaining({ mode: 'conversation' }))
+  })
+
+  it('keeps the draft and sends nothing when the rewind itself fails', async () => {
+    const { reloadHistory, sendMessage } = setup(oneTurn, [checkpoint('user-1', 0, 1)])
+    vi.spyOn(sessionsApi, 'rewind')
+      .mockResolvedValueOnce(rewindResult())
+      .mockRejectedValueOnce(new Error('late tool output'))
+    render(<MessageList />)
+
+    typeAndSend(await openEditorFor('Build a page'), 'Build a landing page')
+
+    await waitFor(() => expect(useUIStore.getState().toasts).toEqual([
+      expect.objectContaining({
+        type: 'error',
+        message: 'Could not resend the edited message. The conversation was not changed. Details: late tool output',
+      }),
+    ]))
+    expect(reloadHistory).not.toHaveBeenCalled()
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect((screen.getByRole('textbox', { name: 'Edited message' }) as HTMLTextAreaElement).value)
+      .toBe('Build a landing page')
+  })
+
+  it('keeps the draft when the dry run fails', async () => {
+    const { sendMessage } = setup(oneTurn, [checkpoint('user-1', 0, 1)])
+    const rewind = vi.spyOn(sessionsApi, 'rewind').mockRejectedValue(new Error('prompt changed'))
+    render(<MessageList />)
+
+    typeAndSend(await openEditorFor('Build a page'), 'Build a landing page')
+
+    await waitFor(() => expect(useUIStore.getState().toasts).toHaveLength(1))
+    expect(rewind).toHaveBeenCalledOnce()
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect((screen.getByRole('textbox', { name: 'Edited message' }) as HTMLTextAreaElement).value)
+      .toBe('Build a landing page')
+  })
+
+  it('hands the edit to the composer when it cannot be sent after the rewind', async () => {
+    const { reloadHistory, sendMessage, queueComposerPrefill } = setup(oneTurn, [checkpoint('user-1', 0, 1)])
+    reloadHistory.mockRejectedValue(new Error('offline'))
+    vi.spyOn(sessionsApi, 'rewind').mockResolvedValue(rewindResult())
+    render(<MessageList />)
+
+    typeAndSend(await openEditorFor('Build a page'), 'Build a landing page')
+
+    await waitFor(() => expect(queueComposerPrefill).toHaveBeenCalledWith(ACTIVE_TAB, {
+      text: 'Build a landing page',
+      attachments: [],
+    }, { restoreMissingSession: true }))
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(useUIStore.getState().toasts).toEqual([
+      expect.objectContaining({ type: 'warning' }),
+    ])
+  })
+
+  it('cancels with Escape without touching the conversation', async () => {
+    setup(oneTurn, [checkpoint('user-1', 0, 1)])
+    const rewind = vi.spyOn(sessionsApi, 'rewind')
+    render(<MessageList />)
+
+    const textbox = await openEditorFor('Build a page')
+    fireEvent.change(textbox, { target: { value: 'Never mind' } })
+    fireEvent.keyDown(textbox, { key: 'Escape' })
+
+    expect(screen.queryByRole('textbox', { name: 'Edited message' })).toBeNull()
+    expect(screen.getByText('Build a page')).toBeTruthy()
+    expect(rewind).not.toHaveBeenCalled()
+  })
+
+  it('resends workspace references and images with the edited text', async () => {
+    const referencePrompt = [
+      'Referenced workspace context:',
+      '@"src/app.ts:L3-L5":',
+      '```typescript',
+      'for (;;) {}',
+      '```',
+    ].join('\n')
+    const { sendMessage } = setup([
+      {
+        id: 'user-1',
+        type: 'user_text',
+        content: 'Why does this spin?',
+        modelContent: `@"/repo/src/app.ts" ${referencePrompt}\n\nWhy does this spin?`,
+        attachments: [
+          { type: 'file', name: 'app.ts', path: 'src/app.ts', lineStart: 3, lineEnd: 5, quote: 'for (;;) {}' },
+          { type: 'image', name: 'shot.png', data: 'data:image/png;base64,AAAA', mimeType: 'image/png' },
+        ],
+        timestamp: 1,
+      },
+      { id: 'assistant-1', type: 'assistant_text', content: 'Because', timestamp: 2 },
+    ], [checkpoint('user-1', 0, 1)])
+    vi.spyOn(sessionsApi, 'rewind').mockResolvedValue(rewindResult())
+    render(<MessageList />)
+
+    typeAndSend(await openEditorFor('Why does this spin?'), 'How do I stop it?')
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledOnce())
+    const [, content, attachments, options] = sendMessage.mock.calls[0]!
+    expect(content).toBe(`${referencePrompt.replace('src/app.ts:L3-L5', '/repo/src/app.ts:L3-L5')}\n\nHow do I stop it?`)
+    expect(attachments).toEqual([
+      expect.objectContaining({ type: 'file', path: '/repo/src/app.ts', lineStart: 3, lineEnd: 5, quote: 'for (;;) {}' }),
+      { type: 'image', name: 'shot.png', mimeType: 'image/png', data: 'data:image/png;base64,AAAA' },
+    ])
+    expect(options).toMatchObject({ displayContent: 'How do I stop it?' })
   })
 })

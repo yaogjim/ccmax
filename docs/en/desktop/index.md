@@ -15,15 +15,16 @@ To learn by doing, choose a task from the [practical guides](../cases/index.md).
 
 ## Three places to know
 
-- **Sidebar** — under the brand seal: New session, Scheduled, Skills Market. Below that, the search bar and your projects and past sessions. Settings sits at the bottom. Drag the edge to resize it.
+- **Sidebar** — under the brand seal: New session, Scheduled, **Skills · Connectors**. Below that, the search bar and your projects and past sessions. Settings sits at the bottom. Drag the edge to resize it.
 - **Tab bar** — sessions side by side, switched like browser tabs. The four buttons on the right are Activity, Open project, Open terminal, and Show/hide workspace.
-- **Composer toolbar** — left to right: attachments, permission mode, launch location, context usage ring, model and effort, and the run button.
+- **Composer toolbar** — the **+** menu groups "for this task" (skills / connectors / files) and "how it runs" (Agent Teams, Computer Use); the rest is permissions, model, and send.
 
 ## What you'll use daily
 
 - [Sessions, permissions, and review](./sessions.md) — starting a session, reading tool cards, answering permission prompts, undoing a turn that went wrong.
-- [Workspace](./workspace.md) — the right-hand panel: changed files, diff review, line comments, isolated worktrees, built-in browser.
-- [Settings reference](./settings.md) — all 16 tabs, one paragraph each: themes, languages, proxy, terminal, MCP, token usage.
+- [In-session trajectory](./sessions.md) — switch Chat / Trajectory next to the title for a step-by-step ledger; the standalone Trace tab is gone.
+- [Workspace](./workspace.md) — the right-hand panel: changed files, diff review, line comments, isolated worktrees, built-in browser, and PDF / Word / Excel preview.
+- [Settings reference](./settings.md) — all 15 tabs, one paragraph each: themes, languages, proxy, terminal, MCP, token usage. The standalone Trace tab moved into the session trajectory.
 
 ## Getting more work out of it
 

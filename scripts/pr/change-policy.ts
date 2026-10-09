@@ -155,6 +155,10 @@ const persistencePrefixes = [
   // proves the legacy-profile fixtures still upgrade. Base name (not the full file)
   // so both the source and its test are covered.
   'desktop/electron/services/userDataProfileMigration',
+  'desktop/electron/services/dataMigration',
+  'desktop/electron/services/migrationCredentials',
+  'src/utils/storageMigrationMetadata',
+  'src/utils/storageRelocations',
   'scripts/quality-gate/persistence-upgrade',
 ]
 

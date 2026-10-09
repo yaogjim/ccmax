@@ -1,10 +1,3 @@
-import sessionZh from '../../../../docs/images/app/zh-CN/session-new.webp'
-import settingsZh from '../../../../docs/images/app/zh-CN/settings-computer-use.webp'
-import sessionEn from '../../../../docs/images/app/en/session-new.webp'
-import settingsEn from '../../../../docs/images/app/en/settings-computer-use.webp'
-import workspaceZh from '../../../../docs/images/app/zh-CN/workspace-diff.webp'
-import workspaceEn from '../../../../docs/images/app/en/workspace-diff.webp'
-
 export const guideContent = {
   zh: {
     eyebrow: 'ccmax / 开源使用指南',
@@ -74,5 +67,3 @@ export const guideContent = {
     footer: 'An open-source, local-first AI coding workbench. This guide evolves with the product.'
   }
 }
-
-export const guideScreenshots = { zh: { session: sessionZh, settings: settingsZh, workspace: workspaceZh }, en: { session: sessionEn, settings: settingsEn, workspace: workspaceEn } }

@@ -24,7 +24,7 @@ import {
   TAB_STORAGE_KEY,
   THEME_STORAGE_KEY,
 } from './persistenceKeys'
-import { WORKSPACE_STORAGE_KEY } from './workspace/storageKey'
+import { LEGACY_WORKSPACE_STORAGE_KEY, WORKSPACE_STORAGE_KEY } from './workspace/storageKey'
 
 /**
  * Explicit user reset may clear both canonical and legacy safe UI keys.
@@ -59,6 +59,7 @@ export const SAFE_DOCTOR_STORAGE_KEYS = [
   // layout and tab descriptors, never content. Leaving it out would mean a
   // corrupt entry has no documented way to be cleared.
   WORKSPACE_STORAGE_KEY,
+  LEGACY_WORKSPACE_STORAGE_KEY,
   DESKTOP_PERSISTENCE_VERSION_KEY,
   LEGACY_DESKTOP_PERSISTENCE_VERSION_KEY,
 ] as const

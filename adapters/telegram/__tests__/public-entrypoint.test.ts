@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import type { Bot } from 'grammy'
 import { SessionStore } from '../../common/session-store.js'
 import { telegramBotIdFromToken } from '../bot-identity.js'
+import { adapterMigrationLifecycle } from '../../common/migration-lifecycle.js'
 import {
   getPublicTelegramBot,
   setPublicTelegramBotHook,
@@ -672,6 +673,40 @@ describe('Telegram public forwarder', () => {
       expect(errors.join('\n')).not.toContain('public-secret-token')
     } finally {
       errorSpy.mockRestore()
+    }
+  })
+
+  it('registers a migration shutdown that waits for public polling to stop', async () => {
+    const cleanups: Array<() => Promise<void> | void> = []
+    let release!: () => void
+    const pendingStop = new Promise<void>(resolve => { release = resolve })
+    const register = spyOn(adapterMigrationLifecycle, 'registerShutdown').mockImplementation(callback => { cleanups.push(callback) })
+    setPublicTelegramBotHook((bot) => {
+      interceptPublicBot(bot, { onPoll: () => { order.push('poll') } })
+      bot.isRunning = (() => true) as typeof bot.isRunning
+      bot.stop = (async () => { await pendingStop }) as typeof bot.stop
+    })
+    try {
+      expect(await startPublicTelegramAdapter()).toBe(true)
+      expect(register.mock.calls.length).toBeGreaterThanOrEqual(1)
+      Object.defineProperty(adapterMigrationLifecycle, 'isQuiescing', { configurable: true, get: () => true })
+      const previousPosts = posts.length
+      const bot = getPublicTelegramBot()
+      expect(bot).toBeDefined()
+      await bot!.handleUpdate(privateMessage(7, 'Should remain unadmitted', { updateId: 9101, messageId: 99 }) as any)
+      expect(posts).toHaveLength(previousPosts)
+      let completed = false
+      const stopping = Promise.all(cleanups.map(cleanup => Promise.resolve(cleanup()))).then(() => { completed = true })
+      await Promise.resolve()
+      expect(completed).toBe(false)
+      release()
+      await stopping
+      expect(getPublicTelegramBot()).toBeUndefined()
+    } finally {
+      release()
+      Reflect.deleteProperty(adapterMigrationLifecycle, 'isQuiescing')
+      register.mockRestore()
+      await stopPublicTelegramAdapter()
     }
   })
 })

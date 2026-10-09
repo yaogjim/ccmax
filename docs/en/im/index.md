@@ -11,8 +11,6 @@ A session running in the Desktop app can be reached from a private chat on your 
 
 The chat partner is a bot or account you bound yourself. Messages reach your local Desktop app; no intermediate service holds your code.
 
-![Settings → IM Adapters: platform tabs and the Slack setup form (Chinese interface)](../../images/app/en/settings-im.webp)
-
 ## What you get
 
 - **The same session, continued.** Messages sent from your phone enter the Claude Code session on your computer, where file edits, commands, and reads really happen.

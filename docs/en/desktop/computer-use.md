@@ -17,8 +17,6 @@ macOS and Windows are supported. There is no Linux executor yet.
 
 ## Check the environment
 
-![Settings → Computer Use: enable switch and OS permission status (Chinese interface)](../../images/app/en/settings-computer-use.webp)
-
 Open **Settings → Computer Use**. On macOS 14.4 or later, the app prefers the native runtime component and shows OS permission status. Windows and other compatible runtime paths show checks for Python 3, a virtual environment, and dependencies. Follow the checks shown on your own screen; the native macOS page does not require a Python setup step.
 
 If the page shows Python checks, install Python 3 if needed. For conda, pyenv, or another custom installation, select **Python interpreter path**, then click **Install Environment** to create the isolated venv and dependencies. Click **Re-check** when finished. If the native runtime component is missing, update or reinstall the app and check again.

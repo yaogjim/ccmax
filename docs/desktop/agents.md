@@ -38,8 +38,6 @@ order: 3
 
 ## 看已经装了哪些
 
-![设置 → Agents：按来源分组的 Agent 浏览器](../images/app/zh-CN/settings-agents.webp)
-
 打开 设置 → Agents。顶部三张卡是总数、生效中、来源类型数，下面按来源分组：
 
 **用户** → **项目** → **本地** → **托管** → **插件** → **CLI 参数** → **内置**
@@ -101,8 +99,6 @@ Agent 配置只保存模型 ID，不绑定 Provider。选择器会列出当前 P
 运行时，对话里这个子 Agent 的卡片会显示「Provider · 模型」标记，说明它实际跑在哪里。
 
 ## 捏一个自己的
-
-![「创建 Agent」弹窗：作用域、模型、思考强度、工具、系统提示词](../images/app/zh-CN/agent-create.webp)
 
 点右上角「创建 Agent」，要填的字段：
 

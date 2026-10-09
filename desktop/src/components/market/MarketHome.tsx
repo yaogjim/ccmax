@@ -1,16 +1,21 @@
-import { forwardRef, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArrowUpRight, CloudOff, PackageSearch, RefreshCw, Search, Sparkles, Store, X } from 'lucide-react'
+import { forwardRef, useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
+import { ArrowUpRight, CloudOff, PackageSearch, RefreshCw, Store } from 'lucide-react'
 import { useTranslation } from '../../i18n'
+import { cx } from '@/lib/cx'
+import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { ErrorState } from '@/components/ui/ErrorState'
-import { IconButton } from '@/components/ui/IconButton'
+import { SearchField } from '@/components/ui/SearchField'
 import { SkeletonCards } from '@/components/ui/Skeleton'
-import { useMarketStore } from '../../stores/marketStore'
+import { EXTENSION_PAGE_COLUMN } from './pageLayout'
+import { marketOwnerOf, useMarketStore } from '../../stores/marketStore'
 import { SETTINGS_TAB_ID, useTabStore } from '../../stores/tabStore'
 import { useUIStore } from '../../stores/uiStore'
+import { CategoryBar } from './CategoryBar'
 import { FilterBar } from './FilterBar'
 import { MarketDisclaimer } from './MarketDisclaimer'
+import { formatIsoDate } from './marketFormat'
 import { SkillCard } from './SkillCard'
 import { SourceStatusBar } from './SourceStatusBar'
 import {
@@ -28,12 +33,17 @@ const PREFETCH_MARGIN = '400px'
 
 const CATALOG_GRID_STYLE = { gridTemplateColumns: CATALOG_GRID_TEMPLATE, gap: CATALOG_GAP }
 
-export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (id: string) => void, featured?: ReactNode }) {
+export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (id: string, owner?: string) => void, featured?: ReactNode }) {
   const t = useTranslation()
   const {
     items,
     nextCursor,
     sources,
+    scope,
+    category,
+    categories,
+    total,
+    catalogGeneratedAt,
     query,
     filters,
     isLoading,
@@ -43,6 +53,10 @@ export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (
     fetchList,
     loadMore,
     setQuery,
+    submitQuery,
+    searchAllMarkets,
+    backToCatalog,
+    setCategory,
     installingIds,
   } = useMarketStore()
 
@@ -88,9 +102,44 @@ export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (
     useTabStore.getState().openTab(SETTINGS_TAB_ID, t('sidebar.settings'), 'settings')
   }, [t])
 
+  const catalog = scope === 'catalog'
   const hasActiveFilters =
-    filters.source !== 'all' || filters.security !== 'all' || filters.installed !== 'all'
-  const hasQuery = query.trim().length > 0
+    filters.source !== 'all' ||
+    filters.security !== 'all' ||
+    filters.installed !== 'all' ||
+    (catalog && category !== 'all')
+  const trimmedQuery = query.trim()
+  const hasQuery = trimmedQuery.length > 0
+
+  /**
+   * The box is driven from a local draft so an IME composition can show its
+   * in-progress text without becoming a query: pinyin like "wendang" would
+   * otherwise search the catalog for each Latin keystroke on the way to 文档.
+   * The composed text is committed once, on `compositionend`.
+   */
+  const [draft, setDraft] = useState(query)
+  const composingRef = useRef(false)
+  useEffect(() => {
+    if (!composingRef.current) setDraft(query)
+  }, [query])
+
+  const handleSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== 'Enter') return
+    // Enter that confirms an IME candidate is not a submit. Safari reports the
+    // confirming keydown as keyCode 229 after `isComposing` has already cleared.
+    if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) return
+    event.preventDefault()
+    submitQuery()
+  }
+
+  const searchMarketLabel = t('market.scope.searchMarket', { q: trimmedQuery })
+  const catalogUpdated = catalog && catalogGeneratedAt ? formatIsoDate(catalogGeneratedAt) : ''
+  const searchLabel = catalog ? t('market.searchPlaceholder') : t('market.scope.livePlaceholder')
+
+  let emptyAction: { label: string; onClick: () => void }
+  if (catalog && hasQuery) emptyAction = { label: searchMarketLabel, onClick: searchAllMarkets }
+  else if (!catalog) emptyAction = { label: t('market.scope.backToCatalog'), onClick: backToCatalog }
+  else emptyAction = { label: t('market.retry'), onClick: () => void fetchList({ reset: true }) }
 
   return (
     <div
@@ -98,86 +147,112 @@ export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (
       data-testid="market-scroll"
       className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-[var(--color-surface)]"
     >
-      <div className="mx-auto flex w-full max-w-[1280px] flex-col px-6 pb-10 pt-7 lg:px-10">
-        <header className="flex flex-wrap items-start gap-x-[18px] gap-y-4">
-          <span className="flex h-14 w-14 flex-shrink-0 items-center justify-center rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-brand)] shadow-[var(--shadow-card)]">
-            <Store className="h-[26px] w-[26px]" strokeWidth={1.4} aria-hidden="true" />
-          </span>
-          <div className="min-w-0 flex-1">
-            <h1
-              style={{ fontFamily: 'var(--font-headline)' }}
-              className="text-[26px] font-bold leading-9 tracking-[-0.012em] text-[var(--color-text-primary)]"
-            >
-              {t('market.title')}
-            </h1>
-            <p className="mt-1 max-w-2xl text-[15px] leading-6 text-[var(--color-text-secondary)]">
-              {t('market.subtitle')}
-            </p>
-          </div>
-          {/* The live-source dots and the way out of the catalogue read as one
-              cluster: what the shelves are serving on top, what is already on
-              the reader's machine under it, both flush right so the header
-              keeps a single trailing edge. */}
-          <div className="flex flex-col items-end gap-2.5 pt-2">
-            <SourceStatusBar sources={sources} />
-            <Button
-              variant="secondary"
+      {/* One page surface from the search row to the last card, like the
+          plugins tab and the skill detail. The page head (title, description,
+          tabs) belongs to the extensions frame above; this view only names
+          itself for the document outline. */}
+      <div className={cx(EXTENSION_PAGE_COLUMN, 'flex flex-1 flex-col pb-10 pt-5')}>
+        <h2 className="sr-only">{t('market.title')}</h2>
+        <div className="flex flex-col gap-3">
+          <MarketDisclaimer />
+
+          <div className="flex flex-wrap items-center gap-2">
+            <SearchField
+              data-testid="market-search-input"
               size="md"
+              value={draft}
+              onChange={(value) => {
+                setDraft(value)
+                if (!composingRef.current) setQuery(value)
+              }}
+              onCompositionStart={() => {
+                composingRef.current = true
+              }}
+              onCompositionEnd={(event) => {
+                composingRef.current = false
+                setQuery(event.currentTarget.value)
+              }}
+              onKeyDown={handleSearchKeyDown}
+              enterKeyHint="search"
+              placeholder={searchLabel}
+              label={searchLabel}
+              clearLabel={t('market.clearSearch')}
+              // The clear button empties the box through `onChange`, which
+              // holds the query back mid-composition; commit it here instead.
+              onClear={() => {
+                if (!composingRef.current) return
+                composingRef.current = false
+                setQuery('')
+              }}
+              containerClassName="min-w-[240px] flex-1"
+            />
+            <FilterBar />
+            <Button
+              variant="ghost"
+              size="base"
               data-testid="market-installed-entry"
               title={t('market.installedSkillsHint')}
               onClick={openInstalledSkills}
-              className="gap-2 pr-3"
-              icon={
-                <Sparkles className="h-4 w-4 text-[var(--color-brand)]" strokeWidth={1.6} aria-hidden="true" />
-              }
+              icon={<ArrowUpRight size={14} strokeWidth={1.75} aria-hidden="true" />}
+              iconPosition="end"
             >
               {t('market.installedSkills')}
-              <ArrowUpRight
-                className="h-3.5 w-3.5 text-[var(--color-text-tertiary)]"
-                strokeWidth={1.8}
-                aria-hidden="true"
-              />
             </Button>
           </div>
-        </header>
 
-        <MarketDisclaimer />
-
-        <div className="mt-[22px] flex flex-wrap items-center gap-3">
-          {/* Kept hand-rolled rather than moved onto `SearchField`: the command
-              bar is a 44px field on the `--radius-lg` step, and the shared
-              component tops out at h-10 / `--radius-md`. Overriding both from a
-              className is the class fight components/AGENTS.md §3.6 warns about. */}
-          <div className="flex min-h-11 min-w-[240px] flex-1 items-center gap-2.5 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface)] px-4 transition-colors focus-within:border-[var(--color-border-focus)] focus-within:shadow-[var(--shadow-focus-ring)]">
-            <Search className="h-[15px] w-[15px] flex-shrink-0 text-[var(--color-text-tertiary)]" strokeWidth={1.6} aria-hidden="true" />
-            <input
-              data-testid="market-search-input"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={t('market.searchPlaceholder')}
-              aria-label={t('market.searchPlaceholder')}
-              className="min-w-0 flex-1 bg-transparent text-[14.5px] text-[var(--color-text-primary)] outline-none placeholder:text-[var(--color-text-tertiary)]"
-            />
-            {query && (
-              <IconButton
-                icon={<X className="h-3.5 w-3.5" strokeWidth={2} aria-hidden="true" />}
-                label={t('market.clearSearch')}
-                size="sm"
-                tone="muted"
-                onClick={() => setQuery('')}
-              />
-            )}
-          </div>
-          <FilterBar />
+          {/* Live results have no catalog categories to pick from. */}
+          {catalog && <CategoryBar categories={categories} value={category} onChange={setCategory} />}
         </div>
 
-        {featured}
+        <div className="mt-5 flex min-h-6 flex-wrap items-center justify-between gap-x-3 gap-y-2">
+          <p
+            data-testid="market-result-summary"
+            aria-live="polite"
+            className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[13px] font-semibold tabular-nums text-[var(--color-text-primary)]"
+          >
+            {/* No count while the first page is in flight: "0 results" would be a claim. */}
+            {!isLoading && !error && (
+              <span>
+                {catalog
+                  ? total !== null
+                    ? t('market.catalog.summary', { count: String(total) })
+                    : t('market.resultCount', { count: String(items.length) })
+                  : t('market.catalog.liveResults', { count: String(items.length) })}
+              </span>
+            )}
+            {catalogUpdated && (
+              <span className="text-xs font-normal text-[var(--color-text-tertiary)]">
+                {t('market.catalog.updated', { date: catalogUpdated })}
+              </span>
+            )}
+            {!catalog && (
+              <Badge tone="warning" size="sm" pill={false} data-testid="market-not-curated" className="self-center">
+                {t('market.scope.notCurated')}
+              </Badge>
+            )}
+          </p>
+          {/* Source health only describes live reads; the catalog is a shipped snapshot. */}
+          {!catalog && <SourceStatusBar sources={sources} />}
+        </div>
 
-        {!isLoading && items.length > 0 && (
-          <p className="mb-4 mt-5 text-sm tabular-nums text-[var(--color-text-secondary)]">
-            {t('market.resultCount', { count: String(items.length) })}
+        {hasQuery && (
+          <p
+            data-testid="market-scope-hint"
+            className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[var(--color-text-tertiary)]"
+          >
+            <span>{catalog ? t('market.scope.catalogHint') : t('market.scope.marketHint')}</span>
+            <Button
+              variant="link"
+              size="sm"
+              data-testid="market-scope-switch"
+              onClick={catalog ? searchAllMarkets : backToCatalog}
+            >
+              {catalog ? searchMarketLabel : t('market.scope.backToCatalog')}
+            </Button>
           </p>
         )}
+
+        {featured}
 
         {isLoading && (
           <MarketGridSkeleton
@@ -185,7 +260,7 @@ export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (
             label={t('market.loading')}
             count={skeletonCount}
             testId="market-loading"
-            className="mt-5"
+            className="mt-4"
           />
         )}
 
@@ -200,15 +275,18 @@ export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (
           <div
             role="alert"
             data-testid="market-error"
-            className="mt-5 flex flex-col items-center gap-3 rounded-[var(--radius-xl)] border border-dashed border-[var(--color-error-soft-hover)] bg-[var(--color-error-soft)] px-6 py-14 text-center"
+            className="mt-4 flex flex-col items-center gap-2 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-6 py-12 text-center"
           >
-            <CloudOff className="h-8 w-8 text-[var(--color-error)]" strokeWidth={1.7} aria-hidden="true" />
-            <p className="text-sm font-medium text-[var(--color-text-primary)]">{t('market.error.list')}</p>
+            <span className="mb-1 flex h-10 w-10 items-center justify-center rounded-[var(--radius-md)] bg-[var(--color-error-container)] text-[var(--color-on-error-container)]">
+              <CloudOff size={20} strokeWidth={1.75} aria-hidden="true" />
+            </span>
+            <p className="text-sm font-semibold text-[var(--color-text-primary)]">{t('market.error.list')}</p>
             <p className="max-w-md break-words text-xs text-[var(--color-text-tertiary)]">{error}</p>
             <Button
               variant="secondary"
-              className="mt-1"
-              icon={<RefreshCw className="h-3.5 w-3.5" strokeWidth={2} aria-hidden="true" />}
+              size="base"
+              className="mt-2"
+              icon={<RefreshCw size={14} strokeWidth={1.75} aria-hidden="true" />}
               onClick={() => void fetchList({ reset: true })}
             >
               {t('market.retry')}
@@ -217,21 +295,17 @@ export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (
         )}
 
         {!isLoading && !error && items.length === 0 && (
-          <div data-testid="market-empty" className="mt-5">
+          <div data-testid="market-empty" className="mt-4">
             <EmptyState
               size="lg"
               icon={
                 hasQuery || hasActiveFilters
-                  ? <PackageSearch size={24} strokeWidth={1.6} />
-                  : <Store size={24} strokeWidth={1.6} />
+                  ? <PackageSearch size={20} strokeWidth={1.75} />
+                  : <Store size={20} strokeWidth={1.75} />
               }
               title={hasQuery || hasActiveFilters ? t('market.emptySearch') : t('market.empty')}
               description={hasQuery || hasActiveFilters ? t('market.emptySearchHint') : t('market.emptyHint')}
-              action={
-                hasQuery
-                  ? { label: t('market.clearSearch'), onClick: () => setQuery('') }
-                  : { label: t('market.retry'), onClick: () => void fetchList({ reset: true }) }
-              }
+              action={emptyAction}
             />
           </div>
         )}
@@ -240,7 +314,7 @@ export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (
           <>
             <div
               ref={measureRef}
-              className="grid"
+              className="mt-4 grid"
               style={CATALOG_GRID_STYLE}
               data-testid="market-grid"
             >
@@ -248,8 +322,8 @@ export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (
                 <SkillCard
                   key={skill.id}
                   skill={skill}
-                  onOpen={(id) => void useMarketStore.getState().openDetail(id)}
-                  onInstall={onRequestInstall}
+                  onOpen={(id) => void useMarketStore.getState().openDetail(id, marketOwnerOf(skill))}
+                  onInstall={(id) => onRequestInstall(id, marketOwnerOf(skill))}
                   installing={installingIds.has(skill.id)}
                 />
               ))}
@@ -287,10 +361,10 @@ export function MarketHome({ onRequestInstall, featured }: { onRequestInstall: (
                 )}
 
                 {!canAutoLoad && !isLoadingMore && !loadMoreError && (
-                  <div className="flex justify-center pt-7">
+                  <div className="flex justify-center pt-6">
                     <Button
                       variant="secondary"
-                      size="lg"
+                      size="base"
                       data-testid="market-load-more"
                       onClick={() => void loadMore()}
                     >

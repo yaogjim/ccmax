@@ -38,8 +38,6 @@ You can name one directly ("use Explore to find…") or let Claude decide who to
 
 ## Seeing what's installed
 
-![Settings → Agents: the agent browser grouped by source (Chinese interface)](../../images/app/en/settings-agents.webp)
-
 Open **Settings → Agents**. Three cards at the top show total agents, how many are active, and how many sources are in play. Below that, agents are grouped by source in a fixed order:
 
 **User** → **Project** → **Local** → **Managed** → **Plugin** → **CLI arg** → **Built-in**
@@ -101,8 +99,6 @@ Things to know before relying on it:
 While it runs, the subagent's card in the conversation shows a "provider · model" badge saying where it actually ran.
 
 ## Writing your own
-
-![The Create Agent dialog: scope, model, effort, tools, system prompt (Chinese interface)](../../images/app/en/agent-create.webp)
 
 Click **Create Agent** in the top right. The fields:
 

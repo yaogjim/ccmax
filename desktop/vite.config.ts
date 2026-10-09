@@ -2,12 +2,13 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
+import { pdfjsAssets } from './scripts/vite-pdfjs-assets'
 
 const host = process.env.TAURI_DEV_HOST
 
 export default defineConfig({
   base: './',
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), pdfjsAssets()],
   build: {
     // Vite 8 defaults to baseline-widely-available (safari16.4+), which
     // requires macOS 13+. Tauri on macOS 12 uses Safari 15 WebView.

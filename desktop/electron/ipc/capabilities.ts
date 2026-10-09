@@ -13,6 +13,22 @@ const booleanPayload: Validator = value => typeof value === 'boolean'
 const hasOnlyKeys = (value: Record<string, unknown>, allowedKeys: string[]) =>
   Object.keys(value).every(key => allowedKeys.includes(key))
 
+const migrationPrepare: Validator = value =>
+  isRecord(value)
+  && hasOnlyKeys(value, ['targetDir'])
+  && typeof value.targetDir === 'string'
+  && value.targetDir.trim().length > 0
+  && value.targetDir.length <= 32_768
+  && !/[\u0000-\u001f\u007f]/.test(value.targetDir)
+
+const migrationIdentity: Validator = value =>
+  isRecord(value)
+  && hasOnlyKeys(value, ['id'])
+  && typeof value.id === 'string'
+  && value.id.length > 0
+  && value.id.length <= 200
+  && /^[A-Za-z0-9._:-]+$/.test(value.id)
+
 const MAX_TERMINAL_DIMENSION = 1_000
 const MAX_TERMINAL_CWD_LENGTH = 4_096
 const MAX_TERMINAL_WRITE_LENGTH = 1_048_576
@@ -199,14 +215,17 @@ const workspaceBrowserTab: Validator = value =>
   && hasOnlyKeys(value, ['tabId'])
   && isWorkspaceBrowserId(value.tabId)
 
+// `webContentsId` names the renderer's `<webview>` guest. It is only a claim:
+// the main process adopts it solely if it is a browser guest of the main window.
 const workspaceBrowserCreate: Validator = value =>
   isRecord(value)
-  && hasOnlyKeys(value, ['tabId', 'storageId', 'url', 'bounds', 'visible'])
+  && hasOnlyKeys(value, ['tabId', 'storageId', 'url', 'webContentsId'])
   && isWorkspaceBrowserId(value.tabId)
   && isWorkspaceBrowserId(value.storageId)
   && (value.url === undefined || (typeof value.url === 'string' && value.url.length <= 8_192))
-  && (value.bounds === undefined || boundsPayload(value.bounds))
-  && (value.visible === undefined || typeof value.visible === 'boolean')
+  && typeof value.webContentsId === 'number'
+  && Number.isSafeInteger(value.webContentsId)
+  && value.webContentsId > 0
 
 const workspaceBrowserMenuLabelKeys = ['find', 'print', 'zoom', 'zoomIn', 'zoomOut', 'zoomReset', 'capture', 'pickElement', 'downloads', 'history', 'openExternal']
 
@@ -239,12 +258,6 @@ const workspaceBrowserReload: Validator = value =>
   && hasOnlyKeys(value, ['tabId', 'ignoreCache'])
   && isWorkspaceBrowserId(value.tabId)
   && (value.ignoreCache === undefined || typeof value.ignoreCache === 'boolean')
-
-const workspaceBrowserSetBounds: Validator = value =>
-  isRecord(value)
-  && hasOnlyKeys(value, ['tabId', 'bounds'])
-  && isWorkspaceBrowserId(value.tabId)
-  && boundsPayload(value.bounds)
 
 const workspaceBrowserSetVisible: Validator = value =>
   isRecord(value)
@@ -332,7 +345,6 @@ export const ELECTRON_IPC_VALIDATORS = {
   [ELECTRON_IPC_CHANNELS.clipboardWriteText]: stringPayload,
   [ELECTRON_IPC_CHANNELS.shellOpen]: stringPayload,
   [ELECTRON_IPC_CHANNELS.shellOpenPath]: stringPayload,
-  [ELECTRON_IPC_CHANNELS.traceOpenWindow]: sessionIdPayload,
   [ELECTRON_IPC_CHANNELS.petsList]: noPayload,
   [ELECTRON_IPC_CHANNELS.petsCreateFromImage]: petCreateFromAtlas,
   [ELECTRON_IPC_CHANNELS.petsCreateFromAtlas]: petCreateFromAtlas,
@@ -386,13 +398,11 @@ export const ELECTRON_IPC_VALIDATORS = {
   [ELECTRON_IPC_CHANNELS.workspaceBrowserGoForward]: workspaceBrowserTab,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserReload]: workspaceBrowserReload,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserStop]: workspaceBrowserTab,
-  [ELECTRON_IPC_CHANNELS.workspaceBrowserSetBounds]: workspaceBrowserSetBounds,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserSetVisible]: workspaceBrowserSetVisible,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserSetZoom]: workspaceBrowserSetZoom,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserFind]: workspaceBrowserFind,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserStopFind]: workspaceBrowserTab,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserCapture]: workspaceBrowserCapture,
-  [ELECTRON_IPC_CHANNELS.workspaceBrowserSnapshot]: workspaceBrowserTab,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserMessage]: workspaceBrowserMessage,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserPrintToPdf]: workspaceBrowserTab,
   [ELECTRON_IPC_CHANNELS.workspaceBrowserClose]: workspaceBrowserTab,
@@ -400,6 +410,10 @@ export const ELECTRON_IPC_VALIDATORS = {
   [ELECTRON_IPC_CHANNELS.appModeSet]: optionalRecord,
   [ELECTRON_IPC_CHANNELS.appModePrepareRestart]: noPayload,
   [ELECTRON_IPC_CHANNELS.appModeRestart]: noPayload,
+  [ELECTRON_IPC_CHANNELS.migrationPrepare]: migrationPrepare,
+  [ELECTRON_IPC_CHANNELS.migrationStart]: migrationIdentity,
+  [ELECTRON_IPC_CHANNELS.migrationStatus]: noPayload,
+  [ELECTRON_IPC_CHANNELS.migrationCancel]: migrationIdentity,
   [ELECTRON_IPC_CHANNELS.adaptersRestartSidecar]: noPayload,
   [ELECTRON_IPC_CHANNELS.zoomSet]: zoomPayload,
   [ELECTRON_IPC_CHANNELS.appearanceSetApplied]: appliedAppearance,

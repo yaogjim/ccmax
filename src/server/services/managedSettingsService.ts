@@ -9,6 +9,10 @@ import { ensurePersistentStorageUpgraded } from './persistentStorageMigrations.j
 export class ManagedSettingsService {
   private static writeLocks = new Map<string, Promise<void>>()
 
+  static async drainForMigration(): Promise<void> {
+    await Promise.all([...this.writeLocks.values()])
+  }
+
   private getSettingsPath(): string {
     return path.join(resolveForkOwnedDir(), 'settings.json')
   }

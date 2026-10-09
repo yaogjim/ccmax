@@ -194,7 +194,7 @@ describe('ModelSelector', () => {
     },
   )
 
-  it('keeps the current Claude Official catalog visible when the API returns legacy settings models', async () => {
+  function renderClaudeOfficialWithLegacyModels() {
     const legacyModels: ModelInfo[] = [
       { id: 'claude-opus-4-7', name: 'Opus 4.7', description: 'Legacy Opus', context: '1m' },
       { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6', description: 'Legacy Sonnet', context: '200k' },
@@ -224,6 +224,11 @@ describe('ModelSelector', () => {
 
     const onRuntimeChange = vi.fn()
     render(<ModelSelector runtimeKey="session-claude-legacy" onRuntimeSelectionChange={onRuntimeChange} />)
+    return onRuntimeChange
+  }
+
+  it('keeps the current Claude Official catalog visible when the API returns legacy settings models', async () => {
+    const onRuntimeChange = renderClaudeOfficialWithLegacyModels()
 
     await clickByRole(/Opus 4\.7/i)
 
@@ -231,11 +236,26 @@ describe('ModelSelector', () => {
     expect(screen.getByRole('button', { name: /Opus 5\.5/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /^Opus 5 / })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Opus 4\.8/ })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Sonnet 5/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Sonnet 5\.5/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Sonnet 5 / })).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: /Opus 4\.7/ }).length).toBeGreaterThan(0)
     await clickByRole(/Opus 5\.5/)
     expect(onRuntimeChange).toHaveBeenCalledWith(expect.objectContaining({
       providerId: null, modelId: 'claude-opus-5-5',
+    }))
+  })
+
+  it('selects Sonnet 5.5 from the Claude Official catalog instead of the Sonnet 5 it supersedes', async () => {
+    const onRuntimeChange = renderClaudeOfficialWithLegacyModels()
+
+    await clickByRole(/Opus 4\.7/i)
+    await clickByRole(/Sonnet 5\.5/)
+
+    expect(onRuntimeChange).toHaveBeenCalledWith(expect.objectContaining({
+      providerId: null, modelId: 'claude-sonnet-5-5',
+    }))
+    expect(onRuntimeChange).not.toHaveBeenCalledWith(expect.objectContaining({
+      modelId: 'claude-sonnet-5',
     }))
   })
 
@@ -709,7 +729,10 @@ describe('ModelSelector', () => {
       .getAllByRole('button', { name: /deepseek-v4-pro/i })
       .find((button) => button.textContent?.includes('Sonnet Model'))
     expect(configuredOption).toBeDefined()
-    expect(configuredOption?.className).toContain('border-[var(--color-model-option-selected-border)]')
+    // 「素」 menu selection: the hover fill at rest plus the terracotta check.
+    expect(configuredOption).toHaveAttribute('aria-current', 'true')
+    expect(configuredOption?.className).toContain('bg-[var(--color-surface-hover)]')
+    expect(configuredOption?.querySelector('svg.lucide-check')).toHaveClass('text-[var(--color-brand)]')
   })
 
   it('closes the focus ring on both halves of the segmented control', () => {
@@ -737,8 +760,8 @@ describe('ModelSelector', () => {
     // The ring traces `border-radius`. Each half is rounded on one side only,
     // so without this the focused half drew a box that was round down one edge
     // and square down the other.
-    expect(modelHalf).toHaveClass('rounded-l-[var(--radius-md)]', 'focus-visible:rounded-[var(--radius-md)]')
-    expect(effortHalf).toHaveClass('rounded-r-[var(--radius-md)]', 'focus-visible:rounded-[var(--radius-md)]')
+    expect(modelHalf).toHaveClass('rounded-l-[var(--radius-sm)]', 'focus-visible:rounded-[var(--radius-sm)]')
+    expect(effortHalf).toHaveClass('rounded-r-[var(--radius-sm)]', 'focus-visible:rounded-[var(--radius-sm)]')
   })
 
   // On the phone composer this control sits between two 44px buttons and opens
@@ -1049,6 +1072,7 @@ describe('ModelSelector', () => {
     })
     useSettingsStore.setState({
       locale: 'en',
+      effortLevel: 'max',
       availableModels: openAIModels,
       currentModel: openAIModels[0],
       activeProviderName: 'ChatGPT Official',

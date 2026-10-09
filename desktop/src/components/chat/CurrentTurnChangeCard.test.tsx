@@ -68,7 +68,14 @@ vi.mock('@tauri-apps/plugin-shell', () => ({
 // Mock desktopRuntime.getServerBaseUrl
 vi.mock('../../lib/desktopRuntime', () => ({
   getServerBaseUrl: vi.fn(() => 'http://127.0.0.1:4321'),
+  isDesktopRuntime: () => false,
 }))
+
+const viewport = vi.hoisted(() => ({ mobile: false }))
+vi.mock('../../hooks/useMobileViewport', () => ({ useMobileViewport: () => viewport.mobile }))
+
+const turnDiff = vi.hoisted(() => ({ get: vi.fn() }))
+vi.mock('../../api/sessions', () => ({ sessionsApi: { getTurnCheckpointDiff: turnDiff.get } }))
 
 vi.mock('../../lib/systemFileOpen', () => ({
   openLocalFileWithSystem: openSystemFileSpy,
@@ -279,10 +286,13 @@ describe('CurrentTurnChangeCard – rich file row (icon / name / type)', () => {
 
     expect(screen.getByText('main.ts')).toBeInTheDocument()
     expect(screen.getByText('generated.ts')).toBeInTheDocument()
-    expect(screen.getByText('chat.turnChangesConversationOnlySubtitle')).toBeInTheDocument()
     // An unrestorable checkpoint must not cost the user the conversation
     // rollback too — the dialog is where the remaining action is chosen.
     const undoButton = screen.getByRole('button', { name: 'chat.turnChangesLatestUndoAria' })
+    // The limitation is the undo button's hint (its accessible description),
+    // not a line of grey text under the card.
+    expect(undoButton).toHaveAttribute('title', 'chat.turnChangesConversationOnlySubtitle')
+    expect(screen.queryByText('chat.turnChangesConversationOnlySubtitle')).toBeNull()
     expect(undoButton).toBeEnabled()
     fireEvent.click(undoButton)
     expect(onUndo).toHaveBeenCalledTimes(1)
@@ -332,8 +342,9 @@ describe('CurrentTurnChangeCard – rich file row (icon / name / type)', () => {
 
     expect(screen.queryByText('chat.turnChangesPartialCoverageSubtitle', { exact: false }))
       .toBeNull()
-    expect(screen.getByText('chat.turnChangesLatestSubtitle')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'chat.turnChangesLatestUndoAria' })).toBeEnabled()
+    const undoButton = screen.getByRole('button', { name: 'chat.turnChangesLatestUndoAria' })
+    expect(undoButton).toHaveAttribute('title', 'chat.turnChangesLatestSubtitle')
+    expect(undoButton).toBeEnabled()
   })
 
   it('prefers the conversation-only message over the coverage warning when restore is unavailable', () => {
@@ -341,10 +352,11 @@ describe('CurrentTurnChangeCard – rich file row (icon / name / type)', () => {
 
     // Both conditions hold, but "files cannot be restored at all" is the one
     // that changes what the user can do, so it wins the subtitle.
-    expect(screen.getByText('chat.turnChangesConversationOnlySubtitle')).toBeInTheDocument()
+    const undoButton = screen.getByRole('button', { name: 'chat.turnChangesLatestUndoAria' })
+    expect(undoButton).toHaveAttribute('title', 'chat.turnChangesConversationOnlySubtitle')
     expect(screen.queryByText('chat.turnChangesPartialCoverageSubtitle', { exact: false }))
       .toBeNull()
-    expect(screen.getByRole('button', { name: 'chat.turnChangesLatestUndoAria' })).toBeEnabled()
+    expect(undoButton).toBeEnabled()
   })
 })
 
@@ -407,6 +419,78 @@ describe('CurrentTurnChangeCard – row opens the workspace diff', () => {
   })
 })
 
+describe('CurrentTurnChangeCard – a document the workspace can draw', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    openPreviewSpy.mockResolvedValue(undefined)
+  })
+
+  it('opens the document itself rather than its diff, since a document has no line diff', () => {
+    renderExpandedCard(['/w/proj/out/thesis.pdf'])
+
+    fireEvent.click(screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ }))
+
+    // The turn's recorded change for a binary file is empty: the review view
+    // would open onto nothing. What the reader asked for is the document.
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', 'out/thesis.pdf', 'file', expect.objectContaining({ sourceTurnKey: 'msg-1' }))
+    expect(reviewOpenSpy).not.toHaveBeenCalled()
+    expect(openSystemFileSpy).not.toHaveBeenCalled()
+  })
+
+  it('opens a Word document itself too, not its diff', () => {
+    renderExpandedCard(['/w/proj/out/thesis.docx'])
+
+    fireEvent.click(screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ }))
+
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', 'out/thesis.docx', 'file', expect.objectContaining({ sourceTurnKey: 'msg-1' }))
+    expect(reviewOpenSpy).not.toHaveBeenCalled()
+    expect(openSystemFileSpy).not.toHaveBeenCalled()
+  })
+
+  it.each(['out/budget.xlsx', 'out/legacy.xls'])('opens an Excel workbook (%s) itself too, not its diff', (relative) => {
+    renderExpandedCard([`/w/proj/${relative}`])
+
+    fireEvent.click(screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ }))
+
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', relative, 'file', expect.objectContaining({ sourceTurnKey: 'msg-1' }))
+    expect(reviewOpenSpy).not.toHaveBeenCalled()
+    expect(openSystemFileSpy).not.toHaveBeenCalled()
+  })
+
+  it('labels the row as opening in the workspace, not as handing the file to another app', () => {
+    renderExpandedCard(['/w/proj/out/thesis.pdf'])
+
+    expect(screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /turnChangesOpenFileAria/ })).not.toBeInTheDocument()
+  })
+
+  it('opens one outside the workdir as a file too, as it does any other file there', () => {
+    renderExpandedCard(['/other/place/thesis.pdf'])
+
+    fireEvent.click(screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ }))
+
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', '/other/place/thesis.pdf', 'file', expect.objectContaining({ sourceTurnKey: 'msg-1' }))
+    expect(reviewOpenSpy).not.toHaveBeenCalled()
+  })
+
+  it('keeps a source file on its diff', () => {
+    renderExpandedCard(['/w/proj/src/main.ts'])
+
+    fireEvent.click(screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ }))
+
+    expect(reviewOpenSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a format without a viewer with the system application', () => {
+    renderExpandedCard(['/w/proj/out/launch.pptx'])
+
+    fireEvent.click(screen.getByRole('button', { name: /turnChangesOpenFileAria/ }))
+
+    expect(openSystemFileSpy).toHaveBeenCalledWith('/w/proj/out/launch.pptx')
+    expect(openPreviewSpy).not.toHaveBeenCalled()
+  })
+})
+
 describe('CurrentTurnChangeCard – open-with buttons', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -441,9 +525,12 @@ describe('CurrentTurnChangeCard – open-with buttons', () => {
   })
 
   it('shows the same destination chevron on every changed-file row', () => {
-    const { container } = renderExpandedCard(['/w/proj/README.md', '/w/proj/src/main.ts'])
+    renderExpandedCard(['/w/proj/README.md', '/w/proj/src/main.ts'])
 
-    expect(container.querySelectorAll('.lucide-chevron-right')).toHaveLength(2)
+    // The card header carries its own disclosure chevron; count the rows'.
+    const rows = screen.getAllByRole('button', { name: /turnChangesOpen(InWorkspace|File)Aria/ })
+    expect(rows).toHaveLength(2)
+    expect(rows.map((row) => row.querySelectorAll('.lucide-chevron-right').length)).toEqual([1, 1])
   })
 
   it('clicking README.md open-with opens menu with workspace preview item', async () => {
@@ -540,12 +627,12 @@ describe('CurrentTurnChangeCard – open-with buttons', () => {
     expect(getTargetsForPathMock).toHaveBeenCalledWith('/w/proj/README.md')
   })
 
-  it('opens an office changed file with the system application instead of the binary workspace preview', () => {
-    renderExpandedCard(['/w/proj/reports/brief.docx'])
+  it('opens an office changed file the workspace cannot draw with the system application instead of the binary workspace preview', () => {
+    renderExpandedCard(['/w/proj/reports/brief.pptx'])
 
     fireEvent.click(screen.getByRole('button', { name: /turnChangesOpenFileAria/ }))
 
-    expect(openSystemFileSpy).toHaveBeenCalledWith('/w/proj/reports/brief.docx')
+    expect(openSystemFileSpy).toHaveBeenCalledWith('/w/proj/reports/brief.pptx')
     expect(openPreviewSpy).not.toHaveBeenCalled()
   })
 
@@ -574,7 +661,8 @@ describe('CurrentTurnChangeCard – conversation continuity', () => {
   it('truthfully labels a historical row as opening the current workspace diff', () => {
     renderExpandedCard(['/w/proj/src/main.ts'], false)
 
-    expect(screen.getByText('chat.turnChangesCurrentWorkspaceDiff')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'chat.turnChangesHistoricalUndoAria' }))
+      .toHaveAttribute('title', 'chat.turnChangesCurrentWorkspaceDiff')
   })
 
   it('records a stable opener id and semantic turn key before opening the diff', () => {
@@ -635,5 +723,44 @@ describe('CurrentTurnChangeCard – collapse long file lists', () => {
     fireEvent.click(showLess)
     expect(screen.getAllByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })).toHaveLength(5)
     expect(screen.getByText('chat.turnChangesShowMore')).toBeInTheDocument()
+  })
+})
+
+describe('CurrentTurnChangeCard on a phone', () => {
+  beforeEach(() => {
+    viewport.mobile = true
+    turnDiff.get.mockReset()
+    reviewOpenSpy.mockClear()
+  })
+  afterEach(() => {
+    viewport.mobile = false
+    cleanup()
+  })
+
+  it('opens the turn\'s change to a file in a full-height sheet, since there is no workspace beside the chat', async () => {
+    turnDiff.get.mockImplementation(async (_session: string, _turn: string, path: string) => ({
+      state: 'ok',
+      path,
+      diff: `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old line in ${path}\n+new line in ${path}\n`,
+    }))
+    renderExpandedCard(['src/todo.ts', 'test/todo.test.ts'])
+
+    fireEvent.click(screen.getByTitle('src/todo.ts'))
+
+    expect(reviewOpenSpy).not.toHaveBeenCalled()
+    expect(turnDiff.get).toHaveBeenCalledWith('s1', 'msg-1', 'src/todo.ts', 0, true)
+    expect(await screen.findByText(/new line in src\/todo\.ts/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'mobile.diff.next' }))
+    expect(await screen.findByText(/new line in test\/todo\.test\.ts/)).toBeInTheDocument()
+  })
+
+  it('says when a file has no line change to show', async () => {
+    turnDiff.get.mockResolvedValue({ state: 'ok', path: 'docs/spec.docx' })
+    renderExpandedCard(['docs/spec.docx'])
+
+    fireEvent.click(screen.getByTitle('docs/spec.docx'))
+
+    expect(await screen.findByText('mobile.diff.empty')).toBeInTheDocument()
   })
 })

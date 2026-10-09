@@ -39,7 +39,7 @@ describe('SystemSettings', () => {
     expect(screen.getByRole('switch', { name: 'Terminal' })).not.toBeChecked()
     expect(screen.getByRole('switch', { name: 'IM Adapters' })).not.toBeChecked()
     expect(screen.getByRole('switch', { name: 'Pets' })).not.toBeChecked()
-    expect(screen.getByRole('switch', { name: 'Trace' })).not.toBeChecked()
+    expect(screen.queryByRole('switch', { name: 'Trace' })).not.toBeInTheDocument()
     expect(screen.getByRole('switch', { name: 'Diagnostics' })).not.toBeChecked()
     expect(screen.getByRole('switch', { name: 'About' })).not.toBeChecked()
     expect(screen.getByRole('switch', { name: 'Skills Market' })).not.toBeChecked()
@@ -54,19 +54,19 @@ describe('SystemSettings', () => {
       preferences: {
         settingsNavigation: {
           ...DEFAULT_SETTINGS_NAVIGATION_PREFERENCES,
-          trace: true,
+          diagnostics: true,
         },
       },
     })
 
     render(<SystemSettings />)
-    fireEvent.click(screen.getByRole('switch', { name: 'Trace' }))
+    fireEvent.click(screen.getByRole('switch', { name: 'Diagnostics' }))
 
     await waitFor(() => {
-      expect(updateSettingsNavigationPreferences).toHaveBeenCalledWith({ trace: true })
+      expect(updateSettingsNavigationPreferences).toHaveBeenCalledWith({ diagnostics: true })
     })
-    expect(useSettingsNavigationStore.getState().preferences.trace).toBe(true)
-    expect(screen.getByRole('switch', { name: 'Trace' })).toBeChecked()
+    expect(useSettingsNavigationStore.getState().preferences.diagnostics).toBe(true)
+    expect(screen.getByRole('switch', { name: 'Diagnostics' })).toBeChecked()
   })
 
   it('persists the sidebar market toggle and URL', async () => {

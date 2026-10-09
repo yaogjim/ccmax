@@ -66,6 +66,13 @@ export function TelegramPublicSettings() {
   const [statusError, setStatusError] = useState('')
   const [isStatusLoading, setIsStatusLoading] = useState(false)
   const statusRequest = useRef(0)
+  const saveStatusTimer = useRef<number | null>(null)
+
+  useEffect(() => () => {
+    if (saveStatusTimer.current === null) return
+    window.clearTimeout(saveStatusTimer.current)
+    saveStatusTimer.current = null
+  }, [])
 
   useEffect(() => {
     setEnabled(publicConfig?.enabled === true)
@@ -128,7 +135,11 @@ export function TelegramPublicSettings() {
         },
       })
       setSaveStatus('saved')
-      window.setTimeout(() => setSaveStatus('idle'), 2000)
+      if (saveStatusTimer.current !== null) window.clearTimeout(saveStatusTimer.current)
+      saveStatusTimer.current = window.setTimeout(() => {
+        saveStatusTimer.current = null
+        setSaveStatus('idle')
+      }, 2000)
       await refreshStatus()
     } catch (err) {
       setActionError(errorMessage(err, t('settings.adapters.telegramPublic.saveError')))
@@ -180,7 +191,7 @@ export function TelegramPublicSettings() {
   return (
     <section aria-labelledby="telegram-public-title" className="space-y-5">
       <div>
-        <h3 id="telegram-public-title" className="text-base font-semibold text-[var(--color-text-primary)]">
+        <h3 id="telegram-public-title" className="text-[15px] font-semibold text-[var(--color-text-primary)]">
           {t('settings.adapters.publicSubscriptionsTab')}
         </h3>
         <p className="mt-1 text-xs leading-5 text-[var(--color-text-secondary)]">
@@ -294,7 +305,7 @@ export function TelegramPublicSettings() {
             </div>
             {pairingCode && (
               <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono text-xl font-bold tracking-[0.3em] text-[var(--color-brand)]">
+                <span className="font-mono text-[22px] text-[var(--color-brand)]">
                   {pairingCode}
                 </span>
                 <CopyButton

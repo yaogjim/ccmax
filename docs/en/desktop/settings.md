@@ -19,8 +19,6 @@ You'll come here once during setup and rarely again. Full steps in [Connecting a
 
 General covers four areas: appearance and replies, how the agent works, network and notifications, and local data. Check the first two before your first session; adjust the others when you need them.
 
-![Settings → General: color themes, language, output style, default permissions (Chinese interface)](../../images/app/en/settings-general.webp)
-
 ### Before your first session: permissions and replies
 
 | Setting | What to choose | When it takes effect |
@@ -48,7 +46,7 @@ General covers four areas: appearance and replies, how the agent works, network 
 | Agent Teams | On by default. Use it when a larger task needs several agents working together. New sessions pick it up; existing sessions do after an app restart. See [Subagents](./agents.md) first. |
 | Auto-answer questions | Off by default. After 1, 5, 10, or 30 minutes without an answer to an agent's multiple-choice question, it can choose a recommended option. If it cannot choose reliably, it keeps waiting. Use only when you want unattended work to continue. |
 | Auto-dream | Off by default. After enough sessions have accumulated, it can organize auto-memory in the background, using additional model calls and tokens. |
-| Agent Trace | On by default. New sessions write condensed request, response, and status events to a local traces directory. Use the **Trace** tab to investigate a failure; turning it off stops new records, while old ones remain readable. |
+| Agent Trace | On by default. New sessions write raw request, response, and status events to a local traces directory. To investigate a failure, open an assistant line in the session's **Trajectory** and switch to its **Raw request** tab; turning it off stops new records, while old ones remain readable. |
 
 ### Network, web search, and notifications
 
@@ -61,9 +59,7 @@ General covers four areas: appearance and replies, how the agent works, network 
 ### Local data: check the effect before changing it
 
 - **Session retention** defaults to 365 days and accepts 0–3650 days. Reducing it immediately removes older records; setting 0 removes all existing records and stops recording session contents. The UI previews and confirms the change. This is not a backup system.
-- **Data Storage Location** defaults to `~/.claude` (`%USERPROFILE%\\.claude` on Windows). Portable mode takes an absolute path outside the app installation folder. After an app restart, sessions, configuration, tasks, skills, and plugins are read from the new location. The two directories are not merged or migrated automatically. If `CLAUDE_CONFIG_DIR` is set at launch, remove that environment variable before switching locations in the UI.
-
-Product screenshots in this guide consistently use the **Pure White** theme so the interface can be compared without palette changes.
+- **Data Storage Location** defaults to `~/.claude` (`%USERPROFILE%\\.claude` on Windows). Portable mode takes an absolute path outside the app installation folder. Changing the location in **Settings → General** stages, verifies, migrates credentials and restarts instead of moving files directly; a journal can recover from an interruption, and IM sidecars are quiesced first. If `CLAUDE_CONFIG_DIR` is set at launch, remove that environment variable before switching locations in the UI.
 
 ## H5 Access
 
@@ -75,7 +71,7 @@ Talk to Claude from WeChat, DingTalk, WhatsApp, Telegram, Feishu, WeCom, QQ, or 
 
 ## Terminal
 
-A real host shell embedded in the app, for installing plugins, skills, MCP servers, and anything else that needs a command line. The desktop app bundles `claude-haha`, so anywhere the docs say `claude <args>` you can run `claude-haha <args>`.
+A real host shell embedded in the app, for installing plugins, skills, MCP servers, and anything else that needs a command line. The desktop app bundles `ccmax`, so anywhere the docs say `claude <args>` you can run `ccmax <args>`. Compatibility aliases `claude-haha` / `cc-haha` still work.
 
 On Windows you can also choose the startup shell (system default, PowerShell 7, Windows PowerShell, Command Prompt, or a custom executable) and set a Bash path — used when a tool calls Unix commands like `grep` or `sed`, usually pointing at Git Bash.
 
@@ -119,19 +115,11 @@ Let Claude read the screen, click, and type. Enable it, confirm the global conse
 
 ## Token usage
 
-![Settings → Token usage: heatmap and stat cards (Chinese interface)](../../images/app/en/settings-usage.webp)
-
 A usage dashboard computed from the Claude Code session records on this machine. Everything is calculated locally and nothing is uploaded.
 
 - Across the top: total tokens, peak tokens, longest task, current and longest streak.
 - In the middle: a heatmap with daily, weekly, and cumulative views. Click a day for that day's sessions, tokens, messages, and tool calls.
 - Below: activity insights — active rate, most-used model, skills used, fresh versus cache-hit token split, and estimated cost. Estimated cost excludes models with no known price, and the UI says how many were skipped.
-
-## Trace
-
-Records the model request chain for each session — requests, responses, status events, timings — for debugging stalls, failures, and unexplained waits. The switch is in **Settings → General** and is on by default; new sessions produce new records.
-
-Once enabled, new sessions write condensed records to a local traces directory. Existing records stay readable after you turn it off; only new ones stop being written. The trace list supports search, filtering (all / LLM / tools / errors), opening a trace in its own window, and deleting a session's trace without touching its chat history.
 
 ## Diagnostics
 

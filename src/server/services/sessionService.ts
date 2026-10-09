@@ -572,6 +572,21 @@ type SessionListSummaryCacheEntry = {
   summary: SessionListSummary
 }
 
+/** Index rows minus the transcripts the index could not project, which are read from disk. */
+type DegradedListPlan = {
+  excludedPaths: ReadonlySet<string>
+  revision: string
+}
+
+/** The index's own list order: modified_at_ms DESC, session_id ASC, transcript_path ASC. */
+function compareIndexedListRows(left: IndexedSessionRow, right: IndexedSessionRow): number {
+  const byTime = Date.parse(right.modifiedAt) - Date.parse(left.modifiedAt)
+  if (byTime) return byTime
+  if (left.id !== right.id) return left.id < right.id ? -1 : 1
+  if (left.transcriptPath !== right.transcriptPath) return left.transcriptPath < right.transcriptPath ? -1 : 1
+  return 0
+}
+
 const DEFAULT_SESSION_LIST_CACHE_MAX_ENTRIES = 16
 const DEFAULT_SESSION_LIST_SUMMARY_CACHE_MAX_ENTRIES = 20_000
 
@@ -711,6 +726,11 @@ export class SessionService {
     }>
   >()
   private readonly taskNotificationMutationEpochs = new Map<string, number>()
+
+  async drainForMigration(): Promise<void> {
+    const writes = [...this.pendingTaskNotificationWrites.values()].flatMap(entries => [...entries].map(entry => entry.promise))
+    await Promise.all(writes)
+  }
   private readonly clearingTaskNotificationSessions = new Set<string>()
 
   private readonly localIndexGateway: LocalIndexGateway
@@ -919,23 +939,7 @@ export class SessionService {
       return null
     }
 
-    const sharedState = getSharedSessionMutationState(this.localIndexGateway)
-    if (sharedState.bypass !== null) {
-      if (
-        status.state !== 'ready' ||
-        status.lastUpdatedAt === sharedState.bypass.completionMarker
-      ) {
-        return null
-      }
-      if (sharedState.bypass.requiresAdditionalCompletion) {
-        sharedState.bypass = {
-          completionMarker: status.lastUpdatedAt,
-          requiresAdditionalCompletion: false,
-        }
-        return null
-      }
-      sharedState.bypass = null
-    }
+    if (!this.passesMutationBypass(status, status.state === 'ready')) return null
 
     if (status.state === 'off' || status.state === 'degraded') return null
     try {
@@ -947,6 +951,93 @@ export class SessionService {
       return null
     }
     return mode
+  }
+
+  /**
+   * After an app mutation, index reads wait until the index completes a
+   * reconciliation that started after it. `servable` says whether the current
+   * snapshot could be served at all once that has happened.
+   */
+  private passesMutationBypass(status: LocalIndexStatus, servable: boolean): boolean {
+    const sharedState = getSharedSessionMutationState(this.localIndexGateway)
+    if (sharedState.bypass === null) return true
+    if (!servable || status.lastUpdatedAt === sharedState.bypass.completionMarker) {
+      return false
+    }
+    if (sharedState.bypass.requiresAdditionalCompletion) {
+      sharedState.bypass = {
+        completionMarker: status.lastUpdatedAt,
+        requiresAdditionalCompletion: false,
+      }
+      return false
+    }
+    sharedState.bypass = null
+    return true
+  }
+
+  /**
+   * A degraded index whose failures all belong to individual transcripts is
+   * still a complete snapshot of every other transcript. Session lists keep
+   * serving it and read only those transcripts from disk, instead of scanning
+   * every JSONL because a handful could not be projected. Only called once
+   * `getUsableIndexMode()` has declined the index.
+   */
+  private getDegradedListPlan(): DegradedListPlan | null {
+    const gateway = this.localIndexGateway
+    if (!gateway.getSourceScopedFailurePaths) return null
+    try {
+      if (gateway.getMode() !== 'on' || this.now() < this.indexFailureCooldownUntil) return null
+      const status = gateway.getPublicStatus()
+      if (status.state !== 'degraded') return null
+      const failedPaths = gateway.getSourceScopedFailurePaths()
+      if (!failedPaths) return null
+      if (!this.passesMutationBypass(status, true)) return null
+      const excludedPaths = new Set(failedPaths.map(filePath => path.resolve(filePath)))
+      return {
+        excludedPaths,
+        revision: JSON.stringify([status.lastUpdatedAt, [...excludedPaths].sort()]),
+      }
+    } catch {
+      this.markIndexReadFailure()
+      return null
+    }
+  }
+
+  /** Whether a degraded-list read may still trust the rows it has collected. */
+  private degradedListRemainsServable(): boolean {
+    try {
+      const status = this.localIndexGateway.getPublicStatus()
+      if (status.state === 'off') return false
+      if (status.state !== 'degraded') return true
+      return this.localIndexGateway.getSourceScopedFailurePaths?.() != null
+    } catch {
+      return false
+    }
+  }
+
+  /** Rows for excluded root transcripts, summarized from disk like the file-mode list. */
+  private async readExcludedTranscriptRows(
+    plan: DegradedListPlan,
+    scope: string,
+    projectDir?: string,
+  ): Promise<IndexedSessionRow[]> {
+    const projectsDir = path.resolve(this.getProjectsDir())
+    const projectsRoot = await fs.realpath(projectsDir)
+    const rows: IndexedSessionRow[] = []
+    for (const filePath of plan.excludedPaths) {
+      const physicalProjectDir = path.basename(path.dirname(filePath))
+      if (path.dirname(path.dirname(filePath)) !== projectsDir) continue
+      if (projectDir !== undefined && physicalProjectDir !== projectDir) continue
+      const sessionId = path.basename(filePath, '.jsonl')
+      try {
+        const stat = await this.validateIndexedTranscriptPath(filePath, physicalProjectDir, sessionId, projectsRoot)
+        const summary = await this.getCachedSessionListSummary(filePath, physicalProjectDir, stat, scope)
+        if (!summary.isTeamWorker) {
+          rows.push({ ...summary, id: sessionId, projectPath: physicalProjectDir, transcriptPath: filePath })
+        }
+      } catch { /* Deleted or unreadable, like the file-mode list. */ }
+    }
+    return rows
   }
 
   private indexStatusRemainsUsable(): boolean {
@@ -1133,24 +1224,22 @@ export class SessionService {
 
     const mutationEpoch = getSharedSessionMutationState(this.localIndexGateway).epoch
     try {
+      // A missing page (source not indexed yet) or an unverifiable/over-budget
+      // read concerns this transcript only: fall back to reading it, without
+      // cooling down index reads for every other session. Read failures are
+      // reported by the gateway itself and still reach the catch below.
       const page = this.localIndexGateway.getSessionEntryLocators(
         found.filePath,
         entryTypes,
       )
-      if (!page) {
-        this.markIndexReadFailure()
-        return null
-      }
+      if (!page) return null
       const result = await this.targetedEntryReader({
         transcriptPath: found.filePath,
         projectsRoot: this.getProjectsDir(),
         expectedProjectDir: found.projectDir,
         page,
       })
-      if (!result) {
-        this.markIndexReadFailure()
-        return null
-      }
+      if (!result) return null
       if (
         mutationEpoch !== getSharedSessionMutationState(this.localIndexGateway).epoch ||
         !this.indexStatusRemainsUsable()
@@ -1820,18 +1909,43 @@ export class SessionService {
   }
 
   private async fileHasConversationTranscript(filePath: string): Promise<boolean> {
-    let hasTranscript = false
-    const scan = await withHistoryReadBudget(undefined, () => streamBoundedHistory(
-      filePath,
-      entry => {
-        if (!hasTranscript && this.hasConversationTranscript([entry as RawEntry])) hasTranscript = true
-      },
-      undefined,
-      { maxRecordBytes: HISTORY_SEMANTIC_RECORD_BYTES },
-    ), 'metadata')
-    // An oversized record may be the only conversation turn. Prefer that
-    // transcript over a newer metadata-only placeholder until it can be read.
-    return hasTranscript || scan.oversizedRecords > 0
+    // The first conversation record settles the answer. Scanning on would make
+    // every session lookup cost a full parse of the transcript.
+    const found = new AbortController()
+    try {
+      const scan = await withHistoryReadBudget(undefined, () => streamBoundedHistory(
+        filePath,
+        entry => {
+          if (this.hasConversationTranscript([entry as RawEntry])) found.abort()
+        },
+        found.signal,
+        { maxRecordBytes: HISTORY_SEMANTIC_RECORD_BYTES },
+      ), 'metadata')
+      // An oversized record may be the only conversation turn. Prefer that
+      // transcript over a newer metadata-only placeholder until it can be read.
+      // A final line without a newline is reported after the last abort check.
+      return found.signal.aborted || scan.oversizedRecords > 0
+    } catch (error) {
+      if (found.signal.aborted && error === found.signal.reason) return true
+      throw error
+    }
+  }
+
+  /** Content is only needed to choose between several files for one session. */
+  private async rankSessionFileMatches<T extends { filePath: string; mtimeMs: number }>(
+    matches: T[],
+    onReadError: (error: unknown) => 'drop' | 'fail',
+  ): Promise<T[] | null> {
+    if (matches.length < 2) return matches
+    const ranked: Array<T & { hasTranscript: boolean }> = []
+    for (const match of matches) {
+      try {
+        ranked.push({ ...match, hasTranscript: await this.fileHasConversationTranscript(match.filePath) })
+      } catch (error) {
+        if (onReadError(error) === 'fail') return null
+      }
+    }
+    return ranked.sort((a, b) => Number(b.hasTranscript) - Number(a.hasTranscript) || b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath))
   }
 
   // --------------------------------------------------------------------------
@@ -1974,17 +2088,6 @@ export class SessionService {
     )
   }
 
-  private isToolResultContent(content: unknown): boolean {
-    return (
-      Array.isArray(content) &&
-      content.some((block) =>
-        block &&
-        typeof block === 'object' &&
-        (block as Record<string, unknown>).type === 'tool_result'
-      )
-    )
-  }
-
   private isTaskNotificationContent(content: unknown): boolean {
     const textBlocks = this.extractTextBlocks(content)
     return (
@@ -2049,6 +2152,36 @@ export class SessionService {
       ...(outputFile ? { outputFile } : {}),
       ...(timestamp ? { timestamp } : {}),
     }
+  }
+
+  // A notification the CLI drains while a turn is running is recorded as a
+  // queued_command attachment instead of a user turn, and one that was queued
+  // but never delivered (e.g. the session exited first) only as a
+  // queue-operation. For a session the desktop never ran, these are the only
+  // records that the task finished.
+  private parseQueuedTaskNotification(
+    entry: RawEntry,
+  ): SessionTaskNotification | null {
+    if (entry.type === 'queue-operation') {
+      return this.parseTaskNotificationContent(entry.content, entry.timestamp)
+    }
+    if (entry.type !== 'attachment') return null
+    const attachment = entry.attachment
+    if (
+      !attachment ||
+      typeof attachment !== 'object' ||
+      Array.isArray(attachment)
+    ) {
+      return null
+    }
+    const record = attachment as Record<string, unknown>
+    if (
+      record.type !== 'queued_command' ||
+      record.commandMode === 'prompt'
+    ) {
+      return null
+    }
+    return this.parseTaskNotificationContent(record.prompt, entry.timestamp)
   }
 
   private parsePersistedTaskNotification(
@@ -2664,8 +2797,10 @@ export class SessionService {
           const projectsRoot = indexedMatches.length > 0
             ? await fs.realpath(this.getProjectsDir())
             : null
-          const hydratedMatches: Array<SessionFileMatch & { mtimeMs: number; hasTranscript: boolean }> = []
+          const hydratedMatches: Array<SessionFileMatch & { mtimeMs: number }> = []
           let hydrationFailed = false
+          const failUnlessMissing = (error: unknown) =>
+            (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'drop' as const : 'fail' as const
           for (const match of indexedMatches) {
             try {
               const stat = await this.validateIndexedTranscriptPath(
@@ -2674,26 +2809,24 @@ export class SessionService {
                 sessionId,
                 projectsRoot!,
               )
-              hydratedMatches.push({
-                ...match,
-                mtimeMs: stat.mtimeMs,
-                hasTranscript: await this.fileHasConversationTranscript(match.filePath),
-              })
+              hydratedMatches.push({ ...match, mtimeMs: stat.mtimeMs })
             } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+              if (failUnlessMissing(error) === 'fail') {
                 hydrationFailed = true
                 break
               }
             }
           }
+          const rankedMatches = hydrationFailed
+            ? null
+            : await this.rankSessionFileMatches(hydratedMatches, failUnlessMissing)
+          if (!rankedMatches) hydrationFailed = true
           if (
-            !hydrationFailed &&
-            hydratedMatches.length > 0 &&
+            rankedMatches &&
+            rankedMatches.length > 0 &&
             indexedMutationEpoch === getSharedSessionMutationState(this.localIndexGateway).epoch
           ) {
-            return hydratedMatches
-              .sort((a, b) => Number(b.hasTranscript) - Number(a.hasTranscript) || b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath))
-              .map(({ filePath, projectDir }) => ({ filePath, projectDir }))
+            return rankedMatches.map(({ filePath, projectDir }) => ({ filePath, projectDir }))
           }
           if (hydrationFailed) this.markIndexReadFailure()
         }
@@ -2719,25 +2852,19 @@ export class SessionService {
       return []
     }
 
-    const matches: Array<{ filePath: string; projectDir: string; mtimeMs: number; hasTranscript: boolean }> = []
+    const matches: Array<{ filePath: string; projectDir: string; mtimeMs: number }> = []
     for (const dir of projectDirs) {
       const filePath = path.join(projectsDir, dir, `${sessionId}.jsonl`)
       try {
         const stat = await fs.stat(filePath)
-        matches.push({
-          filePath,
-          projectDir: dir,
-          mtimeMs: stat.mtimeMs,
-          hasTranscript: await this.fileHasConversationTranscript(filePath),
-        })
+        matches.push({ filePath, projectDir: dir, mtimeMs: stat.mtimeMs })
       } catch {
         continue
       }
     }
 
-    return matches
-      .sort((a, b) => Number(b.hasTranscript) - Number(a.hasTranscript) || b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath))
-      .map(({ filePath, projectDir }) => ({ filePath, projectDir }))
+    const ranked = await this.rankSessionFileMatches(matches, () => 'drop')
+    return ranked!.map(({ filePath, projectDir }) => ({ filePath, projectDir }))
   }
 
   async findSessionFile(
@@ -3354,29 +3481,39 @@ export class SessionService {
     this.prepareSessionListCaches(scope)
     const indexed = this.getUsableIndexMode() === 'on'
     const status = indexed ? this.localIndexGateway.getPublicStatus() : null
+    const degradedPlan = indexed ? null : this.getDegradedListPlan()
     return JSON.stringify([scope, this.sessionListCacheGeneration,
       indexed && (status?.state === 'ready' || status?.state === 'building')
         ? status.lastUpdatedAt
-        : 'files'])
+        : degradedPlan
+          ? ['degraded', degradedPlan.revision]
+          : 'files'])
   }
 
   private async loadProjectHistoryRows(): Promise<ProjectHistoryRow[]> {
     const scope = this.getConfigDir()
     let indexedRows: IndexedSessionRow[] | null = null
-    if (this.getUsableIndexMode() === 'on') {
+    const indexed = this.getUsableIndexMode() === 'on'
+    const degradedPlan = indexed ? null : this.getDegradedListPlan()
+    if (indexed || degradedPlan) {
       const status = this.localIndexGateway.getPublicStatus()
-      if (status.state === 'ready' || status.state === 'building') {
+      if (degradedPlan || status.state === 'ready' || status.state === 'building') {
         try {
           indexedRows = []
           // No await between index pages: a coordinator projection cannot shift
           // the order while this synchronous metadata snapshot is collected.
           for (let offset = 0; ; offset += 500) {
             const page = this.localIndexGateway.listSessions({ limit: 500, offset })
-            if (!this.indexStatusRemainsUsable()) throw new Error('Index unavailable')
-            indexedRows.push(...page.sessions)
+            if (degradedPlan ? !this.degradedListRemainsServable() : !this.indexStatusRemainsUsable()) {
+              throw new Error('Index unavailable')
+            }
+            indexedRows.push(...degradedPlan
+              ? page.sessions.filter(row => !degradedPlan.excludedPaths.has(path.resolve(row.transcriptPath)))
+              : page.sessions)
             if (offset + page.sessions.length >= page.total) break
             if (page.sessions.length === 0) break
           }
+          if (degradedPlan) indexedRows.push(...await this.readExcludedTranscriptRows(degradedPlan, scope))
         } catch {
           this.markIndexReadFailure()
           indexedRows = null
@@ -3487,6 +3624,11 @@ export class SessionService {
 
     const indexMode = this.getUsableIndexMode()
     if (indexMode === null) {
+      const degradedPlan = this.getDegradedListPlan()
+      if (degradedPlan) {
+        const degraded = await this.tryListSessionsFromDegradedIndex(options, degradedPlan)
+        if (degraded) return degraded
+      }
       return this.listSessionsFromFiles(options)
     }
 
@@ -3588,11 +3730,10 @@ export class SessionService {
       const status = this.localIndexGateway.getPublicStatus()
       if (requireReady && status.state !== 'ready') return null
       if (indexedPage.sessions.length === 0) {
-        // Building must not fall through to a full JSONL scan. The sidebar
-        // already treats an empty building page as loading.
-        return status.state === 'building'
-          ? { sessions: [], total: indexedPage.total }
-          : null
+        // A usable index owns empty pages too (including an exhausted offset,
+        // a zero limit or a project without matches). Scanning history cannot
+        // fill those pages and makes a cold empty query parse every transcript.
+        return { sessions: [], total: indexedPage.total }
       }
 
       const sessions: SessionListItem[] = []
@@ -3622,6 +3763,63 @@ export class SessionService {
           : null
       }
       return { sessions, total: indexedPage.total }
+    } catch {
+      this.markIndexReadFailure()
+      return null
+    }
+  }
+
+  /**
+   * The index page for a degraded snapshot: every index row except the
+   * excluded transcripts, plus those transcripts summarized from disk, merged
+   * in the index's own order before paginating.
+   */
+  private async tryListSessionsFromDegradedIndex(
+    options: { project?: string; limit?: number; offset?: number } | undefined,
+    plan: DegradedListPlan,
+  ): Promise<{ sessions: SessionListItem[]; total: number } | null> {
+    const mutationEpoch = getSharedSessionMutationState(this.localIndexGateway).epoch
+    const scope = this.getConfigDir()
+    this.prepareSessionListCaches(scope)
+    const project = options?.project
+      ? this.sanitizePath(normalizeDriveRootPathForPlatform(options.project))
+      : undefined
+    try {
+      const rows: IndexedSessionRow[] = []
+      for (let offset = 0; ; offset += 500) {
+        const page = this.localIndexGateway.listSessions({
+          ...(project !== undefined ? { project } : {}),
+          limit: 500,
+          offset,
+        })
+        if (!this.degradedListRemainsServable()) {
+          this.markIndexReadFailure()
+          return null
+        }
+        rows.push(...page.sessions.filter(row => !plan.excludedPaths.has(path.resolve(row.transcriptPath))))
+        if (offset + page.sessions.length >= page.total || page.sessions.length === 0) break
+      }
+      rows.push(...await this.readExcludedTranscriptRows(plan, scope, project))
+      if (rows.length === 0) return null
+      rows.sort(compareIndexedListRows)
+
+      // Same defaults as the index and file lists.
+      const offset = options?.offset ?? 0
+      const limit = options?.limit ?? 50
+      const sessions: SessionListItem[] = []
+      const pathExists = this.createCachedPathExists()
+      const projectsRoot = await fs.realpath(this.getProjectsDir())
+      for (const row of rows.slice(offset, offset + limit)) {
+        try {
+          await this.validateIndexedTranscriptPath(row.transcriptPath, row.projectPath, row.id, projectsRoot)
+          sessions.push(await this.hydrateIndexedSession(row, pathExists))
+        } catch {
+          // Drop a single stale/unreadable row, like the healthy index list.
+        }
+      }
+      if (mutationEpoch !== getSharedSessionMutationState(this.localIndexGateway).epoch) return null
+      if (sessions.length === 0) return null
+      return { sessions, total: rows.length }
     } catch {
       this.markIndexReadFailure()
       return null
@@ -3991,19 +4189,11 @@ export class SessionService {
       offsets: result.entries.map(item => item.byteStart),
       signal,
       includeUnownedSidechains,
-      classify: raw => {
-        const entry = raw as RawEntry
-        const user = entry.message?.role === 'user' && !entry.isMeta
-        return {
-          notification: user && this.isTaskNotificationContent(entry.message?.content),
-          reset: user && !this.isToolResultContent(entry.message?.content),
-          agentToolId: this.extractAgentToolUseId(entry),
-        }
-      },
+      agentToolId: raw => this.extractAgentToolUseId(raw as RawEntry),
     })
     const visibleEntries = result.entries.flatMap(item => {
       const state = context.contexts.get(item.byteStart)!
-      if (state.suppressed && !this.isGoalLocalCommandEntry(item.entry as RawEntry)) return []
+      if (state.hidden && !this.isGoalLocalCommandEntry(item.entry as RawEntry)) return []
       return [{ ...item.entry, ...(state.owner ? { parent_tool_use_id: state.owner } : {}) } as RawEntry]
     })
     return { entries: visibleEntries, contextScanBytes: context.scannedBytes }
@@ -4153,18 +4343,13 @@ export class SessionService {
       const taskNotifications: SessionTaskNotification[] = []
       let bytes = 0
       let incomplete = false
-      let suppressTaskNotificationResponse = false
       const scan = await streamBoundedHistory(filePath, raw => {
         const entry = raw as RawEntry
         const message = raw.message as { role?: string; content?: unknown } | undefined
-        if (!entry.isMeta && message?.role === 'user') {
-          if (this.isTaskNotificationContent(message.content)) suppressTaskNotificationResponse = true
-          else if (!this.isToolResultContent(message.content)) suppressTaskNotificationResponse = false
-        }
         const content = Array.isArray(message?.content) ? message.content.filter((block: any) =>
           block?.type === 'tool_use' ? ids.has(block.id) : block?.type === 'tool_result' && ids.has(block.tool_use_id)) : []
         const notices = this.taskNotificationsFromEntries([entry]).filter(notice => ids.has(notice.toolUseId))
-        const selected = content.length && !suppressTaskNotificationResponse
+        const selected = content.length
           ? displayPreview({ ...entry, message: { ...message, content } }) : undefined
         if (selected?.bodyTruncated) incomplete = true
         const selectedBytes = (selected ? Buffer.byteLength(JSON.stringify(selected)) : 0) +
@@ -5209,7 +5394,7 @@ export class SessionService {
 
     const entries = await this.readTargetedJsonlEntries(
       found,
-      ['user', PERSISTED_TASK_NOTIFICATION_ENTRY_TYPE],
+      ['user', 'attachment', 'queue-operation', PERSISTED_TASK_NOTIFICATION_ENTRY_TYPE],
     ) ?? await this.readJsonlFile(found.filePath)
     return this.taskNotificationsFromEntries(entries)
   }
@@ -5223,7 +5408,7 @@ export class SessionService {
         ? this.parsePersistedTaskNotification(entry.taskNotification, entry.timestamp)
         : entry.message?.role === 'user'
           ? this.parseTaskNotificationContent(entry.message.content, entry.timestamp)
-          : null
+          : this.parseQueuedTaskNotification(entry)
       if (notification) {
         notifications.set(sessionTaskNotificationIdentity(notification), notification)
       }
@@ -5239,7 +5424,6 @@ export class SessionService {
     const messages: MessageEntry[] = []
     const entriesByUuid = new Map<string, RawEntry>()
     const parentToolUseIdCache = new Map<string, string | undefined>()
-    let suppressTaskNotificationResponse = false
 
     for (const entry of entries) {
       if (typeof entry.uuid === 'string' && entry.uuid.length > 0) {
@@ -5262,23 +5446,9 @@ export class SessionService {
       // message that must render as an ordinary user-position bubble.
       if (entry.isMeta && !parseSessionCollaborationEnvelope(entry.message.content)) continue
 
-      const isTaskNotification =
-        entry.message.role === 'user' &&
-        this.isTaskNotificationContent(entry.message.content)
-      if (isTaskNotification) {
-        suppressTaskNotificationResponse = true
-        continue
-      }
-
-      if (
-        entry.message.role === 'user' &&
-        !this.isToolResultContent(entry.message.content)
-      ) {
-        suppressTaskNotificationResponse = false
-      } else if (suppressTaskNotificationResponse) {
-        continue
-      }
-
+      // The queued <task-notification> turn is system plumbing and is hidden here (the
+      // Activity cards come from its notification data). What the assistant does in
+      // response is ordinary conversation, so it is never dropped with it.
       if (this.shouldHideTranscriptEntry(entry)) continue
 
       // Skip non-transcript entry types

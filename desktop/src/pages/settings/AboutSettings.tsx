@@ -1,9 +1,18 @@
 import { useState, useEffect } from 'react'
+import { ChevronDown, ChevronUp } from 'lucide-react'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useTranslation } from '../../i18n'
 import { Input } from '@/components/ui/Input'
 import { Button } from '@/components/ui/Button'
-import { Card } from '@/components/ui/Card'
+import { Badge } from '@/components/ui/Badge'
+import { SegmentedControl } from '@/components/ui/SegmentedControl'
+import {
+  SettingsBlock,
+  SettingsGroup,
+  SettingsPageHeader,
+  SettingsRow,
+  SettingsSection,
+} from '@/components/settings/SettingsSection'
 import type { UpdateProxyMode } from '../../types/settings'
 import { MarkdownRenderer } from '../../components/markdown/MarkdownRenderer'
 import { useUpdateStore } from '../../stores/updateStore'
@@ -15,9 +24,9 @@ import { isValidHttpProxyUrl } from '../settings/shared'
 /**
  * The About panel: product identity and the app-update card.
  *
- * Moved out of `Settings.tsx`. The GitHub repo, releases and issues entries
- * were removed from this panel; `isValidHttpProxyUrl` stayed in `./shared`,
- * since the General panel needs it too.
+ * The GitHub repo, releases, issues, author and social entries were removed
+ * from this panel; `isValidHttpProxyUrl` stayed in `./shared`, since the
+ * General panel needs it too. See `docs/agents/upstream-removals.md`.
  */
 
 export function AboutSettings() {
@@ -136,25 +145,31 @@ export function AboutSettings() {
     return t('update.idle')
   })()
 
-  return (
-    <div className="w-full min-w-0 max-w-2xl mx-auto flex flex-col items-center py-6">
-      {/* Logo + App Name + Version */}
-      <BrandSeal size="xl" className="mb-4" />
-      <h1 className="text-xl font-bold text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-headline)' }}>ccmax</h1>
-      {version && (
-        <div className="mt-1 text-xs text-[var(--color-text-tertiary)]">
-          {t('settings.about.version')} {version}
-        </div>
-      )}
+  const selectedUpdateProxyMode = updateProxyModes.find((mode) => mode.value === updateProxyDraft.mode)
 
-      <Card radius="xl" surface="low" padding="none" className="mt-4 w-full p-4">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <div className="text-sm font-medium text-[var(--color-text-primary)]">{t('settings.about.updates')}</div>
-            <div className="text-xs text-[var(--color-text-tertiary)] mt-1">
-              {t('settings.about.updatesDesc')}
-            </div>
+  return (
+    <div className="w-full min-w-0">
+      <SettingsPageHeader title={t('settings.tab.about')} />
+
+      <SettingsGroup className="mt-7">
+        {/* Product identity */}
+        <SettingsBlock className="flex items-center gap-4 py-4">
+          <BrandSeal size="lg" />
+          <div className="min-w-0 flex-1">
+            <div className="text-[15px] font-semibold text-[var(--color-text-primary)]">ccmax</div>
+            {version && (
+              <div className="mt-0.5 text-xs text-[var(--color-text-tertiary)]">
+                {t('settings.about.version')} {version}
+              </div>
+            )}
           </div>
+        </SettingsBlock>
+      </SettingsGroup>
+
+      <SettingsSection
+        title={t('settings.about.updates')}
+        description={t('settings.about.updatesDesc')}
+        action={(
           <Button
             size="sm"
             variant="secondary"
@@ -163,161 +178,35 @@ export function AboutSettings() {
           >
             {t('update.checkNow')}
           </Button>
-        </div>
-
-        <div className="mt-4 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-3">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-xs uppercase tracking-[0.14em] text-[var(--color-text-tertiary)]">
-                {t('settings.about.version')}
-              </div>
-              <div className="text-sm font-medium text-[var(--color-text-primary)] mt-1">
-                {version || t('update.currentVersionUnknown')}
-              </div>
-            </div>
-
-            {availableVersion && (
-              <div className="text-right">
-                <div className="text-xs uppercase tracking-[0.14em] text-[var(--color-text-tertiary)]">
-                  {t('update.availableLabel')}
-                </div>
-                <div className="text-sm font-medium text-[var(--color-text-primary)] mt-1">
-                  {availableVersion}
-                </div>
-              </div>
-            )}
-          </div>
-
-          <p className={`mt-3 text-sm ${error ? 'text-[var(--color-error)]' : 'text-[var(--color-text-secondary)]'}`}>
-            {updateDescription}
-          </p>
-
-          {checkedAtText && (
-            <p className="mt-1 text-xs text-[var(--color-text-tertiary)]">
-              {t('update.checkedAt', { time: checkedAtText })}
-            </p>
-          )}
-
-          <div className="mt-3 border-t border-[var(--color-border-separator)] pt-3">
-            <button
-              type="button"
-              onClick={() => setShowUpdateProxyAdvanced((value) => !value)}
-              className="flex w-full items-center justify-between gap-3 rounded-[var(--radius-md)] text-left text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
-              aria-expanded={showUpdateProxyAdvanced}
-            >
-              <span>{t('update.proxyAdvanced')}</span>
-              <span className="material-symbols-outlined text-[18px]">
-                {showUpdateProxyAdvanced ? 'expand_less' : 'expand_more'}
+        )}
+      >
+        <SettingsGroup>
+          <SettingsRow
+            title={(
+              <span className="inline-flex flex-wrap items-center gap-2">
+                <span>{t('settings.about.version')}</span>
+                <span className="font-mono text-xs font-normal text-[var(--color-text-secondary)]">
+                  {version || t('update.currentVersionUnknown')}
+                </span>
+                {availableVersion && (
+                  <Badge tone="info" size="sm">
+                    {t('update.availableLabel')} {availableVersion}
+                  </Badge>
+                )}
               </span>
-            </button>
-
-            {showUpdateProxyAdvanced && (
-              <div className="mt-3 space-y-3">
-                <div className="grid grid-cols-2 gap-2">
-                  {updateProxyModes.map((mode) => (
-                    <button
-                      key={mode.value}
-                      type="button"
-                      onClick={() => {
-                        setUpdateProxyDraft((current) => ({ ...current, mode: mode.value }))
-                        setUpdateProxySaveError(null)
-                      }}
-                      aria-pressed={updateProxyDraft.mode === mode.value}
-                      className={`rounded-[var(--radius-lg)] border px-3 py-2 text-left transition-colors ${
-                        updateProxyDraft.mode === mode.value
-                          ? 'border-[var(--color-brand)] bg-[var(--color-surface-selected)] text-[var(--color-text-primary)]'
-                          : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
-                      }`}
-                    >
-                      <div className="text-xs font-semibold">{mode.label}</div>
-                      <div className="mt-1 text-[11px] leading-4 text-[var(--color-text-tertiary)]">
-                        {mode.description}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-
-                {updateProxyDraft.mode === 'manual' && (
-                  <div>
-                    <Input
-                      id="update-proxy-url"
-                      label={t('update.proxyUrl')}
-                      value={updateProxyDraft.url}
-                      placeholder="http://127.0.0.1:7890"
-                      autoComplete="off"
-                      onChange={(event) => {
-                        setUpdateProxyDraft((current) => ({ ...current, url: event.target.value }))
-                        setUpdateProxySaveError(null)
-                      }}
-                    />
-                    <p className={`mt-1 text-[11px] leading-4 ${manualProxyError ? 'text-[var(--color-error)]' : 'text-[var(--color-text-tertiary)]'}`}>
-                      {manualProxyError ?? t('update.proxyUrlHint')}
-                    </p>
-                  </div>
-                )}
-
-                <div className="flex items-center justify-between gap-3">
-                  <p className="min-w-0 text-[11px] leading-4 text-[var(--color-text-tertiary)]">
-                    {t('update.proxyScopeHint')}
-                  </p>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    className="min-w-[72px] px-4 whitespace-nowrap"
-                    disabled={!updateProxyDirty || !!manualProxyError || isSavingUpdateProxy}
-                    loading={isSavingUpdateProxy}
-                    onClick={() => void saveUpdateProxy()}
-                  >
-                    {t('update.proxySave')}
-                  </Button>
-                </div>
-
-                {updateProxySaveError && (
-                  <p className="text-[11px] leading-4 text-[var(--color-error)]">
-                    {updateProxySaveError}
-                  </p>
-                )}
-              </div>
             )}
-          </div>
-
-          {(updateStatus === 'downloading' || updateStatus === 'restarting') && (
-            <div className="mt-3">
-              <div className="h-1.5 bg-[var(--color-surface-container-low)] rounded-full overflow-hidden">
-                {hasKnownProgress || updateStatus === 'restarting' ? (
-                  <div
-                    className="h-full bg-[var(--color-text-accent)] transition-all duration-300"
-                    style={{ width: `${Math.min(progressPercent, 100)}%` }}
-                  />
-                ) : (
-                  <div className="h-full w-1/3 rounded-full bg-[var(--color-text-accent)] animate-pulse" />
+            description={(
+              <>
+                <span className={`block ${error ? 'text-[var(--color-error)]' : ''}`}>{updateDescription}</span>
+                {checkedAtText && (
+                  <span className="mt-0.5 block">{t('update.checkedAt', { time: checkedAtText })}</span>
                 )}
-              </div>
-              {!hasKnownProgress && updateStatus === 'downloading' && downloadedBytes > 0 && (
-                <p className="mt-1 text-xs text-[var(--color-text-tertiary)]">
-                  {downloadedText}
-                </p>
-              )}
-            </div>
-          )}
-
-          {releaseNotes && availableVersion && (
-            <div className="mt-3 rounded-[var(--radius-lg)] bg-[var(--color-surface-container-low)] px-3 py-3">
-              <div className="text-[11px] uppercase tracking-[0.14em] text-[var(--color-text-tertiary)]">
-                {t('update.releaseNotes')}
-              </div>
-              <MarkdownRenderer
-                content={releaseNotes}
-                variant="document"
-                className="mt-2 text-[13px] leading-6 text-[var(--color-text-secondary)] [&_h1]:text-lg [&_h2]:text-base [&_h3]:text-sm [&_p]:text-[13px] [&_p]:leading-6"
-              />
-            </div>
-          )}
-
-          {availableVersion && (
-            <div className="mt-3 flex justify-end">
+              </>
+            )}
+          >
+            {availableVersion && (
               <Button
-                size="sm"
+                size="base"
                 onClick={() => void installUpdate()}
                 loading={updateStatus === 'downloading' || updateStatus === 'installing' || updateStatus === 'restarting'}
                 disabled={updateStatus === 'checking' || updateStatus === 'downloading'}
@@ -330,10 +219,122 @@ export function AboutSettings() {
                       ? t('update.restarting')
                       : t('update.now')}
               </Button>
-            </div>
+            )}
+          </SettingsRow>
+
+          {(updateStatus === 'downloading' || updateStatus === 'restarting') && (
+            <SettingsBlock>
+              <div className="h-1.5 overflow-hidden rounded-full bg-[var(--color-surface-container-high)]">
+                {hasKnownProgress || updateStatus === 'restarting' ? (
+                  <div
+                    className="h-full bg-[var(--color-info)] transition-all duration-300"
+                    style={{ width: `${Math.min(progressPercent, 100)}%` }}
+                  />
+                ) : (
+                  <div className="h-full w-1/3 animate-pulse rounded-full bg-[var(--color-info)]" />
+                )}
+              </div>
+              {!hasKnownProgress && updateStatus === 'downloading' && downloadedBytes > 0 && (
+                <p className="mt-1 font-mono text-[11px] tabular-nums text-[var(--color-text-tertiary)]">
+                  {downloadedText}
+                </p>
+              )}
+            </SettingsBlock>
           )}
-        </div>
-      </Card>
+
+          {releaseNotes && availableVersion && (
+            <SettingsBlock>
+              <div className="text-xs font-semibold text-[var(--color-text-tertiary)]">
+                {t('update.releaseNotes')}
+              </div>
+              <div className="mt-2 rounded-[var(--radius-md)] bg-[var(--color-surface-container)] px-3 py-2">
+                <MarkdownRenderer
+                  content={releaseNotes}
+                  variant="document"
+                  className="text-[13px] leading-6 text-[var(--color-text-secondary)] [&_h1]:text-[15px] [&_h2]:text-sm [&_h3]:text-[13px] [&_p]:text-[13px] [&_p]:leading-6"
+                />
+              </div>
+            </SettingsBlock>
+          )}
+
+          <div>
+            <button
+              type="button"
+              onClick={() => setShowUpdateProxyAdvanced((value) => !value)}
+              className="flex min-h-[44px] w-full items-center justify-between gap-3 px-4 py-2.5 text-left text-[13px] font-medium text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-border-focus)]"
+              aria-expanded={showUpdateProxyAdvanced}
+            >
+              <span>{t('update.proxyAdvanced')}</span>
+              {showUpdateProxyAdvanced
+                ? <ChevronUp size={14} strokeWidth={1.75} aria-hidden="true" className="text-[var(--color-text-tertiary)]" />
+                : <ChevronDown size={14} strokeWidth={1.75} aria-hidden="true" className="text-[var(--color-text-tertiary)]" />}
+            </button>
+
+            {showUpdateProxyAdvanced && (
+              <div className="space-y-3 px-4 pb-4">
+                <SegmentedControl<UpdateProxyMode>
+                  label={t('update.proxyAdvanced')}
+                  layout="fill"
+                  size="sm"
+                  value={updateProxyDraft.mode}
+                  onChange={(mode) => {
+                    setUpdateProxyDraft((current) => ({ ...current, mode }))
+                    setUpdateProxySaveError(null)
+                  }}
+                  items={updateProxyModes.map(({ value, label }) => ({ value, label }))}
+                />
+                {selectedUpdateProxyMode && (
+                  <p className="text-xs leading-[1.5] text-[var(--color-text-tertiary)]">{selectedUpdateProxyMode.description}</p>
+                )}
+
+                {updateProxyDraft.mode === 'manual' && (
+                  <div>
+                    <Input
+                      id="update-proxy-url"
+                      label={t('update.proxyUrl')}
+                      size="md"
+                      className="font-mono text-xs"
+                      value={updateProxyDraft.url}
+                      placeholder="http://127.0.0.1:7890"
+                      autoComplete="off"
+                      aria-invalid={manualProxyError ? true : undefined}
+                      onChange={(event) => {
+                        setUpdateProxyDraft((current) => ({ ...current, url: event.target.value }))
+                        setUpdateProxySaveError(null)
+                      }}
+                    />
+                    <p className={`mt-1 text-xs leading-[1.5] ${manualProxyError ? 'text-[var(--color-error)]' : 'text-[var(--color-text-tertiary)]'}`}>
+                      {manualProxyError ?? t('update.proxyUrlHint')}
+                    </p>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between gap-3">
+                  <p className="min-w-0 text-xs leading-[1.5] text-[var(--color-text-tertiary)]">
+                    {t('update.proxyScopeHint')}
+                  </p>
+                  <Button
+                    size="base"
+                    variant="secondary"
+                    className="shrink-0 whitespace-nowrap"
+                    disabled={!updateProxyDirty || !!manualProxyError || isSavingUpdateProxy}
+                    loading={isSavingUpdateProxy}
+                    onClick={() => void saveUpdateProxy()}
+                  >
+                    {t('update.proxySave')}
+                  </Button>
+                </div>
+
+                {updateProxySaveError && (
+                  <p className="text-xs leading-[1.5] text-[var(--color-error)]">
+                    {updateProxySaveError}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        </SettingsGroup>
+      </SettingsSection>
     </div>
   )
 }

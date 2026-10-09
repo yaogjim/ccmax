@@ -30,7 +30,7 @@ describe('TaskList', () => {
     useSettingsStore.setState({ locale: 'en' })
     render(<TaskList tasks={[{ ...task, enabled: undefined as unknown as boolean }]} />)
 
-    expect(screen.getByText('Active').previousElementSibling).toHaveTextContent('1')
-    expect(screen.getByText('Disabled').previousElementSibling).toHaveTextContent('0')
+    expect(screen.getByText('Active').nextElementSibling).toHaveTextContent('1')
+    expect(screen.getByText('Disabled').nextElementSibling).toHaveTextContent('0')
   })
 })

@@ -1,5 +1,6 @@
 import { memo, useMemo, useCallback } from 'react'
 import type { MouseEvent as ReactMouseEvent } from 'react'
+import { LoaderCircle } from 'lucide-react'
 import DOMPurify from 'dompurify'
 import katex from 'katex'
 import 'katex/dist/katex.min.css'
@@ -7,19 +8,25 @@ import { marked, type Tokens } from 'marked'
 // The `md-code-link` variant below is spelled out literally so Tailwind can see
 // it; MarkdownRenderer.test.tsx asserts it against CODE_LINK_CLASS.
 import {
+  AUTHORED_FILE_LINK_ATTRIBUTE,
   cjkAwareAutolink,
   fileRefFromElement,
   fileLinkAttributes,
   FILE_LINK_CLASS,
+  guessedFileLinkPaths,
   linkifyFilePaths,
   renderCodespan,
   unwrapFileLinks,
+  unwrapGuessedFileLinks,
+  type FileLinkVerifier,
 } from '@/lib/markdownAutolink'
+import { useFileLinkVerification } from '@/hooks/useFileLinkVerification'
 import { classifyPreviewLink } from '@/lib/previewLinkRouter'
-import { isSafeMarkdownImageSource } from '@/lib/markdownImages'
+import { isSafeMarkdownImageSource, normalizeMarkdownImageDestination } from '@/lib/markdownImages'
 import { CodeViewer } from '../chat/CodeViewer'
 import { MermaidRenderer } from '../chat/MermaidRenderer'
 import { copyTextToClipboard } from '@/lib/clipboard'
+import { MarkdownHtml } from '@/components/markdown/MarkdownHtml'
 import { t } from '../../i18n'
 
 type Props = {
@@ -37,6 +44,24 @@ type Props = {
    * sources survive.
    */
   resolveImageSrc?: (src: string) => string | null
+  /**
+   * Called when an image is clicked (not one inside a link, which belongs to the
+   * link), with every image in the text in reading order — sources as they load,
+   * so a viewer can show them — and the place of the one clicked.
+   */
+  onImageClick?: (click: MarkdownImageClick) => void
+  /**
+   * Check the file links guessed from code spans and prose before they look like
+   * links. Until it answers they render as the plain code or text they came from,
+   * and the ones it finds missing stay that way. Links the author wrote in
+   * Markdown are taken at their word. Without a verifier every guess links.
+   */
+  fileLinkVerifier?: FileLinkVerifier
+}
+
+export type MarkdownImageClick = {
+  images: Array<{ src: string; alt: string }>
+  index: number
 }
 
 type CodeBlock = {
@@ -51,7 +76,7 @@ type MathBlock = {
   displayMode: boolean
 }
 
-type HtmlPart = { type: 'html'; content: string }
+type HtmlPart = { type: 'html'; content: string; guessedFilePaths: string[] }
 type CodePart = { type: 'code'; block: CodeBlock }
 type MarkdownPart = HtmlPart | CodePart
 
@@ -103,10 +128,10 @@ function MermaidStreamingPlaceholder() {
   return (
     <div
       data-testid="mermaid-streaming-placeholder"
-      className="my-4 flex items-center justify-center rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] py-8"
+      className="my-4 flex items-center justify-center rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] py-8"
     >
-      <div className="flex items-center gap-2 text-[11px] text-[var(--color-text-tertiary)]">
-        <span className="material-symbols-outlined animate-spin text-[16px]">progress_activity</span>
+      <div className="flex items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
+        <LoaderCircle size={14} strokeWidth={1.75} className="animate-spin" aria-hidden="true" />
         {t('chat.generatingDiagram')}
       </div>
     </div>
@@ -135,9 +160,19 @@ renderer.link = function (token: Tokens.Link) {
   // validated local destinations as data, just like automatic file references.
   const target = classifyPreviewLink(token.href)
   if (target.path) {
-    return `<a class="${FILE_LINK_CLASS}" ${fileLinkAttributes({ raw: token.href, path: target.path, line: target.line, column: target.column })}>${this.parser.parseInline(token.tokens)}</a>`
+    return `<a class="${FILE_LINK_CLASS}" ${AUTHORED_FILE_LINK_ATTRIBUTE} ${fileLinkAttributes({ raw: token.href, path: target.path, line: target.line, column: target.column })}>${this.parser.parseInline(token.tokens)}</a>`
   }
   return renderDefaultLink.call(this, token)
+}
+
+// `file:///C:/x.png` and `C:\x.png` lose their source in sanitization as written
+// (see normalizeMarkdownImageDestination), and this is the last place the author's
+// destination is still separate from the markup around it — and, in `raw`, still
+// as written, where the parser has taken the backslashes out of a Windows path.
+const renderDefaultImage = renderer.image
+renderer.image = function (token: Tokens.Image) {
+  const href = normalizeMarkdownImageDestination(token.href, token.raw)
+  return renderDefaultImage.call(this, href === token.href ? token : { ...token, href })
 }
 
 marked.setOptions({
@@ -337,7 +372,7 @@ function enhanceMarkdownHtml(
   mathBlocks: MathBlock[],
   references: ReferenceLinking,
   resolveImageSrc?: (src: string) => string | null,
-): string {
+): HtmlPart {
   const cleanHtml = DOMPurify.sanitize(html, MARKDOWN_SANITIZE_CONFIG)
 
   const wantsFilePathLinks = references.bare && REFERENCE_HINT_RE.test(cleanHtml)
@@ -349,11 +384,11 @@ function enhanceMarkdownHtml(
     || wantsFileLinkStripping
     || /<(?:a|table|img|source)\b/i.test(cleanHtml)
   if (!needsDomEnhancement) {
-    return cleanHtml
+    return { type: 'html', content: cleanHtml, guessedFilePaths: [] }
   }
 
   if (typeof document === 'undefined') {
-    return cleanHtml
+    return { type: 'html', content: cleanHtml, guessedFilePaths: [] }
   }
 
   // A detached div is not inert: assigning innerHTML can start image requests
@@ -418,7 +453,16 @@ function enhanceMarkdownHtml(
   if (wantsFilePathLinks) linkifyFilePaths(container as unknown as HTMLElement)
   else if (wantsFileLinkStripping) unwrapFileLinks(container as unknown as HTMLElement)
 
-  return template.innerHTML
+  return { type: 'html', content: template.innerHTML, guessedFilePaths: guessedFileLinkPaths(container) }
+}
+
+/** Unwrap the guessed file links `keep` turns down, on markup already sanitized. */
+function filterGuessedFileLinks(part: HtmlPart, keep: (path: string) => boolean): HtmlPart {
+  if (part.guessedFilePaths.every(keep) || typeof document === 'undefined') return part
+  const template = document.createElement('template')
+  template.innerHTML = part.content
+  unwrapGuessedFileLinks(template.content, keep)
+  return { ...part, content: template.innerHTML }
 }
 
 function parseMarkdown(content: string): { html: string; codeBlocks: CodeBlock[]; mathBlocks: MathBlock[] } {
@@ -529,7 +573,7 @@ const BASE_PROSE_CLASSES = `markdown-prose prose prose-sm min-w-0 max-w-none bre
   prose-headings:text-[var(--color-text-primary)] prose-headings:font-semibold prose-headings:font-[var(--font-headline)]
   prose-p:my-2 prose-p:leading-relaxed
   prose-p:break-words prose-p:[overflow-wrap:anywhere]
-  prose-code:text-[13px] prose-code:text-[var(--color-code-fg)] prose-code:font-mono prose-code:bg-[var(--color-code-bg)] prose-code:border prose-code:border-[var(--color-border)] prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-[var(--radius-sm)] prose-code:before:hidden prose-code:after:hidden
+  prose-code:text-[13px] prose-code:text-[var(--color-code-fg)] prose-code:font-mono prose-code:font-normal prose-code:bg-[var(--color-surface-container)] prose-code:px-[5px] prose-code:py-px prose-code:rounded-[var(--radius-xs)] prose-code:before:hidden prose-code:after:hidden
   prose-pre:!bg-transparent prose-pre:!p-0 prose-pre:!shadow-none
   prose-a:text-[var(--color-text-accent)] prose-a:[overflow-wrap:anywhere]
   prose-a:underline prose-a:decoration-[1px] prose-a:underline-offset-[3px] prose-a:decoration-[var(--color-text-accent)] prose-a:hover:decoration-[2px]
@@ -538,26 +582,26 @@ const BASE_PROSE_CLASSES = `markdown-prose prose prose-sm min-w-0 max-w-none bre
   prose-strong:text-[var(--color-text-primary)]
   prose-ul:my-2 prose-ol:my-2 prose-ul:pl-5 prose-ol:pl-5 prose-ul:list-outside prose-ol:list-outside
   prose-li:my-0.5
-  prose-table:my-0 prose-table:w-full prose-table:table-auto prose-table:text-sm
-  prose-th:bg-[var(--color-surface-info)] prose-th:px-3 prose-th:py-2 prose-th:text-left prose-th:whitespace-normal prose-th:break-words prose-th:align-top prose-th:border-b prose-th:border-[var(--color-border)]
-  prose-td:px-3 prose-td:py-2 prose-td:border-b prose-td:border-[var(--color-border)] prose-td:whitespace-normal prose-td:break-words prose-td:align-top prose-td:bg-[var(--color-surface)]
+  prose-table:my-0 prose-table:w-full prose-table:table-auto prose-table:text-[13px]
+  prose-th:bg-[var(--color-surface-container)] prose-th:px-3 prose-th:py-2 prose-th:text-left prose-th:text-xs prose-th:font-semibold prose-th:text-[var(--color-text-secondary)] prose-th:whitespace-normal prose-th:break-words prose-th:align-top prose-th:border-b prose-th:border-[var(--color-border)]
+  prose-td:px-3 prose-td:py-2 prose-td:border-b prose-td:border-[var(--color-border)] prose-td:whitespace-normal prose-td:break-words prose-td:align-top
   [&_.katex]:[white-space:nowrap] [&_.katex]:[overflow-wrap:normal] [&_.katex]:[word-break:normal]
   [&_.md-math-inline]:inline-flex [&_.md-math-inline]:max-w-full [&_.md-math-inline]:overflow-x-auto [&_.md-math-inline]:[vertical-align:-0.08em] [&_.md-math-inline_.katex]:text-[1.02em]
   [&_.md-math-display]:my-5 [&_.md-math-display]:flex [&_.md-math-display]:max-w-full [&_.md-math-display]:justify-center [&_.md-math-display]:overflow-x-auto [&_.md-math-display]:px-1 [&_.md-math-display]:py-2 [&_.md-math-display]:[scrollbar-width:thin]
   [&_.md-math-display_.katex-display]:m-0 [&_.md-math-display_.katex]:text-[1.14em] [&_.md-math-display_.katex-html]:min-w-max
-  [&_.md-table-wrap]:my-5 [&_.md-table-wrap]:overflow-x-auto [&_.md-table-wrap]:rounded-[var(--radius-lg)] [&_.md-table-wrap]:border [&_.md-table-wrap]:border-[var(--color-border)] [&_.md-table-wrap]:bg-[var(--color-surface-container-lowest)]`
+  [&_.md-table-wrap]:my-4 [&_.md-table-wrap]:overflow-x-auto [&_.md-table-wrap]:rounded-[var(--radius-md)] [&_.md-table-wrap]:border [&_.md-table-wrap]:border-[var(--color-border)] [&_.md-table-wrap]:bg-[var(--color-surface-container-lowest)]`
 
 const DOCUMENT_PROSE_CLASSES = `
   prose-p:text-[15px] prose-p:leading-7
   prose-headings:scroll-mt-6 prose-headings:tracking-[-0.01em]
-  prose-h1:mb-4 prose-h1:text-2xl prose-h1:font-semibold prose-h1:leading-tight
-  prose-h2:mt-8 prose-h2:mb-3 prose-h2:border-b prose-h2:border-[var(--color-border)] prose-h2:pb-2 prose-h2:text-xl prose-h2:font-semibold
-  prose-h3:mt-6 prose-h3:mb-2 prose-h3:text-base prose-h3:font-semibold
+  prose-h1:mb-4 prose-h1:text-[22px] prose-h1:font-semibold prose-h1:leading-tight
+  prose-h2:mt-8 prose-h2:mb-3 prose-h2:border-b prose-h2:border-[var(--color-border)] prose-h2:pb-2 prose-h2:text-lg prose-h2:font-semibold
+  prose-h3:mt-6 prose-h3:mb-2 prose-h3:text-[15px] prose-h3:font-semibold
   prose-h4:mt-5 prose-h4:mb-2 prose-h4:text-sm prose-h4:font-semibold
-  prose-blockquote:my-4 prose-blockquote:rounded-r-[var(--radius-md)] prose-blockquote:border-l-4 prose-blockquote:border-[var(--color-primary-fixed-dim)] prose-blockquote:bg-[var(--color-surface-container-low)] prose-blockquote:px-4 prose-blockquote:py-2 prose-blockquote:italic
+  prose-blockquote:my-4 prose-blockquote:border-l-2 prose-blockquote:border-[var(--color-outline)] prose-blockquote:pl-4 prose-blockquote:font-normal prose-blockquote:not-italic prose-blockquote:text-[var(--color-text-secondary)]
   prose-hr:my-6 prose-hr:border-[var(--color-border)]
-  prose-img:rounded-[var(--radius-lg)] prose-img:border prose-img:border-[var(--color-border)]
-  prose-kbd:rounded-[var(--radius-sm)] prose-kbd:border prose-kbd:border-[var(--color-border)] prose-kbd:bg-[var(--color-surface-container-lowest)] prose-kbd:px-1.5 prose-kbd:py-0.5 prose-kbd:font-mono prose-kbd:text-[12px] prose-kbd:font-normal prose-kbd:text-[var(--color-text-secondary)] prose-kbd:shadow-none
+  prose-img:rounded-[var(--radius-md)] prose-img:border prose-img:border-[var(--color-border)]
+  prose-kbd:rounded-[var(--radius-xs)] prose-kbd:border prose-kbd:border-[var(--color-border)] prose-kbd:bg-[var(--color-surface-container-lowest)] prose-kbd:px-1 prose-kbd:py-0 prose-kbd:font-mono prose-kbd:text-[11px] prose-kbd:font-normal prose-kbd:text-[var(--color-text-tertiary)] prose-kbd:shadow-none
   prose-ul:pl-5 prose-ul:[&>li]:marker:text-[var(--color-text-tertiary)]
   prose-ol:pl-5 prose-ol:[&>li]:marker:text-[var(--color-text-tertiary)]
   prose-li:my-1.5
@@ -567,8 +611,8 @@ const DOCUMENT_PROSE_CLASSES = `
 const COMPACT_PROSE_CLASSES = `
   prose-p:my-1 prose-p:text-xs prose-p:leading-5 prose-p:text-[var(--color-text-secondary)]
   prose-headings:mt-2 prose-headings:mb-1 prose-headings:leading-snug
-  prose-h1:text-base prose-h2:text-sm prose-h3:text-xs prose-h4:text-xs
-  prose-blockquote:my-2 prose-blockquote:border-l-2 prose-blockquote:border-[var(--color-primary-fixed-dim)] prose-blockquote:pl-3 prose-blockquote:text-[var(--color-text-secondary)]
+  prose-h1:text-[15px] prose-h2:text-sm prose-h3:text-xs prose-h4:text-xs
+  prose-blockquote:my-2 prose-blockquote:border-l-2 prose-blockquote:border-[var(--color-outline)] prose-blockquote:pl-3 prose-blockquote:font-normal prose-blockquote:not-italic prose-blockquote:text-[var(--color-text-secondary)]
   prose-code:text-[12px]
   prose-ul:my-1 prose-ol:my-1 prose-ul:pl-4 prose-ol:pl-4
   prose-li:my-0.5 prose-li:text-xs prose-li:leading-5 prose-li:text-[var(--color-text-secondary)]
@@ -576,25 +620,43 @@ const COMPACT_PROSE_CLASSES = `
   [&_.md-math-display]:my-2 [&_.md-math-display]:py-1 [&_.md-math-display_.katex]:text-[1.04em]
   [&_.md-table-wrap]:my-2`
 
-function getProseClasses(variant: 'default' | 'document' | 'compact', className?: string) {
+function getProseClasses(variant: 'default' | 'document' | 'compact', className?: string, zoomableImages = false) {
   return [
     BASE_PROSE_CLASSES,
     variant === 'document' ? DOCUMENT_PROSE_CLASSES : '',
     variant === 'compact' ? COMPACT_PROSE_CLASSES : '',
+    // Only where a click on the picture does something.
+    zoomableImages ? '[&_img]:cursor-zoom-in' : '',
     className ?? '',
   ]
     .filter(Boolean)
     .join(' ')
 }
 
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, variant = 'default', className, cache = true, streaming = false, onLinkClick, resolveImageSrc }: Props) {
+function reportImageClick(
+  target: HTMLElement | null,
+  container: HTMLElement,
+  onImageClick: (click: MarkdownImageClick) => void,
+): void {
+  const clicked = target?.closest<HTMLImageElement>('img')
+  if (!clicked || !container.contains(clicked)) return
+  const images = Array.from(container.querySelectorAll<HTMLImageElement>('img')).filter((image) => !image.hidden && image.getAttribute('src'))
+  const index = images.indexOf(clicked)
+  if (index < 0) return
+  onImageClick({
+    images: images.map((image) => ({ src: image.getAttribute('src')!, alt: image.getAttribute('alt') ?? '' })),
+    index,
+  })
+}
+
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, variant = 'default', className, cache = true, streaming = false, onLinkClick, resolveImageSrc, onImageClick, fileLinkVerifier }: Props) {
   const { html, codeBlocks, mathBlocks } = useMemo(
     () => cache ? getCachedMarkdownParse(content, streaming) : parseMarkdown(content),
     [cache, content, streaming],
   )
   const proseClasses = useMemo(
-    () => getProseClasses(variant, className),
-    [variant, className],
+    () => getProseClasses(variant, className, Boolean(onImageClick)),
+    [variant, className, onImageClick],
   )
 
   const parts = useMemo(() => {
@@ -617,7 +679,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, varian
     }
 
     if (codeBlocks.length === 0) {
-      return [{ type: 'html' as const, content: enhanceMarkdownHtml(html, mathBlocks, references, resolveImageSrc) }]
+      return [enhanceMarkdownHtml(html, mathBlocks, references, resolveImageSrc)]
     }
 
     const result: MarkdownPart[] = []
@@ -630,25 +692,43 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, varian
 
       const before = remaining.slice(0, idx)
       if (before) {
-        result.push({ type: 'html', content: enhanceMarkdownHtml(before, mathBlocks, references, resolveImageSrc) })
+        result.push(enhanceMarkdownHtml(before, mathBlocks, references, resolveImageSrc))
       }
       result.push({ type: 'code', block })
       remaining = remaining.slice(idx + marker.length)
     }
 
     if (remaining) {
-      result.push({ type: 'html', content: enhanceMarkdownHtml(remaining, mathBlocks, references, resolveImageSrc) })
+      result.push(enhanceMarkdownHtml(remaining, mathBlocks, references, resolveImageSrc))
     }
 
     return result
   }, [html, codeBlocks, mathBlocks, streaming, onLinkClick, resolveImageSrc])
+
+  // A guessed link is a promise the file is there. Ask once the markup is final;
+  // the guesses look like plain code until then, and stay so if the file is not.
+  const guessedFilePaths = useMemo(
+    () => parts.flatMap((part) => part.type === 'html' ? part.guessedFilePaths : []),
+    [parts],
+  )
+  const missingFilePaths = useFileLinkVerification(fileLinkVerifier, guessedFilePaths)
+  const visibleParts = useMemo(() => {
+    if (!fileLinkVerifier || guessedFilePaths.length === 0) return parts
+    const keep = (path: string) => missingFilePaths !== null && !missingFilePaths.has(path)
+    return parts.map((part) => part.type === 'html' ? filterGuessedFileLinks(part, keep) : part)
+  }, [fileLinkVerifier, guessedFilePaths.length, missingFilePaths, parts])
 
   const handleClick = useCallback(async (event: ReactMouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement | null
     const button = target?.closest<HTMLButtonElement>('[data-copy-code]')
     if (!button) {
       const link = target?.closest<HTMLAnchorElement>('a[href], a[data-file-path]')
-      if (!link || !onLinkClick) return
+      if (!link) {
+        // A picture in a link is the link's; a bare one opens in the viewer.
+        if (onImageClick) reportImageClick(target, event.currentTarget, onImageClick)
+        return
+      }
+      if (!onLinkClick) return
 
       const handled = onLinkClick(fileRefFromElement(link) ?? link.getAttribute('href') ?? '', event)
       if (handled) {
@@ -669,13 +749,13 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, varian
     window.setTimeout(() => {
       button.textContent = original
     }, 1500)
-  }, [onLinkClick])
+  }, [onImageClick, onLinkClick])
 
   if (codeBlocks.length === 0) {
     return (
-      <div
+      <MarkdownHtml
         className={proseClasses}
-        dangerouslySetInnerHTML={{ __html: parts[0]?.type === 'html' ? parts[0].content : '' }}
+        html={visibleParts[0]?.type === 'html' ? visibleParts[0].content : ''}
         onClick={handleClick}
       />
     )
@@ -683,9 +763,9 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, varian
 
   return (
     <div className={proseClasses} onClick={handleClick}>
-      {parts.map((part, i) =>
+      {visibleParts.map((part, i) =>
         part.type === 'html' ? (
-          <div key={i} dangerouslySetInnerHTML={{ __html: part.content }} />
+          <MarkdownHtml key={i} html={part.content} />
         ) : shouldRenderAsMermaid(part.block) ? (
           streaming ? (
             <MermaidStreamingPlaceholder key={part.block.id} />

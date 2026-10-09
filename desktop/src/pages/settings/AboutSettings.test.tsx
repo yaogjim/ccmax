@@ -45,7 +45,8 @@ describe('AboutSettings product identity', () => {
   it('renders the app name, version and update card without legacy author or social entries', async () => {
     render(<AboutSettings />)
 
-    expect(screen.getByRole('heading', { name: 'ccmax' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'About' })).toBeInTheDocument()
+    expect(screen.getByText('ccmax')).toBeInTheDocument()
     expect(screen.getByText('App Updates')).toBeInTheDocument()
 
     await waitFor(() => {

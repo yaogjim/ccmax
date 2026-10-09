@@ -49,6 +49,7 @@ const SETTINGS_TABS = [
   'providers',
   'activity',
   'general',
+  'voice',
   'h5Access',
   'adapters',
   'terminal',
@@ -59,7 +60,6 @@ const SETTINGS_TABS = [
   'plugins',
   'pets',
   'computerUse',
-  'trace',
   'diagnostics',
   'system',
   'about',
@@ -113,6 +113,9 @@ function getStoredSettingsTab(): SettingsTab {
   try {
     const stored = readCanonicalFirst(globalThis.localStorage, DESKTOP_PERSISTENCE_KEYS.activeSettingsTab)
     if (isSettingsTab(stored)) return stored
+    // The retired Trace entry; its capture toggle now lives under General.
+    // persistenceMigrations rewrites it at startup — this is the second guard.
+    if (stored === 'trace') return 'general'
   } catch { /* localStorage unavailable */ }
   return 'providers'
 }
@@ -179,9 +182,9 @@ export function initializeTheme() {
   stopSystemAppearanceWatch?.()
   stopSystemAppearanceWatch = subscribeSystemAppearance((appearance) => {
     // Read the preference from storage rather than this window's store. The
-    // pet and trace windows run the same bootstrap with their own store
-    // instance over one shared localStorage, so after the main window changes
-    // the setting their in-memory copy is stale — and acting on it here would
+    // pet window runs the same bootstrap with its own store instance over one
+    // shared localStorage, so after the main window changes the setting its
+    // in-memory copy is stale — and acting on it here would
     // write the user's choice straight back out.
     if (!readStoredFollowSystemTheme()) return
     const lightTheme = readStoredLightTheme()
@@ -234,10 +237,17 @@ export type Toast = {
   duration?: number
 }
 
+export type MarketTarget = {
+  section: 'plugins' | 'skills'
+  /** Open this connector's detail once the catalog loads. */
+  connectorId?: string
+}
+
 export type SettingsTab =
   | 'providers'
   | 'activity'
   | 'general'
+  | 'voice'
   | 'h5Access'
   | 'adapters'
   | 'terminal'
@@ -248,10 +258,11 @@ export type SettingsTab =
   | 'plugins'
   | 'pets'
   | 'computerUse'
-  | 'trace'
   | 'diagnostics'
   | 'system'
   | 'about'
+  /** Retired Settings rail entry; pending/legacy values fall back at resolve time. */
+  | 'trace'
 
 type ActiveView = 'code' | 'scheduled' | 'terminal' | 'history' | 'settings'
 
@@ -271,6 +282,8 @@ type UIStore = {
   activeSettingsTab: SettingsTab
   pendingSettingsTab: SettingsTab | null
   pendingMemoryPath: string | null
+  /** Where the extension market should open next (set by the composer + menu). */
+  pendingMarketTarget: MarketTarget | null
   activeModal: string | null
   toasts: Toast[]
 
@@ -284,6 +297,7 @@ type UIStore = {
   setActiveSettingsTab: (tab: SettingsTab) => void
   setPendingSettingsTab: (tab: SettingsTab | null) => void
   setPendingMemoryPath: (path: string | null) => void
+  setPendingMarketTarget: (target: MarketTarget | null) => void
   openModal: (id: string) => void
   closeModal: () => void
   addToast: (toast: Omit<Toast, 'id'>) => void
@@ -303,6 +317,7 @@ export const useUIStore = create<UIStore>((set) => ({
   activeSettingsTab: getStoredSettingsTab(),
   pendingSettingsTab: null,
   pendingMemoryPath: null,
+  pendingMarketTarget: null,
   activeModal: null,
   toasts: [],
 
@@ -376,6 +391,7 @@ export const useUIStore = create<UIStore>((set) => ({
   },
   setPendingSettingsTab: (tab) => set({ pendingSettingsTab: tab }),
   setPendingMemoryPath: (path) => set({ pendingMemoryPath: path }),
+  setPendingMarketTarget: (target) => set({ pendingMarketTarget: target }),
   openModal: (id) => set({ activeModal: id }),
   closeModal: () => set({ activeModal: null }),
 

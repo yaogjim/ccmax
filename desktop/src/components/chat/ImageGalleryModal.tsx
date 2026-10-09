@@ -1,13 +1,23 @@
 import { useEffect } from 'react'
-import { X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ExternalLink, X } from 'lucide-react'
 import { IconButton } from '@/components/ui/IconButton'
 import { Modal } from '@/components/ui/Modal'
-import { useOverlayStore } from '../../stores/overlayStore'
+import { ZoomableImage, type ZoomableImageProps } from '@/components/ui/ZoomableImage'
+import { useAuthedImageFallback } from '../../lib/useAuthedImageFallback'
+import { AuthedImage } from './AuthedImage'
+import { getDesktopHost } from '@/lib/desktopHost'
+import { isRootedLocalPath } from '@/lib/handlePreviewLink'
+import { openLocalFileWithSystem, reportOpenFailure } from '@/lib/systemFileOpen'
 import { useTranslation } from '../../i18n'
 
 type GalleryImage = {
   src: string
   name: string
+  /**
+   * The file on disk, when the picture is one (a blob or inline image is not).
+   * It is what "open in system app" hands to the operating system.
+   */
+  path?: string
 }
 
 type Props = {
@@ -18,19 +28,15 @@ type Props = {
   onSelect: (index: number) => void
 }
 
+/** The lightbox picture, which also loads where a bare request is refused (web UI, H5). */
+function AuthedZoomableImage({ src, onError, ...props }: ZoomableImageProps) {
+  const image = useAuthedImageFallback(src, onError)
+  return <ZoomableImage {...props} src={image.src ?? src} onError={image.onError} />
+}
+
 export function ImageGalleryModal({ open, images, activeIndex, onClose, onSelect }: Props) {
   const t = useTranslation()
   const activeImage = images[activeIndex]
-
-  // Native child webviews (e.g. the in-app browser preview) always render
-  // ABOVE the DOM, so this fullscreen overlay would be partially covered.
-  // Bump the overlay count while open so BrowserSurface can hide the webview.
-  useEffect(() => {
-    if (!open) return
-    const { push, pop } = useOverlayStore.getState()
-    push()
-    return () => pop()
-  }, [open])
 
   useEffect(() => {
     if (!open || images.length <= 1) return
@@ -48,6 +54,14 @@ export function ImageGalleryModal({ open, images, activeIndex, onClose, onSelect
   }, [activeIndex, images.length, onSelect, open])
 
   if (!activeImage) return null
+
+  // Only in the desktop app: in a browser the "system" is the machine the server
+  // runs on, which is not the one the reader is looking at. (Same rule as the
+  // attachment chips.)
+  const host = getDesktopHost()
+  const originalPath = activeImage.path && isRootedLocalPath(activeImage.path) && host.isDesktop && host.capabilities.shell
+    ? activeImage.path
+    : undefined
 
   return (
     <Modal open={open} onClose={onClose} title={activeImage.name} variant="media">
@@ -67,18 +81,38 @@ export function ImageGalleryModal({ open, images, activeIndex, onClose, onSelect
           />
         </div>
 
-        <div className="relative flex min-h-0 flex-1 items-center justify-center px-4 pb-4">
-          <img
+        <div className="relative flex min-h-0 flex-1 flex-col px-4 pb-4">
+          <AuthedZoomableImage
+            // The size it measures belongs to one picture, and so does the zoom.
+            key={activeImage.src}
             src={activeImage.src}
             alt={activeImage.name}
-            className="max-h-full max-w-full rounded-[var(--radius-md)] object-contain"
+            surface="media"
+            labels={{
+              group: t('workspace.zoom.group'),
+              zoomIn: t('workspace.zoom.in'),
+              zoomOut: t('workspace.zoom.out'),
+              fit: t('workspace.zoom.fitWindow'),
+            }}
+            actions={originalPath ? (
+              <IconButton
+                icon={<ExternalLink size={16} strokeWidth={1.9} />}
+                label={t('workspace.openInSystemApp')}
+                size="md"
+                tone="secondary"
+                surface="media"
+                onClick={() => {
+                  void openLocalFileWithSystem(originalPath).catch(() => reportOpenFailure(originalPath))
+                }}
+              />
+            ) : undefined}
           />
 
           {images.length > 1 ? (
             <>
               <div className="absolute left-3 top-1/2 -translate-y-1/2">
                 <IconButton
-                  icon="chevron_left"
+                  icon={<ChevronLeft size={20} strokeWidth={1.75} aria-hidden="true" />}
                   label={t('attachments.previousImage')}
                   size="xl"
                   tone="secondary"
@@ -90,7 +124,7 @@ export function ImageGalleryModal({ open, images, activeIndex, onClose, onSelect
               </div>
               <div className="absolute right-3 top-1/2 -translate-y-1/2">
                 <IconButton
-                  icon="chevron_right"
+                  icon={<ChevronRight size={20} strokeWidth={1.75} aria-hidden="true" />}
                   label={t('attachments.nextImage')}
                   size="xl"
                   tone="secondary"
@@ -117,7 +151,7 @@ export function ImageGalleryModal({ open, images, activeIndex, onClose, onSelect
                     : 'border-[var(--color-media-border)] opacity-55 hover:opacity-90'
                 }`}
               >
-                <img src={image.src} alt={image.name} className="h-12 w-12 object-cover" />
+                <AuthedImage src={image.src} alt={image.name} className="h-12 w-12 object-cover" />
               </button>
             ))}
           </div>

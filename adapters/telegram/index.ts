@@ -13,6 +13,7 @@
  * Desktop sidecar: --telegram (public-only config also takes this flag).
  */
 
+import { registerAdapterShutdown } from '../common/migration-lifecycle.js'
 import { loadConfig } from '../common/config.js'
 import { resolveDedicatedIdentity } from './bot-identity.js'
 import {
@@ -47,7 +48,6 @@ export const MAX_PENDING_INPUTS_PER_CHAT =
   dedicated?.MAX_PENDING_INPUTS_PER_CHAT ?? FALLBACK_MAX_PENDING_INPUTS_PER_CHAT
 export { setPublicTelegramBotHook }
 
-let shutdownBound = false
 let publicStarting: Promise<boolean> | undefined
 
 export async function stopTelegramAdapter(): Promise<void> {
@@ -61,7 +61,7 @@ export async function stopTelegramAdapter(): Promise<void> {
 }
 
 export function startTelegramAdapter(): void {
-  bindProcessShutdown()
+  bindAdapterShutdown()
   if (dedicated) {
     try {
       dedicated.startTelegramAdapter({ registerProcessShutdown: false })
@@ -103,15 +103,11 @@ async function startPublicEntry(): Promise<boolean> {
   }
 }
 
-function bindProcessShutdown(): void {
-  if (shutdownBound) return
-  shutdownBound = true
-  const shutdown = (): void => {
+function bindAdapterShutdown(): void {
+  registerAdapterShutdown(async () => {
     console.log('[Telegram] Shutting down...')
-    void stopTelegramAdapter().finally(() => process.exit(0))
-  }
-  process.once('SIGINT', shutdown)
-  process.once('SIGTERM', shutdown)
+    await stopTelegramAdapter()
+  })
 }
 
 if (import.meta.main || process.argv.includes('--telegram')) startTelegramAdapter()

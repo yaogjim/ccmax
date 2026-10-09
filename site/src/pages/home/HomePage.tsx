@@ -2,18 +2,15 @@ import { useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent, KeyboardEvent } from 'react'
 import { ArrowUpRight, ArrowRight, ArrowDown, Upload, X, Check, Copy, Plus, Minus, Pause, Play, Code2, MousePointer2, GitCompareArrows, Download, Menu, FileText, FolderOpen, SlidersHorizontal, ScanEye, Monitor, Laptop, Command } from 'lucide-react'
 import { DOWNLOAD_URL, GITHUB_URL } from '@/components/SiteHeader'
-import ImageViewer from '@/components/ImageViewer'
 import { toSiteHref } from '@/content/docs'
 import { rememberLocale } from '@/lib/locale'
 import { setPageMeta } from '@/lib/meta'
-import { guideScreenshots } from './guideContent'
 import { landingContent } from './landingContent'
 import type { LandingLocale, TaskCategory } from './landingContent'
 import AmbientScene from './AmbientScene'
 import poster from './assets/wandor-poster.webp'
 import landscape from './assets/quiet-landscape.webp'
 import stillLife from './assets/quiet-moments.webp'
-import projectSession from './assets/project-session.png'
 import './home.css'
 
 const VIDEO = 'https://pollen-batch-41236914.figma.site/_components/v2/f0ee2dae7671c170c34f12e31c4cb41418976c98/769c564298c132f7919405cd9f17c1b1231f341d.769c5642.mp4'
@@ -34,7 +31,6 @@ const taskSteps = {
 
 type Attachment = { id: string; name: string; size: number }
 type Preview = { text: string; category: TaskCategory; files: Attachment[] }
-type EnlargedImage = { src: string; alt: string; opener: HTMLElement }
 
 function TaskPreview({ task, locale, onClose }: { task: Preview; locale: LandingLocale; onClose: () => void }) {
   const ref = useRef<HTMLDialogElement>(null)
@@ -143,21 +139,11 @@ function Hero({ locale, paused, setPaused, onPreview }: { locale: LandingLocale;
   </section>
 }
 
-function Discover({ locale, onEnlarge }: { locale: LandingLocale; onEnlarge: (image: EnlargedImage) => void }) {
+function Discover({ locale }: { locale: LandingLocale }) {
   const c = landingContent[locale]
   const en = locale === 'en'
   const [active, setActive] = useState(0)
   const item = c.features[active]
-  const images = { ...guideScreenshots[locale], session: projectSession }
-  const screenshot = images[item.imageKey]
-  const dimensions = {
-    session: { width: 3456, height: 2168 },
-    settings: { width: 2000, height: 1651 },
-    workspace: { width: 2000, height: 1255 },
-  }[item.imageKey]
-  const screenshotAlt = item.imageKey === 'session'
-    ? (en ? 'ccmax with the real project and session list visible' : 'ccmax 真实项目界面，完整展示左侧项目与会话列表')
-    : item.title
   function onKey(event: KeyboardEvent<HTMLButtonElement>, index: number) {
     const choices: Record<string, number> = { ArrowRight: (index + 1) % 3, ArrowLeft: (index + 2) % 3, Home: 0, End: 2 }
     if (!(event.key in choices)) return
@@ -169,8 +155,7 @@ function Discover({ locale, onEnlarge }: { locale: LandingLocale; onEnlarge: (im
     <div className="wander-section__heading"><span className="wander-eyebrow">01 / {en ? 'MEET YOUR NEW COMPANION' : '认识你的新搭档'}</span><h2 id="discover-title">{en ? <>A little less doing.<br />A lot more <em>living.</em></> : <>少一点忙碌。<br />多一点<em>可能。</em></>}</h2><p>{en ? 'One place for your ideas, your apps, and every change along the way.' : '想法、应用和每一次改动，都在同一个工作空间里。'}</p></div>
     <div className="wander-feature-tabs" role="tablist" aria-label={en ? 'Explore capabilities' : '探索产品能力'}>{c.features.map((feature, index) => { const Symbol = featureIcons[index]; return <button role="tab" key={feature.id} id={`feature-${feature.id}`} aria-controls="feature-panel" aria-selected={active === index} tabIndex={active === index ? 0 : -1} onClick={() => setActive(index)} onKeyDown={event => onKey(event, index)}><Symbol size={17} />{en ? ['Write code', 'Use apps', 'Review changes'][index] : ['写代码', '操作应用', '审阅改动'][index]}</button> })}</div>
     <div className="wander-showcase" role="tabpanel" id="feature-panel" aria-labelledby={`feature-${item.id}`}>
-      <div className="wander-showcase__bar"><span className="wander-window-dots"><i /><i /><i /></span><span>ccmax / {en ? 'YOUR WORKSPACE' : '你的工作空间'}</span><span className="wander-live"><i />{en ? 'REAL PRODUCT' : '真实产品界面'}</span></div>
-      <button className="wander-showcase__image" onClick={event => onEnlarge({ src: screenshot, alt: screenshotAlt, opener: event.currentTarget })} aria-label={en ? 'Enlarge product screenshot' : '放大查看产品截图'}><img key={item.imageKey} src={screenshot} alt={screenshotAlt} width={dimensions.width} height={dimensions.height} loading="lazy" /><span><Plus size={16} />{en ? 'A closer look' : '看看细节'}</span></button>
+      <div className="wander-showcase__bar"><span className="wander-window-dots"><i /><i /><i /></span><span>ccmax / {en ? 'YOUR WORKSPACE' : '你的工作空间'}</span></div>
       <div className="wander-showcase__caption"><div><span className="wander-eyebrow">{item.kicker}</span><h3>{item.title}</h3></div><div><p>{item.body}</p><a className="wander-text-link" href={toSiteHref(item.route)}>{en ? 'Explore this workflow' : '了解这个工作流'}<ArrowUpRight size={16} /></a></div></div>
     </div>
     <div className="wander-discover__note"><span><Check size={14} />{en ? 'Bring your own model' : '连接你自己的模型'}</span><span><Check size={14} />{en ? 'Work in your local project' : '在本地项目里工作'}</span><span><Check size={14} />{en ? 'Keep the final call' : '下一步，由你决定'}</span></div>
@@ -215,9 +200,8 @@ function Closing({ locale }: { locale: LandingLocale }) {
 export default function HomePage({ locale = 'en' }: { locale?: LandingLocale }) {
   const [paused, setPaused] = useState(false)
   const [preview, setPreview] = useState<Preview | null>(null)
-  const [enlargedImage, setEnlargedImage] = useState<EnlargedImage | null>(null)
   useEffect(() => {
     setPageMeta({ alternate: locale === 'en' ? '/' : '/en', canonical: locale === 'en' ? '/en' : '/', description: landingContent[locale].hero.description, lang: locale === 'en' ? 'en' : 'zh-CN', title: locale === 'en' ? 'ccmax — Less busywork. More room for life.' : 'ccmax — 把琐碎交给 AI，把时间留给生活。' })
   }, [locale])
-  return <div className="wander-page font-sans"><a className="u-skip" href="#main">{locale === 'en' ? 'Skip to content' : '跳到正文'}</a><main id="main" tabIndex={-1}><Hero locale={locale} paused={paused} setPaused={setPaused} onPreview={setPreview} /><Discover locale={locale} onEnlarge={setEnlargedImage} /><Journey locale={locale} /><Possibilities locale={locale} onPreview={setPreview} /><Faq locale={locale} /></main><Closing locale={locale} />{preview && <TaskPreview task={preview} locale={locale} onClose={() => setPreview(null)} />}{enlargedImage && <ImageViewer image={enlargedImage} locale={locale} onClose={() => setEnlargedImage(null)} />}</div>
+  return <div className="wander-page font-sans"><a className="u-skip" href="#main">{locale === 'en' ? 'Skip to content' : '跳到正文'}</a><main id="main" tabIndex={-1}><Hero locale={locale} paused={paused} setPaused={setPaused} onPreview={setPreview} /><Discover locale={locale} /><Journey locale={locale} /><Possibilities locale={locale} onPreview={setPreview} /><Faq locale={locale} /></main><Closing locale={locale} />{preview && <TaskPreview task={preview} locale={locale} onClose={() => setPreview(null)} />}</div>
 }

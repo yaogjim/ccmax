@@ -14,6 +14,12 @@ import {
   isSameOrInsidePathForPlatform,
   normalizeDriveRootPathForPlatform,
 } from './windowsDrivePath.js'
+import {
+  documentFormatForPath,
+  workspaceFileVersion,
+  type WorkspaceDocumentFormat,
+  type WorkspaceDocumentPreviewType,
+} from './workspaceDocumentPreview.js'
 
 const MAX_PREVIEW_BYTES = 1024 * 1024
 const MAX_UNTRACKED_STAT_BYTES = 256 * 1024
@@ -91,7 +97,12 @@ export type WorkspaceStatusResult = {
 export type WorkspaceReadFileResult = {
   state: 'ok' | 'binary' | 'too_large' | 'missing' | 'error'
   path: string
-  previewType?: 'text' | 'image'
+  /**
+   * `text` and `image` carry their payload in this response. A document type
+   * (`pdf`, `docx`, `xlsx`) carries metadata only — the bytes come from the `raw`
+   * route, so a watcher-triggered reload never re-ships a large file as JSON.
+   */
+  previewType?: 'text' | 'image' | WorkspaceDocumentPreviewType
   content?: string
   dataUrl?: string
   mimeType?: string
@@ -99,13 +110,31 @@ export type WorkspaceReadFileResult = {
   size: number
   truncated?: boolean
   readBytes?: number
+  /** Document types only: changes whenever the bytes may have changed. */
+  version?: string
   error?: string
+}
+
+/** A validated file the `raw` route may stream. */
+export type WorkspaceRawFile = {
+  /** Realpath of the file, already checked against the workspace boundary. */
+  canonicalPath: string
+  relativePath: string
+  size: number
+  format: WorkspaceDocumentFormat
 }
 
 export type WorkspaceTreeEntry = {
   name: string
   path: string
   isDirectory: boolean
+}
+
+export type WorkspaceFileStat = {
+  /** The path exactly as requested. */
+  path: string
+  state: 'file' | 'missing' | 'unavailable'
+  mtimeMs?: number
 }
 
 export type WorkspaceTreeResult = {
@@ -154,6 +183,12 @@ type GitRepoInfo =
       kind: 'error'
       message: string
     }
+
+type ResolvedWorkspaceRoot = {
+  workDir: string
+  workspaceRoot: string
+  canonicalWorkspaceRoot: string
+}
 
 type WorkspacePathResolution = {
   requestedPath: string
@@ -432,6 +467,23 @@ export class WorkspaceService {
     const language = this.detectLanguage(resolvedPath.absolutePath)
     const imageMimeType = this.detectImageMimeType(resolvedPath.absolutePath)
 
+    // Decided from the extension, before any byte is read. Sniffing the head for
+    // a NUL used to be the only gate, so a small PDF whose first MiB happened to
+    // hold none was shown as garbled text; and a document must never be shipped
+    // through this JSON response (see `WorkspaceReadFileResult.previewType`).
+    const documentFormat = documentFormatForPath(resolvedPath.absolutePath)
+    if (documentFormat) {
+      return {
+        state: stat.stat.size > documentFormat.maxBytes ? 'too_large' : 'ok',
+        path: resolvedPath.relativePath,
+        previewType: documentFormat.previewType,
+        mimeType: documentFormat.mimeType,
+        language: documentFormat.previewType,
+        size: stat.stat.size,
+        version: workspaceFileVersion(stat.stat),
+      }
+    }
+
     let content: Buffer
     try {
       if (!imageMimeType && stat.stat.size > MAX_PREVIEW_BYTES) {
@@ -489,6 +541,48 @@ export class WorkspaceService {
       size: stat.stat.size,
       truncated: content.length < stat.stat.size,
       readBytes: content.length,
+    }
+  }
+
+  /**
+   * Validate a file for the `raw` route and describe it; the route streams it.
+   *
+   * The boundary is the one {@link readFile} enforces, but the caller gets the
+   * canonical path back, so what is streamed is the file that passed the check
+   * rather than a path a symlink could be swapped under. The extension allowlist
+   * is the only reason a workspace file may leave through this route at all —
+   * the JSON route already serves text, and nothing else should be readable in
+   * bulk by design.
+   */
+  async resolveRawFile(sessionId: string, requestedPath: string): Promise<WorkspaceRawFile> {
+    const resolvedPath = await this.resolveWorkspacePath(sessionId, requestedPath)
+    const format = documentFormatForPath(resolvedPath.absolutePath)
+    if (!format) {
+      throw new ApiError(
+        415,
+        `Unsupported preview type: ${resolvedPath.relativePath}`,
+        'UNSUPPORTED_MEDIA_TYPE',
+      )
+    }
+
+    const stat = await this.safeStat(resolvedPath.canonicalTargetPath)
+    if (stat.kind === 'error') throw ApiError.internal(stat.message)
+    if (stat.kind === 'missing' || !stat.stat.isFile()) {
+      throw ApiError.notFound(`File not found: ${resolvedPath.relativePath}`)
+    }
+    if (stat.stat.size > format.maxBytes) {
+      throw new ApiError(
+        413,
+        `File exceeds the ${format.maxBytes} byte preview limit: ${resolvedPath.relativePath}`,
+        'PAYLOAD_TOO_LARGE',
+      )
+    }
+
+    return {
+      canonicalPath: resolvedPath.canonicalTargetPath,
+      relativePath: resolvedPath.relativePath,
+      size: stat.stat.size,
+      format,
     }
   }
 
@@ -570,6 +664,35 @@ export class WorkspaceService {
     }
     if (signal.aborted) stop()
     return stop
+  }
+
+  /**
+   * Whether each path is a file, and when it was last written. Paths resolve
+   * under the same boundary as {@link readFile}, so this tells a caller nothing
+   * the file route would not; a path that boundary refuses is `unavailable`.
+   */
+  async statFiles(
+    sessionId: string,
+    filePaths: string[],
+  ): Promise<WorkspaceFileStat[]> {
+    // One reply's links arrive together; look the workspace up once for all of them.
+    let root: ResolvedWorkspaceRoot
+    try {
+      root = await this.resolveWorkspaceRoot(sessionId)
+    } catch {
+      return filePaths.map((filePath) => ({ path: filePath, state: 'unavailable' }))
+    }
+    return Promise.all(filePaths.map(async (filePath): Promise<WorkspaceFileStat> => {
+      try {
+        const resolvedPath = await this.resolveWorkspacePathIn(root, filePath)
+        const stat = await this.safeStat(resolvedPath.absolutePath)
+        if (stat.kind === 'error') return { path: filePath, state: 'unavailable' }
+        if (stat.kind === 'missing' || !stat.stat.isFile()) return { path: filePath, state: 'missing' }
+        return { path: filePath, state: 'file', mtimeMs: stat.stat.mtimeMs }
+      } catch {
+        return { path: filePath, state: 'unavailable' }
+      }
+    }))
   }
 
   async readTree(
@@ -779,7 +902,9 @@ export class WorkspaceService {
     if (change.diff?.trim()) return change.diff
 
     const file = await this.readFile(sessionId, relativePath)
-    if (file.state !== 'ok' || file.previewType === 'image' || typeof file.content !== 'string') {
+    // Only text has a line diff. Images and documents are opaque, and a document
+    // result carries no `content` at all.
+    if (file.state !== 'ok' || file.previewType !== 'text' || typeof file.content !== 'string') {
       return null
     }
     return this.buildSyntheticDiff('/dev/null', relativePath, '', file.content)
@@ -1171,6 +1296,11 @@ export class WorkspaceService {
     sessionId: string,
     requestedPath: string,
   ): Promise<WorkspacePathResolution> {
+    return this.resolveWorkspacePathIn(await this.resolveWorkspaceRoot(sessionId), requestedPath)
+  }
+
+  /** The session's workdir and its canonical root — the same for every path a request names. */
+  private async resolveWorkspaceRoot(sessionId: string): Promise<ResolvedWorkspaceRoot> {
     const workDir = await this.requireWorkDir(sessionId)
     const workspaceRoot = await this.getWorkspaceRoot(workDir)
     if (workspaceRoot.kind === 'missing') {
@@ -1179,7 +1309,13 @@ export class WorkspaceService {
     if (workspaceRoot.kind === 'error') {
       throw new Error(workspaceRoot.message)
     }
+    return { workDir, ...workspaceRoot }
+  }
 
+  private async resolveWorkspacePathIn(
+    { workDir, ...workspaceRoot }: ResolvedWorkspaceRoot,
+    requestedPath: string,
+  ): Promise<WorkspacePathResolution> {
     const absolutePath = path.resolve(workDir, requestedPath || '.')
     if (!this.isWithinRoot(absolutePath, workDir)) {
       // Files this session changed outside its workdir (the user pointed the

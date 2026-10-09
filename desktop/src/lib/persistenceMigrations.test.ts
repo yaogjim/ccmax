@@ -6,6 +6,7 @@ import {
   LEGACY_UI_ZOOM_STORAGE_KEY,
   LOCALE_STORAGE_KEY,
   SESSION_RUNTIME_STORAGE_KEY,
+  ACTIVE_SETTINGS_TAB_STORAGE_KEY,
   TAB_STORAGE_KEY,
   THEME_STORAGE_KEY,
 } from './persistenceKeys'
@@ -14,7 +15,7 @@ import {
   DESKTOP_PERSISTENCE_VERSION_KEY,
   runDesktopPersistenceMigrations,
 } from './persistenceMigrations'
-import { WORKSPACE_STORAGE_VERSION } from './workspace/storageKey'
+import { LEGACY_WORKSPACE_STORAGE_KEY, WORKSPACE_STORAGE_KEY, WORKSPACE_STORAGE_VERSION } from './workspace/storageKey'
 import { CHAT_APPEARANCE_STORAGE_KEY, DEFAULT_CHAT_APPEARANCE, LEGACY_CHAT_APPEARANCE_STORAGE_KEY } from './chatAppearance'
 
 const LEGACY_TAB = DESKTOP_PERSISTENCE_KEYS.openTabs.legacy
@@ -104,7 +105,7 @@ describe('desktop persistence migrations', () => {
       { sessionId: 123, title: 'bad' },
     ])
     expect(window.localStorage.getItem(DESKTOP_PERSISTENCE_VERSION_KEY)).toBe(String(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION))
-    expect(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION).toBe(5)
+    expect(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION).toBe(6)
   })
 
   test('does not overwrite an existing canonical key when legacy also exists', () => {
@@ -172,7 +173,6 @@ describe('desktop persistence migrations', () => {
     window.localStorage.setItem(LEGACY_TAB, JSON.stringify({
       openTabs: [
         { sessionId: '__market__', title: 'Market', type: 'market' },
-        { sessionId: '__traces__', title: 'Traces', type: 'traces' },
       ],
       activeTabId: '__market__',
     }))
@@ -183,11 +183,122 @@ describe('desktop persistence migrations', () => {
     expect(JSON.parse(window.localStorage.getItem(TAB_STORAGE_KEY) || '{}')).toEqual({
       openTabs: [
         { sessionId: '__market__', title: 'Market', type: 'market' },
-        { sessionId: '__traces__', title: 'Traces', type: 'traces' },
       ],
       activeTabId: '__market__',
     })
     expect(window.localStorage.getItem(LEGACY_TAB)).not.toBeNull()
+  })
+
+  test('upgrades a frozen schema-5 install with retired Trace tabs and Settings entry', () => {
+    // Exactly what a schema-5 build persisted with the Trace list open, two
+    // per-session trace tabs (one of whose sessions also has a chat tab), and
+    // a trace tab focused. The Trace page is gone; traces live in the chat's
+    // 轨迹 view, so a trace tab must reopen as its session's chat tab.
+    localStorage.setItem(DESKTOP_PERSISTENCE_VERSION_KEY, '5')
+    localStorage.setItem('cc-haha-open-tabs', JSON.stringify({
+      openTabs: [
+        { sessionId: 'session-a', title: 'Chat A', type: 'session' },
+        { sessionId: '__traces__', title: 'Traces', type: 'traces' },
+        { sessionId: '__trace__session-a', title: 'Chat A', type: 'trace', traceSessionId: 'session-a' },
+        { sessionId: '__trace__session-b', title: 'Chat B', type: 'trace', traceSessionId: 'session-b' },
+        { sessionId: '__settings__', title: 'Settings', type: 'settings' },
+      ],
+      activeTabId: '__trace__session-b',
+    }))
+    localStorage.setItem('cc-haha-active-settings-tab', 'trace')
+
+    const report = runDesktopPersistenceMigrations()
+
+    const expected = {
+      openTabs: [
+        { sessionId: 'session-a', title: 'Chat A', type: 'session' },
+        { sessionId: 'session-b', title: 'Chat B', type: 'session' },
+        { sessionId: '__settings__', title: 'Settings', type: 'settings' },
+      ],
+      activeTabId: 'session-b',
+    }
+    expect(JSON.parse(localStorage.getItem(TAB_STORAGE_KEY)!)).toEqual(expected)
+    expect(localStorage.getItem(ACTIVE_SETTINGS_TAB_STORAGE_KEY)).toBe('general')
+    expect(report.migratedKeys).toContain(TAB_STORAGE_KEY)
+    expect(report.migratedKeys).toContain(ACTIVE_SETTINGS_TAB_STORAGE_KEY)
+    expect(localStorage.getItem(DESKTOP_PERSISTENCE_VERSION_KEY)).toBe(String(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION))
+    // Legacy keys stay as the copy source; canonical holds the v6 shape.
+    expect(JSON.parse(localStorage.getItem('cc-haha-open-tabs')!).activeTabId).toBe('__trace__session-b')
+    expect(localStorage.getItem('cc-haha-active-settings-tab')).toBe('trace')
+
+    // Idempotent: a second launch leaves both keys alone.
+    const second = runDesktopPersistenceMigrations()
+    expect(JSON.parse(localStorage.getItem(TAB_STORAGE_KEY)!)).toEqual(expected)
+    expect(second.migratedKeys).not.toContain(ACTIVE_SETTINGS_TAB_STORAGE_KEY)
+  })
+
+
+  test('upgrades a canonical ccmax schema-5 install the same way as a legacy-key fixture', () => {
+    const tabs = {
+      openTabs: [
+        { sessionId: 'session-a', title: 'Chat A', type: 'session' },
+        { sessionId: '__traces__', title: 'Traces', type: 'traces' },
+        { sessionId: '__trace__session-b', title: 'Chat B', type: 'trace', traceSessionId: 'session-b' },
+        { sessionId: '__settings__', title: 'Settings', type: 'settings' },
+      ],
+      activeTabId: '__trace__session-b',
+    }
+    localStorage.setItem(DESKTOP_PERSISTENCE_VERSION_KEY, '5')
+    localStorage.setItem(TAB_STORAGE_KEY, JSON.stringify(tabs))
+    localStorage.setItem(ACTIVE_SETTINGS_TAB_STORAGE_KEY, 'trace')
+    localStorage.setItem('unrelated-user-key', '{"keep":true}')
+
+    const report = runDesktopPersistenceMigrations()
+    const expected = {
+      openTabs: [
+        { sessionId: 'session-a', title: 'Chat A', type: 'session' },
+        { sessionId: 'session-b', title: 'Chat B', type: 'session' },
+        { sessionId: '__settings__', title: 'Settings', type: 'settings' },
+      ],
+      activeTabId: 'session-b',
+    }
+    expect(JSON.parse(localStorage.getItem(TAB_STORAGE_KEY)!)).toEqual(expected)
+    expect(localStorage.getItem(ACTIVE_SETTINGS_TAB_STORAGE_KEY)).toBe('general')
+    expect(localStorage.getItem('unrelated-user-key')).toBe('{"keep":true}')
+    expect(report.migratedKeys).toEqual(expect.arrayContaining([TAB_STORAGE_KEY, ACTIVE_SETTINGS_TAB_STORAGE_KEY]))
+    expect(localStorage.getItem(DESKTOP_PERSISTENCE_VERSION_KEY)).toBe('6')
+
+    const second = runDesktopPersistenceMigrations()
+    expect(JSON.parse(localStorage.getItem(TAB_STORAGE_KEY)!)).toEqual(expected)
+    expect(second.migratedKeys).not.toContain(ACTIVE_SETTINGS_TAB_STORAGE_KEY)
+  })
+
+  test.each([
+    ['the Trace list', '__traces__'],
+    ['an unresolvable trace tab', '__trace__'],
+  ])('falls back to the first surviving tab when %s was focused', (_label, activeTabId) => {
+    localStorage.setItem('cc-haha-open-tabs', JSON.stringify({
+      openTabs: [
+        { sessionId: '__traces__', title: 'Traces', type: 'traces' },
+        { sessionId: '__trace__', title: 'Broken', type: 'trace' },
+        { sessionId: 'session-a', title: 'Chat A', type: 'session' },
+      ],
+      activeTabId,
+    }))
+
+    runDesktopPersistenceMigrations()
+
+    expect(JSON.parse(localStorage.getItem(TAB_STORAGE_KEY)!)).toEqual({
+      openTabs: [{ sessionId: 'session-a', title: 'Chat A', type: 'session' }],
+      activeTabId: 'session-a',
+    })
+  })
+
+  test('drops the open-tabs key when only retired Trace tabs were open', () => {
+    localStorage.setItem('cc-haha-open-tabs', JSON.stringify({
+      openTabs: [{ sessionId: '__traces__', title: 'Traces', type: 'traces' }],
+      activeTabId: '__traces__',
+    }))
+
+    runDesktopPersistenceMigrations()
+
+    expect(localStorage.getItem(TAB_STORAGE_KEY)).toBeNull()
+    expect(localStorage.getItem('cc-haha-open-tabs')).not.toBeNull()
   })
 
   test('canonicalizes mismatched persisted special tab ids and types during startup migration', () => {
@@ -418,8 +529,8 @@ describe('desktop persistence migrations', () => {
 
     const report = runDesktopPersistenceMigrations()
 
-    expect(report.migratedKeys).not.toContain('cc-haha.workspace')
-    expect(window.localStorage.getItem('cc-haha.workspace')).toBeNull()
+    expect(report.migratedKeys).not.toContain(WORKSPACE_STORAGE_KEY)
+    expect(window.localStorage.getItem(WORKSPACE_STORAGE_KEY)).toBeNull()
     // The schema-1 keys a v0.6.2 install carries must survive untouched.
     expect(window.localStorage.getItem('cc-haha-theme')).toBe('ink-blue')
     expect(JSON.parse(window.localStorage.getItem('cc-haha-open-tabs')!).openTabs).toHaveLength(1)
@@ -438,8 +549,9 @@ describe('desktop persistence migrations', () => {
     // The hydrator already refuses an unknown version. Deleting it here would
     // mean a single downgrade launch permanently discards the workspace the
     // newer build is still using.
-    expect(report.migratedKeys).not.toContain('cc-haha.workspace')
-    expect(window.localStorage.getItem('cc-haha.workspace')).toBe(future)
+    expect(report.migratedKeys).not.toContain(WORKSPACE_STORAGE_KEY)
+    expect(window.localStorage.getItem(WORKSPACE_STORAGE_KEY)).toBe(future)
+    expect(window.localStorage.getItem(LEGACY_WORKSPACE_STORAGE_KEY)).toBe(future)
   })
 
   test('upgrades workspace v1 without losing the Files launcher, turns, or unknown metadata', () => {
@@ -461,7 +573,7 @@ describe('desktop persistence migrations', () => {
     }))
 
     runDesktopPersistenceMigrations()
-    const stored = JSON.parse(window.localStorage.getItem('cc-haha.workspace')!)
+    const stored = JSON.parse(window.localStorage.getItem(WORKSPACE_STORAGE_KEY)!)
     expect(stored).toMatchObject({
       version: WORKSPACE_STORAGE_VERSION,
       futureMetadata: { keep: true },
@@ -479,9 +591,38 @@ describe('desktop persistence migrations', () => {
     })
     expect(window.localStorage.getItem(DESKTOP_PERSISTENCE_VERSION_KEY))
       .toBe(String(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION))
-    const once = window.localStorage.getItem('cc-haha.workspace')
+    const once = window.localStorage.getItem(WORKSPACE_STORAGE_KEY)
     runDesktopPersistenceMigrations()
-    expect(window.localStorage.getItem('cc-haha.workspace')).toBe(once)
+    expect(window.localStorage.getItem(WORKSPACE_STORAGE_KEY)).toBe(once)
+  })
+
+  test('prefers a canonical ccmax workspace over a coexisting legacy key and keeps unknown fields', () => {
+    const canonical = JSON.stringify({
+      version: WORKSPACE_STORAGE_VERSION,
+      extra: { keep: 'canonical' },
+      sessions: {
+        s1: { tabs: [{ kind: 'file', id: 'f1', path: 'keep.ts' }], extraSession: 1 },
+      },
+    })
+    const legacy = JSON.stringify({
+      version: 1,
+      extra: { keep: 'legacy' },
+      sessions: {
+        s2: { tabs: [{ kind: 'file', id: 'f2', path: 'drop.ts' }] },
+      },
+    })
+    window.localStorage.setItem(WORKSPACE_STORAGE_KEY, canonical)
+    window.localStorage.setItem(LEGACY_WORKSPACE_STORAGE_KEY, legacy)
+
+    const report = runDesktopPersistenceMigrations()
+
+    expect(JSON.parse(window.localStorage.getItem(WORKSPACE_STORAGE_KEY)!)).toEqual(JSON.parse(canonical))
+    expect(window.localStorage.getItem(LEGACY_WORKSPACE_STORAGE_KEY)).toBe(legacy)
+    expect(report.migratedKeys).not.toContain(WORKSPACE_STORAGE_KEY)
+
+    const second = runDesktopPersistenceMigrations()
+    expect(window.localStorage.getItem(WORKSPACE_STORAGE_KEY)).toBe(canonical)
+    expect(second.migratedKeys).not.toContain(WORKSPACE_STORAGE_KEY)
   })
 
   test('strips tab entries that name a host resource the previous run owned', () => {
@@ -507,8 +648,8 @@ describe('desktop persistence migrations', () => {
 
     const report = runDesktopPersistenceMigrations()
 
-    expect(report.migratedKeys).toContain('cc-haha.workspace')
-    const stored = JSON.parse(window.localStorage.getItem('cc-haha.workspace')!)
+    expect(report.migratedKeys).toContain(WORKSPACE_STORAGE_KEY)
+    const stored = JSON.parse(window.localStorage.getItem(WORKSPACE_STORAGE_KEY)!)
     expect(stored.sessions.s1.tabs.map((tab: { id: string }) => tab.id)).toEqual(['f1'])
   })
 
@@ -517,8 +658,8 @@ describe('desktop persistence migrations', () => {
 
     const report = runDesktopPersistenceMigrations()
 
-    expect(report.migratedKeys).toContain('cc-haha.workspace')
-    expect(window.localStorage.getItem('cc-haha.workspace')).toBeNull()
+    expect(report.migratedKeys).toContain(WORKSPACE_STORAGE_KEY)
+    expect(window.localStorage.getItem(WORKSPACE_STORAGE_KEY)).toBeNull()
   })
 
   test('merges legacy connector and skill market tabs while preserving the active market and unrelated user state', () => {
@@ -598,7 +739,7 @@ describe('desktop persistence migrations', () => {
       expect(window.localStorage.getItem(pair.canonical)).toBe(`from-legacy:${pair.canonical}`)
       expect(window.localStorage.getItem(pair.legacy)).toBe(`from-legacy:${pair.canonical}`)
     }
-    expect(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION).toBe(5)
+    expect(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION).toBe(6)
     expect(window.localStorage.getItem(DESKTOP_PERSISTENCE_VERSION_KEY)).toBe(String(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION))
   })
 

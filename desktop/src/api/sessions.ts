@@ -1,4 +1,4 @@
-import { api, type ApiRequestOptions } from './client'
+import { api, apiGetBlob, type ApiRequestOptions } from './client'
 import type { SlashCommandOption } from '../types/slashCommand'
 import type { AgentTaskNotification } from '../types/chat'
 import type { LocalIndexStatus, SessionListItem, MessageEntry } from '../types/session'
@@ -29,6 +29,11 @@ export type PetSessionRuntimeStatus = 'waiting' | 'failed' | 'review' | 'running
 export type SessionChatStatusResponse = {
   state: 'idle' | 'thinking' | 'compacting' | 'tool_executing'
   activityState: PetSessionRuntimeStatus
+}
+/** One entry per session that is working or waiting right now; idle sessions are absent. */
+export type LiveSessionActivity = {
+  id: string
+  activityState: 'running' | 'waiting'
 }
 type MessagesResponse = {
   messages: MessageEntry[]
@@ -325,10 +330,18 @@ export type WorkspaceStatusResult = {
   error?: string
 }
 
+/** Formats the workspace renders itself from bytes fetched with {@link sessionsApi.getWorkspaceRaw}. */
+export type WorkspaceDocumentPreviewType = 'pdf' | 'docx' | 'xlsx'
+
 export type WorkspaceReadFileResult = {
   state: 'ok' | 'binary' | 'too_large' | 'missing' | 'error'
   path: string
-  previewType?: 'text' | 'image'
+  /**
+   * `text` and `image` carry their payload in this response. A document type is
+   * metadata only — its bytes are fetched separately, so a watcher reload never
+   * re-downloads a large file as JSON.
+   */
+  previewType?: 'text' | 'image' | WorkspaceDocumentPreviewType
   content?: string
   dataUrl?: string
   mimeType?: string
@@ -336,6 +349,8 @@ export type WorkspaceReadFileResult = {
   size: number
   truncated?: boolean
   readBytes?: number
+  /** Document types only: changes whenever the bytes may have changed. */
+  version?: string
   error?: string
 }
 
@@ -343,6 +358,12 @@ export type WorkspaceTreeEntry = {
   name: string
   path: string
   isDirectory: boolean
+}
+
+export type WorkspaceFileStat = {
+  path: string
+  state: 'file' | 'missing' | 'unavailable'
+  mtimeMs?: number
 }
 
 export type WorkspaceTreeResult = {
@@ -373,6 +394,8 @@ export type SessionTurnCheckpoint = {
   workDir?: string
   restoreAvailable?: boolean
   unverifiedChangeSources?: string[]
+  /** When the turn's prompt was recorded, epoch ms on the server's clock. */
+  startedAt?: number
 }
 
 export type SessionTurnCheckpointsResponse = {
@@ -400,9 +423,15 @@ function getSessionGitInfo(sessionId: string) {
   return trackedRequest
 }
 
+/**
+ * A whole document is fetched in one request and can be large and slow to
+ * cross a remote link; the default request timeout is sized for JSON.
+ */
+const WORKSPACE_RAW_TIMEOUT_MS = 10 * 60_000
+
 function buildWorkspacePath(
   sessionId: string,
-  resource: 'status' | 'tree' | 'file' | 'diff',
+  resource: 'status' | 'tree' | 'file' | 'diff' | 'raw',
   workspacePath?: string,
 ) {
   const query = new URLSearchParams()
@@ -501,6 +530,10 @@ export const sessionsApi = {
     return api.get<SessionListItem>(`/api/sessions/${sessionId}/summary`, options)
   },
 
+  getLiveStatus(signal?: AbortSignal) {
+    return api.get<{ sessions: LiveSessionActivity[] }>('/api/sessions/live-status', { signal })
+  },
+
   getChatStatus(sessionId: string, signal?: AbortSignal) {
     return api.get<SessionChatStatusResponse>(`/api/sessions/${sessionId}/chat/status`, { signal })
   },
@@ -514,8 +547,10 @@ export const sessionsApi = {
     return api.get<TraceSession>(`/api/sessions/${sessionId}/trace${suffix}`, options)
   },
 
-  getTraceCall(sessionId: string, callId: string) {
-    return api.get<{ call: TraceCallRecord }>(`/api/sessions/${sessionId}/trace/calls/${callId}`)
+  /** `at` is the record locator from `/trace/near`, needed for calls outside the indexed window. */
+  getTraceCall(sessionId: string, callId: string, at?: string) {
+    const suffix = at ? `?${new URLSearchParams({ at })}` : ''
+    return api.get<{ call: TraceCallRecord }>(`/api/sessions/${sessionId}/trace/calls/${callId}${suffix}`)
   },
 
   create(input?: string | CreateSessionRequest) {
@@ -602,8 +637,26 @@ export const sessionsApi = {
     return api.get<WorkspaceSearchResult>(`/api/sessions/${sessionId}/workspace/search?${params}`, { signal })
   },
 
+  statWorkspaceFiles(sessionId: string, workspacePaths: string[], signal?: AbortSignal) {
+    const query = new URLSearchParams()
+    for (const workspacePath of workspacePaths) query.append('path', workspacePath)
+    return api.get<{ files: WorkspaceFileStat[] }>(`/api/sessions/${sessionId}/workspace/stat?${query}`, { signal })
+  },
+
   getWorkspaceFile(sessionId: string, workspacePath: string, signal?: AbortSignal) {
     return api.get<WorkspaceReadFileResult>(buildWorkspacePath(sessionId, 'file', workspacePath), { signal })
+  },
+
+  /**
+   * The bytes of a document the workspace previews, as a Blob. Fetched with the
+   * bearer credential, the one form that works in the desktop shell, a LAN
+   * browser and remote access alike — an `<img>`/`<iframe>` cannot send it.
+   */
+  getWorkspaceRaw(sessionId: string, workspacePath: string, signal?: AbortSignal) {
+    return apiGetBlob(buildWorkspacePath(sessionId, 'raw', workspacePath), {
+      signal,
+      timeout: WORKSPACE_RAW_TIMEOUT_MS,
+    })
   },
 
   getWorkspaceDiff(sessionId: string, workspacePath: string) {

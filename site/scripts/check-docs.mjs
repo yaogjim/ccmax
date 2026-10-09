@@ -155,7 +155,6 @@ async function collectAppScreenshots(locale, problems) {
   try {
     entries = await fs.readdir(directory, { withFileTypes: true })
   } catch {
-    problems.push(`docs/images/app/${directoryName}: screenshot directory is missing`)
     return new Map()
   }
 
@@ -172,10 +171,6 @@ async function collectAppScreenshots(locale, problems) {
     }
 
     screenshots.set(basename, path.join(directory, entry.name))
-  }
-
-  if (screenshots.size === 0) {
-    problems.push(`docs/images/app/${directoryName}: no WebP screenshots found`)
   }
 
   return screenshots

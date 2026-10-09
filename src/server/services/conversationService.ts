@@ -1,5 +1,6 @@
 import { PINNED_AGENT_ENTRYPOINT, TEAM_WORKER_ENTRYPOINT } from '../../shared/workerSession.js'
 import { closeSideChatsForParent, getSideChat, isSideChatId, SIDE_CHAT_BOUNDARY } from './sideChatRegistry.js'
+import { migrationMaintenance, waitForMigrationExit } from '../migrationMaintenance.js'
 /**
  * ConversationService — CLI subprocess manager
  *
@@ -55,6 +56,7 @@ import {
   REJECT_MESSAGE_WITH_REASON_PREFIX,
 } from '../../constants/messages.js'
 import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
+import { resolveRelocatedAttachmentPath } from '../../utils/storageRelocations.js'
 import { findCanonicalGitRoot } from '../../utils/git.js'
 import { sanitizePath } from '../../utils/path.js'
 import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
@@ -323,6 +325,23 @@ export type TeamWorkerStart = {
   systemPrompt: string
   tools?: string[]
   agentDefinition?: Record<string, unknown>
+  /**
+   * Restart a worker whose process stopped by resuming its own transcript.
+   * A worker never inherits the parent's launch metadata, so resume is opt-in.
+   */
+  resume?: boolean
+}
+
+/**
+ * Hooks for the server-owned Agent Teams runtime. Workers are independent
+ * processes, so the lead's process lifecycle must not decide their fate on its
+ * own: a lead restart keeps them, and Stop lets the runtime pause them first.
+ */
+export type TeamRuntimeListener = {
+  /** Synchronously before Stop kills a lead's workers; true when it paused a running team. */
+  leadInterrupted?: (parentSessionId: string) => boolean | void
+  /** After any CLI session finished starting. */
+  sessionStarted?: (sessionId: string, info: { isTeamWorker: boolean }) => void
 }
 
 /**
@@ -378,6 +397,7 @@ function getWorkerParentId(
 export class ConversationService {
   private sessions = new Map<string, SessionProcess>()
   private teamStopOperations = new Map<string, Promise<void>>()
+  private teamRuntimeListeners = new Set<TeamRuntimeListener>()
   private deletedSessions = new Set<string>()
   private providerService = new ProviderService()
   private pendingPermissionModeChanges = new Map<string, Map<string, number>>()
@@ -635,6 +655,7 @@ export class ConversationService {
     sdkUrl: string,
     options?: SessionStartOptions,
   ): Promise<void> {
+    migrationMaintenance.assertAvailable()
     if (this.deletedSessions.has(sessionId)) {
       throw new ConversationStartupError(
         `Session was deleted before startup completed: ${sessionId}`,
@@ -648,7 +669,9 @@ export class ConversationService {
       throw new ConversationStartupError('This temporary side chat has expired. Open a new side chat.', 'SESSION_DELETED')
     }
     const launchInfo = options?.teamWorker || options?.agentWorker ? null : await sessionService.getSessionLaunchInfo(sessionId)
-    const shouldResume = !!launchInfo && launchInfo.transcriptMessageCount > 0
+    const shouldResume = options?.teamWorker
+      ? options.teamWorker.resume === true && !!await sessionService.findSessionFile(sessionId)
+      : !!launchInfo && launchInfo.transcriptMessageCount > 0
     const shouldReplacePlaceholder =
       !side && !!launchInfo && launchInfo.transcriptMessageCount === 0
     const shouldCreateWorktree =
@@ -782,6 +805,7 @@ export class ConversationService {
     const usesOfficialOAuth = this.shouldMarkManagedOAuth(options?.providerId)
 
     let proc: ReturnType<typeof Bun.spawn>
+    migrationMaintenance.assertAvailable()
     try {
       proc = Bun.spawn(args, buildConversationCliSpawnOptions(launchWorkDir, childEnv))
       if (side) side.started = true
@@ -927,6 +951,18 @@ export class ConversationService {
     }
 
     console.log(`[ConversationService] CLI started successfully for ${sessionId}`)
+    for (const listener of this.teamRuntimeListeners) {
+      try {
+        listener.sessionStarted?.(sessionId, { isTeamWorker: Boolean(options?.teamWorker) })
+      } catch (error) {
+        console.error('[ConversationService] Team runtime start hook failed', error)
+      }
+    }
+  }
+
+  addTeamRuntimeListener(listener: TeamRuntimeListener): () => void {
+    this.teamRuntimeListeners.add(listener)
+    return () => this.teamRuntimeListeners.delete(listener)
   }
 
   onOutput(sessionId: string, callback: (msg: any) => void): void {
@@ -963,6 +999,7 @@ export class ConversationService {
     attachments?: AttachmentRef[],
     options?: SendMessageOptions,
   ): Promise<boolean> {
+    if (migrationMaintenance.isActive) return false
     const userContent = await this.buildUserContent(content, sessionId, attachments)
     let session = this.sessions.get(sessionId)
     if (session && !await this.refreshNetworkEnvironmentBeforeTurn(sessionId, session)) {
@@ -976,7 +1013,7 @@ export class ConversationService {
     // can all suspend this call. Stop may revoke the owning desktop turn while
     // one of those awaits is pending, so check ownership at the last possible
     // point before writing the user message to the SDK socket.
-    if (options?.canSend && !options.canSend()) return false
+    if (migrationMaintenance.isActive || (options?.canSend && !options.canSend())) return false
     const sent = this.sendSdkMessage(sessionId, {
       type: 'user',
       ...(options?.messageUuid ? { uuid: options.messageUuid } : {}),
@@ -1212,22 +1249,37 @@ export class ConversationService {
   }
 
   sendInterrupt(sessionId: string): boolean {
+    // Stop ends all team activity immediately, but an approved team that is
+    // already working is paused rather than destroyed: the runtime marks its
+    // members as user-stopped before their processes die, and a later message
+    // from the lead or the user resumes each member from its own transcript.
+    let pausedTeam = false
+    for (const listener of this.teamRuntimeListeners) {
+      try {
+        if (listener.leadInterrupted?.(sessionId) === true) pausedTeam = true
+      } catch (error) {
+        console.error('[ConversationService] Team runtime interrupt hook failed', error)
+      }
+    }
     for (const [childId, child] of this.sessions) {
       if (getWorkerParentId(child) === sessionId) this.stopSession(childId)
     }
     const stop = (this.teamStopOperations.get(sessionId) ?? Promise.resolve()).then(async () => {
       const runtime = await import('./teamPlanRuntime.js')
-      await runtime.stopTeamPlanRuntimesForParent(sessionId)
+      await runtime.stopTeamPlanRuntimesForParent(sessionId, { pauseReleased: true })
     }).catch(error => {
       console.error('[ConversationService] Failed to revoke interrupted team launch', error)
     }).finally(() => {
       if (this.teamStopOperations.get(sessionId) === stop) this.teamStopOperations.delete(sessionId)
     })
     this.teamStopOperations.set(sessionId, stop)
+    // A paused team's lead also holds the mail its members sent before the
+    // Stop until the user speaks again; acting on it would start lead turns,
+    // and restart members, that the user just stopped.
     return this.sendSdkMessage(sessionId, {
       type: 'control_request',
       request_id: crypto.randomUUID(),
-      request: { subtype: 'interrupt' },
+      request: { subtype: pausedTeam ? 'team_plan_pause' : 'interrupt' },
     })
   }
 
@@ -1356,6 +1408,11 @@ export class ConversationService {
   isWorkerSession(sessionId: string): boolean {
     const session = this.sessions.get(sessionId)
     return !!session && getWorkerParentId(session) !== undefined
+  }
+
+  /** Team workers report through their lead: their requests already count there. */
+  isTeamWorkerSession(sessionId: string): boolean {
+    return Boolean(this.sessions.get(sessionId)?.teamWorker)
   }
 
   getSessionWorkDir(sessionId: string): string {
@@ -1713,9 +1770,18 @@ export class ConversationService {
     pending.clear()
   }
 
-  stopSession(sessionId: string): void {
+  /**
+   * `keepTeamWorkers` is for restarting a lead's process (runtime or
+   * permission change): approved team members are independent processes and
+   * keep working while the lead's process is replaced. Pinned agent workers
+   * are not teammates — they still stop with the parent even when team
+   * workers are kept.
+   */
+  stopSession(sessionId: string, options?: { keepTeamWorkers?: boolean }): void {
     for (const [childId, child] of this.sessions) {
-      if (getWorkerParentId(child) === sessionId) this.stopSession(childId)
+      if (getWorkerParentId(child) !== sessionId) continue
+      if (options?.keepTeamWorkers && child.teamWorker) continue
+      this.stopSession(childId, options)
     }
     const session = this.sessions.get(sessionId)
     if (!session) return
@@ -1729,9 +1795,12 @@ export class ConversationService {
   async stopSessionAndWait(
     sessionId: string,
     timeoutMs = DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+    options?: { keepTeamWorkers?: boolean },
   ): Promise<void> {
     for (const [childId, child] of this.sessions) {
-      if (getWorkerParentId(child) === sessionId) await this.stopSessionAndWait(childId, timeoutMs)
+      if (getWorkerParentId(child) !== sessionId) continue
+      if (options?.keepTeamWorkers && child.teamWorker) continue
+      await this.stopSessionAndWait(childId, timeoutMs, options)
     }
     const session = this.sessions.get(sessionId)
     if (!session) return
@@ -1828,6 +1897,24 @@ export class ConversationService {
     return Array.from(this.sessions.keys())
   }
 
+  getProcessIds(): number[] {
+    return [...this.sessions.values()].map(session => session.proc.pid).filter(pid => pid > 0)
+  }
+
+  async stopForMigration(): Promise<void> {
+    const sessions = [...this.sessions.entries()]
+    await Promise.all(sessions.map(async ([sessionId, session]) => {
+      if (session.proc.exitCode == null) {
+        await this.requestControl(sessionId, { subtype: 'end_session', reason: 'data_migration' }, 10_000)
+      }
+      const exited = await waitForMigrationExit(session.proc.exited)
+      if (!exited) throw new Error(`CLI process did not exit: ${sessionId}`)
+      await session.outputDrain
+      this.sessions.delete(sessionId)
+    }))
+    await Promise.all([...this.teamStopOperations.values()])
+  }
+
   private async readProcessOutputStream(
     sessionId: string,
     stream: ReadableStream | null | undefined,
@@ -1911,8 +1998,14 @@ export class ConversationService {
 
     const activeSession = this.sessions.get(sessionId)
     if (activeSession?.proc === proc) {
+      // A lead process that dies on its own (crash, OOM, provider SDK fault)
+      // must not take its approved team with it: members are independent
+      // processes, their messages queue in the lead's mailbox, and the next
+      // lead start receives the team snapshot again. Explicit stops (close,
+      // delete, /clear) still stop workers through stopSession.
+      // Pinned agent workers are not teammates and still stop with the parent.
       for (const [childId, child] of this.sessions) {
-        if (getWorkerParentId(child) === sessionId) this.stopSession(childId)
+        if (child.agentWorker?.parentSessionId === sessionId) this.stopSession(childId)
       }
       this.cancelPendingControlRequests(
         activeSession,
@@ -2338,7 +2431,7 @@ export class ConversationService {
       }
     })()
 
-    session.officialOAuthRefreshPromise = recovery
+    session.officialOAuthRefreshPromise = migrationMaintenance.track(recovery)
     void recovery.finally(() => {
       if (session.officialOAuthRefreshPromise === recovery) {
         session.officialOAuthRefreshPromise = undefined
@@ -2752,7 +2845,10 @@ export class ConversationService {
     const savedPaths: string[] = []
     const imageBlocks: UserContentBlock[] = []
     const imageMetadataTexts: string[] = []
-    for (const attachment of attachments) {
+    for (const originalAttachment of attachments) {
+      const attachment = originalAttachment.path
+        ? { ...originalAttachment, path: resolveRelocatedAttachmentPath(originalAttachment.path) }
+        : originalAttachment
       if (this.shouldInlineImageAttachment(attachment)) {
         const image = await this.materializeImageAttachment(attachment, uploadDir)
         if (image) {

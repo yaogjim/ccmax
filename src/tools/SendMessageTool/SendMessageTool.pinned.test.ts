@@ -58,4 +58,42 @@ describe('SendMessage to a pinned agent', () => {
     expect(resumeSpy).toHaveBeenCalledTimes(1)
     expect(result.data).toMatchObject({ success: true })
   })
+
+  test('an in-process teammate without a pinned runtime is still resumed', async () => {
+    spyOn(sessionStorage, 'readAgentMetadata').mockResolvedValue({
+      agentType: 'general-purpose',
+      taskKind: 'in_process_teammate',
+      teamName: 'review-team',
+      name: 'reader',
+    })
+    const resumeSpy = spyOn(resumeAgentModule, 'resumeAgentBackground').mockResolvedValue({
+      agentId: AGENT_ID,
+      description: 'd',
+      outputFile: '/tmp/out',
+    })
+
+    const result = await send()
+
+    expect(resumeSpy).toHaveBeenCalledTimes(1)
+    expect(result.data).toMatchObject({ success: true })
+  })
+
+  test('a teammate that is also pinned is still refused so it cannot resume on this session', async () => {
+    spyOn(sessionStorage, 'readAgentMetadata').mockResolvedValue({
+      agentType: 'niuma',
+      taskKind: 'in_process_teammate',
+      teamName: 'review-team',
+      name: 'reader',
+      runtime: { mode: 'pinned', providerId: 'deepseek', providerName: 'DeepSeek', requestedModel: 'deepseek-flash', model: 'deepseek-v4-flash', workerSessionId: 'w' },
+    })
+    const resumeSpy = spyOn(resumeAgentModule, 'resumeAgentBackground')
+
+    const result = await send()
+
+    expect(result.data).toMatchObject({
+      success: false,
+      message: expect.stringContaining('cannot be resumed or sent messages'),
+    })
+    expect(resumeSpy).not.toHaveBeenCalled()
+  })
 })

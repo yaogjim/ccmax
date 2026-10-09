@@ -1,6 +1,5 @@
 export type LandingLocale = 'zh' | 'en'
 export type TaskCategory = 'code' | 'apps' | 'review'
-export type FeatureImageKey = 'session' | 'settings' | 'workspace'
 
 export interface TaskSuggestion {
   label: string
@@ -15,7 +14,6 @@ export interface LandingFeature {
   kicker: string
   detail: string
   route: string
-  imageKey: FeatureImageKey
 }
 
 export interface LandingContent {
@@ -52,8 +50,7 @@ export const landingContent: Record<LandingLocale, LandingContent> = {
         title: '想法有了，剩下的一起做。',
         body: '一个新功能，一个恼人的 Bug，或者迟迟没动手的个人项目。说出目标，ccmax 会读取代码、编辑文件、运行命令，把过程留在同一条会话里。',
         detail: '你的项目 · 你的模型 · 清晰可见的过程',
-        route: '/start/first-session',
-        imageKey: 'session'
+        route: '/start/first-session'
       },
       {
         id: 'apps',
@@ -61,8 +58,7 @@ export const landingContent: Record<LandingLocale, LandingContent> = {
         title: '工作，也发生在别的窗口里。',
         body: '开启 Computer Use，让 AI 看见并操作桌面应用。从整理一条笔记，到完成一段重复操作，任务可以继续走下去。',
         detail: 'macOS 原生控制不占用真实鼠标和键盘；Windows 使用兼容执行器。',
-        route: '/desktop/computer-use',
-        imageKey: 'settings'
+        route: '/desktop/computer-use'
       },
       {
         id: 'review',
@@ -70,8 +66,7 @@ export const landingContent: Record<LandingLocale, LandingContent> = {
         title: '每一处改动，都有迹可循。',
         body: '在工作区查看文件差异，给具体代码留下意见，再打开内置浏览器看看实际效果。把反馈说清楚，让下一轮更接近你的想法。',
         detail: '文件差异 · 行级评论 · 页面预览',
-        route: '/desktop/workspace',
-        imageKey: 'workspace'
+        route: '/desktop/workspace'
       }
     ],
     workflowSteps: [
@@ -111,8 +106,7 @@ export const landingContent: Record<LandingLocale, LandingContent> = {
         title: 'You have the idea. Build it together.',
         body: 'A new feature, a stubborn bug, or that personal project waiting to happen. Describe the goal. ccmax reads code, edits files, and runs commands, with the work visible in one conversation.',
         detail: 'Your project · Your model · A process you can follow',
-        route: '/en/start/first-session',
-        imageKey: 'session'
+        route: '/en/start/first-session'
       },
       {
         id: 'apps',
@@ -120,8 +114,7 @@ export const landingContent: Record<LandingLocale, LandingContent> = {
         title: 'Work happens in other windows, too.',
         body: 'Enable Computer Use to let AI see and operate desktop apps. From organizing a note to working through a repetitive sequence, your task can keep moving.',
         detail: 'Native macOS control leaves your physical mouse and keyboard free. Windows uses a compatibility executor.',
-        route: '/en/desktop/computer-use',
-        imageKey: 'settings'
+        route: '/en/desktop/computer-use'
       },
       {
         id: 'review',
@@ -129,8 +122,7 @@ export const landingContent: Record<LandingLocale, LandingContent> = {
         title: 'Every change tells its story.',
         body: 'Inspect file diffs, leave feedback on a line of code, and open the built-in browser to see the page in action. Make the next iteration closer to what you had in mind.',
         detail: 'File diffs · Line comments · Page previews',
-        route: '/en/desktop/workspace',
-        imageKey: 'workspace'
+        route: '/en/desktop/workspace'
       }
     ],
     workflowSteps: [

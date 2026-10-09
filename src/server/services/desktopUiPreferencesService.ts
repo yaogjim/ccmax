@@ -5,6 +5,8 @@ import { randomBytes } from 'node:crypto'
 import { ApiError } from '../middleware/errorHandler.js'
 import { readRecoverableJsonFile } from './recoverableJsonFile.js'
 import { ensurePersistentStorageUpgraded } from './persistentStorageMigrations.js'
+import { normalizeVoicePreferences } from './voice/preferences.js'
+import { DEFAULT_VOICE_PREFERENCES, type VoicePreferences } from './voice/types.js'
 
 const CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION = 6
 const MAX_PROJECT_PREFERENCE_ENTRIES = 2_000
@@ -54,6 +56,8 @@ export type DesktopPetPreferences = {
   lastSessionId: string | null
 }
 
+export type DesktopVoiceInputPreferences = VoicePreferences
+
 export type ProjectDisplayNames = Record<string, string>
 
 export type DesktopSettingsNavigationPreferences = {
@@ -76,6 +80,7 @@ export type DesktopUiPreferences = {
   sidebar: SidebarProjectPreferences
   profile: DesktopProfilePreferences
   pet: DesktopPetPreferences
+  voiceInput: DesktopVoiceInputPreferences
   projectDisplayNames: ProjectDisplayNames
   settingsNavigation: DesktopSettingsNavigationPreferences
   skillMarket: DesktopSkillMarketPreferences
@@ -137,6 +142,7 @@ function defaultPreferences(): DesktopUiPreferences {
     sidebar: { ...DEFAULT_SIDEBAR_PROJECT_PREFERENCES },
     profile: { ...DEFAULT_PROFILE_PREFERENCES },
     pet: { ...DEFAULT_PET_PREFERENCES },
+    voiceInput: { ...DEFAULT_VOICE_PREFERENCES },
     projectDisplayNames: createProjectDisplayNames(),
     settingsNavigation: { ...DEFAULT_SETTINGS_NAVIGATION_PREFERENCES },
     skillMarket: { ...DEFAULT_SKILL_MARKET_PREFERENCES },
@@ -450,6 +456,7 @@ function normalizeDesktopUiPreferences(value: unknown): DesktopUiPreferences | n
     sidebar: normalizeSidebarProjectPreferences(record.sidebar),
     profile: normalizeProfilePreferences(record.profile),
     pet: normalizeDesktopPetPreferences(record.pet),
+    voiceInput: normalizeVoicePreferences(record.voiceInput),
     projectDisplayNames: normalizeProjectDisplayNames(record.projectDisplayNames),
     settingsNavigation: normalizeDesktopSettingsNavigationPreferences(record.settingsNavigation),
     skillMarket: normalizeDesktopSkillMarketPreferences(record.skillMarket),
@@ -565,6 +572,7 @@ export class DesktopUiPreferencesService {
         }),
         profile: normalizeProfilePreferences(preferences.profile),
         pet: normalizeDesktopPetPreferences(preferences.pet),
+        voiceInput: normalizeVoicePreferences(preferences.voiceInput),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
         skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
@@ -600,6 +608,7 @@ export class DesktopUiPreferencesService {
           avatarUpdatedAt: currentProfile.avatarUpdatedAt,
         },
         pet: normalizeDesktopPetPreferences(preferences.pet),
+        voiceInput: normalizeVoicePreferences(preferences.voiceInput),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
         skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
@@ -639,6 +648,7 @@ export class DesktopUiPreferencesService {
         sidebar: normalizeSidebarProjectPreferences(preferences.sidebar),
         profile: normalizeProfilePreferences(preferences.profile),
         pet: normalizeDesktopPetPreferences(preferences.pet),
+        voiceInput: normalizeVoicePreferences(preferences.voiceInput),
         projectDisplayNames,
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
         skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
@@ -664,6 +674,33 @@ export class DesktopUiPreferencesService {
         profile: normalizeProfilePreferences(preferences.profile),
         pet: normalizeDesktopPetPreferences({
           ...currentPet,
+          ...patch,
+        }),
+        voiceInput: normalizeVoicePreferences(preferences.voiceInput),
+        projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
+      }
+
+      await this.writePreferences(nextPreferences)
+      return nextPreferences
+    })
+  }
+
+  async updateVoiceInputPreferences(voiceInput: unknown): Promise<DesktopUiPreferences> {
+    const filePath = this.getPreferencesPath()
+    return this.withWriteLock(filePath, async () => {
+      const { preferences } = await this.readPreferences()
+      const currentVoiceInput = normalizeVoicePreferences(preferences.voiceInput)
+      const patch = voiceInput && typeof voiceInput === 'object' && !Array.isArray(voiceInput)
+        ? voiceInput as Record<string, unknown>
+        : {}
+      const nextPreferences: DesktopUiPreferences = {
+        ...preferences,
+        schemaVersion: preferences.schemaVersion,
+        sidebar: normalizeSidebarProjectPreferences(preferences.sidebar),
+        profile: normalizeProfilePreferences(preferences.profile),
+        pet: normalizeDesktopPetPreferences(preferences.pet),
+        voiceInput: normalizeVoicePreferences({
+          ...currentVoiceInput,
           ...patch,
         }),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
@@ -771,6 +808,7 @@ export class DesktopUiPreferencesService {
           avatarUpdatedAt: new Date().toISOString(),
         },
         pet: normalizeDesktopPetPreferences(preferences.pet),
+        voiceInput: normalizeVoicePreferences(preferences.voiceInput),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
         skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),
@@ -800,6 +838,7 @@ export class DesktopUiPreferencesService {
           avatarUpdatedAt: null,
         },
         pet: normalizeDesktopPetPreferences(preferences.pet),
+        voiceInput: normalizeVoicePreferences(preferences.voiceInput),
         projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
         settingsNavigation: normalizeDesktopSettingsNavigationPreferences(preferences.settingsNavigation),
         skillMarket: normalizeDesktopSkillMarketPreferences(preferences.skillMarket),

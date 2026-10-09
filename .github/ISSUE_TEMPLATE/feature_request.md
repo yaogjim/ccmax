@@ -9,8 +9,8 @@ assignees: ''
 ## 提交前确认
 <!-- 请在提交前确认以下事项 -->
 
-- [ ] 我已经阅读过[现有功能文档](https://cchaha.ai)，确认不是已有能力
-- [ ] 我已经搜索过[现有 issues](https://github.com/NanmiCoder/cc-haha/issues)，确认没有重复建议
+- [ ] 我已经阅读过[现有功能文档](https://yaogjim.github.io/ccmax/)，确认不是已有能力
+- [ ] 我已经搜索过[现有 issues](https://github.com/yaogjim/ccmax/issues)，确认没有重复建议
 - [ ] 我已经隐藏截图和日志中的 API Key、Token、Cookie 等敏感信息
 
 ## 你想要什么

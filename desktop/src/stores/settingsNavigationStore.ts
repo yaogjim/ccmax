@@ -211,6 +211,7 @@ export const useSettingsNavigationStore = create<SettingsNavigationState>((set, 
   },
 
   isSettingsTabVisible: (tab) => {
+    if (tab === 'trace') return false
     if (!isOptionalSettingsTab(tab)) return true
     return get().preferences[tab]
   },

@@ -374,20 +374,21 @@ describe('Business Flow: Models & Effort', () => {
 
   it('should return available fallback models', async () => {
     const { data } = await api('GET', '/api/models')
-    expect(data.models.length).toBe(7)
+    expect(data.models.length).toBe(8)
     const names = data.models.map((m: any) => m.name)
     expect(names).toContain('Fable 5.1')
     expect(names).toContain('Fable 5')
     expect(names).toContain('Opus 5.5')
     expect(names).toContain('Opus 5')
     expect(names).toContain('Opus 4.8')
+    expect(names).toContain('Sonnet 5.5')
     expect(names).toContain('Sonnet 5')
     expect(names).toContain('Haiku 4.5')
   })
 
   it('should default to Opus model', async () => {
     const { data } = await api('GET', '/api/models/current')
-    expect(data.model.id).toBe('claude-opus-5')
+    expect(data.model.id).toBe('claude-opus-5-5')
   })
 
   it('should switch to Opus 4.8', async () => {
@@ -456,9 +457,9 @@ describe('Business Flow: Models & Effort', () => {
     expect(status).toBe(400)
   })
 
-  it('should default effort to max', async () => {
+  it('should default effort to low', async () => {
     const { data } = await api('GET', '/api/effort')
-    expect(data.level).toBe('max')
+    expect(data.level).toBe('low')
     expect(data.available).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
   })
 

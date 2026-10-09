@@ -139,6 +139,7 @@ vi.mock('../../i18n', () => ({
       'sidebar.collapse': 'Collapse sidebar',
       'sidebar.expand': 'Expand sidebar',
       'session.lastUpdated': 'last updated {time}',
+      'sidebar.sessionStatus.attention': 'Needs you',
       'session.timeJustNow': 'just now',
       'session.timeMinutes': '{n}m ago',
       'session.timeHours': '{n}h ago',
@@ -297,6 +298,13 @@ function makeChatSessionState(overrides: Partial<PerSessionState> = {}): PerSess
   }
 }
 
+// 一条挂起的授权请求，形状与 store 里的一致：`pendingPermission` 是最新一条的镜像，
+// `pendingPermissions` 是全集。
+const openRequest: Partial<PerSessionState> = {
+  pendingPermission: { requestId: 'r1', toolName: 'Bash', toolUseId: 'tu-1', input: {} },
+  pendingPermissions: { r1: { requestId: 'r1', toolName: 'Bash', toolUseId: 'tu-1', input: {} } },
+}
+
 function createDeferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason?: unknown) => void
@@ -360,7 +368,7 @@ function makeDesktopUiPreferencesResponse({
   }
 }
 
-function SidebarDrawerHarness({ request }: { request: Promise<DesktopUiPreferencesResponse> }) {
+function SidebarRemountHarness({ request }: { request: Promise<DesktopUiPreferencesResponse> }) {
   const [open, setOpen] = useState(true)
   const [preferencesRequest, setPreferencesRequest] = useState<
     Promise<DesktopUiPreferencesResponse> | null
@@ -369,11 +377,10 @@ function SidebarDrawerHarness({ request }: { request: Promise<DesktopUiPreferenc
   return (
     <>
       <button type="button" onClick={() => setOpen((current) => !current)}>
-        {open ? 'Close drawer harness' : 'Open drawer harness'}
+        {open ? 'Unmount sidebar harness' : 'Mount sidebar harness'}
       </button>
       {open && (
         <Sidebar
-          isMobile
           desktopUiPreferencesRequest={preferencesRequest}
           onDesktopUiPreferencesConsumed={(consumedRequest) => {
             setPreferencesRequest((current) => current === consumedRequest ? null : current)
@@ -592,7 +599,10 @@ describe('Sidebar', () => {
     expect(screen.getByText('beta')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Alpha newest/ })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Alpha hidden/ })).not.toBeInTheDocument()
-    expect(screen.getByTestId('sidebar-project-session-list-workspace-alpha').parentElement).toHaveClass('pl-5')
+    // Rows span the full width (so the selected card does) and carry the
+    // indent themselves: `pl-8` lands the title on the project name's line.
+    expect(screen.getByRole('button', { name: /Alpha newest/ })).toHaveClass('pl-8')
+    expect(screen.getByTestId('sidebar-project-count-workspace-alpha')).toHaveTextContent('11')
     expect(screen.getByRole('button', { name: 'Collapse alpha' })).toHaveAttribute('data-state', 'open')
     expect(screen.getByTestId('sidebar-project-icon-workspace-alpha')).toHaveAttribute('data-icon-state', 'open')
 
@@ -600,6 +610,75 @@ describe('Sidebar', () => {
 
     expect(screen.getByRole('button', { name: /Alpha hidden/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Collapse display' })).toBeInTheDocument()
+  })
+
+  describe('a folded project with a session waiting on the user', () => {
+    // Eleven sessions against a six-row preview: the last two are past the fold.
+    function seedFoldedProject() {
+      const base = new Date('2026-05-15T10:00:00.000Z').getTime()
+      useSessionStore.setState({
+        sessions: Array.from({ length: 11 }, (_, index) => (
+          makeSession(
+            `alpha-${index + 1}`,
+            index === 10 ? 'Alpha waiting' : index === 9 ? 'Alpha folded' : `Alpha ${index + 1}`,
+            '/workspace/alpha',
+            new Date(base - index * 1000).toISOString(),
+          )
+        )),
+      })
+    }
+
+    it('keeps the waiting row on screen while its quiet neighbour stays folded away', () => {
+      seedFoldedProject()
+      useChatStore.setState({
+        sessions: { 'alpha-11': makeChatSessionState({ chatState: 'tool_executing', ...openRequest }) },
+      } as Partial<ReturnType<typeof useChatStore.getState>>)
+
+      render(<Sidebar />)
+
+      // On a phone the dot on the menu button points at this row, and there is no
+      // tab strip to fall back on: a row folded out of the drawer would end the
+      // signal one step short.
+      const waitingRow = screen.getByRole('button', { name: /Alpha waiting/ })
+      expect(within(waitingRow).getByLabelText('Waiting for your approval')).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /Alpha folded/ })).not.toBeInTheDocument()
+    })
+
+    it('folds the row away again once it stops waiting', () => {
+      seedFoldedProject()
+      useChatStore.setState({
+        sessions: { 'alpha-11': makeChatSessionState({ chatState: 'tool_executing', ...openRequest }) },
+      } as Partial<ReturnType<typeof useChatStore.getState>>)
+      render(<Sidebar />)
+      expect(screen.getByRole('button', { name: /Alpha waiting/ })).toBeInTheDocument()
+
+      act(() => {
+        useChatStore.setState({
+          sessions: {
+            'alpha-11': makeChatSessionState({ chatState: 'tool_executing', pendingPermission: null, pendingPermissions: {} }),
+          },
+        } as Partial<ReturnType<typeof useChatStore.getState>>)
+      })
+
+      expect(screen.queryByRole('button', { name: /Alpha waiting/ })).not.toBeInTheDocument()
+    })
+
+    it('keeps the open session and a waiting one visible together, in list order', () => {
+      seedFoldedProject()
+      useTabStore.setState({
+        tabs: [{ sessionId: 'alpha-10', title: 'Alpha folded', type: 'session', status: 'idle' }],
+        activeTabId: 'alpha-10',
+      })
+      useChatStore.setState({
+        sessions: { 'alpha-11': makeChatSessionState({ chatState: 'tool_executing', ...openRequest }) },
+      } as Partial<ReturnType<typeof useChatStore.getState>>)
+
+      render(<Sidebar />)
+
+      const rows = screen.getAllByRole('button', { name: /^Alpha / }).map((row) => row.textContent ?? '')
+      expect(rows.at(-2)).toContain('Alpha folded')
+      expect(rows.at(-1)).toContain('Alpha waiting')
+    })
   })
 
   it('does not show a fold control when a project is at or below the collapse threshold', () => {
@@ -797,7 +876,7 @@ describe('Sidebar', () => {
     const expandButton = screen.getByRole('button', { name: 'Expand display' })
     expect(expandButton).toHaveAttribute('aria-expanded', 'false')
     expect(expandButton.parentElement).toHaveClass('justify-start')
-    expect(expandButton).toHaveClass('text-[var(--color-text-tertiary)]', 'opacity-75')
+    expect(expandButton).toHaveClass('text-[var(--color-text-tertiary)]', 'pl-8')
 
     fireEvent.click(expandButton)
 
@@ -1689,13 +1768,13 @@ describe('Sidebar', () => {
     expect(JSON.parse(window.localStorage.getItem(PROJECT_HIDDEN_STORAGE_KEY) ?? '[]')).toEqual(['/workspace/alpha'])
   })
 
-  it('invalidates stale bootstrap preferences before a mobile drawer remount', async () => {
+  it('invalidates stale bootstrap preferences before a sidebar remount', async () => {
     const preferencesResponse = createDeferred<DesktopUiPreferencesResponse>()
     useSessionStore.setState({
       sessions: [makeSession('alpha-1', 'Alpha Session', '/workspace/alpha', new Date().toISOString())],
     })
 
-    render(<SidebarDrawerHarness request={preferencesResponse.promise} />)
+    render(<SidebarRemountHarness request={preferencesResponse.promise} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Project actions for alpha' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Hide from Sidebar' }))
@@ -1710,8 +1789,8 @@ describe('Sidebar', () => {
       })
     })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close drawer harness' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Open drawer harness' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Unmount sidebar harness' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Mount sidebar harness' }))
     expect(screen.queryByTestId('sidebar-project-group-workspace-alpha')).not.toBeInTheDocument()
 
     await act(async () => {
@@ -2117,8 +2196,17 @@ describe('Sidebar', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Batch manage' }))
     fireEvent.click(screen.getByRole('button', { name: /First Session/ }))
 
-    expect(screen.getByRole('button', { name: /First Session/ }).parentElement).toHaveClass('mb-0.5')
+    expect(screen.getByRole('button', { name: /First Session/ }).parentElement).toHaveClass('mb-px')
     expect(screen.getByRole('button', { name: /First Session/ })).toHaveClass('sidebar-session-row--selected')
+    // Both the batch selection and the open session are the white card lifted
+    // off the sidebar ground: paper fill, hairline ring, raised shadow step.
+    for (const name of [/First Session/, /Second Session/]) {
+      expect(screen.getByRole('button', { name })).toHaveClass(
+        'bg-[var(--color-sidebar-item-active)]',
+        'shadow-[0_0_0_1px_var(--color-border),var(--shadow-raised)]',
+      )
+    }
+    expect(screen.getByRole('button', { name: /Third Session/ })).not.toHaveClass('bg-[var(--color-sidebar-item-active)]')
     expect(screen.getByRole('button', { name: /Second Session/ })).toHaveClass('sidebar-session-row--active')
     expect(screen.getByRole('button', { name: /Third Session/ })).toHaveClass('sidebar-session-row--idle')
   })
@@ -2186,45 +2274,68 @@ describe('Sidebar', () => {
     expect(screen.getByTestId('sidebar-settings-dock')).toHaveClass('absolute', 'bottom-0')
   })
 
-  it('keeps mobile navigation focused on chat sessions', async () => {
-    const onRequestClose = vi.fn()
-    createSession.mockResolvedValue('session-mobile-new')
+  // 「素」: refresh and batch-manage are list maintenance, not peers of search.
+  // They moved from beside the search box into the projects header, where the
+  // other list actions already sit, and must stay reachable there.
+  it('keeps refresh and batch-manage in the projects header instead of beside search', () => {
+    useSessionStore.setState({
+      sessions: [makeSession('alpha-1', 'Alpha one', '/workspace/alpha', '2026-05-15T10:00:00.000Z')],
+    })
+    render(<Sidebar />)
+
+    const header = screen.getByTestId('sidebar-projects-header')
+    const search = screen.getByTestId('sidebar-search-controls-section')
+    for (const name of ['Refresh sessions', 'Batch manage', 'Project menu']) {
+      expect(within(header).getByRole('button', { name })).toBeInTheDocument()
+      expect(within(search).queryByRole('button', { name })).not.toBeInTheDocument()
+    }
+
+    // Still a working toggle from its new home, and held in sight while on.
+    fireEvent.click(within(header).getByRole('button', { name: 'Batch manage' }))
+    const exit = within(header).getByRole('button', { name: 'Cancel batch mode' })
+    expect(exit).toHaveAttribute('aria-pressed', 'true')
+    expect(exit.parentElement).toHaveClass('opacity-100')
+  })
+
+  it('keeps the refresh control reachable while the first load is still in flight', async () => {
+    useSessionStore.setState({ sessions: [], isLoading: true })
+    render(<Sidebar />)
+    await waitFor(() => expect(fetchSessions).toHaveBeenCalledTimes(1))
+
+    const refresh = within(screen.getByTestId('sidebar-projects-header')).getByRole('button', { name: 'Refresh sessions' })
+    expect(refresh.querySelector('svg')).toHaveClass('animate-spin')
+    fireEvent.click(refresh)
+    await waitFor(() => expect(fetchSessions).toHaveBeenCalledTimes(2))
+  })
+
+  it('swaps the relative time for a short waiting label on a session that needs the user', () => {
+    useSessionStore.setState({
+      sessions: [makeSession('waiting', 'Waiting row', '/workspace/alpha', new Date(Date.now() - 20 * 60_000).toISOString())],
+    })
+    useChatStore.setState({
+      sessions: { waiting: makeChatSessionState({ chatState: 'tool_executing', ...openRequest }) },
+    } as Partial<ReturnType<typeof useChatStore.getState>>)
+    render(<Sidebar />)
+
+    const row = screen.getByRole('button', { name: /Waiting row/ })
+    expect(within(row).getByLabelText('Waiting for your approval')).toBeInTheDocument()
+    expect(within(row).getByText('Needs you')).toHaveAttribute('aria-hidden', 'true')
+    expect(within(row).queryByText('20m ago')).not.toBeInTheDocument()
+  })
+
+  it('draws the worktree branch only on sessions that really run in their own checkout', () => {
+    const at = new Date(Date.now() - 5 * 60_000).toISOString()
     useSessionStore.setState({
       sessions: [
-        {
-          id: 'session-1',
-          title: 'Open Session',
-          createdAt: new Date().toISOString(),
-          modifiedAt: new Date().toISOString(),
-          messageCount: 1,
-          projectPath: '/workspace/project',
-          workDir: '/workspace/project',
-          workDirExists: true,
-        },
+        // git spells the root through /private, the shell does not: same place.
+        { ...makeSession('tmp', 'Temp project', '/private/var/folders/x/T/proj', at), workDir: '/var/folders/x/T/proj' },
+        { ...makeSession('wt', 'Worktree run', '/workspace/alpha', at), workDir: '/workspace/alpha/.claude/worktrees/feature' },
       ],
     })
+    render(<Sidebar />)
 
-    render(<Sidebar isMobile onRequestClose={onRequestClose} />)
-
-    expect(screen.queryByRole('button', { name: 'Scheduled' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Extension Market' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    expect(useTabStore.getState().activeTabId).toBe('__settings__')
-    expect(onRequestClose).toHaveBeenCalledTimes(1)
-    onRequestClose.mockClear()
-
-    fireEvent.click(screen.getByRole('button', { name: /Open Session/ }))
-    expect(onRequestClose).toHaveBeenCalledTimes(1)
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'New Session' }))
-    })
-
-    await waitFor(() => {
-      expect(createSession).toHaveBeenCalled()
-    })
-    expect(onRequestClose).toHaveBeenCalledTimes(2)
+    expect(within(screen.getByRole('button', { name: /Temp project/ })).queryByText('worktree')).not.toBeInTheDocument()
+    expect(within(screen.getByRole('button', { name: /Worktree run/ })).getByText('worktree')).toHaveClass('sr-only')
   })
 
   it('hides the market entry from desktop navigation by default', () => {
@@ -2645,65 +2756,15 @@ describe('Sidebar', () => {
     })
   })
 
-  // The whole drawer is touch-only: it has no hover, and nothing can be focused
-  // through `pointer-events: none`. Every control gated on `group-hover` was
-  // therefore either dead or an invisible tap target, and the 53 tests above
-  // never saw it because they all render the desktop sidebar.
-  describe('touch drawer controls', () => {
-    const renderWithProject = (isMobile: boolean) => {
-      useSessionStore.setState({
-        sessions: [makeSession('alpha-1', 'Alpha newest', '/workspace/alpha', new Date('2026-05-15T10:00:00.000Z').toISOString())],
-      })
-      return render(<Sidebar isMobile={isMobile} />)
-    }
-
-    it('keeps the project row actions hover-gated on desktop', () => {
-      renderWithProject(false)
-
-      const actions = screen.getByRole('button', { name: 'Project actions for alpha' })
-      expect(actions).toHaveClass('h-7', 'w-7')
-      expect(actions.parentElement).toHaveClass('pointer-events-none', 'opacity-0')
+  it('keeps the project row actions hover-gated on desktop', () => {
+    useSessionStore.setState({
+      sessions: [makeSession('alpha-1', 'Alpha newest', '/workspace/alpha', new Date('2026-05-15T10:00:00.000Z').toISOString())],
     })
+    render(<Sidebar />)
 
-    it('leaves the project row actions tappable at 44px in the drawer', () => {
-      renderWithProject(true)
-
-      const actions = screen.getByRole('button', { name: 'Project actions for alpha' })
-      const create = screen.getByRole('button', { name: 'New session in alpha' })
-      expect(actions).toHaveClass('h-11', 'w-11')
-      expect(create).toHaveClass('h-11', 'w-11')
-      // Both live in one row, so they need a gap wide enough not to catch a
-      // thumb aimed at the other.
-      expect(actions.parentElement).toHaveClass('opacity-100', 'gap-1.5')
-      expect(actions.parentElement).not.toHaveClass('pointer-events-none')
-    })
-
-    it('stops rendering the projects header actions as an invisible tap target', () => {
-      renderWithProject(true)
-
-      // These kept `pointer-events` while sitting at `opacity: 0` — visually
-      // absent on a phone, yet still firing on tap.
-      const menu = screen.getByRole('button', { name: 'Project menu' })
-      expect(menu).toHaveClass('h-11', 'w-11')
-      expect(menu.parentElement).toHaveClass('opacity-100')
-      expect(menu.parentElement).not.toHaveClass('opacity-0')
-    })
-
-    it('raises the search row and overflow toggle to the touch minimum', () => {
-      renderWithProject(true)
-
-      expect(screen.getByRole('button', { name: 'Refresh sessions' })).toHaveClass('h-11', 'w-11')
-      expect(screen.getByRole('button', { name: 'Batch manage' })).toHaveClass('h-11', 'w-11')
-      // Same flex row as the two above; at h-9 it left the row ragged.
-      expect(screen.getAllByRole('button', { name: 'Search chats' })[0]).toHaveClass('h-11')
-    })
-
-    it('raises the task view bell to the touch minimum as well', () => {
-      renderWithProject(true)
-
-      // 铃铛跟旁边的折叠按钮同处标题行；停在 32px 会是这行里唯一打不中的目标。
-      expect(screen.getByRole('button', { name: 'Task view' })).toHaveClass('h-11', 'w-11')
-    })
+    const actions = screen.getByRole('button', { name: 'Project actions for alpha' })
+    expect(actions).toHaveClass('h-7', 'w-7')
+    expect(actions.parentElement).toHaveClass('pointer-events-none', 'opacity-0')
   })
 
   describe('task view', () => {
@@ -2844,7 +2905,9 @@ describe('Sidebar', () => {
       seedSessions()
       useChatStore.setState({
         sessions: {
-          'today-1': makeChatSessionState({ chatState: 'permission_pending' }),
+          // chatState 故意不是 'permission_pending'：`status` 消息会在卡片还开着时
+          // 把它改成别的，只看 chatState 的实现在这里会熄灯。
+          'today-1': makeChatSessionState({ chatState: 'tool_executing', ...openRequest }),
         },
       } as Partial<ReturnType<typeof useChatStore.getState>>)
 
@@ -2855,6 +2918,71 @@ describe('Sidebar', () => {
       const waitingRow = within(runningGroup).getByRole('button', { name: /Today Session/ })
       expect(within(waitingRow).getByLabelText('Waiting for your approval')).toBeInTheDocument()
       expect(within(waitingRow).queryByLabelText('Session running')).not.toBeInTheDocument()
+    })
+
+    it('does not call a session waiting from chatState alone, since no card exists for it', async () => {
+      seedSessions()
+      useChatStore.setState({
+        sessions: {
+          'today-1': makeChatSessionState({ chatState: 'permission_pending' }),
+        },
+      } as Partial<ReturnType<typeof useChatStore.getState>>)
+
+      render(<Sidebar />)
+      await act(async () => { toggleBell() })
+
+      const runningGroup = screen.getByTestId('sidebar-task-group-running')
+      const row = within(runningGroup).getByRole('button', { name: /Today Session/ })
+      expect(within(row).queryByLabelText('Waiting for your approval')).not.toBeInTheDocument()
+      expect(within(row).getByLabelText('Session running')).toBeInTheDocument()
+    })
+
+    it('marks a waiting session in the project view too, in place of the running spinner', () => {
+      seedSessions()
+      // 没有为它开 tab：侧边栏要能标出没有 tab 的会话，tab 栏那边看不到它。
+      useChatStore.setState({
+        sessions: {
+          'today-1': makeChatSessionState({ chatState: 'tool_executing', ...openRequest }),
+          'yesterday-1': makeChatSessionState({ chatState: 'thinking' }),
+        },
+      } as Partial<ReturnType<typeof useChatStore.getState>>)
+
+      render(<Sidebar />)
+
+      const waitingRow = screen.getByRole('button', { name: /Today Session/ })
+      expect(within(waitingRow).getByLabelText('Waiting for your approval')).toBeInTheDocument()
+      expect(within(waitingRow).queryByLabelText('Session running')).not.toBeInTheDocument()
+
+      // 只是在跑、没有在等的会话仍然转圈。
+      const busyRow = screen.getByRole('button', { name: /^Yesterday Session/ })
+      expect(within(busyRow).getByLabelText('Session running')).toBeInTheDocument()
+      expect(within(busyRow).queryByLabelText('Waiting for your approval')).not.toBeInTheDocument()
+    })
+
+    it('hands a project-view row back to the spinner once the request is answered', () => {
+      seedSessions()
+      useChatStore.setState({
+        sessions: {
+          'today-1': makeChatSessionState({ chatState: 'tool_executing', ...openRequest }),
+        },
+      } as Partial<ReturnType<typeof useChatStore.getState>>)
+
+      render(<Sidebar />)
+      expect(within(screen.getByRole('button', { name: /Today Session/ })).getByLabelText('Waiting for your approval'))
+        .toBeInTheDocument()
+
+      // 往返：授权被处理后标志要撤掉，会话还在跑，所以回到转圈。
+      act(() => {
+        useChatStore.setState({
+          sessions: {
+            'today-1': makeChatSessionState({ chatState: 'tool_executing', pendingPermission: null, pendingPermissions: {} }),
+          },
+        } as Partial<ReturnType<typeof useChatStore.getState>>)
+      })
+
+      const row = screen.getByRole('button', { name: /Today Session/ })
+      expect(within(row).queryByLabelText('Waiting for your approval')).not.toBeInTheDocument()
+      expect(within(row).getByLabelText('Session running')).toBeInTheDocument()
     })
 
     it('lights the bell when the organize menu picks by time, because they are one state', async () => {

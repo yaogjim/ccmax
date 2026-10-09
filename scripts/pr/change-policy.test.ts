@@ -159,6 +159,19 @@ describe('evaluateChangePolicy', () => {
     expect(testOnly.blocked).toBe(false)
   })
 
+  test('routes upstream data-directory migration modules to the persistence check', () => {
+    const sourceOnly = evaluateChangePolicy(['desktop/electron/services/dataMigration.ts'])
+
+    expect(sourceOnly.checks.persistence).toBe(true)
+    expect(sourceOnly.checks.desktopNative).toBe(true)
+    expect(sourceOnly.checks.desktop).toBe(false)
+
+    const metadataOnly = evaluateChangePolicy(['src/utils/storageMigrationMetadata.ts'])
+
+    expect(metadataOnly.checks.persistence).toBe(true)
+    expect(metadataOnly.checks.server).toBe(true)
+  })
+
   test('keeps sibling Electron services off the persistence check', () => {
     // The prefix is the migration file's base name, so an unrelated service under the same
     // directory still routes to the native lane without pulling in the persistence lane.

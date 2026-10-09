@@ -108,6 +108,10 @@ export const DESKTOP_PERSISTENCE_KEYS = {
     canonical: 'ccmax.scheduledTaskNotificationScan.v1',
     legacy: 'cc-haha.scheduledTaskNotificationScan.v1',
   },
+  workspace: {
+    canonical: 'ccmax.workspace',
+    legacy: 'cc-haha.workspace',
+  },
 } as const satisfies Record<string, PersistenceKeyPair>
 
 /** Older zoom key kept only as a tertiary read fallback. */
@@ -196,6 +200,7 @@ export const STARTUP_COPY_KEY_PAIRS: readonly PersistenceKeyPair[] = [
   DESKTOP_PERSISTENCE_KEYS.marketDisclaimerDismissed,
   DESKTOP_PERSISTENCE_KEYS.notifiedDesktopTaskRuns,
   DESKTOP_PERSISTENCE_KEYS.scheduledTaskNotificationScan,
+  DESKTOP_PERSISTENCE_KEYS.workspace,
 ]
 
 export function safeGetItem(storage: StorageLike | null | undefined, key: string): string | null {

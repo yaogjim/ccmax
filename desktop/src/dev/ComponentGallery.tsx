@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Check, Ellipsis, Filter, Folder, RefreshCw, Settings, SlidersHorizontal, Trash2, X } from 'lucide-react'
 
 import { AgentTeamsPlanCard } from '@/components/agentTeams/AgentTeamsPlanCard'
 import { installTeamPlanGalleryFixture, TEAM_PLAN_GALLERY_SESSION } from './teamPlanGalleryFixture'
@@ -25,7 +26,10 @@ import { Spinner } from '@/components/ui/Spinner'
 import { Switch } from '@/components/ui/Switch'
 import { TextArea } from '@/components/ui/TextArea'
 import { Tooltip } from '@/components/ui/Tooltip'
+import { ZoomableImage, type ImageZoom } from '@/components/ui/ZoomableImage'
+import { ZoomControls, type ZoomControlsLabels } from '@/components/ui/ZoomControls'
 import { BrandSeal } from '@/components/composite/BrandSeal'
+import { ZOOM_MAX, ZOOM_MIN, stepZoom, zoomPercent } from '@/lib/zoomPan'
 import { useTeamStore } from '@/stores/teamStore'
 import { THEME_MODES } from '@/types/settings'
 import type {
@@ -51,7 +55,7 @@ import type {
 /** Sourced from the type rather than restated, so a new palette shows up here. */
 const THEMES = THEME_MODES
 const TONES: Tone[] = ['neutral', 'brand', 'success', 'warning', 'danger', 'info']
-const VARIANTS: ButtonVariant[] = ['primary', 'secondary', 'tonal', 'tonal-outline', 'ghost', 'danger', 'danger-outline', 'link', 'inverse']
+const VARIANTS: ButtonVariant[] = ['primary', 'secondary', 'tonal', 'tonal-outline', 'ghost', 'danger', 'danger-outline', 'danger-ghost', 'link', 'inverse']
 const SIZES: ButtonSize[] = ['xs', 'sm', 'base', 'md', 'lg']
 const ICON_SIZES: IconButtonSize[] = ['2xs', 'xs', 'sm', 'md', 'lg', 'xl', '2xl']
 const ICON_TONES: IconButtonTone[] = ['default', 'secondary', 'muted', 'brand', 'danger']
@@ -323,11 +327,47 @@ function createAgentTeamsGallerySnapshots(now = Date.now()): TeamWorkbenchSnapsh
   ]
 }
 
+const ZOOM_LABELS: ZoomControlsLabels = {
+  group: 'Zoom controls',
+  zoomIn: 'Zoom in',
+  zoomOut: 'Zoom out',
+  fit: 'Fit to window',
+}
+
+/** A grid, so that zooming and panning are visible, with named colours to stay clear of hex literals. */
+const ZOOM_SAMPLE = `data:image/svg+xml;utf8,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">'
+  + '<defs><pattern id="g" width="100" height="100" patternUnits="userSpaceOnUse">'
+  + '<path d="M100 0H0V100" fill="none" stroke="gray" stroke-width="2"/></pattern></defs>'
+  + '<rect width="1600" height="1000" fill="lightsteelblue"/><rect width="1600" height="1000" fill="url(#g)"/>'
+  + '<text x="800" y="530" font-size="120" text-anchor="middle" fill="darkslategray">1600 x 1000</text></svg>',
+)}`
+
+/** The cluster on its own, with a real ladder behind it so the disabled ends can be seen. */
+function ZoomControlsDemo({ surface, flat }: { surface?: 'default' | 'media'; flat?: boolean }) {
+  const [zoom, setZoom] = useState<ImageZoom>('fit')
+  const scale = zoom === 'fit' ? 1 : zoom
+  return (
+    <ZoomControls
+      percent={zoomPercent(scale)}
+      fitActive={zoom === 'fit'}
+      canZoomIn={scale < ZOOM_MAX}
+      canZoomOut={scale > ZOOM_MIN}
+      onZoomIn={() => setZoom(stepZoom(scale, 1))}
+      onZoomOut={() => setZoom(stepZoom(scale, -1))}
+      onFit={() => setZoom('fit')}
+      labels={ZOOM_LABELS}
+      surface={surface}
+      flat={flat}
+    />
+  )
+}
+
 function Section({ title, note, children }: { title: string; note?: string; children: React.ReactNode }) {
   return (
     <section className="flex flex-col gap-3 border-b border-[var(--color-border)] py-6">
       <div>
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)]">{title}</h2>
+        <h2 className="text-[15px] font-semibold text-[var(--color-text-primary)]">{title}</h2>
         {note && <p className="mt-0.5 text-xs text-[var(--color-text-tertiary)]">{note}</p>}
       </div>
       {children}
@@ -369,14 +409,14 @@ function SessionSurfacePreview({ kind }: { kind: 'main' | 'agent' }) {
             { key: 'project', content: <span>claude-code-haha</span> },
             { key: 'scope', content: <span>{isAgent ? 'commit-analysis / teams-analyst' : 'main'}</span> },
           ]}
-          actions={<IconButton icon="refresh" label={`Refresh ${kind} session`} size="sm" />}
+          actions={<IconButton icon={<RefreshCw size={14} strokeWidth={1.75} />} label={`Refresh ${kind} session`} size="sm" />}
         />
         <div className="min-h-0 flex-1 overflow-hidden px-8 py-6">
           <div className="mx-auto max-w-[900px] space-y-4">
-            <div className="max-w-[72%] rounded-[var(--radius-lg)] bg-[var(--color-surface-container)] p-4 text-sm">
+            <div className="ml-auto w-fit max-w-[82%] rounded-[var(--radius-lg)] bg-[var(--color-surface-user-msg)] px-3.5 py-2.5 text-[15px] text-[var(--color-text-primary)]">
               {isAgent ? 'Review the assigned module and report findings.' : 'Coordinate the task and keep Agent Teams in its workbench.'}
             </div>
-            <div className="ml-auto max-w-[72%] rounded-[var(--radius-lg)] bg-[var(--color-primary-container)] p-4 text-sm text-[var(--color-on-primary-container)]">
+            <div className="text-[15px] leading-[1.7] text-[var(--color-text-primary)]">
               {isAgent ? 'I am using the same session surface as the main chat.' : 'The main session keeps only its own activity.'}
             </div>
           </div>
@@ -456,7 +496,7 @@ export function ComponentGallery() {
     <div className="min-h-screen bg-[var(--color-background)] px-8 py-6 text-[var(--color-text-primary)]">
       <header className="sticky top-0 z-[var(--z-sticky)] -mx-8 mb-2 border-b border-[var(--color-border)] bg-[var(--color-background)] px-8 py-4">
         <div className="flex items-center justify-between gap-4">
-          <h1 className="text-lg font-bold">components/ui gallery</h1>
+          <h1 className="text-lg font-semibold">components/ui gallery</h1>
           <SegmentedControl
             items={THEMES.map((value) => ({ value, label: value }))}
             value={theme}
@@ -519,22 +559,23 @@ export function ComponentGallery() {
             <div key={tone} className="flex flex-wrap items-center gap-2">
               <code className="w-32 shrink-0 text-xs text-[var(--color-text-tertiary)]">{tone}</code>
               {ICON_SIZES.map((size) => (
-                <IconButton key={size} icon="settings" label={`Settings ${size}`} tone={tone} size={size} />
+                <IconButton key={size} icon={<Settings size={16} strokeWidth={1.75} />} label={`Settings ${size}`} tone={tone} size={size} />
               ))}
-              <IconButton icon="close" label="Filled" tone={tone} filled />
-              <IconButton icon="tune" label="Bordered" tone={tone} bordered />
-              <IconButton icon="refresh" label="Circle" tone={tone} shape="circle" />
-              <IconButton icon="sync" label="Loading" tone={tone} loading />
+              <IconButton icon={<X size={16} strokeWidth={1.75} />} label="Filled" tone={tone} filled />
+              <IconButton icon={<SlidersHorizontal size={16} strokeWidth={1.75} />} label="Bordered" tone={tone} bordered />
+              <IconButton icon={<X size={16} strokeWidth={1.75} />} label="Soft" tone={tone} shape="circle" soft />
+              <IconButton icon={<RefreshCw size={16} strokeWidth={1.75} />} label="Circle" tone={tone} shape="circle" />
+              <IconButton icon={<RefreshCw size={16} strokeWidth={1.75} />} label="Loading" tone={tone} loading />
             </div>
           ))}
           <div className="flex flex-wrap items-center gap-2 border-t border-[var(--color-border)] pt-2">
             <code className="w-32 shrink-0 text-xs text-[var(--color-text-tertiary)]">states</code>
-            <IconButton icon="delete" label="Danger on hover only" tone="muted" hoverTone="danger" />
-            <IconButton icon="filter_alt" label="Pressed off" pressed={false} />
-            <IconButton icon="filter_alt" label="Pressed on" pressed />
-            <IconButton icon="close" label="Solid danger" tone="danger" solid size="2xs" shape="circle" />
-            <IconButton icon="check" label="Solid brand" tone="brand" solid />
-            <IconButton icon="more_horiz" label="Solid default" solid />
+            <IconButton icon={<Trash2 size={16} strokeWidth={1.75} />} label="Danger on hover only" tone="muted" hoverTone="danger" />
+            <IconButton icon={<Filter size={16} strokeWidth={1.75} />} label="Pressed off" pressed={false} />
+            <IconButton icon={<Filter size={16} strokeWidth={1.75} />} label="Pressed on" pressed />
+            <IconButton icon={<X size={12} strokeWidth={2} />} label="Solid danger" tone="danger" solid size="2xs" shape="circle" />
+            <IconButton icon={<Check size={16} strokeWidth={1.75} />} label="Solid brand" tone="brand" solid />
+            <IconButton icon={<Ellipsis size={16} strokeWidth={1.75} />} label="Solid default" solid />
           </div>
           {/* `solid` has to stay legible over arbitrary content — this strip
               stands in for a user-supplied image behind a remove badge. */}
@@ -543,8 +584,8 @@ export function ComponentGallery() {
             style={{ backgroundImage: 'linear-gradient(45deg, #8b5cf6, #ec4899, #f59e0b)' }}
           >
             <code className="w-32 shrink-0 text-xs text-white">solid over image</code>
-            <IconButton icon="close" label="Remove" tone="danger" solid size="2xs" shape="circle" />
-            <IconButton icon="close" label="Remove tinted" tone="danger" filled size="2xs" shape="circle" />
+            <IconButton icon={<X size={12} strokeWidth={2} />} label="Remove" tone="danger" solid size="2xs" shape="circle" />
+            <IconButton icon={<X size={12} strokeWidth={2} />} label="Remove tinted" tone="danger" filled size="2xs" shape="circle" />
           </div>
           <div
             className="flex flex-wrap items-center gap-2 rounded-[var(--radius-md)] bg-[var(--color-surface-sidebar)] p-2"
@@ -553,7 +594,7 @@ export function ComponentGallery() {
             {/* The sidebar hover token differs from surface-hover in all three
                 themes; hover these against the sidebar fill to check it. */}
             {ICON_TONES.map((tone) => (
-              <IconButton key={tone} icon="folder" label={`Sidebar ${tone}`} tone={tone} surface="sidebar" />
+              <IconButton key={tone} icon={<Folder size={16} strokeWidth={1.75} />} label={`Sidebar ${tone}`} tone={tone} surface="sidebar" />
             ))}
           </div>
         </div>
@@ -623,6 +664,23 @@ export function ComponentGallery() {
             appearance="underline"
           />
         </div>
+        <div className="max-w-xl">
+          <SegmentedControl
+            items={[
+              { value: 'all', label: 'All' },
+              { value: 'active', label: <>Active <span className="text-[11px] opacity-60">40</span></> },
+              { value: 'done', label: <>Done <span className="text-[11px] opacity-60">36</span></> },
+              { value: 'research', label: 'Research' },
+              { value: 'office', label: 'Office documents' },
+              { value: 'media', label: 'Design & media' },
+              { value: 'data', label: 'Data analysis' },
+            ]}
+            value={segment}
+            onChange={setSegment}
+            label="Filter (chip, wraps)"
+            appearance="chip"
+          />
+        </div>
       </Section>
 
       <Section title="States">
@@ -654,6 +712,27 @@ export function ComponentGallery() {
           <Card shadow="card">shadow=card</Card>
           <Card shadow="composer">shadow=composer</Card>
           <Card interactive lift>lift (hover raises 2px)</Card>
+        </div>
+      </Section>
+
+      <Section
+        title="ZoomControls / ZoomableImage"
+        note="The zoom cluster every viewer shares. In the images: Ctrl/⌘+wheel and pinch zoom about the pointer, drag pans, double-click toggles fit and 100%, and + - 0 1 work from the keyboard. Check the dark lightbox surface as well as the panel."
+      >
+        <div className="flex flex-wrap items-center gap-4">
+          <ZoomControlsDemo />
+          <ZoomControlsDemo flat />
+          <div className="flex items-center rounded-[var(--radius-lg)] bg-[var(--color-media-bg)] p-3">
+            <ZoomControlsDemo surface="media" />
+          </div>
+        </div>
+        <div className="grid h-80 grid-cols-1 gap-3 md:grid-cols-2">
+          <div className="flex min-h-0 overflow-hidden rounded-[var(--radius-lg)] border border-[var(--color-border)]">
+            <ZoomableImage src={ZOOM_SAMPLE} alt="Sample grid" labels={ZOOM_LABELS} />
+          </div>
+          <div className="flex min-h-0 overflow-hidden rounded-[var(--radius-lg)] bg-[var(--color-media-bg)]">
+            <ZoomableImage src={ZOOM_SAMPLE} alt="Sample grid on the lightbox" labels={ZOOM_LABELS} surface="media" />
+          </div>
         </div>
       </Section>
 

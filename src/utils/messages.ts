@@ -37,7 +37,9 @@ import {
 import { OUTPUT_STYLE_CONFIG } from '../constants/outputStyles.js'
 import {
   type BusinessErrorCode,
+  BUSINESS_ERROR_CODES,
   BUSINESS_ERROR_MEDIA_BLOCK_TYPES,
+  LEGACY_REQUEST_TOO_LARGE_ERROR_MESSAGES,
 } from '../constants/businessErrors.js'
 import { isAutoMemoryEnabled } from '../memdir/paths.js'
 import {
@@ -50,7 +52,6 @@ import {
   getPdfInvalidErrorMessage,
   getPdfPasswordProtectedErrorMessage,
   getPdfTooLargeErrorMessage,
-  getRequestTooLargeErrorMessage,
 } from '../services/api/errors.js'
 import type { AnyObject, Progress } from '../Tool.js'
 import { isConnectorTextBlock } from '../types/connectorText.js'
@@ -2020,6 +2021,80 @@ function relocateToolReferenceSiblings(
   return result
 }
 
+/**
+ * Replaces image and document blocks with short text markers, including media
+ * nested in tool_result content. Markers (rather than removal) keep turn
+ * structure and tool_use/tool_result pairing valid, and let the model see that
+ * media was there. Returns the same object when there is nothing to replace.
+ *
+ * Only user messages carry media; assistant messages hold text, tool_use and
+ * thinking blocks.
+ */
+export function replaceMediaWithPlaceholders(message: UserMessage): UserMessage {
+  const content = message.message.content
+  if (!Array.isArray(content)) {
+    return message
+  }
+
+  let hasMediaBlock = false
+  const newContent = content.flatMap(block => {
+    if (block.type === 'image') {
+      hasMediaBlock = true
+      return [{ type: 'text' as const, text: '[image]' }]
+    }
+    if (block.type === 'document') {
+      hasMediaBlock = true
+      return [{ type: 'text' as const, text: '[document]' }]
+    }
+    // Also replace media nested inside tool_result content arrays
+    if (block.type === 'tool_result' && Array.isArray(block.content)) {
+      let toolHasMedia = false
+      const newToolContent = block.content.map(item => {
+        if (item.type === 'image') {
+          toolHasMedia = true
+          return { type: 'text' as const, text: '[image]' }
+        }
+        if (item.type === 'document') {
+          toolHasMedia = true
+          return { type: 'text' as const, text: '[document]' }
+        }
+        return item
+      })
+      if (toolHasMedia) {
+        hasMediaBlock = true
+        return [{ ...block, content: newToolContent }]
+      }
+    }
+    return [block]
+  })
+
+  if (!hasMediaBlock) {
+    return message
+  }
+
+  return {
+    ...message,
+    message: {
+      ...message.message,
+      content: newContent,
+    },
+  } as UserMessage
+}
+
+// Legacy transcripts predate businessErrorCode and only carry the wording.
+function isRequestTooLargeAnchor(
+  message: AssistantMessage,
+  errorText: string | undefined,
+): boolean {
+  if (typeof message.businessErrorCode === 'string') {
+    return message.businessErrorCode === BUSINESS_ERROR_CODES.REQUEST_TOO_LARGE
+  }
+  return (
+    errorText !== undefined &&
+    LEGACY_REQUEST_TOO_LARGE_ERROR_MESSAGES.includes(errorText)
+  )
+}
+
 export function normalizeMessagesForAPI(
   messages: Message[],
   tools: Tools = [],
@@ -2044,12 +2119,18 @@ export function normalizeMessagesForAPI(
     [getPdfInvalidErrorMessage()]: new Set(['document']),
     [getImageTooLargeErrorMessage()]: new Set(['image']),
     [getImageUnsupportedErrorMessage()]: new Set(['image']),
-    [getRequestTooLargeErrorMessage()]: new Set(['document', 'image']),
   }
 
   // Walk the reordered messages to build a targeted strip map:
   // userMessageUUID → set of block types to strip from that message.
   const stripTargets = new Map<string, Set<string>>()
+  // Index of the last request-too-large anchor. Unlike the rejections above it
+  // says nothing about which block was at fault: the whole conversation was over
+  // an upstream byte limit. So media is dropped from everything the failed
+  // request carried, not just the turn before the anchor. It carries no
+  // sourceModel on purpose: a byte limit belongs to the provider or relay, so
+  // it must survive a model switch.
+  let mediaStrippedThrough = -1
   for (let i = 0; i < reorderedMessages.length; i++) {
     const msg = reorderedMessages[i]!
     if (!isSyntheticApiErrorMessage(msg)) {
@@ -2068,6 +2149,17 @@ export function normalizeMessagesForAPI(
     ) {
       continue
     }
+    const errorText =
+      Array.isArray(msg.message.content) &&
+      msg.message.content[0]?.type === 'text'
+        ? msg.message.content[0].text
+        : undefined
+    if (isRequestTooLargeAnchor(msg, errorText)) {
+      // Anchors are visited in order, so the last one wins.
+      mediaStrippedThrough = i
+      continue
+    }
+
     let blockTypesToStrip: Set<string> | undefined
     const blockTypesFromCode =
       typeof msg.businessErrorCode === 'string'
@@ -2078,11 +2170,6 @@ export function normalizeMessagesForAPI(
     }
 
     // Determine which legacy text error this is.
-    const errorText =
-      Array.isArray(msg.message.content) &&
-      msg.message.content[0]?.type === 'text'
-        ? msg.message.content[0].text
-        : undefined
     if (!blockTypesToStrip && errorText) {
       blockTypesToStrip = errorToBlockTypes[errorText]
     }
@@ -2111,6 +2198,16 @@ export function normalizeMessagesForAPI(
       }
       // Stop if we hit an assistant message or any other non-user message.
       break
+    }
+  }
+
+  // Identity rather than uuid: attachment-derived messages (an @-mentioned
+  // image) are rebuilt on every normalization, so they have no stable uuid.
+  const mediaStripped = new Set<Message>()
+  for (let i = 0; i < mediaStrippedThrough; i++) {
+    const candidate = reorderedMessages[i]!
+    if (candidate.type === 'user' || candidate.type === 'attachment') {
+      mediaStripped.add(candidate)
     }
   }
 
@@ -2173,9 +2270,16 @@ export function normalizeMessagesForAPI(
             )
           }
 
+          // Before the merge below: the rejected turn and the retry become
+          // adjacent once the synthetic error is filtered out, and only the
+          // rejected part may lose its media.
+          if (mediaStripped.has(message)) {
+            normalizedMessage = replaceMediaWithPlaceholders(normalizedMessage)
+          }
+
           // Strip document/image blocks from the specific user message that
-          // preceded a PDF/image/request-too-large error, to prevent re-sending
-          // the problematic content on every subsequent API call.
+          // preceded a PDF/image error, to prevent re-sending the problematic
+          // content on every subsequent API call.
           const typesToStrip = stripTargets.get(normalizedMessage.uuid)
           if (typesToStrip) {
             const content = normalizedMessage.message.content
@@ -2357,11 +2461,14 @@ export function normalizeMessagesForAPI(
             )
             return
           }
+          const keptAttachmentMessage = mediaStripped.has(message)
+            ? rawAttachmentMessage.map(m => replaceMediaWithPlaceholders(m))
+            : rawAttachmentMessage
           const attachmentMessage = checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
             'tengu_chair_sermon',
           )
-            ? rawAttachmentMessage.map(ensureSystemReminderWrap)
-            : rawAttachmentMessage
+            ? keptAttachmentMessage.map(ensureSystemReminderWrap)
+            : keptAttachmentMessage
 
           // If the last message is also a user message, merge them
           const lastMessage = last(result)
@@ -3148,6 +3255,15 @@ export function handleMessageFromStream(
           streamingEndedAt: Date.now(),
         }))
       }
+    }
+    // A mid-stream re-send discards the failed attempt; its half-streamed tool
+    // calls never ran and must not linger until the retry's message_stop.
+    if (
+      message.type === 'system' &&
+      message.subtype === 'streaming_fallback' &&
+      message.cause === 'stream_retry'
+    ) {
+      onStreamingToolUses(() => [])
     }
     // Clear streaming text NOW so the render can switch displayedMessages
     // from deferredMessages to messages in the same batch, making the
@@ -4834,7 +4950,7 @@ export function createSystemStreamingFallbackMessage(
     subtype: 'streaming_fallback',
     level: 'info',
     content: cause === 'stream_retry'
-      ? 'Provider stream stalled before a tool side effect; retrying safely'
+      ? 'Provider stream was interrupted before any tool ran; retrying safely'
       : `Streaming request failed (${cause.replace(/_/g, ' ')}); retrying in non-streaming mode`,
     cause,
     timestamp: new Date().toISOString(),

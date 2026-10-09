@@ -94,6 +94,23 @@ describe('useTranslation', () => {
     }
   })
 
+  it('localizes pinned-agent runtime and scheduled-task extras in every registered locale', () => {
+    for (const locale of ['en', 'zh', 'zh-TW', 'jp', 'kr'] as const) {
+      for (const key of [
+        'settings.agents.runtime.title',
+        'settings.agents.runtime.set',
+        'settings.agents.runtime.status.valid',
+        'newTask.telegramRouteLabel',
+        'newTask.telegramRouteDedicated',
+        'newTask.telegramRoutePublic',
+        'newTask.telegramRouteBoth',
+        'newTask.timeoutLabel',
+      ] as const) {
+        expect(translate(locale, key), `${locale} is missing ${key}`).not.toBe(key)
+      }
+    }
+  })
+
   it('describes exactly the standard ~/.claude mode and an external custom mode', () => {
     expect(translate('en', 'settings.general.storageSystemDescription')).toContain('~/.claude')
     expect(translate('zh', 'settings.general.storageSystemDescription')).toContain('~/.claude')

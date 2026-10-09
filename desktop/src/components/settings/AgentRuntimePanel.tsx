@@ -86,7 +86,7 @@ export function AgentRuntimeSection({
           <div className="flex flex-wrap items-center gap-2">
             <span
               data-testid="agent-runtime-value"
-              className="break-all font-mono text-[13px] font-semibold text-[var(--color-text-primary)]"
+              className="break-all font-mono text-[13px] text-[var(--color-text-primary)]"
             >
               {formatAgentRuntime(runtime)}
             </span>
@@ -200,7 +200,7 @@ export function AgentRuntimeModal({
       )}
     >
       <div className="space-y-4">
-        <span className="break-all font-mono text-sm font-semibold text-[var(--color-text-primary)]">
+        <span className="break-all font-mono text-sm text-[var(--color-text-primary)]">
           {agent.agentType}
         </span>
 

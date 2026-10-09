@@ -42,6 +42,17 @@ export type MentionComposerHandle = {
   /** Caret/selection as offsets in the projected plain text. */
   getSelectionOffsets: () => { start: number; end: number }
   setSelectionOffsets: (start: number, end?: number) => void
+  /** Whether the editable element currently holds keyboard focus. */
+  hasFocus: () => boolean
+  /**
+   * Replaces the projected-text range with plain text as one editor
+   * transaction, so a single undo removes it (unlike a `value` rewrite, which
+   * resets history). The caret lands after the inserted text.
+   *
+   * `flash` tints the new text for a moment, for writes the user did not type
+   * (dictation) and so has to find in the draft.
+   */
+  insertTextAtOffsets: (start: number, end: number, text: string, options?: { flash?: boolean }) => void
   /**
    * Content for the model: text with each mention pill serialized to
    * file paths or explicit skill/plugin requests. Read from the live document, so literal text that
@@ -77,6 +88,36 @@ export type MentionComposerProps = {
  */
 const composerViewRegistry = new WeakMap<HTMLElement, EditorView>()
 const workflowKeywordPluginKey = new PluginKey('workflow-keyword-highlight')
+const insertionFlashPluginKey = new PluginKey<DecorationSet>('insertion-flash')
+/** Matches `composer-insertion-flash` in globals.css. */
+export const INSERTION_FLASH_MS = 1600
+
+/**
+ * Holds the one range `insertTextAtOffsets({ flash })` marked. Any other edit
+ * drops it: a tint that follows the text around after the user starts typing
+ * reads as a selection, not as "this is what just arrived".
+ */
+function insertionFlashPlugin() {
+  return new Plugin<DecorationSet>({
+    key: insertionFlashPluginKey,
+    state: {
+      init: () => DecorationSet.empty,
+      apply: (tr, current) => {
+        const range = tr.getMeta(insertionFlashPluginKey) as { from: number; to: number } | null | undefined
+        if (range === null) return DecorationSet.empty
+        if (range) {
+          return DecorationSet.create(tr.doc, [
+            Decoration.inline(range.from, range.to, { class: 'composer-insertion-flash' }),
+          ])
+        }
+        return tr.docChanged ? DecorationSet.empty : current
+      },
+    },
+    props: {
+      decorations: (state) => insertionFlashPluginKey.getState(state),
+    },
+  })
+}
 
 export function getComposerViewForTesting(element: HTMLElement | null): EditorView | undefined {
   return element ? composerViewRegistry.get(element) : undefined
@@ -130,6 +171,7 @@ export const MentionComposer = forwardRef<MentionComposerHandle, MentionComposer
 
     const containerRef = useRef<HTMLDivElement | null>(null)
     const viewRef = useRef<EditorView | null>(null)
+    const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const workflowKeywordTriggerEnabled = useSettingsStore(
       (state) => state.workflowKeywordTriggerEnabled,
     )
@@ -206,6 +248,7 @@ export const MentionComposer = forwardRef<MentionComposerHandle, MentionComposer
                 ),
               },
             }),
+            insertionFlashPlugin(),
             history(),
             // Whole-pill deletion, ahead of baseKeymap's structural commands.
             keymap({
@@ -245,6 +288,7 @@ export const MentionComposer = forwardRef<MentionComposerHandle, MentionComposer
       syncEmptyState(view, propsRef.current.placeholder)
 
       return () => {
+        if (flashTimerRef.current) clearTimeout(flashTimerRef.current)
         composerViewRegistry.delete(view.dom)
         viewRef.current = null
         view.destroy()
@@ -341,6 +385,28 @@ export const MentionComposer = forwardRef<MentionComposerHandle, MentionComposer
           ? TextSelection.near(view.state.doc.resolve(from))
           : TextSelection.create(view.state.doc, from, to)
         view.dispatch(view.state.tr.setSelection(selection))
+      },
+      hasFocus: () => viewRef.current?.hasFocus() ?? false,
+      insertTextAtOffsets: (start, end, text, options) => {
+        const view = viewRef.current
+        if (!view || !text) return
+        const docLength = projectedDocLength(view.state.doc)
+        const from = textOffsetToPmPos(view.state.doc, Math.min(start, docLength))
+        const to = textOffsetToPmPos(view.state.doc, Math.min(Math.max(start, end), docLength))
+        const tr = view.state.tr.insertText(text, from, to)
+        tr.setSelection(TextSelection.near(tr.doc.resolve(from + text.length)))
+        if (options?.flash) tr.setMeta(insertionFlashPluginKey, { from, to: from + text.length })
+        view.dispatch(tr.scrollIntoView())
+        if (!options?.flash) return
+        if (flashTimerRef.current) clearTimeout(flashTimerRef.current)
+        flashTimerRef.current = setTimeout(() => {
+          flashTimerRef.current = null
+          const current = viewRef.current
+          if (!current || insertionFlashPluginKey.getState(current.state) === DecorationSet.empty) return
+          current.dispatch(current.state.tr
+            .setMeta(insertionFlashPluginKey, null)
+            .setMeta('addToHistory', false))
+        }, INSERTION_FLASH_MS)
       },
       getModelContent: () => {
         const view = viewRef.current

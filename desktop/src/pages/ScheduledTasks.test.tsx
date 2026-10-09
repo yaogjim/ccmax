@@ -20,6 +20,7 @@ describe('ScheduledTasks', () => {
     render(<ScheduledTasks />)
 
     expect(screen.getByText(/Describe the local task you want to create or manage/)).toBeInTheDocument()
+    // Desktop tasks are local; do not send people to the cloud /schedule command.
     expect(screen.queryByText('/schedule')).not.toBeInTheDocument()
   })
 })

@@ -91,6 +91,44 @@ describe('sessionStorage flush', () => {
     })
   })
 
+  it('round-trips pinned runtime fields without dropping in-process teammate identity', async () => {
+    switchSession('33333333-2222-4333-8444-555555555555' as SessionId)
+    resetProjectForTesting()
+    const agentId = asAgentId('pinned-and-teammate')
+
+    await writeAgentMetadata(agentId, {
+      agentType: 'niuma',
+      runtime: {
+        mode: 'pinned',
+        providerId: 'deepseek',
+        providerName: 'DeepSeek',
+        requestedModel: 'deepseek-flash',
+        model: 'deepseek-v4-flash',
+        workerSessionId: 'worker-session',
+      },
+      taskKind: 'in_process_teammate',
+      teamName: 'review-team',
+      name: 'reader',
+      customAgentType: 'niuma',
+    })
+
+    expect(await readAgentMetadata(agentId)).toEqual({
+      agentType: 'niuma',
+      runtime: {
+        mode: 'pinned',
+        providerId: 'deepseek',
+        providerName: 'DeepSeek',
+        requestedModel: 'deepseek-flash',
+        model: 'deepseek-v4-flash',
+        workerSessionId: 'worker-session',
+      },
+      taskKind: 'in_process_teammate',
+      teamName: 'review-team',
+      name: 'reader',
+      customAgentType: 'niuma',
+    })
+  })
+
   it('records the desktop transcript entrypoint without changing the runtime entrypoint', async () => {
     const sessionId = '22222222-2222-4222-8222-222222222222'
     switchSession(sessionId as SessionId)

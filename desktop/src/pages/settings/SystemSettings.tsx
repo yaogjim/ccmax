@@ -10,15 +10,18 @@ import {
   useSettingsNavigationStore,
 } from '../../stores/settingsNavigationStore'
 
-const MENU_LABELS: Record<OptionalSettingsTab, TranslationKey> = {
+const MENU_LABELS: Record<Exclude<OptionalSettingsTab, 'trace'>, TranslationKey> = {
   h5Access: 'settings.tab.h5Access',
   terminal: 'settings.tab.terminal',
   adapters: 'settings.tab.adapters',
   pets: 'settings.tab.pets',
-  trace: 'settings.tab.trace',
   diagnostics: 'settings.tab.diagnostics',
   about: 'settings.tab.about',
 }
+
+const VISIBLE_OPTIONAL_SETTINGS_TABS = OPTIONAL_SETTINGS_TABS.filter(
+  (tab): tab is Exclude<OptionalSettingsTab, 'trace'> => tab !== 'trace',
+)
 
 export function SystemSettings() {
   const t = useTranslation()
@@ -56,7 +59,7 @@ export function SystemSettings() {
         description={t('settings.system.menusDescription')}
       >
         <div className="divide-y divide-[var(--color-border-separator)] rounded-[var(--radius-xl)] border border-[var(--color-border)]">
-          {OPTIONAL_SETTINGS_TABS.map((tab) => (
+          {VISIBLE_OPTIONAL_SETTINGS_TABS.map((tab) => (
             <div key={tab} className="px-4 py-3">
               <Switch
                 label={t(MENU_LABELS[tab])}

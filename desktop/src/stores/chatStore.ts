@@ -12,7 +12,7 @@ import { subagentsApi } from '../api/subagents'
 import { useTeamPlanStore } from './teamPlanStore'
 import { useTeamStore } from './teamStore'
 import { useSessionStore } from './sessionStore'
-import { useCLITaskStore } from './cliTaskStore'
+import { useCLITaskStore, type CLITaskSnapshot } from './cliTaskStore'
 import { useWorkflowStore } from './workflowStore'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
 import { useProviderStore } from './providerStore'
@@ -34,6 +34,7 @@ import { AGENT_LIFECYCLE_TYPES } from '../types/team'
 import type { ComposerAttachment } from '../lib/composerAttachments'
 import type { ComposerMention } from '../lib/composerMentions'
 import type { MessageEntry } from '../types/session'
+import { stripAgentTeamRequest } from '../lib/agentTeamRequest'
 import type { PermissionMode } from '../types/settings'
 import type { RuntimeSelection } from '../types/runtime'
 import type {
@@ -203,7 +204,6 @@ export type PerSessionState = {
   historyMutationEpoch?: number
   /** Changes when a directed child stream starts or settles. */
   agentStreamRevision?: number
-  suppressNextTaskNotificationResponse?: boolean
   replaceHistoryOnCompletion?: boolean
   activeGoal?: ActiveGoalState | null
   activeGoalRevision?: number
@@ -211,6 +211,7 @@ export type PerSessionState = {
   composerPrefill?: {
     text: string
     attachments?: UIAttachment[]
+    sessionReferences?: Array<{ sessionId: string }>
     mode?: ComposerPrefillMode
     nonce: number
   } | null
@@ -257,7 +258,6 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   historyBootstrapDisabled: false,
   historyMutationEpoch: 0,
   agentStreamRevision: 0,
-  suppressNextTaskNotificationResponse: false,
   replaceHistoryOnCompletion: false,
   activeGoal: null,
   activeGoalRevision: 0,
@@ -445,10 +445,19 @@ type ChatStore = {
       messages: UIMessage[]
       backgroundAgentTasks?: Record<string, BackgroundAgentTask>
     },
+    /** Reject errors and skipped/incomplete reloads after a destructive rewind. */
+    options?: { requireApplied?: boolean },
   ) => Promise<void>
   queueComposerPrefill: (
     sessionId: string,
-    prefill: { text: string; attachments?: UIAttachment[]; mode?: ComposerPrefillMode },
+    prefill: {
+      text: string
+      attachments?: UIAttachment[]
+      sessionReferences?: Array<{ sessionId: string }>
+      mode?: ComposerPrefillMode
+    },
+    /** Retain an edit after its committed rewind outlives the source tab. */
+    options?: { restoreMissingSession?: boolean },
   ) => void
   clearComposerPrefill: (sessionId: string, nonce?: number) => void
   queueComposerInsertion: (
@@ -475,6 +484,12 @@ type ChatStore = {
 const TASK_TOOL_NAMES = new Set(['TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TodoWrite'])
 const TASK_STOP_TOOL_NAMES = new Set(['TaskStop', 'KillShell'])
 const pendingTaskToolUseIdsBySession = new Map<string, Set<string>>()
+/**
+ * What the task bar showed before a live TodoWrite from a stream attempt that
+ * has not committed. A `stream_retry` re-sends the whole request, so a write
+ * the discarded attempt applied never happened and is put back.
+ */
+const taskBarBeforeAttemptBySession = new Map<string, CLITaskSnapshot>()
 const pendingToolParentUseIdsBySession = new Map<string, Map<string, string>>()
 type OwnedTaskRouteRegistration = {
   count: number
@@ -859,13 +874,28 @@ function consumePendingTaskToolUseId(sessionId: string, toolUseId: string): bool
 
 function clearPendingTaskToolUseIds(sessionId: string): void {
   pendingTaskToolUseIdsBySession.delete(sessionId)
+  taskBarBeforeAttemptBySession.delete(sessionId)
 }
 
 function consumeAllPendingTaskToolUseIds(sessionId: string): boolean {
   const hasPendingTaskTools =
     (pendingTaskToolUseIdsBySession.get(sessionId)?.size ?? 0) > 0
   pendingTaskToolUseIdsBySession.delete(sessionId)
+  taskBarBeforeAttemptBySession.delete(sessionId)
   return hasPendingTaskTools
+}
+
+/** Remember the task bar once, before the attempt's first live TodoWrite changes it. */
+function rememberTaskBarBeforeAttempt(sessionId: string): void {
+  if (taskBarBeforeAttemptBySession.has(sessionId)) return
+  const taskStore = useCLITaskStore.getState()
+  if (taskStore.sessionId !== sessionId) return
+  taskBarBeforeAttemptBySession.set(sessionId, {
+    sessionId,
+    tasks: taskStore.tasks,
+    completedAndDismissed: taskStore.completedAndDismissed,
+    dismissedCompletionKey: taskStore.dismissedCompletionKey,
+  })
 }
 
 function rememberPendingToolParentUseId(
@@ -1331,15 +1361,6 @@ function isCancellableSubagentTask(task: BackgroundAgentTask): boolean {
   return task.status === 'running' && (
     task.taskType === 'local_agent' || task.taskType === 'remote_agent'
   )
-}
-
-function shouldSuppressTaskNotificationResponse(session: PerSessionState): boolean {
-  if (session.chatState !== 'idle') return false
-  const lastMessage = session.messages[session.messages.length - 1]
-  const hasVisibleActiveOutput =
-    session.streamingText.trim().length > 0 ||
-    Boolean(session.activeToolUseId)
-  return !hasVisibleActiveOutput && lastMessage?.type !== 'user_text'
 }
 
 function mergeRestoredTerminalGoalEvents(
@@ -2314,7 +2335,21 @@ async function fetchAndMapSessionHistory(
   // jobs and notifications into the parent rail after every reload.
   const rootRunMessages = messages.filter((message) => !message.parentToolUseId)
   const rootToolUseIds = transcriptToolUseIds(rootRunMessages)
-  const rootRunNotifications = (taskNotifications ?? []).filter(
+  const rootShellTasks = reconstructBackgroundShellTasks(rootRunMessages)
+  const rootRunNotifications = (taskNotifications ?? []).map((notification) => {
+    // After a server restart, a late Stop can only persist the task ID as its
+    // tool anchor. Recover the real anchor from this root run's Bash result so
+    // the terminal survives cold history loading and links to the right tool.
+    const rootShellTask = rootShellTasks[notification.taskId]
+    if (
+      !notification.ownerAgentId &&
+      notification.toolUseId === notification.taskId &&
+      rootShellTask?.toolUseId
+    ) {
+      return { ...notification, toolUseId: rootShellTask.toolUseId }
+    }
+    return notification
+  }).filter(
     (notification) => (
       !notification.ownerAgentId && (
         // workflow_run_id predates owner_agent_id. Keep restoring those
@@ -3034,6 +3069,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
           historyBootstrapDisabled: options?.minimalBootstrap === true,
           activeGoal: existing?.activeGoal ?? null,
           composerDraft: existing?.composerDraft ?? null,
+          composerPrefill: existing?.composerPrefill ?? null,
           repositoryLaunchDraft: existing?.repositoryLaunchDraft ?? null,
           queuedUserMessages: existing?.queuedUserMessages ?? [],
           backgroundAgentTasks: existing?.backgroundAgentTasks ?? {},
@@ -3338,7 +3374,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             isPreparingTurn: false,
             historyMutationEpoch: (session.historyMutationEpoch ?? 0) + 1,
             elapsedSeconds: 0,
-            suppressNextTaskNotificationResponse: false,
             replaceHistoryOnCompletion: false,
             streamingText: '',
             streamingResponseChars: 0,
@@ -3561,7 +3596,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             pendingComputerUsePermissions: {},
             apiRetry: null,
             streamingFallback: null,
-            suppressNextTaskNotificationResponse: false,
             stoppingBackgroundTaskIds,
             stopAllSubagentsRequested: true,
             elapsedTimer: null,
@@ -4065,8 +4099,11 @@ export const useChatStore = create<ChatStore>((setState, get) => {
     await loadOlderHistoryPage(sessionId, get, set)
   },
 
-  reloadHistory: async (sessionId, guard) => {
-    if (isSideChatSession(sessionId)) return
+  reloadHistory: async (sessionId, guard, options) => {
+    const skipReload = () => {
+      if (options?.requireApplied) throw new Error('History reload was not applied')
+    }
+    if (isSideChatSession(sessionId)) return skipReload()
     if (historyPageControllers.has(sessionId)) {
       historyPageControllers.get(sessionId)?.abort()
       historyPageControllers.delete(sessionId)
@@ -4085,7 +4122,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       if (pendingLoad?.lifecycleGeneration === lifecycleGeneration) {
         await pendingLoad.promise
       }
-      if (!isCurrentHistoryLifecycle(sessionId, lifecycleGeneration) || controller.signal.aborted) return
+      if (!isCurrentHistoryLifecycle(sessionId, lifecycleGeneration) || controller.signal.aborted) return skipReload()
       historyRecoveryControllers.get(sessionId)?.abort()
       historyRecoveryControllers.delete(sessionId)
       // A reload can queue behind a cold load. Capture snapshot baselines only
@@ -4118,12 +4155,15 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         sessionOwnedActivityToolUseIds(get().sessions[sessionId]),
         controller.signal,
       )
+      // A partial reload merges existing rows. It cannot prove that a rewound
+      // turn disappeared, so strict callers must keep their draft for retry.
+      if (options?.requireApplied && !historyComplete) return skipReload()
       durableHistoryRows.set(sessionId, new WeakSet(uiMessages))
 
       if (
         !isCurrentHistoryLifecycle(sessionId, lifecycleGeneration) ||
         historyReloadGenerations.get(sessionId) !== reloadGeneration
-      ) return
+      ) return skipReload()
 
       if (guard) {
         const current = get().sessions[sessionId]
@@ -4132,7 +4172,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
           current.chatState !== 'idle' ||
           (current.historyMutationEpoch ?? 0) !== requestedMutationEpoch
         ) {
-          return
+          return skipReload()
         }
       }
 
@@ -4235,7 +4275,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         }
       })
 
-      if (!historyApplied) return
+      if (!historyApplied) return skipReload()
       if (!historyComplete && page) void recoverSessionHistory(sessionId, page.sourceVersion)
       const terminalReconnectBoundary = terminalReconnectHistoryBoundaries.get(sessionId)
       if (
@@ -4299,7 +4339,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
           requestedTasks,
         )
       }
-    } catch {
+    } catch (error) {
       // A stop failure can arrive before the task history that identifies it.
       // If that history request fails, surface the failure instead of leaving it
       // cached forever waiting for a reconciliation that may never happen.
@@ -4321,22 +4361,34 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             )),
         }
       })
+      if (options?.requireApplied) throw error
     } finally {
       if (historyReloadControllers.get(sessionId) === controller) historyReloadControllers.delete(sessionId)
     }
   },
 
-  queueComposerPrefill: (sessionId, prefill) => {
-    set((state) => ({
-      sessions: updateSessionIn(state.sessions, sessionId, () => ({
-        composerPrefill: {
-          text: prefill.text,
-          attachments: prefill.attachments,
-          mode: prefill.mode,
-          nonce: Date.now(),
+  queueComposerPrefill: (sessionId, prefill, options) => {
+    set((state) => {
+      const session = state.sessions[sessionId] ?? (
+        options?.restoreMissingSession ? createDefaultSessionState() : undefined
+      )
+      if (!session) return state
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...session,
+            composerPrefill: {
+              text: prefill.text,
+              attachments: prefill.attachments,
+              ...(prefill.sessionReferences ? { sessionReferences: prefill.sessionReferences } : {}),
+              mode: prefill.mode,
+              nonce: Date.now(),
+            },
+          },
         },
-      })),
-    }))
+      }
+    })
   },
 
   clearComposerPrefill: (sessionId, nonce) => {
@@ -4503,7 +4555,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
           queuedUserMessages: (currentSession.queuedUserMessages ?? [])
             .filter((message) => message.id !== messageId),
           ...(pendingText.trim() ? { streamingText: '' } : {}),
-          suppressNextTaskNotificationResponse: false,
           replaceHistoryOnCompletion: false,
         }
       }),
@@ -4538,7 +4589,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       preHydrationSocketGapPending: false,
       apiRetry: null,
       streamingFallback: null,
-      suppressNextTaskNotificationResponse: false,
       replaceHistoryOnCompletion: false,
       queuedUserMessages: [],
     })) }))
@@ -4816,6 +4866,9 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       }
 
       case 'status':
+        // A new attempt only starts once the previous one committed or was
+        // retried, so its task bar change is no longer undoable.
+        if (msg.attemptStart) taskBarBeforeAttemptBySession.delete(sessionId)
         update((session) => {
           const pendingText = `${session.streamingText}${consumePendingDelta(sessionId)}`
           const hasPendingStreamText =
@@ -4913,18 +4966,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       case 'content_start': {
         const session = get().sessions[sessionId]
         if (!session) break
-        if (session.suppressNextTaskNotificationResponse && msg.blockType === 'text') {
-          consumePendingDelta(sessionId)
-          update(() => ({
-            streamingText: '',
-            activeThinkingId: null,
-            statusVerb: '',
-          }))
-          break
-        }
-        if (session.suppressNextTaskNotificationResponse) {
-          update(() => ({ suppressNextTaskNotificationResponse: false }))
-        }
         // The server keeps a stopped-turn fence until it attributes a replay
         // (or a pure local command's first output) to the replacement turn.
         // Mirror that boundary instead of clearing the SubAgent stop latch on
@@ -5007,6 +5048,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
 
       case 'streaming_fallback': {
         if (msg.cause === 'stream_retry') {
+          const taskBarBeforeAttempt = taskBarBeforeAttemptBySession.get(sessionId)
           consumePendingDelta(sessionId)
           clearPendingToolInputDelta(sessionId)
           clearPendingTaskToolUseIds(sessionId)
@@ -5019,12 +5061,22 @@ export const useChatStore = create<ChatStore>((setState, get) => {
                 session.messages.length,
               ),
             )
+            const resolvedToolUseIds = new Set(session.messages.flatMap((message) => (
+              message.type === 'tool_result' ? [message.toolUseId] : []
+            )))
             const messages = [
               ...session.messages.slice(0, startIndex),
               ...session.messages.slice(startIndex).filter((message) =>
                 message.type !== 'assistant_text' &&
                 message.type !== 'thinking' &&
-                !(message.type === 'tool_use' && message.isPending)),
+                !(message.type === 'tool_use' && (
+                  message.isPending ||
+                  // The retry re-sends the whole request, so none of the
+                  // attempt's own calls ran, even one the server already
+                  // completed at its block stop. Only the root request is
+                  // retried here; a sub-agent's call may still be running.
+                  (!message.parentToolUseId && !resolvedToolUseIds.has(message.toolUseId))
+                ))),
             ]
             return {
               messages,
@@ -5043,6 +5095,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
               statusVerb: '',
             }
           })
+          if (taskBarBeforeAttempt) useCLITaskStore.getState().restoreTasks(taskBarBeforeAttempt)
           ensureElapsedTimer()
           useTabStore.getState().updateTabStatus(sessionId, 'running')
           break
@@ -5066,10 +5119,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       }
 
       case 'content_delta':
-        if (get().sessions[sessionId]?.suppressNextTaskNotificationResponse) {
-          consumePendingDelta(sessionId)
-          break
-        }
         let receivedLiveDelta = false
         if (msg.text !== undefined) {
           if (!get().sessions[sessionId]) break
@@ -5130,15 +5179,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         break
 
       case 'thinking': {
-        if (get().sessions[sessionId]?.suppressNextTaskNotificationResponse) {
-          consumePendingDelta(sessionId)
-          update(() => ({
-            streamingText: '',
-            activeThinkingId: null,
-            statusVerb: '',
-          }))
-          break
-        }
         // 重放/空块都不该冒出一个新的「已思考」气泡，也不该把会话拖回 thinking 态
         // 或者启动计时器 —— 那正是"打开一个早就结束的会话，它自己开始输出"的观感。
         let skippedThinkingBlock = false
@@ -5231,6 +5271,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
           }
         })
         if (!parentToolUseId && toolName === 'TodoWrite' && Array.isArray((msg.input as any)?.todos)) {
+          rememberTaskBarBeforeAttempt(sessionId)
           useCLITaskStore.getState().setTasksFromTodos((msg.input as any).todos, sessionId)
         } else if (!parentToolUseId && TASK_TOOL_NAMES.has(toolName)) {
           const useId = msg.toolUseId || session?.activeToolUseId
@@ -5468,39 +5509,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             void cliTaskStore.refreshTasks(sessionId)
           }
         }
-        if (session.suppressNextTaskNotificationResponse) {
-          consumePendingDelta(sessionId)
-          clearPendingToolInputDelta(sessionId)
-          if (session.elapsedTimer) clearInterval(session.elapsedTimer)
-          const hasRunningBackgroundAgents = hasRunningBackgroundTasks(session.backgroundAgentTasks)
-          update((current) => ({
-            tokenUsage: msg.usage,
-            chatState: 'idle',
-            activeThinkingId: null,
-            pendingPermission: null,
-            pendingPermissions: {},
-            pendingComputerUsePermission: null,
-            pendingComputerUsePermissions: {},
-            elapsedTimer: null,
-            apiRetry: null,
-            streamingFallback: null,
-            streamingText: '',
-            streamingToolInput: '',
-            suppressNextTaskNotificationResponse: false,
-            replaceHistoryOnCompletion: false,
-            historyMutationEpoch: (current.historyMutationEpoch ?? 0) + 1,
-          }))
-          useTabStore.getState().updateTabStatus(sessionId, hasRunningBackgroundAgents ? 'running' : 'idle')
-          reconcileCompletedTranscriptHistory(
-            get,
-            sessionId,
-            session.replaceHistoryOnCompletion === true,
-          )
-          for (const queuedMessage of get().sessions[sessionId]?.queuedUserMessages ?? []) {
-            get().sendQueuedUserMessage(sessionId, queuedMessage.id)
-          }
-          break
-        }
         const completedAt = Date.now()
         const wasAgentRunning = session.chatState !== 'idle'
         const text = `${session.streamingText}${consumePendingDelta(sessionId)}`
@@ -5567,7 +5575,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             messages: appendReplayedUserMessage(baseMessages, msg.content, Date.now(), msg.sessionReferences, msg.collaboration),
             ...(pendingText.trim() ? { streamingText: '' } : {}),
             activeThinkingId: null,
-            suppressNextTaskNotificationResponse: false,
             replaceHistoryOnCompletion: false,
             stopAllSubagentsRequested: false,
             historyMutationEpoch: (session.historyMutationEpoch ?? 0) + 1,
@@ -5615,7 +5622,6 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             pendingComputerUsePermissions: {},
             apiRetry: null,
             streamingFallback: null,
-            suppressNextTaskNotificationResponse: false,
             historyMutationEpoch: (s.historyMutationEpoch ?? 0) + 1,
           }
         })
@@ -5979,18 +5985,11 @@ export const useChatStore = create<ChatStore>((setState, get) => {
               hasRunningBackgroundAgentsAfterUpdate = hasRunningBackgroundTasks(backgroundAgentTasks)
               const task = backgroundAgentTasks[taskEvent.taskId]
               const accepted = Boolean(task)
-              const suppressNotificationResponse =
-                accepted &&
-                (taskEvent.status === 'completed' ||
-                  taskEvent.status === 'failed' ||
-                  taskEvent.status === 'stopped') &&
-                shouldSuppressTaskNotificationResponse(session)
               const stoppingBackgroundTaskIds = { ...session.stoppingBackgroundTaskIds }
               delete stoppingBackgroundTaskIds[taskEvent.taskId]
               return {
                 ...buildBackgroundTaskSessionUpdate(session, backgroundAgentTasks, task, now),
                 stoppingBackgroundTaskIds,
-                ...(suppressNotificationResponse ? { suppressNextTaskNotificationResponse: true } : {}),
                 agentTaskNotifications: {
                   ...session.agentTaskNotifications,
                   ...(accepted &&
@@ -6993,6 +6992,7 @@ function reconstructBackgroundShellTasks(
   messages: MessageEntry[],
 ): Record<string, BackgroundAgentTask> {
   const shellToolUses = new Map<string, TranscriptShellToolUse>()
+  const taskStopInputs = new Map<string, Record<string, unknown>>()
   let tasks: Record<string, BackgroundAgentTask> = {}
 
   for (const message of messages) {
@@ -7002,11 +7002,12 @@ function reconstructBackgroundShellTasks(
     ) continue
 
     for (const block of message.content as AssistantHistoryBlock[]) {
-      if (
-        block.type !== 'tool_use' ||
-        !block.id ||
-        !BACKGROUND_SHELL_TOOL_NAMES.has(block.name ?? '')
-      ) continue
+      if (block.type !== 'tool_use' || !block.id) continue
+      if (TASK_STOP_TOOL_NAMES.has(block.name ?? '')) {
+        taskStopInputs.set(block.id, readRecord(block.input) ?? {})
+        continue
+      }
+      if (!BACKGROUND_SHELL_TOOL_NAMES.has(block.name ?? '')) continue
       const input = readRecord(block.input) ?? {}
       const description = readNonEmptyString(input, 'description', 'command')
       if (!description) continue
@@ -7027,6 +7028,22 @@ function reconstructBackgroundShellTasks(
 
     for (const block of message.content as UserHistoryBlock[]) {
       if (block.type !== 'tool_result' || !block.tool_use_id) continue
+      const taskStopInput = taskStopInputs.get(block.tool_use_id)
+      if (taskStopInput) {
+        // A TaskStop leaves no task-notification behind, so its own result is
+        // the only record that a restored shell stopped running.
+        if (block.is_error) continue
+        const output = parseJsonRecord(block.content) ?? readRecord(message.toolUseResult) ?? {}
+        const taskId = readNonEmptyString(output, 'task_id', 'taskId') ??
+          readNonEmptyString(taskStopInput, 'task_id', 'taskId', 'shell_id', 'shellId')
+        if (!taskId || !tasks[taskId]) continue
+        tasks = upsertBackgroundAgentTask(tasks, {
+          taskId,
+          status: 'stopped',
+          summary: readNonEmptyString(output, 'message'),
+        }, transcriptTimestamp(message.timestamp))
+        continue
+      }
       const shellToolUse = shellToolUses.get(block.tool_use_id)
       if (!shellToolUse) continue
       const taskId = shellBackgroundTaskIdFromResult(
@@ -7282,7 +7299,7 @@ function getReferenceName(referencePath: string): string {
   return name || referencePath
 }
 
-function extractLeadingFileReferences(text: string): {
+export function extractLeadingFileReferences(text: string): {
   content: string
   attachments?: UIAttachment[]
   modelContent?: string
@@ -7404,7 +7421,7 @@ function parseWorkspaceReferenceHistoryPrompt(text: string): WorkspaceReferenceH
   }
 }
 
-function pathsReferToSameFile(left: string | undefined, right: string | undefined): boolean {
+export function pathsReferToSameFile(left: string | undefined, right: string | undefined): boolean {
   if (!left || !right) return false
   const normalizedLeft = left.replace(/\\/g, '/').replace(/^\.\//, '')
   const normalizedRight = right.replace(/\\/g, '/').replace(/^\.\//, '')
@@ -7422,7 +7439,12 @@ type RestoredUserDisplay = {
   modelContent?: string
 }
 
-function extractRestoredUserDisplay(text: string): RestoredUserDisplay {
+export function extractRestoredUserDisplay(text: string): RestoredUserDisplay {
+  // The Agent Team switch prefixes an instruction block the user never typed.
+  const teamRequest = stripAgentTeamRequest(text)
+  if (teamRequest.requested) {
+    return { ...extractRestoredUserDisplay(teamRequest.content), modelContent: text }
+  }
   const referenceContext = splitSessionReferenceContext(text)
   if (referenceContext.sessionReferences.length) {
     return { ...extractRestoredUserDisplay(referenceContext.content), sessionReferences: referenceContext.sessionReferences, modelContent: text }
@@ -7776,14 +7798,14 @@ export function mapHistoryMessagesToUiMessages(
 ): UIMessage[] {
   const includeTeammateMessages = options?.includeTeammateMessages === true
   const uiMessages: UIMessage[] = []
-  let suppressTaskNotificationResponse = false
   let pendingGoalCommand: { name: string; args: string } | null = null
 
   for (const msg of messages) {
-    if (msg.type === 'user' && isTaskNotificationContent(msg.content)) {
-      suppressTaskNotificationResponse = true
-      continue
-    }
+    // A task notification is a system-injected prompt: the background task
+    // cards already stand for it. What the assistant does in the turn that
+    // answers it (thinking, text, tool calls) is ordinary transcript content
+    // and stays visible.
+    if (msg.type === 'user' && isTaskNotificationContent(msg.content)) continue
     if (msg.type === 'user') {
       const commandDisplayText = getCommandMetadataDisplayText(msg.content)
       if (commandDisplayText) {
@@ -7794,17 +7816,11 @@ export function mapHistoryMessagesToUiMessages(
           ...(msg.id ? { transcriptMessageId: msg.id } : {}),
           timestamp: new Date(msg.timestamp).getTime(),
         })
-        suppressTaskNotificationResponse = false
         continue
       }
       if (shouldHideCommandMetadataContent(msg.content)) {
         continue
       }
-    }
-    if (msg.type === 'user') {
-      suppressTaskNotificationResponse = false
-    } else if (suppressTaskNotificationResponse) {
-      continue
     }
 
     const timestamp = new Date(msg.timestamp).getTime()

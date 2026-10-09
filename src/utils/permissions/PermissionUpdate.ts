@@ -24,6 +24,7 @@ import {
 } from './permissionRuleParser.js'
 // Use the live ESM binding: require() can capture incomplete exports while
 // permissionSetup imports applyPermissionUpdate through the same module cycle.
+// Bun's require interop can retain incomplete exports from the cycle.
 import { transitionPermissionMode } from './permissionSetup.js'
 import { addPermissionRulesToSettings } from './permissionsLoader.js'
 

@@ -20,8 +20,6 @@ The pet is **off by default**:
 3. Pick one from **Built-in pets**.
 4. Turn on **Show desktop pet**.
 
-![Settings → Pets: four built-in pets and appearance controls (Chinese interface)](../../images/app/en/settings-pets.webp)
-
 ## The four built-in pets
 
 | Character | Who it is |
@@ -56,8 +54,6 @@ Clicking a row raises the main window and opens that session. Permissions are st
 - **Collapsed by default** — show just the pet and expand the task panel only when you want it.
 
 ## Making your own
-
-![Add a pet: three ways to create your own (Chinese interface)](../../images/app/en/pet-create.webp)
 
 Click **Add pet** to the right of **Your pets**. Every image is processed on your own machine — nothing is uploaded, and nothing costs conversation credits.
 
@@ -109,7 +105,7 @@ The most common failure is a **white background**. A white-backed image becomes 
 
 ## Where they live, and deleting one
 
-Custom pet packages live in `${CLAUDE_CONFIG_DIR:-~/.claude}/cc-haha/pets`, and there's an **Open folder** button at the bottom of the settings page. Each pet gets its own subdirectory containing `pet.json` and its images.
+Custom pet packages live in `${CLAUDE_CONFIG_DIR:-~/.claude}/cc-haha/pets` (the legacy on-disk folder name used by ccmax, not the product name), and there's an **Open folder** button at the bottom of the settings page. Each pet gets its own subdirectory containing `pet.json` and its images.
 
 There's no delete button in the UI yet. To remove one: select a built-in pet first, click **Open folder**, delete only that pet's subdirectory, then click **Refresh** back in settings. Don't delete the whole `pets` or `cc-haha` directory.
 

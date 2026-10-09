@@ -1,5 +1,5 @@
 import { getBaseUrl } from '../api/client'
-import { isAbsoluteLocalPath } from './handlePreviewLink'
+import { filesystemImageUrl, isAbsoluteLocalPath } from './handlePreviewLink'
 
 /**
  * Extensions that count as an inline image attachment.
@@ -18,12 +18,12 @@ export function isInlineImagePath(pathOrName: string | undefined): boolean {
 
 /** Host-managed ImageGen results already render through their dedicated result card. */
 export function isManagedGeneratedImagePath(filePath: string): boolean {
-  return filePath.replaceAll('\\', '/').includes('/.claude/cc-haha/generated-images/')
+  return /(?:^|\/)cc-haha\/generated-images\//.test(filePath.replaceAll('\\', '/'))
 }
 
 /** Serves a local absolute image path through the local server. */
 export function localImageFileUrl(filePath: string): string {
-  return `${getBaseUrl()}/api/filesystem/file?path=${encodeURIComponent(filePath)}`
+  return filesystemImageUrl(getBaseUrl(), filePath)
 }
 
 type ImageSourceCandidate = {

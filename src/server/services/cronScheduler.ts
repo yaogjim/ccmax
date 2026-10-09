@@ -8,6 +8,7 @@
  */
 
 import * as fs from 'fs/promises'
+import { migrationMaintenance, waitForMigrationExit } from '../migrationMaintenance.js'
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import * as path from 'path'
 import * as os from 'os'
@@ -15,6 +16,7 @@ import * as crypto from 'crypto'
 import { ApiError } from '../middleware/errorHandler.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { parseCronExpression } from '../../utils/cron.js'
+import { isBlankFileContent } from './blankFileContent.js'
 import { CronService, type CronTask } from './cronService.js'
 import { SessionService } from './sessionService.js'
 import { sendTaskNotification } from './notificationService.js'
@@ -22,6 +24,7 @@ import type { NotificationDeliveryReport } from './notificationService.js'
 import { ProviderService } from './providerService.js'
 import { isValidTaskTimeoutMs } from './cronService.js'
 import { SettingsService } from './settingsService.js'
+import { stripBOM } from '../../utils/jsonRead.js'
 import { isProviderManagedEnvVar } from '../../utils/managedEnvConstants.js'
 import {
   buildClaudeCliArgs,
@@ -308,8 +311,14 @@ function captureRunsFileMutationTarget(): RunsFileMutationTarget {
   }
 }
 
+/**
+ * Same tolerance as the task file (CronService.readTasksFile): a BOM is stripped and
+ * a blank file — empty, whitespace or NUL padding — means no runs. Content that has
+ * data but will not parse still throws, so a later write cannot replace it unseen.
+ */
 function parseRunsFile(raw: string): RunsFile {
-  const parsed = JSON.parse(raw) as RunsFile
+  if (isBlankFileContent(raw)) return { runs: [] }
+  const parsed = JSON.parse(stripBOM(raw)) as RunsFile
   return Array.isArray(parsed.runs) ? parsed : { runs: [] }
 }
 
@@ -733,7 +742,7 @@ export class CronScheduler {
   private intervalId: Timer | null = null
   private runningTasks = new Map<
     string,
-    { proc: ReturnType<typeof Bun.spawn>; startedAt: number; runId: string }
+    { proc: ReturnType<typeof Bun.spawn>; startedAt: number; runId: string; resultReceived?: boolean; migrationInterrupted?: boolean }
   >()
   private stoppedRunIds = new Set<string>()
   /** Track which minute each task last fired (prevents same-process duplicate within a minute). */
@@ -754,8 +763,13 @@ export class CronScheduler {
 
   /** Start the scheduler (called on server boot). */
   start(): void {
+    if (migrationMaintenance.isActive) return
     if (this.intervalId) return // already running
     console.log('[CronScheduler] Starting — checking every 60 s')
+    // Clean up stale "running" entries left by previously crashed processes
+    migrationMaintenance.track(this.cleanupStaleRuns()).catch((err) =>
+      console.error('[CronScheduler] Error cleaning up stale runs:', err),
+    )
     this.intervalId = setInterval(() => this.tick(), 60_000)
     // The first tick also reconciles runs abandoned by earlier processes.
     this.tick()
@@ -852,6 +866,7 @@ export class CronScheduler {
 
   /** One tick of the scheduler — evaluate all tasks against the current time. */
   async tick(): Promise<void> {
+    if (migrationMaintenance.isActive) return
     // Recheck on every tick: a crashed process's lock can still look fresh at
     // startup, and a run skipped then must not stay "running" indefinitely.
     await this.cleanupStaleRuns().catch((err) =>
@@ -863,6 +878,7 @@ export class CronScheduler {
       const currentKey = CronScheduler.minuteKey(now)
 
       for (const task of tasks) {
+        if (migrationMaintenance.isActive) return
         // Skip disabled tasks
         if (task.enabled === false) continue
 
@@ -901,7 +917,41 @@ export class CronScheduler {
    * @param task The task to execute
    * @param options.createSession When true, creates a Session for rich output viewing (used for manual "Run Now")
    */
-  async executeTask(
+  executeTask(
+    task: CronTask,
+    options?: CronTaskExecutionOptions,
+  ): Promise<TaskRun> {
+    if (migrationMaintenance.isActive) return Promise.reject(new Error('Data migration is in progress'))
+    return migrationMaintenance.track(this.executeTaskOnce(task, options))
+  }
+
+  getProcessIds(): number[] {
+    return [...this.runningTasks.values()].map(entry => entry.proc.pid).filter(pid => pid > 0)
+  }
+
+  async stopAndWait(): Promise<void> {
+    const entries = [...this.runningTasks.values()]
+    for (const entry of entries) {
+      if (!entry.resultReceived) entry.migrationInterrupted = true
+    }
+    const processes = entries.map(entry => entry.proc)
+    if (this.intervalId) clearInterval(this.intervalId)
+    this.intervalId = null
+    for (const proc of processes) {
+      try {
+        proc.stdin.write(JSON.stringify({ type: 'control_request', request_id: crypto.randomUUID(), request: { subtype: 'end_session', reason: 'data_migration' } }) + '\n')
+        proc.stdin.end()
+      } catch {
+        // A completed run may already have closed stdin; exit still must be confirmed.
+      }
+    }
+    for (const proc of processes) {
+      const exited = await waitForMigrationExit(proc.exited)
+      if (!exited) throw new Error('Scheduled task process did not exit')
+    }
+  }
+
+  private async executeTaskOnce(
     task: CronTask,
     options?: CronTaskExecutionOptions,
   ): Promise<TaskRun> {
@@ -1044,21 +1094,30 @@ export class CronScheduler {
     const taskTimeoutMs = resolveCronTaskTimeoutMs(task)
     let timeoutId: Timer | undefined
     let timedOut = false
+    let runningEntry: {
+      proc: ReturnType<typeof Bun.spawn>
+      startedAt: number
+      runId: string
+      resultReceived: boolean
+      migrationInterrupted: boolean
+    } | undefined
 
     let settled: TaskRun
     try {
       const childEnv = await this.buildTaskChildEnv(workDir, task)
+      migrationMaintenance.assertAvailable()
       const proc = Bun.spawn(
         cliArgs,
         buildCronTaskSpawnOptions(workDir, childEnv),
       )
 
-      this.runningTasks.set(task.id, { proc, startedAt: Date.now(), runId })
+      runningEntry = { proc, startedAt: Date.now(), runId, resultReceived: false, migrationInterrupted: false }
+      this.runningTasks.set(task.id, runningEntry)
 
-      // Write prompt to stdin then close it
+      // Keep the control stream open until the terminal result so migration can
+      // request a graceful stop even while this scheduled turn is running.
       try {
         proc.stdin.write(inputPayload)
-        proc.stdin.end()
       } catch {
         // If writing fails, the process may have already exited
       }
@@ -1085,6 +1144,7 @@ export class CronScheduler {
       // that inherits its pipe: waiting for EOF *before* proc.exited then
       // holds the task at running until that helper exits (or forever).
       const stdoutChunks: string[] = []
+      let pendingLine = ''
       const reader = proc.stdout?.getReader()
       const readStdout = (async () => {
         if (!reader) return
@@ -1093,7 +1153,22 @@ export class CronScheduler {
           while (true) {
             const { done, value } = await reader.read()
             if (done) break
-            stdoutChunks.push(decoder.decode(value, { stream: true }))
+            const chunk = decoder.decode(value, { stream: true })
+            stdoutChunks.push(chunk)
+            pendingLine += chunk
+            const lines = pendingLine.split('\n')
+            pendingLine = lines.pop() ?? ''
+            for (const line of lines) {
+              try {
+                const message = JSON.parse(line)
+                if (message.type === 'result' && !message.parent_tool_use_id) {
+                  runningEntry!.resultReceived = true
+                  proc.stdin.end()
+                }
+              } catch {
+                // Non-JSON diagnostic output does not affect the run.
+              }
+            }
           }
         } catch {
           // stream may be interrupted on kill
@@ -1122,10 +1197,17 @@ export class CronScheduler {
       const output = extractAssistantText(rawOutput)
 
       const wasStopped = this.stoppedRunIds.has(runId)
+      const migrationInterrupted = runningEntry.migrationInterrupted === true
       const completedRun: TaskRun = {
         ...run,
         completedAt,
-        status: wasStopped ? 'failed' : timedOut ? 'timeout' : exitCode === 0 ? 'completed' : 'failed',
+        status: wasStopped || migrationInterrupted
+          ? 'failed'
+          : timedOut
+            ? 'timeout'
+            : exitCode === 0
+              ? 'completed'
+              : 'failed',
         output: output.slice(0, 50_000), // cap after extraction
         exitCode,
         durationMs,
@@ -1133,6 +1215,7 @@ export class CronScheduler {
 
       const stderrText = await drain(stderrResult, '')
       if (wasStopped) completedRun.error = 'Stopped by user'
+      else if (migrationInterrupted) completedRun.error = 'Interrupted for data migration'
       else if (timedOut) completedRun.error = `Task timed out after ${taskTimeoutMs} ms`
       else if (exitCode !== 0) completedRun.error = stderrText.slice(0, 5_000) || `Process exited with code ${exitCode}`
 
@@ -1232,16 +1315,16 @@ export class CronScheduler {
     // written before the API validated it) must not read `.length` here: that
     // throws before the delivery service can record the visible failure, and
     // the throw would escape `executeTask` even though the run itself finished.
-    if (task.notification?.enabled) {
+    if (task.notification?.enabled && run.error !== 'Interrupted for data migration') {
       try {
-        const report = await sendTaskNotification(run, task.notification, {
+        const report = await migrationMaintenance.track(sendTaskNotification(run, task.notification, {
           getTaskNotificationContext: this.buildTaskNotificationContextProvider(
             task.id,
             run.id,
             runLogTarget.sourcePath,
             trustedWorkDir,
           ),
-        })
+        }))
         if (report) {
           run.notificationReport = summarizeNotificationReport(report)
           await updateRun(run, runLogTarget).catch(() => {
@@ -1257,8 +1340,9 @@ export class CronScheduler {
       }
     }
 
-    // If non-recurring, disable after first run
-    if (!task.recurring) {
+    // If non-recurring, disable after first run. A migration interrupt is not a
+    // completed execution — the task must remain enabled so it can fire again.
+    if (!task.recurring && run.error !== 'Interrupted for data migration') {
       await this.cronService.updateTask(task.id, { enabled: false }).catch(() => {
         // Task may have been deleted
       })

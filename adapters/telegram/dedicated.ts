@@ -12,6 +12,7 @@ import { WsBridge, type ServerMessage } from '../common/ws-bridge.js'
 import { MessageDedup } from '../common/message-dedup.js'
 import { enqueue } from '../common/chat-queue.js'
 import { loadConfig } from '../common/config.js'
+import { adapterMigrationLifecycle, registerAdapterShutdown } from '../common/migration-lifecycle.js'
 import {
   formatImStatus,
   formatPermissionRequest,
@@ -77,6 +78,7 @@ if (telegramTranscriber) {
 }
 
 export const bot = new Bot(config.telegram.botToken)
+bot.use((_ctx, next) => adapterMigrationLifecycle.isQuiescing ? Promise.resolve() : adapterMigrationLifecycle.track(next()))
 bot.catch((err) => {
   console.error('[Telegram]', sanitizeTelegramError(err))
 })
@@ -789,7 +791,7 @@ registerAuthorizedTelegramCommand(bot, 'stop', isAuthorizedTelegramUser, (ctx) =
   // sent. Runs outside the chat queue, so it is prompt.
   invalidateChatInputs(chatId)
   questionController.clear(chatId)
-  void (async () => {
+  void adapterMigrationLifecycle.track((async () => {
     const result = await ensureExistingSession(chatId)
     if (result.status !== 'restored') {
       await ctx.reply(result.status === 'unavailable' ? SESSION_RECONNECT_NOTICE : formatImStatus(null))
@@ -797,7 +799,7 @@ registerAuthorizedTelegramCommand(bot, 'stop', isAuthorizedTelegramUser, (ctx) =
     }
     bridge.sendStopGeneration(chatId)
     await ctx.reply('⏹ 已发送停止信号。')
-  })()
+  })())
 })
 
 registerAuthorizedTelegramCommand(bot, 'status', isAuthorizedTelegramUser, async (ctx) => {
@@ -811,7 +813,7 @@ registerAuthorizedTelegramCommand(bot, 'clear', isAuthorizedTelegramUser, (ctx) 
   // not be written into the freshly cleared context.
   invalidateChatInputs(chatId)
   questionController.clear(chatId)
-  void (async () => {
+  void adapterMigrationLifecycle.track((async () => {
     const result = await ensureExistingSession(chatId)
     if (result.status !== 'restored') {
       await ctx.reply(result.status === 'unavailable' ? SESSION_RECONNECT_NOTICE : formatImStatus(null))
@@ -825,7 +827,7 @@ registerAuthorizedTelegramCommand(bot, 'clear', isAuthorizedTelegramUser, (ctx) 
     }
     getRuntimeState(chatId).state = 'thinking'
     await ctx.reply('🧹 已清空当前会话上下文。')
-  })()
+  })())
 })
 
 for (const command of ['allow', 'always', 'allow-always', 'deny'] as const) {
@@ -1337,7 +1339,7 @@ export async function stopTelegramAdapter(): Promise<void> {
   // cleanup short.
   const inFlight = [...pendingInputs.values()]
     .flatMap((inputs) => inputs.map((input) => input.completion))
-  if (bot.isRunning()) void bot.stop()
+  if (bot.isRunning()) await bot.stop()
   bridge.destroy()
   dedup.destroy()
   await Promise.all(inFlight)
@@ -1355,18 +1357,23 @@ export function startTelegramAdapter(options?: { registerProcessShutdown?: boole
   void bot.start({ onStart: () => console.log('[Telegram] Bot is running!') }).catch((err) => {
     console.error('[Telegram] start failed:', sanitizeTelegramError(err))
   })
-  // The dual-bot launcher owns SIGINT/SIGTERM so one entry cannot process.exit
-  // before the other finishes. Standalone `bun run dedicated.ts` still registers.
+  // Dual-launcher (`index.ts`) owns process signals so one entry cannot
+  // process.exit before the other finishes. This entry still registers a
+  // migration shutdown so quiesce() stops dedicated polling on its own.
+  adapterMigrationLifecycle.registerShutdown(stopTelegramAdapter)
   if (options?.registerProcessShutdown === false) return
-  // SIGTERM is what the desktop host sends first (with a graceful window) when
-  // it stops the sidecar, so both signals must run the same asynchronous
-  // shutdown and only exit once provider cleanup has finished.
-  const shutdown = (): void => {
+  bindDedicatedProcessShutdown()
+}
+
+let dedicatedProcessShutdownBound = false
+
+function bindDedicatedProcessShutdown(): void {
+  if (dedicatedProcessShutdownBound) return
+  dedicatedProcessShutdownBound = true
+  registerAdapterShutdown(async () => {
     console.log('[Telegram] Shutting down...')
-    void stopTelegramAdapter().finally(() => process.exit(0))
-  }
-  process.once('SIGINT', shutdown)
-  process.once('SIGTERM', shutdown)
+    await stopTelegramAdapter()
+  })
 }
 
 if (import.meta.main) startTelegramAdapter()

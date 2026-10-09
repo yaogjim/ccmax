@@ -3,12 +3,12 @@ import { useRef, useEffect, useMemo, memo, useState, useCallback, useDeferredVal
 import { createPortal, flushSync } from 'react-dom'
 import { ArrowDown, BookMarked, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, FileStack, LoaderCircle, Settings, Target, Undo2, XCircle } from 'lucide-react'
 import { ApiError } from '../../api/client'
-import { sessionsApi, type SessionRewindMode, type SessionTurnCheckpoint } from '../../api/sessions'
+import { sessionsApi, type SessionRewindMode, type SessionTurnCheckpoint, type WorkspaceChangedFile } from '../../api/sessions'
 import { listPendingPermissions, useChatStore } from '../../stores/chatStore'
 import { useSessionStore } from '../../stores/sessionStore'
+import { useSideChatStore } from '../../stores/sideChatStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { useWorkspaceStore, type WorkspaceOrigin } from '../../stores/workspaceStore'
-import { useWorkspaceReviewStore } from '../../stores/workspaceReviewStore'
 import { SETTINGS_TAB_ID, useTabStore } from '../../stores/tabStore'
 import { teamTaskWindowsForSnapshot, useTeamStore } from '../../stores/teamStore'
 import { useUIStore } from '../../stores/uiStore'
@@ -28,9 +28,14 @@ import type { ActivityStep } from './activityGroupModel'
 import { ToolResultBlock } from './ToolResultBlock'
 import { PermissionDialog } from './PermissionDialog'
 import { AskUserQuestion } from './AskUserQuestion'
+import { RenderItemBoundary } from './RenderItemBoundary'
 import { StreamingIndicator } from './StreamingIndicator'
 import { InlineTaskSummary } from './InlineTaskSummary'
 import { CurrentTurnChangeCard } from './CurrentTurnChangeCard'
+import { describeRewindResult, getApiErrorMessage, rewindToTurnCheckpoint } from './turnRewind'
+import { useUserMessageEditResend, type EditableTurnCard } from './useUserMessageEditResend'
+import type { UserMessageEditAction } from './UserMessage'
+import { WorkspaceChangesFallback } from '@/components/chat/WorkspaceChangesFallback'
 import { AgentTeamsInlineCard } from '../agentTeams/AgentTeamsSummary'
 import { MEMBER_AVATARS, memberAccentColor } from '../agentTeams/agentTeamsAvatars'
 import {
@@ -49,7 +54,10 @@ import type { TeamDetail, TeamWorkbenchSnapshot } from '../../types/team'
 import { formatTokenCount } from '../../lib/formatTokenCount'
 import { formatDurationMs, hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks } from '../../lib/backgroundTasks'
 import { buildTurnCompletionByMessageId, type TurnCompletion } from '../../lib/turnCompletion'
+import type { TurnOutputEvidence } from '../../lib/assistantOutputTargets'
 import { isTouchH5Document } from '../../lib/touchH5'
+import { findChatRenderTarget } from '../../lib/trajectory/chatTarget'
+import { useTrajectoryViewStore } from '../../stores/trajectoryViewStore'
 import {
   EMPTY_TEAM_LIFECYCLE_CURSOR,
   isTeamLifecycleScopedAt,
@@ -111,6 +119,8 @@ type RenderModel = {
 
 type RewindTurnTarget = {
   messageId: string
+  /** The prompt's own transcript id; a live prompt has none until history reloads. */
+  transcriptMessageId?: string
   userMessageIndex: number
   content: string
   expectedContent: string
@@ -143,6 +153,12 @@ type SelectionPointer = {
   clientX: number
   clientY: number
 }
+
+// Business errors whose raw message carries evidence worth keeping under the
+// translated explanation (e.g. what the stream received before it was cut).
+const BUSINESS_ERRORS_WITH_RAW_DETAIL: ReadonlySet<string> = new Set([
+  'upstream_stream_interrupted',
+])
 
 const CHAT_SELECTION_MENU_OFFSET = 10
 const CHAT_SELECTION_MENU_WIDTH = 360
@@ -415,7 +431,7 @@ function BackgroundTaskEventCard({ message }: { message: BackgroundTaskEvent }) 
       >
         <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
           {isRunning ? (
-            <LoaderCircle size={15} strokeWidth={2.25} className="animate-spin text-[var(--color-brand)]" aria-hidden="true" />
+            <LoaderCircle size={15} strokeWidth={1.75} className="animate-spin text-[var(--color-info)]" aria-hidden="true" />
           ) : isFailed ? (
             <XCircle size={15} strokeWidth={2.25} className="text-[var(--color-error)]" aria-hidden="true" />
           ) : isStopped ? (
@@ -1127,7 +1143,7 @@ function TeamCoordinationAudit({ toolCalls }: { toolCalls: ToolCall[] }) {
           const summary = coordinationToolSummary(toolCall)
           return (
             <li key={toolCall.toolUseId} className="flex min-w-0 items-start gap-2">
-              <code className="shrink-0 font-mono text-[10px] font-semibold text-[var(--color-text-tertiary)]">
+              <code className="shrink-0 font-mono text-[11px] text-[var(--color-text-tertiary)]">
                 {toolCall.toolName}
               </code>
               {summary ? <span className="min-w-0 break-words">{summary}</span> : null}
@@ -1230,6 +1246,7 @@ export function getCompletedTurnTargets(messages: UIMessage[]): RewindTurnTarget
       userMessageIndex += 1
       currentTarget = {
         messageId: message.id,
+        ...(message.transcriptMessageId ? { transcriptMessageId: message.transcriptMessageId } : {}),
         userMessageIndex,
         content: message.content,
         expectedContent: message.modelContent ?? message.content,
@@ -1300,23 +1317,34 @@ function buildTurnCardInsertionMap(
   return cardsByRenderIndex
 }
 
+type TurnFileEvidence = TurnOutputEvidence & { changedFiles: string[] }
+
+const UNKNOWN_TURN_OUTPUT_EVIDENCE: TurnOutputEvidence = { unlistedWrites: true }
+
 /**
- * Map each render item to the REAL changed files of the turn it belongs to, so an
- * assistant message can anchor its output chips on files that were actually
- * written this turn instead of guessing paths from the prose. Items are attributed
- * to the most recent preceding non-pending user message (the turn boundary).
+ * Map each render item to what its turn's checkpoint knows: the REAL changed
+ * files, so an assistant message can anchor its output chips on files that were
+ * actually written this turn instead of guessing paths from the prose, and
+ * whether anything else could have written one. Items are attributed to the
+ * most recent preceding non-pending user message (the turn boundary).
  */
 function buildChangedFilesByRenderIndex(
   renderItems: RenderItem[],
   turnChangeCards: TurnChangeCardModel[],
-): Map<number, string[]> {
-  const filesByTurnId = new Map<string, string[]>()
+): Map<number, TurnFileEvidence> {
+  const filesByTurnId = new Map<string, TurnFileEvidence>()
   for (const card of turnChangeCards) {
-    filesByTurnId.set(card.target.messageId, card.checkpoint.code.filesChanged)
+    const { code, unverifiedChangeSources, startedAt } = card.checkpoint
+    filesByTurnId.set(card.target.messageId, {
+      changedFiles: code.filesChanged,
+      // An older server does not say; assume the worst.
+      unlistedWrites: unverifiedChangeSources === undefined || unverifiedChangeSources.length > 0,
+      ...(typeof startedAt === 'number' ? { startedAt } : {}),
+    })
   }
   if (filesByTurnId.size === 0) return new Map()
 
-  const filesByRenderIndex = new Map<number, string[]>()
+  const filesByRenderIndex = new Map<number, TurnFileEvidence>()
   let activeTurnId: string | null = null
   renderItems.forEach((item, index) => {
     if (item.kind === 'message' && item.message.type === 'user_text' && !item.message.pending) {
@@ -1434,16 +1462,6 @@ export function trailingStreamingRailPosition(positions: TurnRailPosition[]): Tu
   return last === 'start' || last === 'middle' ? 'end' : 'solo'
 }
 
-function getApiErrorMessage(error: unknown) {
-  return error instanceof ApiError
-    ? typeof error.body === 'object' && error.body && 'message' in error.body
-      ? String((error.body as { message: unknown }).message)
-      : error.message
-    : error instanceof Error
-      ? error.message
-      : String(error)
-}
-
 function isCheckpointPreviewBudgetError(error: unknown): boolean {
   return error instanceof ApiError &&
     error.status === 413 &&
@@ -1497,14 +1515,14 @@ function MemoryEventCard({ message }: { message: MemoryEvent }) {
 
   return (
     <div className="mb-3 flex justify-center px-3">
-      <div className="w-full max-w-2xl rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3.5 py-3 text-xs shadow-[var(--shadow-card)]">
+      <div className="w-full max-w-2xl rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-3.5 py-3 text-xs">
         <div className="flex items-start gap-3">
-          <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-brand)]">
-            <BookMarked size={15} aria-hidden="true" />
+          <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-[var(--color-surface-container)] text-[var(--color-text-secondary)]">
+            <BookMarked size={15} strokeWidth={1.75} aria-hidden="true" />
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="font-medium text-[var(--color-text-primary)]">
+              <div className="text-[13px] font-medium text-[var(--color-text-primary)]">
                 {t('chat.memorySavedTitle', { count: message.files.length })}
               </div>
               <Button
@@ -1524,13 +1542,13 @@ function MemoryEventCard({ message }: { message: MemoryEvent }) {
                 <span
                   key={file.path}
                   title={file.path}
-                  className="max-w-full truncate rounded-[var(--radius-sm)] border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-mono text-[10px] text-[var(--color-text-secondary)]"
+                  className="max-w-full truncate rounded-[var(--radius-xs)] bg-[var(--color-surface-container)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--color-text-secondary)]"
                 >
                   {memoryFileLabel(file.path)}
                 </span>
               ))}
               {hiddenCount > 0 ? (
-                <span className="rounded-[var(--radius-sm)] border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-mono text-[10px] text-[var(--color-text-tertiary)]">
+                <span className="rounded-[var(--radius-xs)] bg-[var(--color-surface-container)] px-1.5 py-0.5 text-[11px] text-[var(--color-text-tertiary)]">
                   {t('chat.memoryMoreFiles', { count: hiddenCount })}
                 </span>
               ) : null}
@@ -1546,6 +1564,12 @@ type MessageListProps = {
   sessionId?: string | null
   compact?: boolean
   mobileLayout?: boolean
+  /**
+   * The host answers waiting requests from an approval bar in the composer's
+   * place (the phone session page). Permission, plan and question cards then
+   * shrink to a marker line here while they wait, so only one live copy exists.
+   */
+  decisionsInComposer?: boolean
   onOpenAgentRun?: (payload: OpenAgentRunPayload) => void
   /**
    * Lets a host that renders the list under a non-session id (an agent run's
@@ -1780,7 +1804,7 @@ function collectConversationFindRanges(root: Node, query: string) {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT
-      if (node.parentElement?.closest('[data-find-bar], script, style, noscript, .material-symbols-outlined')) {
+      if (node.parentElement?.closest('[data-find-bar], script, style, noscript')) {
         return NodeFilter.FILTER_REJECT
       }
       return NodeFilter.FILTER_ACCEPT
@@ -2179,7 +2203,14 @@ function VirtualSpacer({ height, position }: { height: number; position: 'top' |
   }
 
   return (
-    <div data-virtual-spacer={position} aria-hidden="true">
+    <div
+      data-virtual-spacer={position}
+      aria-hidden="true"
+      className="overflow-hidden"
+      // Fractional zoom rounds each chunk independently. Keep their accumulated
+      // error out of scrollHeight so native scrolling cannot toggle the window.
+      style={{ height }}
+    >
       {chunks.map((chunk) => (
         <div
           key={chunk.key}
@@ -2256,6 +2287,7 @@ export function MessageList({
   sessionId,
   compact = false,
   mobileLayout = false,
+  decisionsInComposer = false,
   onOpenAgentRun,
   resolveAgentActivityTarget,
 }: MessageListProps = {}) {
@@ -2271,7 +2303,6 @@ export function MessageList({
     resolvedSessionId ? s.sessions[resolvedSessionId] : undefined,
   )
   const branchSession = useSessionStore((s) => s.branchSession)
-  const stopGeneration = useChatStore((s) => s.stopGeneration)
   const reloadHistory = useChatStore((s) => s.reloadHistory)
   const loadOlderHistory = useChatStore((s) => s.loadOlderHistory)
   const queueComposerPrefill = useChatStore((s) => s.queueComposerPrefill)
@@ -2284,6 +2315,7 @@ export function MessageList({
     (tab.type === 'subagent' || tab.type === 'team-member')
   )))
   const isDirectAgentSession = isMemberSession || isAgentRunTab
+  const isSideChatSession = useSideChatStore((s) => Boolean(resolvedSessionId && s.entries[resolvedSessionId]))
   const teamWorkbench = useTeamStore((s) =>
     resolvedSessionId ? s.workbenchesBySession[resolvedSessionId] : undefined,
   )
@@ -2390,6 +2422,10 @@ export function MessageList({
   const [expandedChangeCards, setExpandedChangeCards] = useState<Record<string, boolean>>({})
   const [turnChangeCards, setTurnChangeCards] = useState<TurnChangeCardModel[]>([])
   const [turnChangeLoadError, setTurnChangeLoadError] = useState<string | null>(null)
+  const [workspaceChangesFallback, setWorkspaceChangesFallback] = useState<{
+    sessionId: string
+    files: WorkspaceChangedFile[] | null
+  } | null>(null)
   const [turnActionErrors, setTurnActionErrors] = useState<Record<string, string>>({})
   const [isLoadingTurnChangeCards, setIsLoadingTurnChangeCards] = useState(false)
   const [branchingMessageId, setBranchingMessageId] = useState<string | null>(null)
@@ -2402,19 +2438,20 @@ export function MessageList({
   })
   const [measuredItemsVersion, setMeasuredItemsVersion] = useState(0)
   const [highlightedNavigationItemKey, setHighlightedNavigationItemKey] = useState<string | null>(null)
+  /** The tool call inside the highlighted item a jump is about, if any. */
+  const [highlightedNavigationToolUseId, setHighlightedNavigationToolUseId] = useState<string | null>(null)
   const [programmaticNavigationItemId, setProgrammaticNavigationItemId] = useState<string | null>(null)
   const [activeConversationFindMatch, setActiveConversationFindMatch] = useState<ConversationFindMatch | null>(null)
   const conversationFindMatchesRef = useRef<ConversationFindMatch[]>([])
   const [messageListWidth, setMessageListWidth] = useState<number | null>(null)
-  const branchActionsDisabled =
-    isDirectAgentSession ||
+  const turnInProgress =
     isPreparingTurn ||
     chatState !== 'idle' ||
-    hasRunningBackgroundTasks ||
     streamingText.trim().length > 0 ||
     Boolean(activeThinkingId) ||
     Boolean(sessionState?.activeToolUseId) ||
     Boolean(sessionState?.activeToolName)
+  const branchActionsDisabled = isDirectAgentSession || turnInProgress || hasRunningBackgroundTasks
   const hasCompactingDivider = messages.some((message) =>
     message.type === 'compact_summary' && message.phase === 'compacting')
 
@@ -2870,6 +2907,9 @@ export function MessageList({
     () => buildChangedFilesByRenderIndex(renderItems, turnChangeCards),
     [renderItems, turnChangeCards],
   )
+  // No checkpoint is coming for this view; the disk alone has to vouch for outputs.
+  // While one is still loading, nothing unproven is shown instead.
+  const turnEvidenceUnavailable = isDirectAgentSession || turnChangeLoadError !== null || workspaceChangesFallback !== null
   const turnOutputOwnerIndexes = useMemo(
     () => buildTurnOutputOwnerIndexes(renderItems, turnChangeCards),
     [renderItems, turnChangeCards],
@@ -3087,18 +3127,21 @@ export function MessageList({
     if (!resolvedSessionId || !checkpointHistoryReady || completedTurnTargets.length === 0 || isDirectAgentSession) {
       setTurnChangeCards([])
       setTurnChangeLoadError(null)
+      setWorkspaceChangesFallback(null)
       setIsLoadingTurnChangeCards(false)
       return
     }
 
     if (hasRunningBackgroundTasks) {
       setTurnChangeLoadError(null)
+      setWorkspaceChangesFallback(null)
       setIsLoadingTurnChangeCards(false)
       return
     }
 
     if (chatState !== 'idle') {
       setTurnChangeLoadError(null)
+      setWorkspaceChangesFallback(null)
       setIsLoadingTurnChangeCards(false)
       return
     }
@@ -3107,13 +3150,31 @@ export function MessageList({
     const controller = new AbortController()
     setIsLoadingTurnChangeCards(true)
     setTurnChangeLoadError(null)
+    setWorkspaceChangesFallback(null)
 
-    Promise.all([
+    // Keep the bounded workspace evidence even if full turn previews exceed
+    // their budget. These files describe the current workspace, not a turn.
+    Promise.allSettled([
       sessionsApi.getTurnCheckpoints(resolvedSessionId, { signal: controller.signal }),
-      sessionsApi.getWorkspaceStatus(resolvedSessionId).catch(() => null),
+      sessionsApi.getWorkspaceStatus(resolvedSessionId, controller.signal),
     ])
-      .then(([checkpointResponse, workspaceStatus]) => {
+      .then(([checkpointResult, workspaceResult]) => {
         if (cancelled) return
+        const workspaceStatus = workspaceResult.status === 'fulfilled' ? workspaceResult.value : null
+        if (checkpointResult.status === 'rejected') {
+          setTurnChangeCards([])
+          if (isCheckpointPreviewBudgetError(checkpointResult.reason)) {
+            const files = workspaceStatus?.state === 'ok' &&
+              Array.isArray(workspaceStatus.changedFiles) &&
+              workspaceStatus.changedFiles.every((file) => typeof file?.path === 'string' && file.path.trim().length > 0)
+              ? workspaceStatus.changedFiles
+              : null
+            setWorkspaceChangesFallback({ sessionId: resolvedSessionId, files })
+          } else {
+            setTurnChangeLoadError(getApiErrorMessage(checkpointResult.reason))
+          }
+          return
+        }
         const targetByMessageId = new Map(
           completedTurnTargets.map((target) => [target.messageId, target] as const),
         )
@@ -3121,7 +3182,7 @@ export function MessageList({
           completedTurnTargets.map((target) => [target.userMessageIndex, target] as const),
         )
 
-        const nextCards = normalizeTurnCheckpoints(checkpointResponse).flatMap((checkpoint) => {
+        const nextCards = normalizeTurnCheckpoints(checkpointResult.value).flatMap((checkpoint) => {
             const target =
               targetByMessageId.get(checkpoint.target.targetUserMessageId) ??
               (sessionState?.historyWindowed ? undefined : targetByUserMessageIndex.get(checkpoint.target.userMessageIndex))
@@ -3140,8 +3201,7 @@ export function MessageList({
       .catch((error) => {
         if (cancelled) return
         setTurnChangeCards([])
-        // This limit only disables optional turn previews; the chat transcript is still readable.
-        setTurnChangeLoadError(isCheckpointPreviewBudgetError(error) ? null : getApiErrorMessage(error))
+        setTurnChangeLoadError(getApiErrorMessage(error))
       })
       .finally(() => {
         if (!cancelled) {
@@ -3168,45 +3228,17 @@ export function MessageList({
     })
 
     try {
-      if (chatState !== 'idle') {
-        stopGeneration(resolvedSessionId)
-      }
-
-      const checkpointTarget = confirmTurnCard.checkpoint.target
-      const result = await sessionsApi.rewind(resolvedSessionId, {
-        targetUserMessageId: checkpointTarget.targetUserMessageId,
-        userMessageIndex: checkpointTarget.userMessageIndex,
+      const result = await rewindToTurnCheckpoint(resolvedSessionId, {
+        checkpointTarget: confirmTurnCard.checkpoint.target,
         expectedContent: target.expectedContent,
-        mode,
-      })
-
-      useWorkspaceStore.getState().pruneTurnReviewTabs(resolvedSessionId, checkpointTarget.userMessageIndex)
-      useWorkspaceReviewStore.getState().clearTurnReviews(resolvedSessionId, checkpointTarget.userMessageIndex)
+      }, mode)
 
       await reloadHistory(resolvedSessionId)
       queueComposerPrefill(resolvedSessionId, {
         text: target.content,
         attachments: target.attachments,
       })
-
-      // Each branch has to match what actually happened on disk: nothing was
-      // restored in conversation mode, and in `both` mode a turn that also wrote
-      // off-checkpoint left changes behind. A plain success would overstate both.
-      const messageCount = result.conversation.messagesRemoved
-      const leftBehind = mode === 'both' ? result.unverifiedChangeSources ?? [] : []
-      addToast({
-        type: leftBehind.length > 0 ? 'warning' : 'success',
-        message: mode === 'conversation'
-          ? t('chat.rewindSuccessConversationOnly', { count: messageCount })
-          : leftBehind.length > 0
-            ? t('chat.rewindSuccessPartialCoverage', {
-                count: messageCount,
-                sources: leftBehind.join(', '),
-              })
-            : result.code.available
-              ? t('chat.rewindSuccessWithCode', { count: messageCount })
-              : t('chat.rewindSuccessConversationOnly', { count: messageCount }),
-      })
+      addToast(describeRewindResult(result, mode, t))
 
       setTurnUndoConfirmTargetId(null)
     } catch (error) {
@@ -3220,14 +3252,12 @@ export function MessageList({
     }
   }, [
     addToast,
-    chatState,
     confirmTurnCard,
     hasRunningBackgroundTasks,
     queueComposerPrefill,
     reloadHistory,
     resolvedSessionId,
     rewindingTurnId,
-    stopGeneration,
     t,
   ])
 
@@ -3299,6 +3329,54 @@ export function MessageList({
     return result
   }, [branchableMessageTargets, branchingMessageId, handleBranchMessage, t])
 
+  const completedTurnMessageIds = useMemo(
+    () => new Set(completedTurnTargets.map((target) => target.messageId)),
+    [completedTurnTargets],
+  )
+  const checkpointPreviewOverBudget = workspaceChangesFallback !== null &&
+    workspaceChangesFallback.sessionId === resolvedSessionId
+  // Past the preview budget the server lists no checkpoints at all, but one
+  // rewind still resolves a prompt by its transcript id, so those prompts stay
+  // editable. This mode tells the user file undo is unavailable, so the edit
+  // rolls back the conversation only.
+  const editTurnCards = useMemo<EditableTurnCard[]>(
+    () => checkpointPreviewOverBudget
+      ? completedTurnTargets.flatMap((target) => target.transcriptMessageId
+        ? [{
+            target: { messageId: target.messageId, expectedContent: target.expectedContent },
+            checkpoint: {
+              target: { targetUserMessageId: target.transcriptMessageId, userMessageIndex: target.userMessageIndex },
+            },
+            conversationOnly: true,
+          }]
+        : [])
+      : visibleTurnChangeCards,
+    [checkpointPreviewOverBudget, completedTurnTargets, visibleTurnChangeCards],
+  )
+  const editBlockedReason = turnInProgress
+    ? t('chat.editMessageWaitForTurn')
+    : hasRunningBackgroundTasks
+      ? t('chat.editMessageWaitForBackgroundTasks')
+      : null
+  const editPendingReason = !checkpointHistoryReady || isLoadingTurnChangeCards
+    ? t('chat.editMessageCheckingCheckpoints')
+    : turnChangeLoadError !== null
+      ? t('chat.editMessageCheckpointsUnavailable')
+      : null
+
+  const { editActionByMessageId, dialog: editResendDialog } = useUserMessageEditResend({
+    sessionId: resolvedSessionId,
+    messages,
+    turnCards: editTurnCards,
+    completedMessageIds: completedTurnMessageIds,
+    blockedReason: editBlockedReason,
+    pendingReason: editPendingReason,
+    disabled: isDirectAgentSession || isSideChatSession || Boolean(turnUndoConfirmTargetId),
+    rewindingTurnId,
+    setRewindingTurnId,
+    t,
+  })
+
   const toolResultByToolUseId = useMemo(() => {
     if (toolResultMap.size === 0) return new Map<string, { content: unknown; isError: boolean; agentRuntime?: AgentRuntimeBadge }>()
     const result = new Map<string, { content: unknown; isError: boolean; agentRuntime?: AgentRuntimeBadge }>()
@@ -3312,7 +3390,10 @@ export function MessageList({
     return result
   }, [toolResultMap])
 
-  const handleNavigateToConversationItem = useCallback((item: ConversationNavigationItem) => {
+  const handleNavigateToConversationItem = useCallback((
+    item: ConversationNavigationItem,
+    options: { toolUseId?: string } = {},
+  ) => {
     const container = scrollContainerRef.current
     if (!container) return
 
@@ -3320,6 +3401,9 @@ export function MessageList({
     userScrollIntentUntilRef.current = 0
     setProgrammaticNavigationItemId(item.id)
     setHighlightedNavigationItemKey(item.renderItemKey)
+    // A tool call inside the item: its group opens onto it and the call itself
+    // takes the highlight, since the item is mostly the rows around it.
+    setHighlightedNavigationToolUseId(options.toolUseId ?? null)
 
     const scheduleHighlightClear = () => {
       if (navigationHighlightTimerRef.current !== null) {
@@ -3352,10 +3436,22 @@ export function MessageList({
     }
     setVirtualViewport({ scrollTop: targetScrollTop, viewportHeight })
 
-    requestAnimationFrame(() => {
-      const targetNode = Array.from(
+    const alignTarget = (retriesLeft: number) => {
+      const itemNode = Array.from(
         scrollContentRef.current?.querySelectorAll<HTMLElement>('[data-chat-render-item-key]') ?? [],
       ).find((node) => node.dataset.chatRenderItemKey === item.renderItemKey)
+      // Align the call itself, not the top of a group that may be thousands of
+      // rows tall. The group opens in the render this navigation triggered, so
+      // give it one more frame if the row is not in the DOM yet.
+      const toolNode = options.toolUseId && itemNode
+        ? Array.from(itemNode.querySelectorAll<HTMLElement>('[data-tool-use-id]'))
+          .find((node) => node.dataset.toolUseId === options.toolUseId)
+        : undefined
+      if (options.toolUseId && itemNode && !toolNode && retriesLeft > 0) {
+        requestAnimationFrame(() => alignTarget(retriesLeft - 1))
+        return
+      }
+      const targetNode = toolNode ?? itemNode
 
       if (targetNode) {
         const targetRect = targetNode.getBoundingClientRect()
@@ -3370,7 +3466,8 @@ export function MessageList({
       }
 
       scheduleHighlightClear()
-    })
+    }
+    requestAnimationFrame(() => alignTarget(1))
   }, [
     syncVirtualViewportFromContainer,
     virtualTranscriptWindow.offsets,
@@ -3405,6 +3502,33 @@ export function MessageList({
   const conversationFindStreamingTextRef = useRef(streamingText)
   conversationFindStreamingTextRef.current = streamingText
   const conversationFindControllerRef = useRef<ConversationFindController | null>(null)
+
+  // "Locate in chat" from the trajectory view. The request arrives together
+  // with the switch back to chat, so wait two frames for the list to have real
+  // dimensions again before measuring offsets.
+  const trajectoryNav = useTrajectoryViewStore((state) => (
+    state.nav?.to === 'chat' && state.nav.sessionId === resolvedSessionId ? state.nav : null
+  ))
+  const consumeTrajectoryNav = useTrajectoryViewStore((state) => state.consumeNav)
+  const handleNavigateToConversationItemRef = useRef(handleNavigateToConversationItem)
+  handleNavigateToConversationItemRef.current = handleNavigateToConversationItem
+  useEffect(() => {
+    if (trajectoryNav?.to !== 'chat') return
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        consumeTrajectoryNav(trajectoryNav.nonce)
+        const items = conversationFindRenderItemsRef.current
+        const { index, toolUseId } = findChatRenderTarget(items, trajectoryNav.target)
+        if (index < 0) return
+        const key = getRenderItemKey(items[index]!)
+        handleNavigateToConversationItemRef.current(
+          { id: key, renderItemKey: key, renderIndex: index, turnNumber: 0, preview: '', attachmentCount: 0 },
+          { toolUseId },
+        )
+      })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [consumeTrajectoryNav, trajectoryNav])
 
   useEffect(() => {
     if (!resolvedSessionId || resolvedSessionId !== activeTabId) return
@@ -3554,75 +3678,93 @@ export function MessageList({
   }, [isWorkspacePanelOpen, resolvedSessionId, restoreWorkspaceOrigin, workspacePanelOrigin])
 
 
+  /** Only the item a jump landed on hears about it, so other memoized items keep their props. */
+  const navigationToolUseIdFor = (item: RenderItem): string | undefined => (
+    highlightedNavigationToolUseId !== null && highlightedNavigationItemKey === getRenderItemKey(item)
+      ? highlightedNavigationToolUseId
+      : undefined
+  )
+
   const renderTranscriptItem = (item: RenderItem, index: number) => {
     const cardsForItem = turnCardsByRenderIndex.get(index) ?? []
 
     return (
       <>
-        {item.kind === 'tool_group' ? (
-          <ToolCallGroup
-            sessionId={resolvedSessionId}
-            onOpenAgentRun={onOpenAgentRun}
-            resolveAgentActivityTarget={resolveAgentActivityTarget}
-            toolCalls={item.toolCalls}
-            steps={item.steps}
-            resultMap={toolResultMap}
-            childToolCallsByParent={childToolCallsByParent}
-            agentTaskNotifications={agentTaskNotifications}
-            agentTaskStatuses={agentTaskStatuses}
-            activeThinkingId={activeThinkingId}
-            isStreaming={
-              chatState === 'tool_executing' &&
-              item.toolCalls.some((tc) => !toolResultMap.has(tc.toolUseId))
-            }
-            // Only the tail of a live turn can still grow. Everything above it
-            // is finished, whatever any individual tool's state looks like this
-            // instant — which is why this, and not `isStreaming`, decides
-            // whether a run stands open.
-            isLive={chatState !== 'idle' && index === renderItems.length - 1 && !hasTrailingStreamingItem}
-            disclosureKey={getRenderItemKey(item)}
-          />
-        ) : item.kind === 'team_card' ? (
-          resolvedSessionId ? (() => {
-            const cardSnapshot = snapshotForTeamCard(teamSnapshot, item)
-            const fallbackPhase = item.endedAt !== undefined || teamTaskWindows.some((window) => (
-              item.startedAt >= window.startedAt &&
-              window.endedAt !== undefined &&
-              item.startedAt <= window.endedAt
-            )) ? 'completed' : 'forming'
-            return (
-            <AgentTeamsInlineCard
-              snapshot={cardSnapshot}
-              teamName={item.teamName}
-              fallbackPhase={fallbackPhase}
-              phaseOverride={item.endedAt !== undefined ? 'completed' : undefined}
-              onOpen={cardSnapshot
-                ? () => openTeamWorkbench(resolvedSessionId, cardSnapshot.team.name)
-                : undefined}
-            >
-              <TeamCoordinationAudit toolCalls={item.coordinationToolCalls} />
-            </AgentTeamsInlineCard>
-            )
-          })() : null
-        ) : (
-          <MessageBlock
-            sessionId={resolvedSessionId}
-            message={item.message}
-            team={memberSessionTeam ?? undefined}
-            activeThinkingId={activeThinkingId}
-            agentTaskNotifications={agentTaskNotifications}
-            toolResult={
-              item.message.type === 'tool_use'
-                ? toolResultByToolUseId.get(item.message.toolUseId) ?? null
-                : null
-            }
-            branchAction={branchActionByMessageId.get(item.message.id)}
-            turnChangedFiles={changedFilesByRenderIndex.get(index)}
-            isTurnOutputOwner={turnOutputOwnerIndexes.has(index)}
-            turnCompletion={turnCompletionByMessageId.get(item.message.id)}
-            supersededAskUserQuestionIds={supersededAskUserQuestionIds}
-          />
-        )}
+        <RenderItemBoundary>
+          {item.kind === 'tool_group' ? (
+            <ToolCallGroup
+              sessionId={resolvedSessionId}
+              onOpenAgentRun={onOpenAgentRun}
+              resolveAgentActivityTarget={resolveAgentActivityTarget}
+              toolCalls={item.toolCalls}
+              steps={item.steps}
+              resultMap={toolResultMap}
+              childToolCallsByParent={childToolCallsByParent}
+              agentTaskNotifications={agentTaskNotifications}
+              agentTaskStatuses={agentTaskStatuses}
+              activeThinkingId={activeThinkingId}
+              isStreaming={
+                chatState === 'tool_executing' &&
+                item.toolCalls.some((tc) => !toolResultMap.has(tc.toolUseId))
+              }
+              // Only the tail of a live turn can still grow. Everything above it
+              // is finished, whatever any individual tool's state looks like this
+              // instant — which is why this, and not `isStreaming`, decides
+              // whether a run stands open.
+              isLive={chatState !== 'idle' && index === renderItems.length - 1 && !hasTrailingStreamingItem}
+              disclosureKey={getRenderItemKey(item)}
+              revealToolUseId={navigationToolUseIdFor(item)}
+              activityPresentation={mobileLayout ? 'sheet' : 'inline'}
+            />
+          ) : item.kind === 'team_card' ? (
+            resolvedSessionId ? (() => {
+              const cardSnapshot = snapshotForTeamCard(teamSnapshot, item)
+              const fallbackPhase = item.endedAt !== undefined || teamTaskWindows.some((window) => (
+                item.startedAt >= window.startedAt &&
+                window.endedAt !== undefined &&
+                item.startedAt <= window.endedAt
+              )) ? 'completed' : 'forming'
+              return (
+              <AgentTeamsInlineCard
+                snapshot={cardSnapshot}
+                teamName={item.teamName}
+                fallbackPhase={fallbackPhase}
+                phaseOverride={item.endedAt !== undefined ? 'completed' : undefined}
+                onOpen={cardSnapshot
+                  ? () => openTeamWorkbench(resolvedSessionId, cardSnapshot.team.name)
+                  : undefined}
+              >
+                <TeamCoordinationAudit toolCalls={item.coordinationToolCalls} />
+              </AgentTeamsInlineCard>
+              )
+            })() : null
+          ) : (
+            <MessageBlock
+              sessionId={resolvedSessionId}
+              message={item.message}
+              team={memberSessionTeam ?? undefined}
+              activeThinkingId={activeThinkingId}
+              agentTaskNotifications={agentTaskNotifications}
+              toolResult={
+                item.message.type === 'tool_use'
+                  ? toolResultByToolUseId.get(item.message.toolUseId) ?? null
+                  : null
+              }
+              branchAction={branchActionByMessageId.get(item.message.id)}
+              editAction={editActionByMessageId.get(item.message.id)}
+              turnChangedFiles={changedFilesByRenderIndex.get(index)?.changedFiles}
+              turnOutputEvidence={changedFilesByRenderIndex.get(index) ?? (turnEvidenceUnavailable ? UNKNOWN_TURN_OUTPUT_EVIDENCE : undefined)}
+              isTurnOutputOwner={turnOutputOwnerIndexes.has(index)}
+              turnCompletion={turnCompletionByMessageId.get(item.message.id)}
+              supersededAskUserQuestionIds={supersededAskUserQuestionIds}
+              decisionsInComposer={decisionsInComposer}
+              navigationHighlighted={
+                item.message.type === 'tool_use' &&
+                navigationToolUseIdFor(item) === item.message.toolUseId
+              }
+            />
+          )}
+        </RenderItemBoundary>
 
 
         {resolvedSessionId && cardsForItem.map((card) => {
@@ -3782,10 +3924,19 @@ export function MessageList({
           )}
 
           {!isLoadingTurnChangeCards && visibleTurnChangeCards.length === 0 && turnChangeLoadError && (
-            <div className="mx-auto mb-5 w-full max-w-[var(--chat-content-max-width)] rounded-[var(--radius-lg)] border border-[var(--color-error)] bg-[var(--color-error-container)] px-4 py-3 text-xs text-[var(--color-on-error-container)]">
+            <div className="mx-auto mb-5 w-full max-w-[var(--chat-content-max-width)] rounded-[var(--radius-md)] bg-[var(--color-error-container)] px-3.5 py-2.5 text-xs text-[var(--color-on-error-container)]">
               {turnChangeLoadError}
             </div>
           )}
+
+          {!isLoadingTurnChangeCards && chatState === 'idle' && !hasRunningBackgroundTasks &&
+            workspaceChangesFallback?.sessionId === resolvedSessionId ? (
+              <WorkspaceChangesFallback
+                key={workspaceChangesFallback.sessionId}
+                sessionId={workspaceChangesFallback.sessionId}
+                files={workspaceChangesFallback.files}
+              />
+            ) : null}
 
           <div />
         </div>
@@ -3809,7 +3960,7 @@ export function MessageList({
           aria-label={t('chat.jumpToLatest')}
           // `glass-panel` is unlayered CSS, so it wins over the variant's
           // layered background/border utilities without a tailwind-merge.
-          className="glass-panel absolute bottom-4 right-5 z-20 rounded-full text-[13.5px] font-medium hover:-translate-y-px motion-reduce:hover:translate-y-0"
+          className="glass-panel absolute bottom-4 right-5 z-20 rounded-full text-[13px] font-medium hover:-translate-y-px motion-reduce:hover:translate-y-0"
           icon={<ArrowDown size={15} aria-hidden="true" />}
         >
           {t('chat.jumpToLatest')}
@@ -3831,6 +3982,15 @@ export function MessageList({
         width={520}
         loading={Boolean(rewindingTurnId)}
       />
+      <ActionDialog
+        open={editResendDialog.open}
+        onClose={editResendDialog.onClose}
+        title={editResendDialog.title}
+        body={editResendDialog.body}
+        actions={editResendDialog.actions}
+        width={520}
+        loading={editResendDialog.loading}
+      />
     </div>
   )
 }
@@ -3843,10 +4003,14 @@ export const MessageBlock = memo(function MessageBlock({
   agentTaskNotifications,
   toolResult,
   branchAction,
+  editAction,
   turnChangedFiles,
+  turnOutputEvidence,
   isTurnOutputOwner,
   turnCompletion,
   supersededAskUserQuestionIds,
+  decisionsInComposer = false,
+  navigationHighlighted = false,
 }: {
   sessionId?: string | null
   message: UIMessage
@@ -3859,10 +4023,15 @@ export const MessageBlock = memo(function MessageBlock({
     loading?: boolean
     onBranch: () => void
   }
+  editAction?: UserMessageEditAction
   turnChangedFiles?: string[]
+  turnOutputEvidence?: TurnOutputEvidence
   isTurnOutputOwner?: boolean
   turnCompletion?: TurnCompletion
   supersededAskUserQuestionIds?: ReadonlySet<string>
+  decisionsInComposer?: boolean
+  /** A "locate in chat" jump landed on this tool call. */
+  navigationHighlighted?: boolean
 }) {
   const t = useTranslation()
   const teammateVisual = message.type === 'user_text' && message.teammateFrom && team
@@ -3893,6 +4062,7 @@ export const MessageBlock = memo(function MessageBlock({
             sessionReferences={message.sessionReferences}
             collaboration={message.collaboration}
             branchAction={branchAction}
+            editAction={editAction}
             timestamp={message.timestamp}
             sessionId={sessionId ?? undefined}
             teammateFrom={message.teammateFrom}
@@ -3915,6 +4085,7 @@ export const MessageBlock = memo(function MessageBlock({
             branchAction={branchAction}
             sessionId={sessionId ?? undefined}
             turnChangedFiles={turnChangedFiles}
+            turnOutputEvidence={turnOutputEvidence}
             isTurnOutputOwner={isTurnOutputOwner}
             turnCompletion={turnCompletion}
           />
@@ -3933,6 +4104,7 @@ export const MessageBlock = memo(function MessageBlock({
             input={message.input}
             result={toolResult?.content}
             supersededByUserMessage={supersededAskUserQuestionIds?.has(message.toolUseId)}
+            markerWhenPending={decisionsInComposer}
           />
         )
       }
@@ -3950,6 +4122,8 @@ export const MessageBlock = memo(function MessageBlock({
           status={message.status}
           partialInput={message.partialInput}
           disclosureKey={message.toolUseId}
+          toolUseId={message.parentToolUseId ? undefined : message.toolUseId}
+          navigationHighlighted={navigationHighlighted}
           agentTaskNotification={
             message.toolName === 'Agent'
               ? agentTaskNotifications[message.toolUseId]
@@ -3975,6 +4149,7 @@ export const MessageBlock = memo(function MessageBlock({
           input={message.input}
           description={message.description}
           displayName={message.displayName}
+          markerWhenPending={decisionsInComposer}
         />
       )
     case 'error': {
@@ -3991,12 +4166,13 @@ export const MessageBlock = memo(function MessageBlock({
             ? errorText
             : message.message
       const showRawDetail =
-        !message.businessErrorCode &&
+        (!message.businessErrorCode ||
+          BUSINESS_ERRORS_WITH_RAW_DETAIL.has(message.businessErrorCode)) &&
         Boolean(message.message) &&
         message.message.trim() !== '' &&
         message.message !== displayMessage
       return (
-        <div className="mb-3 px-4 py-2.5 rounded-[var(--radius-lg)] border border-[var(--color-error)] bg-[var(--color-error-container)] text-sm text-[var(--color-on-error-container)]">
+        <div className="mb-3 rounded-[var(--radius-md)] bg-[var(--color-error-container)] px-3.5 py-2.5 text-[13px] text-[var(--color-on-error-container)]">
           <strong>{t('common.error')}:</strong> {displayMessage}
           {showRawDetail && (
             <div className="mt-1 whitespace-pre-wrap text-xs text-[var(--color-on-error-container)]">

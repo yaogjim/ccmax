@@ -17,8 +17,6 @@ order: 7
 
 ## 开启前检查环境
 
-![设置 → Computer Use：启用开关和系统权限状态](../images/app/zh-CN/settings-computer-use.webp)
-
 打开「设置 → Computer Use」。macOS 14.4 或更新版本会优先显示原生运行组件和系统权限状态。Windows 等使用兼容运行组件的环境会显示 Python 3、虚拟环境和依赖包检查；按页面提示安装，不必在 macOS 原生页面寻找 Python 配置。
 
 如果页面显示 Python 检查，未安装时先安装 Python 3。使用 conda、pyenv 等自定义环境时，可指定「Python 解释器路径」，再点「安装环境」创建隔离的 venv 和依赖包。完成后点「重新检测」。若页面提示原生运行组件缺失，请更新或重新安装应用，再重新检测。

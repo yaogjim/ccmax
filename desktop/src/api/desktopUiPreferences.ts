@@ -1,4 +1,5 @@
 import { ApiError, api, getApiUrl, getAuthToken } from './client'
+import type { VoicePreferences } from './voice'
 
 export type SidebarProjectPreferences = {
   projectOrder: string[]
@@ -45,6 +46,8 @@ export type DesktopUiPreferences = {
   sidebar: SidebarProjectPreferences
   profile: DesktopProfilePreferences
   pet: DesktopPetPreferences
+  /** Absent when talking to a server older than the voice input feature. */
+  voiceInput?: VoicePreferences
   projectDisplayNames: Record<string, string>
   settingsNavigation: DesktopSettingsNavigationPreferences
   skillMarket: DesktopSkillMarketPreferences
