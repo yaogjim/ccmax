@@ -1230,6 +1230,9 @@ function runHeadlessStreaming(
     | undefined
   let inputClosed = false
   let shutdownPromptInjected = false
+  // Poll cadence for the lead's teammate mailbox, and for waiting on the team
+  // to finish exiting after the closing lead was asked to stand it down.
+  const LEAD_POLL_INTERVAL_MS = 500
   const leadMailboxPoll = createLeadMailboxPollState()
   let heldBackResult: StdoutMessage | null = null
   const deferredAgentNotifications = new TaskNotificationFollowUpBatch()
@@ -2701,8 +2704,6 @@ function runHeadlessStreaming(
         // Poll for messages while teammates are active
         // This is needed because teammates may send messages while we're waiting
         // Keep polling until the team is shut down
-        const POLL_INTERVAL_MS = 500
-
         while (true) {
           // Check if teammates are still active
           const refreshedState = getAppState()
@@ -2729,7 +2730,7 @@ function runHeadlessStreaming(
           }
 
           if (step.kind === 'retry') {
-            await sleep(POLL_INTERVAL_MS)
+            await sleep(LEAD_POLL_INTERVAL_MS)
             continue
           }
 
@@ -2851,7 +2852,7 @@ function runHeadlessStreaming(
           }
 
           // Wait and check again
-          await sleep(POLL_INTERVAL_MS)
+          await sleep(LEAD_POLL_INTERVAL_MS)
         }
       }
     }
@@ -2870,9 +2871,27 @@ function runHeadlessStreaming(
         return hasTeammatesRequiringShutdown(refreshedAppState)
       })()
 
-      if (hasActiveSwarm) {
-        // Team members are idle or pane-based - inject prompt to shut down team
+      if (
+        shouldInjectShutdownPrompt(getAppState(), {
+          inputClosed,
+          alreadyInjected: shutdownPromptInjected,
+        })
+      ) {
+        // Team members are idle or pane-based - ask the lead to stand the team
+        // down, once per session.
+        shutdownPromptInjected = true
+        logForDebugging(
+          '[print.ts] Input closed with active teammates, injecting shutdown prompt',
+        )
         enqueue(createShutdownTeamPrompt())
+        void run()
+      } else if (hasActiveSwarm) {
+        // Already asked and members have not exited yet. Wait for the team to
+        // dissipate instead of re-enqueuing the same prompt every turn — that
+        // re-injected once per `run()` and looped without bound — or spinning
+        // tightly. The next run() re-reads the roster and closes the session
+        // once it is empty.
+        await sleep(LEAD_POLL_INTERVAL_MS)
         void run()
       } else {
         // Wait for any in-flight push suggestion before closing the output stream.
@@ -4523,6 +4542,11 @@ function runHeadlessStreaming(
       void run()
     }
     inputClosed = true
+    // The session is ending, so there is no "next user message" for a host
+    // pause to wait for. Release it: otherwise the closing lead can never see
+    // the teammates' shutdown approvals (takeLeadMailboxBatch short-circuits on
+    // `held`), the team could never exit, and that mail would be stranded.
+    leadMailboxPoll.held = false
     cronScheduler?.stop()
     if (!running) {
       // If a push-suggestion is in-flight, wait for it to emit before closing

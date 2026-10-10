@@ -47,6 +47,21 @@ const SMOKE_MODEL_ID = 'desktop-ui-smoke-model'
 export const DESKTOP_UI_SMOKE_LOCALE = 'en'
 export const DESKTOP_UI_SMOKE_ALLOW_SELECTOR = 'button[aria-label^="Allow: "]'
 
+/** The tool the mock turn runs and the name the history is filtered by. */
+export const DESKTOP_UI_SMOKE_TOOL_NAME = 'Write'
+/** Assistant text the turn ends with; asserted in both history and the reloaded DOM. */
+export const DESKTOP_UI_SMOKE_REPLY = `wrote ${TARGET_FILE}`
+
+/**
+ * How long to hold the reload after the *persisted* turn is confirmed on disk.
+ *
+ * This is a settle delay, not the race guard: completion is established by polling
+ * `/messages` first (see `executeDeterministicDesktopSmoke`), so a request still in
+ * flight can no longer be mistaken for an absent history. The delay only gives the
+ * live socket a moment to stop touching the DOM before the page is reloaded.
+ */
+export const DESKTOP_UI_SMOKE_RELOAD_DELAY_MS = 2_500
+
 /**
  * The tab of a session stopped on a decision only the user can make.
  * `data-attention` is set on the tab by TabBar; the strip is the only place it
@@ -62,6 +77,21 @@ export const DESKTOP_UI_SMOKE_ATTENTION_TAB = '[data-testid="tab-bar"] [data-att
 export const DESKTOP_UI_SMOKE_ATTENTION_PROBE =
   `(() => { const tab = document.querySelector('${DESKTOP_UI_SMOKE_ATTENTION_TAB}'); ` +
   `return !!tab && !!tab.querySelector('[role="img"]') && !tab.querySelector('[aria-label="Session running"]') })()`
+
+/** The accessible label TabBar puts on the running dot; the lane pins English. */
+export const DESKTOP_UI_SMOKE_RUNNING_LABEL = 'Session running'
+
+/**
+ * True once the session tab strip has no running dot left: the turn the UI was
+ * streaming has ended.
+ *
+ * It reads the rendered DOM, so a just-written fixture file cannot satisfy it. That
+ * is the shortcut this probe exists to prevent — the tool writes the file *before*
+ * the turn's terminal frame, so "the file exists" is not evidence the UI finished.
+ */
+export const DESKTOP_UI_SMOKE_IDLE_PROBE =
+  `(() => { const strip = document.querySelector('[data-testid="tab-bar"]'); ` +
+  `return !!strip && !strip.querySelector('[aria-label="${DESKTOP_UI_SMOKE_RUNNING_LABEL}"]') })()`
 
 export function buildDesktopUiSmokeBootstrap(sessionId: string) {
   return [
@@ -79,11 +109,58 @@ export function buildDesktopUiSmokePrompt(projectDir: string) {
   return {
     target,
     prompt: buildMockToolPrompt({
-      tool: 'Write',
+      tool: DESKTOP_UI_SMOKE_TOOL_NAME,
       input: { file_path: target, content: TARGET_CONTENT },
       write: { path: target, content: TARGET_CONTENT },
-      reply: `wrote ${TARGET_FILE}`,
+      reply: DESKTOP_UI_SMOKE_REPLY,
+      // Persist the turn so a reload after it completes still resolves the tool
+      // cards and the reply from the real transcript, not from a live frame.
+      persist: true,
     }),
+  }
+}
+
+export type DesktopUiSmokeHistoryInspection = {
+  /** A persisted `Write` tool_use block exists. */
+  hasToolUse: boolean
+  /** A `tool_result` block resolves that exact tool_use id. */
+  hasToolResult: boolean
+  /** The assistant's closing reply text is present. */
+  hasReply: boolean
+  /** Id shared by the persisted tool_use and its result. */
+  toolUseId: string | null
+}
+
+/**
+ * Read the tool turn out of a `/messages` response.
+ *
+ * This checks the *server's* history projection rather than the live stream: the
+ * regression was that the turn's cards were replaced by an empty history, so the
+ * assertion has to run against what `/messages` returns after the turn finished.
+ * Only the mock lane's own `Write` tool_use and its linked result count, so an
+ * unrelated tool in the same session cannot satisfy it.
+ */
+export function inspectDesktopUiSmokeHistory(body: unknown): DesktopUiSmokeHistoryInspection {
+  const messages = Array.isArray((body as { messages?: unknown } | null)?.messages)
+    ? (body as { messages: Array<{ content?: unknown }> }).messages
+    : []
+  const blocks = messages.flatMap(message =>
+    Array.isArray(message?.content) ? message.content as Array<Record<string, unknown>> : [])
+
+  const toolUse = blocks.find(block =>
+    block?.type === 'tool_use' && block?.name === DESKTOP_UI_SMOKE_TOOL_NAME && typeof block.id === 'string')
+  const toolUseId = typeof toolUse?.id === 'string' ? toolUse.id : null
+  const toolResult = toolUseId === null
+    ? undefined
+    : blocks.find(block => block?.type === 'tool_result' && block.tool_use_id === toolUseId && block.is_error !== true)
+  const hasReply = blocks.some(block =>
+    block?.type === 'text' && typeof block.text === 'string' && block.text.includes(DESKTOP_UI_SMOKE_REPLY))
+
+  return {
+    hasToolUse: Boolean(toolUse),
+    hasToolResult: Boolean(toolResult),
+    hasReply,
+    toolUseId,
   }
 }
 
@@ -292,6 +369,10 @@ export async function executeDeterministicDesktopSmoke(
       'the approved tool to write the fixture file',
     )
 
+    // The file on disk is the tool's side effect, not proof the turn finished: the
+    // UI can still be streaming, and the server may still be ingesting the turn. So
+    // this only checks that the live frame rendered the tool call, never that the
+    // turn is complete.
     const finalText = await browserStep(['get', 'text', 'body'], { timeoutMs: 15_000, allowFailure: true })
     const rendered = `${finalText.stdout}${finalText.stderr}`
     writeFileSync(join(artifactDir, 'final-content.txt'), rendered)
@@ -299,6 +380,58 @@ export async function executeDeterministicDesktopSmoke(
       throw new Error(`the UI never rendered the tool call for ${TARGET_FILE}`)
     }
     await browserStep(['screenshot', join(artifactDir, 'final.png')], { allowFailure: true })
+
+    // The turn's live cards proved nothing on their own: the regression was that
+    // fetching history after the turn replaced them with an empty transcript. Poll
+    // the server's own history projection until the tool_use, its linked
+    // tool_result and the reply are all present — that is the durable proof the
+    // turn reached disk, and it removes the fixed-sleep race.
+    let historyBody: unknown = undefined
+    await pollUntil(async () => {
+      const response = await fetch(`${baseUrl}/api/sessions/${session.sessionId}/messages?mode=full`)
+      if (!response.ok) return false
+      const body = await response.json()
+      const inspected = inspectDesktopUiSmokeHistory(body)
+      if (inspected.hasToolUse && inspected.hasToolResult && inspected.hasReply) {
+        historyBody = body
+        return true
+      }
+      return false
+    }, 60_000, 'the persisted tool turn to reach /messages')
+    writeFileSync(join(artifactDir, 'history-after-completion.json'), JSON.stringify(historyBody, null, 2) + '\n')
+    const history = inspectDesktopUiSmokeHistory(historyBody)
+    if (!history.hasToolUse || !history.hasToolResult || !history.hasReply) {
+      throw new Error(
+        `the persisted history is missing part of the tool turn ` +
+        `(tool_use=${history.hasToolUse}, tool_result=${history.hasToolResult}, reply=${history.hasReply}); ` +
+        `the mock runtime must opt into persisting the turn with the real uuid/toolUse chain.`,
+      )
+    }
+
+    // Completion has to be visible in the UI itself, not inferred from the file: a
+    // just-written file says nothing about the turn the tab is still streaming. Wait
+    // until the running dot is gone, which only happens on the terminal frame.
+    await browserStep(['wait', '--fn', DESKTOP_UI_SMOKE_IDLE_PROBE], { timeoutMs: 30_000 })
+
+    // Settle, then reload against the confirmed history. The delay is no longer the
+    // race guard — the history poll is — so a request in flight cannot mask it.
+    await Bun.sleep(DESKTOP_UI_SMOKE_RELOAD_DELAY_MS)
+    if (!existsSync(target) || readFileSync(target, 'utf8') !== TARGET_CONTENT) {
+      throw new Error('the written fixture file disappeared before the reload check')
+    }
+
+    await browserStep(['reload'])
+    await browserStep(['wait', DESKTOP_SMOKE_COMPOSER_SELECTOR], { timeoutMs: 30_000 })
+    const reloadedText = await browserStep(['get', 'text', 'body'], { timeoutMs: 15_000, allowFailure: true })
+    const reloaded = `${reloadedText.stdout}${reloadedText.stderr}`
+    writeFileSync(join(artifactDir, 'reloaded-content.txt'), reloaded)
+    if (!reloaded.includes(TARGET_FILE) || !reloaded.includes(DESKTOP_UI_SMOKE_REPLY)) {
+      throw new Error(
+        `the reloaded UI lost the tool turn (tool card=${reloaded.includes(TARGET_FILE)}, ` +
+        `reply=${reloaded.includes(DESKTOP_UI_SMOKE_REPLY)}); history did not render the persisted cards.`,
+      )
+    }
+    await browserStep(['screenshot', join(artifactDir, 'reloaded.png')], { allowFailure: true })
 
     await runDesktopUiTeamPlanSmoke({ configDir: sandbox.configDir, sessionId: session.sessionId, projectDir, baseUrl, artifactDir, auditPath: join(workRoot, 'team-worker-audit.jsonl'), browserStep })
 

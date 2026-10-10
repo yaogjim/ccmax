@@ -126,7 +126,9 @@ export async function startBackgroundIndexesInPriorityOrder(
     options.maxPrimaryWaitMs ?? SEARCH_INDEX_PRIMARY_WAIT_MS,
   )
 
-  await startPrimary()
+  // Shutdown aborts this signal before the upgrade settles; the primary index
+  // must not open a database the stop already closed.
+  if (!options.signal?.aborted) await startPrimary()
   while (
     !options.signal?.aborted &&
     getPrimaryState() === 'building' &&
@@ -136,6 +138,16 @@ export async function startBackgroundIndexesInPriorityOrder(
 }
 
 const publicAccessServers = new Set<PublicAccessServer>()
+/**
+ * True once the runtime has begun shutting down. Deferred startup work — the
+ * storage-upgrade gates in `startServer` and the background index chain below —
+ * checks it when its promise finally settles, so a stop that lands while the
+ * upgrade is still copying cannot restart an index database, a file watcher or
+ * the public channel that shutdown already closed. `startServer` re-arms it for
+ * a new runtime. A reversible quiesce is *not* a stop: that path is gated by
+ * `migrationMaintenance.isActive` and `activate` starts the subsystems again.
+ */
+let runtimeStopped = false
 /**
  * Storage upgrade (including SQLite family migration) must finish before any
  * background index opens a database path. Migration failures do not block
@@ -273,6 +285,9 @@ function startPendingDeliveryRecoveryAtStartup(): void {
 }
 
 export function startServer(port = PORT, host = HOST) {
+  // A new runtime re-arms deferred startup; a previous runtime's stop must not
+  // disable this one.
+  runtimeStopped = false
   if (process.env.CC_HAHA_MIGRATION_VALIDATION === '1') migrationMaintenance.beginValidation()
   if (!migrationMaintenance.isActive) enableConfigs()
   const trustedRendererOrigin = resolveTrustedRendererOrigin(process.env.CC_HAHA_TRUSTED_RENDERER_ORIGIN)
@@ -305,6 +320,36 @@ export function startServer(port = PORT, host = HOST) {
     process.env.SERVER_AUTH_REQUIRED === '1'
   const h5AccessService = new H5AccessService()
 
+  const telegramPublic = getTelegramPublicService()
+  /**
+   * `telegramPublic.start()` reads and repairs `<config>/ccmax/telegram-public.json`,
+   * so it is a writer of the fork-owned directory: it must wait for the
+   * persistent-storage migration that publishes a legacy `cc-haha` tree,
+   * because the store file it creates makes that whole-directory import refuse
+   * to run and the user's subscriptions would disappear. It is also the only
+   * startup step that talks to the platform, so a migration-validation startup
+   * (which must leave the directory untouched) defers it to `activate` — the
+   * callers keep that guard. A stop that lands before the upgrade settles must
+   * not resurrect the channel either, hence the `runtimeStopped` check.
+   */
+  const startTelegramPublicAfterStorageUpgrade = (port: number): void => {
+    void ensurePersistentStorageUpgraded().then(() => {
+      if (runtimeStopped || migrationMaintenance.isActive) return
+      telegramPublic.configure({ serverHost: localConnectHost, serverPort: port })
+      void telegramPublic.start().catch(error => {
+        console.error(
+          '[Server] Telegram public channel failed to start',
+          error instanceof Error ? error.message : error,
+        )
+      })
+    }).catch(error => {
+      console.error(
+        '[Server] Telegram public channel startup skipped: storage upgrade failed',
+        error instanceof Error ? error.message : error,
+      )
+    })
+  }
+
   const publicAccess = new PublicAccessServer({
     handleApiRequest: (request, url, context) => migrationMaintenance.isActive
       ? Promise.resolve(migrationUnavailableResponse())
@@ -319,7 +364,22 @@ export function startServer(port = PORT, host = HOST) {
   // Open SQLite before the first REST request. Discovery still runs in the
   // background; without this, getPublicStatus() reports `off` and the sidebar
   // falls through to a full JSONL scan that can exceed the 120s client timeout.
-  if (!migrationMaintenance.isActive) void localIndexCoordinator.start().catch(() => undefined)
+  //
+  // This is the earliest fork-owned writer: `start()` creates
+  // `<config>/ccmax/db`, and the whole-directory import of a legacy
+  // `<config>/cc-haha` tree refuses to touch a primary that already exists. An
+  // index that wins that race makes every legacy provider, managed setting and
+  // public-channel record silently disappear, so the index waits for the
+  // storage upgrade here and in the request path below.
+  if (!migrationMaintenance.isActive) {
+    void ensurePersistentStorageUpgraded()
+      .then(() => {
+        // A stop or migration quiescence that begins during the upgrade wins.
+        if (runtimeStopped || migrationMaintenance.isActive) return
+        return localIndexCoordinator.start()
+      })
+      .catch(() => undefined)
+  }
 
   // A restart leaves `pending` delivery rows behind: the previous process died
   // before the platform answer was observed, so the desktop panel would show a
@@ -358,6 +418,9 @@ export function startServer(port = PORT, host = HOST) {
               teamWatcher.start()
               cronScheduler.start()
               startPendingDeliveryRecoveryAtStartup()
+              // The runtime may write again: start the public channel after the
+              // storage upgrade publishes the fork-owned directory.
+              startTelegramPublicAfterStorageUpgrade(server.port)
             },
           })
         }
@@ -383,8 +446,11 @@ export function startServer(port = PORT, host = HOST) {
         }
 
         if (!migrationMaintenance.isActive) {
-          await localIndexCoordinator.start().catch(() => undefined)
+          // Same order as the boot path: publish the fork-owned directory before
+          // opening a database inside it, and never read a provider config the
+          // import is still writing.
           await ensurePersistentStorageUpgraded()
+          await localIndexCoordinator.start().catch(() => undefined)
         }
         const collaborationAction = collaborationToolAction(url.pathname)
         if (collaborationAction) {
@@ -742,16 +808,13 @@ export function startServer(port = PORT, host = HOST) {
       websocket: handleWebSocket,
     })
     const disposeCollaboration = configureSessionCollaborationHost(localConnectHost, server.port)
-    const telegramPublic = getTelegramPublicService()
-    telegramPublic.configure({ serverHost: localConnectHost, serverPort: server.port })
-    void telegramPublic.start().catch(error => {
-      console.error(
-        '[Server] Telegram public channel failed to start',
-        error instanceof Error ? error.message : error,
-      )
-    })
+    if (!migrationMaintenance.isActive) startTelegramPublicAfterStorageUpgrade(server.port)
     const stop = server.stop.bind(server)
     server.stop = (closeActiveConnections?: boolean) => {
+      // This runtime is going away: cancel deferred startup that has not run yet
+      // and stop anything that is already up.
+      runtimeStopped = true
+      backgroundIndexStartupController?.abort()
       apiPerformanceMonitor.stop()
       telegramPublic.stop()
       disposeCollaboration()
@@ -842,6 +905,9 @@ export async function quiesceServerRuntimeForRecovery(): Promise<void> {
 export async function stopServerRuntimeForShutdown(
   options: { waitForCli?: boolean } = {},
 ): Promise<void> {
+  // Set before the first await: deferred startup whose promise settles during
+  // this shutdown must not restart what we are about to stop.
+  runtimeStopped = true
   for (const remote of publicAccessServers) remote.disable()
   publicAccessServers.clear()
   teamWatcher.stop()
@@ -867,6 +933,12 @@ export async function stopServerRuntimeForShutdown(
 }
 
 function cleanupAllSessions() {
+  // `process.exit()` never waits for promises, and the async teardown below
+  // stops the background indexes before it reaches the CLI kill. Kill the CLI
+  // subprocesses synchronously first, otherwise an exit path (the `exit`
+  // handler, a fatal-diagnostics exit) orphans every running one. The async
+  // teardown then finds no active session and skips its own kill.
+  conversationService.stopAllSessions()
   void stopServerRuntimeForShutdown({ waitForCli: false })
 }
 

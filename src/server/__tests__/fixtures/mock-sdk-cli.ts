@@ -2,6 +2,7 @@ import { mkdir, appendFile, readFile, writeFile, readdir } from 'node:fs/promise
 import { createHash } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { formatSessionCollaborationPrompt } from '../../../utils/sessionCollaborationEnvelope.js'
+import { buildMockToolTranscript, persistMockToolTranscript, shouldEmitMockToolReplyFrame } from '../../../../scripts/quality-gate/agent-flow/mockToolTurn.js'
 
 const args = process.argv.slice(2)
 
@@ -134,6 +135,13 @@ type MockToolStep = {
   /** Emit an is_error tool_result even when the request is allowed. */
   failWith?: string
   reply?: string
+  /**
+   * Opt in to appending this turn to the session JSONL. Off by default: the plain
+   * `MOCK_TOOL` protocol stays streaming-only so every existing test that reasons
+   * about an empty transcript keeps doing so. The desktop smoke sets it to prove a
+   * reload after the turn still resolves the tool cards from real history.
+   */
+  persist?: true
 }
 
 const MOCK_TOOL_PREFIX = 'MOCK_TOOL '
@@ -149,7 +157,7 @@ function parseMockToolStep(text: string): MockToolStep | null {
   return { ...parsed, input: parsed.input ?? {} }
 }
 
-async function runToolStep(ws: WebSocket, step: MockToolStep) {
+async function runToolStep(ws: WebSocket, step: MockToolStep, userFrame: any) {
   const toolUseId = `toolu_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`
   const requestId = `req_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`
   const inputJson = JSON.stringify(step.input)
@@ -209,6 +217,57 @@ async function runToolStep(ws: WebSocket, step: MockToolStep) {
     },
     session_id: sessionId,
   })
+
+  // The assistant's closing text is part of the *opt-in persisted* turn, not the
+  // plain protocol. A default `MOCK_TOOL` prompt (no `persist`) has to keep its
+  // historical frame sequence — `tool_use → tool_result → result` — that the
+  // side-chat protocol and every existing assertion reason about, so the frame is
+  // emitted only when the turn also writes the reply to the transcript. Denied and
+  // failing turns never carry it.
+  const assistantReply = shouldEmitMockToolReplyFrame({
+    allowed: decision.allowed,
+    failWith: step.failWith,
+    persist: step.persist,
+    reply: step.reply,
+  }) ? step.reply : undefined
+  if (assistantReply) {
+    emit(ws, {
+      type: 'assistant',
+      message: {
+        id: `msg_${crypto.randomUUID()}`,
+        role: 'assistant',
+        model: 'mock-opus',
+        content: [{ type: 'text', text: assistantReply }],
+      },
+      session_id: sessionId,
+    })
+  }
+
+  // Opt-in persistence. Without it the streamed cards vanish the next time the
+  // desktop fetches `/messages`, because the mock never authored the turn. The
+  // entries reuse the incoming user frame's uuid so the transcript chain matches
+  // the one the client already saw.
+  if (step.persist) {
+    const promptText = extractUserText(userFrame) || JSON.stringify(step.input)
+    const entries = buildMockToolTranscript({
+      sessionId,
+      cwd: process.cwd(),
+      prompt: promptText,
+      promptUuid: typeof userFrame?.uuid === 'string' ? userFrame.uuid : undefined,
+      toolUseId,
+      toolName: step.tool,
+      input: step.input,
+      resultContent: content,
+      isError,
+      ...(assistantReply ? { reply: assistantReply } : {}),
+      timestamp: new Date().toISOString(),
+    })
+    const persisted = await persistMockToolTranscript(process.env.CLAUDE_CONFIG_DIR, sessionId, entries)
+    if (!persisted) {
+      console.error('[mock-sdk-cli] persist:true but no session transcript was found to append to')
+    }
+  }
+
   emit(ws, {
     type: 'result',
     subtype: 'success',
@@ -497,7 +556,7 @@ ws.addEventListener('message', (event) => {
         }
         const toolStep = parseMockToolStep(text)
         if (toolStep) {
-          await runToolStep(ws, toolStep)
+          await runToolStep(ws, toolStep, parsed)
           continue
         }
         const slashCommand = text.trim()

@@ -79,6 +79,41 @@ describe('mock tool prompt', () => {
   test('refuses an empty tool name rather than emitting an unusable request', () => {
     expect(() => buildMockToolPrompt({ tool: '  ', input: {} })).toThrow(/tool name/)
   })
+
+  test('carries the opt-in persistence flag to the fixture untouched', () => {
+    const prompt = buildMockToolPrompt({
+      tool: 'Write',
+      input: { file_path: '/tmp/x', content: 'hi' },
+      write: { path: '/tmp/x', content: 'hi' },
+      reply: 'wrote x',
+      persist: true,
+    })
+
+    expect(JSON.parse(prompt.slice('MOCK_TOOL '.length)).persist).toBe(true)
+    // Omitting it must stay the default: every existing prompt keeps its old
+    // behavior, so the flag cannot be inferred or defaulted on.
+    const plain = buildMockToolPrompt({ tool: 'Write', input: {} })
+    expect(JSON.parse(plain.slice('MOCK_TOOL '.length)).persist).toBeUndefined()
+  })
+
+  test('the fixture only persists when the prompt explicitly opts in', () => {
+    const fixture = readFileSync('src/server/__tests__/fixtures/mock-sdk-cli.ts', 'utf8')
+
+    expect(fixture).toContain('persist')
+    expect(fixture).toContain('buildMockToolTranscript')
+  })
+
+  test('keeps the default MOCK_TOOL wire sequence by gating the reply frame on persist', () => {
+    const fixture = readFileSync('src/server/__tests__/fixtures/mock-sdk-cli.ts', 'utf8')
+
+    // The existing protocol is `tool_use → can_use_tool → tool_result → result`.
+    // The closing assistant frame is a new, opt-in addition: emitting it whenever a
+    // `reply` is present silently changed the wire protocol for prompts that never
+    // asked to persist. The gate must read the caller's flag, not `isError` alone.
+    expect(fixture).toContain('shouldEmitMockToolReplyFrame({')
+    expect(fixture).toContain('persist: step.persist')
+    expect(fixture).not.toContain('const assistantReply = isError ? undefined : step.reply')
+  })
 })
 
 describe('protocol ordering assertions', () => {

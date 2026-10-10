@@ -41,12 +41,10 @@ let isolatedConfigDir = ''
 
 class FakeSidecarChild extends EventEmitter {
   exitCode: number | null = null
-  signalCode: string | null = null
+  signalCode: NodeJS.Signals | null = null
   readonly stdin = new PassThrough()
   readonly stdout = new PassThrough()
   readonly stderr = new PassThrough()
-  exitCode: number | null = null
-  signalCode: NodeJS.Signals | null = null
   private heldExit: Promise<void> | null = null
   private releaseHeldExitFn: (() => void) | null = null
 
@@ -167,6 +165,7 @@ describe('ElectronServerRuntime', () => {
       order.push('server-stopped')
       server.exitCode = 0
       server.emit('exit', 0, null)
+      return true
     })
     for (const child of sidecarMocks.adapterChildren) {
       child.stdin.on('data', value => {
@@ -215,7 +214,7 @@ describe('ElectronServerRuntime', () => {
       else child.stdin.on('data', complete)
     }
     const server = sidecarMocks.serverChildren[0]!
-    server.kill.mockImplementation(() => { server.exitCode = 0; server.emit('exit', 0, null) })
+    server.kill.mockImplementation(() => { server.exitCode = 0; server.emit('exit', 0, null); return true })
     await runtime.quiesceForMigration()
     expect(sidecarMocks.adapterChildren.every(child => child.exitCode === 0)).toBe(true)
     expect(await runtime.getMigrationPreview()).toEqual({ activeTasks: 0, externalProcesses: 0 })
@@ -234,7 +233,7 @@ describe('ElectronServerRuntime', () => {
       })
     }
     const server = sidecarMocks.serverChildren[0]!
-    server.kill.mockImplementation(() => { server.exitCode = 0; server.emit('exit', 0, null) })
+    server.kill.mockImplementation(() => { server.exitCode = 0; server.emit('exit', 0, null); return true })
     await runtime.quiesceForMigration()
     expect(await runtime.getMigrationPreview()).toEqual({ activeTasks: 0, externalProcesses: 0 })
     const external = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
@@ -264,6 +263,7 @@ describe('ElectronServerRuntime', () => {
       order.push('server-stopped')
       server.exitCode = 0
       server.emit('exit', 0, null)
+      return true
     })
     for (const child of sidecarMocks.adapterChildren) {
       child.stdin.on('data', value => {
@@ -501,7 +501,7 @@ describe('ElectronServerRuntime', () => {
         spawnSidecar: plan => {
           if (plan.args[0] !== 'server') {
             const child = new FakeSidecarChild()
-            child.kill.mockImplementation(() => { child.exitCode = 0; child.emit('exit', 0, null) })
+            child.kill.mockImplementation(() => { child.exitCode = 0; child.emit('exit', 0, null); return true })
             return child as unknown as SidecarChild
           }
           const readyFile = path.join(root, `ready-${++serverStarts}`)

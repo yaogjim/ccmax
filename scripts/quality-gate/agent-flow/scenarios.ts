@@ -35,6 +35,12 @@ export type MockToolStep = {
   write?: { path: string; content: string }
   failWith?: string
   reply?: string
+  /**
+   * Opt in to appending the turn to the session JSONL. Off by default so every
+   * existing prompt keeps streaming-only behavior; the desktop smoke sets it so a
+   * reload after the turn still shows the tool cards in the real history.
+   */
+  persist?: true
 }
 
 export type AgentFlowScenario = {
