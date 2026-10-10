@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { cp, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { cp, link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { relocateManagedData } from './storageMigrationMetadata.js'
@@ -10,7 +10,10 @@ afterEach(async () => {
 })
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), 'storage-metadata-'))
+  // Use the canonical temp root. `mkdtemp(tmpdir())` returns a `/var/...` path
+  // on macOS, and `/var` is a symlink to `/private/var`, so the fixture spelling
+  // would not match the canonical root the migration records via `realpath`.
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'storage-metadata-')))
   roots.push(root)
   const source = join(root, 'source')
   const target = join(root, 'target')

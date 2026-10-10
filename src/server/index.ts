@@ -248,6 +248,30 @@ function originFromUrl(value: string | null): string | null {
   }
 }
 
+/**
+ * One-time restart reconciliation of `pending` delivery rows: the previous
+ * process died before the platform answer was observed, so the desktop panel
+ * would show a permanent "sending" entry until some later send reconciled it.
+ * Must run *after* the persistent-storage migration: that migration rewrites
+ * `ccmax/notification-deliveries.json` without the delivery store's lock, so a
+ * pass that ran first could be clobbered back to `pending` by a migration
+ * snapshot. Every send awaits the same promise, so the first send cannot race
+ * the pass. Fire-and-forget on purpose (the boot path is synchronous) and
+ * best-effort: a failure is logged and never blocks startup.
+ *
+ * Deferred while a data-directory migration is active (see the caller): reading
+ * the store creates the fork-owned `ccmax` directory, which a validation
+ * startup must not do.
+ */
+function startPendingDeliveryRecoveryAtStartup(): void {
+  void startPendingDeliveryRecovery({}, { after: ensurePersistentStorageUpgraded() }).catch((error) => {
+    console.error(
+      '[Server] 通知投递启动对账失败，已跳过（不影响启动）',
+      error instanceof Error ? error.message : error,
+    )
+  })
+}
+
 export function startServer(port = PORT, host = HOST) {
   if (process.env.CC_HAHA_MIGRATION_VALIDATION === '1') migrationMaintenance.beginValidation()
   if (!migrationMaintenance.isActive) enableConfigs()
@@ -299,21 +323,14 @@ export function startServer(port = PORT, host = HOST) {
 
   // A restart leaves `pending` delivery rows behind: the previous process died
   // before the platform answer was observed, so the desktop panel would show a
-  // permanent "sending" entry until some later send reconciled it. Start the
-  // one-time reconciliation here, before the HTTP server or the cron scheduler
-  // can open a new pending row. It must run *after* the persistent-storage
-  // migration: that migration rewrites ccmax/notification-deliveries.json
-  // without the delivery store's lock, so a pass that ran first could be
-  // clobbered back to `pending` by a migration snapshot. Every send awaits the
-  // same promise, so the first send cannot race the pass. Fire-and-forget on
-  // purpose (the boot path is synchronous) and best-effort: a failure is logged
-  // and never blocks startup.
-  void startPendingDeliveryRecovery({}, { after: ensurePersistentStorageUpgraded() }).catch((error) => {
-    console.error(
-      '[Server] 通知投递启动对账失败，已跳过（不影响启动）',
-      error instanceof Error ? error.message : error,
-    )
-  })
+  // permanent "sending" entry until some later send reconciled it. This must
+  // NOT run while a data-directory migration is active: reading the delivery
+  // store creates the fork-owned `ccmax` directory, and a validation startup
+  // must leave the source tree byte-for-byte untouched. It starts on `activate`
+  // instead, once the runtime is allowed to write. See
+  // `startPendingDeliveryRecovery` for the ordering guarantee against the
+  // persistent-storage migration.
+  if (!migrationMaintenance.isActive) startPendingDeliveryRecoveryAtStartup()
 
   try {
     server = Bun.serve<WebSocketData>({
@@ -340,6 +357,7 @@ export function startServer(port = PORT, host = HOST) {
               beginBackgroundIndexStartup()
               teamWatcher.start()
               cronScheduler.start()
+              startPendingDeliveryRecoveryAtStartup()
             },
           })
         }

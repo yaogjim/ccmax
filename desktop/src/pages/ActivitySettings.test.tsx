@@ -98,6 +98,27 @@ async function flushActivityLoad() {
   })
 }
 
+/** A saved profile, for the tests that start from one instead of the empty default. */
+const persistedProfilePreferences = {
+  exists: true,
+  preferences: {
+    schemaVersion: 2,
+    profile: {
+      displayName: 'Local Captain',
+      subtitle: 'Local workspace',
+      avatarFile: 'profile/avatar.webp',
+      avatarUpdatedAt: '2026-05-09T12:00:00.000Z',
+    },
+    sidebar: {
+      projectOrder: [],
+      pinnedProjects: [],
+      hiddenProjects: [],
+      projectOrganization: 'recentProject',
+      projectSortBy: 'updatedAt',
+    },
+  },
+}
+
 describe('ActivitySettings', () => {
   beforeEach(() => {
     vi.useFakeTimers()
@@ -460,7 +481,7 @@ describe('ActivitySettings', () => {
     expect(follows(models, screen.getByRole('table'))).toBe(true)
   })
 
-  it('supports localized heatmap mode switches and persisted display name edits', async () => {
+  it('switches the localized heatmap between daily, weekly and cumulative labels', async () => {
     useSettingsStore.setState({ locale: 'zh' })
     render(<ActivitySettings />)
 
@@ -472,10 +493,23 @@ describe('ActivitySettings', () => {
     fireEvent.click(within(modeGroup).getByRole('radio', { name: '每周' }))
     expect(within(modeGroup).getByRole('radio', { name: '每周' })).toHaveAttribute('aria-checked', 'true')
     expect(within(modeGroup).getByRole('radio', { name: '每日' })).toHaveAttribute('aria-checked', 'false')
-    // Weekly mode relabels the cells as week ranges.
-    expect(screen.getAllByRole('gridcell', { name: /^2026年5月3日 - 2026年5月9日:/ }).length).toBeGreaterThan(0)
+    // Weekly mode relabels the cells as week ranges. Read the labels straight off the cells:
+    // asking the same query for every gridcell's accessible name is what makes this file the
+    // slowest in the suite under the coverage run.
+    expect(
+      screen
+        .getAllByRole('gridcell')
+        .some((cell) => cell.getAttribute('aria-label')?.startsWith('2026年5月3日 - 2026年5月9日')),
+    ).toBe(true)
     fireEvent.click(within(modeGroup).getByRole('radio', { name: '累计' }))
     expect(within(modeGroup).getByRole('radio', { name: '累计' })).toHaveAttribute('aria-checked', 'true')
+  })
+
+  it('persists localized display name and subtitle edits from the profile card', async () => {
+    useSettingsStore.setState({ locale: 'zh' })
+    render(<ActivitySettings />)
+
+    await flushActivityLoad()
 
     fireEvent.click(screen.getByRole('button', { name: '编辑个人资料' }))
     const input = screen.getByLabelText('显示名称')
@@ -498,27 +532,8 @@ describe('ActivitySettings', () => {
     expect(screen.getByRole('link', { name: 'relakkes.dev' })).toHaveAttribute('href', 'https://relakkes.dev')
   })
 
-  it('handles avatar upload, fallback, removal, save failure, and cancel reset', async () => {
-    getPreferencesMock.mockResolvedValueOnce({
-      exists: true,
-      preferences: {
-        schemaVersion: 2,
-        profile: {
-          displayName: 'Local Captain',
-          subtitle: 'Local workspace',
-          avatarFile: 'profile/avatar.webp',
-          avatarUpdatedAt: '2026-05-09T12:00:00.000Z',
-        },
-        sidebar: {
-          projectOrder: [],
-          pinnedProjects: [],
-          hiddenProjects: [],
-          projectOrganization: 'recentProject',
-          projectSortBy: 'updatedAt',
-        },
-      },
-    })
-    updateProfilePreferencesMock.mockRejectedValueOnce(new Error('display name rejected'))
+  it('falls back to the product icon when the saved avatar fails, then uploads or removes one', async () => {
+    getPreferencesMock.mockResolvedValueOnce(persistedProfilePreferences)
     render(<ActivitySettings />)
 
     await flushActivityLoad()
@@ -529,6 +544,31 @@ describe('ActivitySettings', () => {
     fireEvent.error(avatar)
     expect(avatar).toHaveAttribute('src', '/app-icon.png')
     expect(avatar).toHaveClass('scale-[1.28]')
+
+    // The avatar controls live in the profile editor, which starts collapsed.
+    fireEvent.click(screen.getByRole('button', { name: 'Edit profile' }))
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement
+    const file = new File([new Uint8Array([1, 2, 3])], 'avatar.png', { type: 'image/png' })
+    fireEvent.change(input, { target: { files: [file] } })
+
+    await flushActivityLoad()
+
+    expect(uploadProfileAvatarMock).toHaveBeenCalledWith(file)
+    expect(screen.getByText('Saved locally')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove avatar' }))
+    await flushActivityLoad()
+
+    expect(deleteProfileAvatarMock).toHaveBeenCalled()
+    expect(screen.getByAltText('ccmax avatar')).toHaveAttribute('src', '/app-icon.png')
+  })
+
+  it('surfaces a failed profile save and resets drafts when the editor is cancelled', async () => {
+    getPreferencesMock.mockResolvedValueOnce(persistedProfilePreferences)
+    updateProfilePreferencesMock.mockRejectedValueOnce(new Error('display name rejected'))
+    render(<ActivitySettings />)
+
+    await flushActivityLoad()
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit profile' }))
     fireEvent.change(screen.getByLabelText('Display name'), { target: { value: 'Rejected Name' } })
@@ -545,21 +585,6 @@ describe('ActivitySettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Edit profile' }))
     expect(screen.getByLabelText('Display name')).toHaveValue('Local Captain')
     expect(screen.getByLabelText('Second line')).toHaveValue('Local workspace')
-
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement
-    const file = new File([new Uint8Array([1, 2, 3])], 'avatar.png', { type: 'image/png' })
-    fireEvent.change(input, { target: { files: [file] } })
-
-    await flushActivityLoad()
-
-    expect(uploadProfileAvatarMock).toHaveBeenCalledWith(file)
-    expect(screen.getByText('Saved locally')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Remove avatar' }))
-    await flushActivityLoad()
-
-    expect(deleteProfileAvatarMock).toHaveBeenCalled()
-    expect(screen.getByAltText('ccmax avatar')).toHaveAttribute('src', '/app-icon.png')
   })
 
   it('shows localized duration details and the empty usage state', async () => {

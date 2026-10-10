@@ -417,6 +417,27 @@ export function hasTeammatesRequiringShutdown(state: AppState): boolean {
   return false
 }
 
+/**
+ * Whether a closing lead still has to ask the team to shut down.
+ *
+ * `state` must be read at the decision point, not reused from the start of the
+ * poll iteration. The mailbox read awaits, and the host can shrink the roster
+ * while it is in flight (the desktop closes the session, the last teammate
+ * exits), so a roster captured a moment ago can claim company that is already
+ * gone. Injecting then burns a model turn after the session closed, for a team
+ * that no longer exists; the closing lead must end the session instead.
+ */
+export function shouldInjectShutdownPrompt(
+  state: AppState,
+  options: { inputClosed: boolean; alreadyInjected: boolean },
+): boolean {
+  return (
+    options.inputClosed &&
+    !options.alreadyInjected &&
+    hasTeammatesRequiringShutdown(state)
+  )
+}
+
 export function createShutdownTeamPrompt(): QueuedCommand {
   return {
     mode: 'prompt',
@@ -2808,9 +2829,18 @@ function runHeadlessStreaming(
             return // run() will come back here after processing
           }
 
-          // No messages - check if we need to prompt for shutdown
-          // If input is closed and teammates are active, inject shutdown prompt once
-          if (inputClosed && !shutdownPromptInjected) {
+          // No messages - check if we need to prompt for shutdown.
+          // The roster is re-read here rather than trusted from the top of the
+          // iteration: the mailbox read above awaited, and the host can clear
+          // the team while one is in flight. A closing lead with nobody left to
+          // shut down must just end the session (the `inputClosed` branch
+          // below), not spend a turn asking an empty team to stand down.
+          if (
+            shouldInjectShutdownPrompt(getAppState(), {
+              inputClosed,
+              alreadyInjected: shutdownPromptInjected,
+            })
+          ) {
             shutdownPromptInjected = true
             logForDebugging(
               '[print.ts] Input closed with active teammates, injecting shutdown prompt',

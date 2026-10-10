@@ -239,7 +239,7 @@ describe('cron scheduler launcher resolution', () => {
         sidecarPath,
         [
           '#!/bin/sh',
-          '/bin/cat >/dev/null',
+          'read -r _cron_input || true',
           "printf '%s\\n' '{\"type\":\"result\",\"result\":\"timeout env ok\"}'",
           'exit 0',
           '',
@@ -330,7 +330,7 @@ describe('cron scheduler launcher resolution', () => {
         sidecarPath,
         [
           '#!/bin/sh',
-          '/bin/cat >/dev/null',
+          'read -r _cron_input || true',
           // Absolute path: the task child env scopes PATH, so a bare `sleep`
           // may not resolve. `exec` makes the killed pid the sleeper itself.
           'exec /bin/sleep 30',
@@ -461,7 +461,7 @@ describe('cron scheduler launcher resolution', () => {
       [
         '#!/bin/sh',
         `printf '%s\\n' "$@" > "${sidecarArgsPath}"`,
-        '/bin/cat >/dev/null',
+        'read -r _cron_input || true',
         'printf \'%s\\n\' \'{"type":"result","result":"sidecar ok"}\'',
         'exit 0',
         '',
@@ -516,7 +516,7 @@ describe('cron scheduler launcher resolution', () => {
       sidecarPath,
       [
         '#!/bin/sh',
-        '/bin/cat >/dev/null',
+        'read -r _cron_input || true',
         'printf \'%s\\n\' \'{"type":"result","result":"legacy ok"}\'',
         'exit 0',
         '',
@@ -579,7 +579,7 @@ describe('cron scheduler launcher resolution', () => {
         '#!/bin/sh',
         `printf '%s\\n' "$@" > "${sidecarArgsPath}"`,
         `env | sort > "${sidecarEnvPath}"`,
-        '/bin/cat >/dev/null',
+        'read -r _cron_input || true',
         'printf \'%s\\n\' \'{"type":"result","result":"provider ok"}\'',
         'exit 0',
         '',
@@ -670,7 +670,7 @@ describe('cron scheduler launcher resolution', () => {
       [
         '#!/bin/sh',
         `env | sort > "${sidecarEnvPath}"`,
-        '/bin/cat >/dev/null',
+        'read -r _cron_input || true',
         'printf \'%s\\n\' \'{"type":"result","result":"local env ok"}\'',
         'exit 0',
         '',
@@ -729,7 +729,7 @@ describe('cron scheduler launcher resolution', () => {
       [
         '#!/bin/sh',
         `env | sort > "${sidecarEnvPath}"`,
-        '/bin/cat >/dev/null',
+        'read -r _cron_input || true',
         'printf \'%s\\n\' \'{"type":"result","result":"network env ok"}\'',
         'exit 0',
         '',
@@ -809,7 +809,7 @@ describe('cron scheduler launcher resolution', () => {
     await fs.writeFile(sidecarPath, [
       '#!/bin/sh',
       `printf '%s\\n' "$CC_HAHA_AGENT_TEAMS_DEFAULT" "\${CC_HAHA_AGENT_TEAMS_ENABLED-unset}" "$CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" > "${teamEnvPath}"`,
-      '/bin/cat >/dev/null',
+      'read -r _cron_input || true',
       'printf \'%s\\n\' \'{"type":"result","result":"team env ok"}\'',
       '',
     ].join('\n'))
@@ -863,7 +863,7 @@ describe('cron scheduler launcher resolution', () => {
       [
         '#!/bin/sh',
         `printf '%s\\n' "$@" > "${sidecarArgsPath}"`,
-        '/bin/cat >/dev/null',
+        'read -r _cron_input || true',
         'printf \'%s\\n\' \'{"type":"result","result":"permissions ok"}\'',
         'exit 0',
         '',
@@ -969,7 +969,7 @@ describe('cron scheduler launcher resolution', () => {
       [
         '#!/bin/sh',
         `env | sort > "${sidecarEnvPath}"`,
-        '/bin/cat >/dev/null',
+        'read -r _cron_input || true',
         'printf \'%s\\n\' \'{"type":"result","result":"shell env ok"}\'',
         'exit 0',
         '',

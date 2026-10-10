@@ -61,7 +61,13 @@ test('a gracefully interrupted scheduled turn is saved as failed and remains ava
   process.env.CLAUDE_CLI_PATH = cli
   const cron = new CronService()
   const scheduler = new CronScheduler(cron) as any
-  const childEnv = spyOn(scheduler, 'buildTaskChildEnv').mockResolvedValue({ CLAUDE_CONFIG_DIR: root })
+  // The real builder always carries the parent PATH (it spreads the process
+  // environment); the fake must keep it too, or `Bun.spawn(['bun', …])` for the
+  // `.ts` fixture cannot resolve its executable from the scoped child env.
+  const childEnv = spyOn(scheduler, 'buildTaskChildEnv').mockResolvedValue({
+    CLAUDE_CONFIG_DIR: root,
+    PATH: process.env.PATH,
+  })
   try {
     const task = await cron.createTask({ name: 'Migration fixture', prompt: 'Fixture only', cron: '* * * * *', workDir: root, enabled: true, recurring: false })
     const execution = scheduler.executeTask(task)

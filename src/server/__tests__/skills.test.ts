@@ -4,6 +4,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { getCwdState, setCwdState } from '../../bootstrap/state.js'
 import { enableConfigs } from '../../utils/config.js'
+import { resolveForkOwnedDir } from '../../utils/envUtils.js'
 import { invalidateComputerUseSkillGate } from '../../utils/computerUse/skillGate.js'
 import { clearInstalledPluginsCache } from '../../utils/plugins/installedPluginsManager.js'
 import { clearPluginCache } from '../../utils/plugins/pluginLoader.js'
@@ -158,9 +159,14 @@ describe('Skills API', () => {
     const provider = (id: string, extra: Record<string, unknown> = {}) => ({
       id, presetId: 'custom', name: id, apiKey: 'fake-key', baseUrl: 'http://127.0.0.1:9/v1', models, ...extra,
     })
-    await fs.mkdir(path.join(tmpHome, '.claude', 'cc-haha'), { recursive: true })
+    // Providers live in the fork-owned directory the server resolves
+    // (`ccmax`, or the legacy `cc-haha` when that is the only one present).
+    // Writing the legacy path unconditionally would be invisible once a
+    // `ccmax` dir exists, because `resolveForkOwnedDir` then prefers it.
+    const forkDir = resolveForkOwnedDir()
+    await fs.mkdir(forkDir, { recursive: true })
     const writeProviders = (activeId: string | null) => fs.writeFile(
-      path.join(tmpHome, '.claude', 'cc-haha', 'providers.json'),
+      path.join(forkDir, 'providers.json'),
       JSON.stringify({
         schemaVersion: 2,
         activeId,

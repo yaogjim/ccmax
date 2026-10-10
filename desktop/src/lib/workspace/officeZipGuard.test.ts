@@ -1,12 +1,54 @@
 // @vitest-environment node
 import { strToU8, unzipSync, zipSync } from 'fflate'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   DEFAULT_OFFICE_ZIP_LIMITS,
   OfficeZipError,
   inspectOfficeZip,
   type OfficeZipLimits,
 } from './officeZipGuard'
+
+/**
+ * "It stopped early" is a claim about work, not about time. The two tests that make it used
+ * to assert a wall-clock bound, which a busy or coverage-instrumented run fails with nothing
+ * wrong — the same walk simply takes ten times as long. So fflate is wrapped here to count the
+ * work instead: the bytes the guard inflates, and the directory entries its filter is shown.
+ */
+const { zipProbe } = vi.hoisted(() => ({
+  zipProbe: {
+    countingInflation: false,
+    inflatedBytes: 0,
+    countingFilters: false,
+    filteredEntries: 0,
+  },
+}))
+
+vi.mock('fflate', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fflate')>()
+  class CountingInflate extends actual.Inflate {
+    constructor(onData: (chunk: Uint8Array, final: boolean) => void) {
+      super((chunk, final) => {
+        if (zipProbe.countingInflation) zipProbe.inflatedBytes += chunk.length
+        onData(chunk, final)
+      })
+    }
+  }
+  return {
+    ...actual,
+    Inflate: CountingInflate,
+    unzipSync: (data: Uint8Array, options?: Parameters<typeof actual.unzipSync>[1]) => {
+      const filter = options?.filter
+      if (!filter || !zipProbe.countingFilters) return actual.unzipSync(data, options)
+      return actual.unzipSync(data, {
+        ...options,
+        filter: (file) => {
+          zipProbe.filteredEntries += 1
+          return filter(file)
+        },
+      })
+    },
+  }
+})
 
 const KIB = 1024
 const MIB = 1024 * KIB
@@ -36,6 +78,13 @@ function rejection(bytes: Uint8Array, limits: OfficeZipLimits): OfficeZipError {
   }
   throw new Error('expected the archive to be refused')
 }
+
+/**
+ * The bomb the second pass exists for: one 32 MiB entry that deflates to ~32 KiB. Built once
+ * here because compressing 32 MiB is pure setup — inside a test body it is heavy enough to
+ * count against the per-test timeout of the coverage run rather than the file's collection.
+ */
+const ZERO_BOMB = zipOf({ 'a.bin': zeros(32 * MIB) })
 
 describe('inspectOfficeZip', () => {
   it('lets an ordinary document through and says what it found', () => {
@@ -164,13 +213,22 @@ describe('inspectOfficeZip', () => {
     })
 
     it('is stopped at the limit, not after inflating everything it holds', () => {
-      const lying = declaring(zipOf({ 'a.bin': zeros(32 * MIB) }), 100)
+      const lying = declaring(ZERO_BOMB, 100)
       const limits: OfficeZipLimits = { ...DEFAULT_OFFICE_ZIP_LIMITS, maxEntryBytes: 256 * KIB }
 
-      const started = performance.now()
-      expect(rejection(lying, limits).reason).toBe('entry-too-large')
+      zipProbe.countingInflation = true
+      zipProbe.inflatedBytes = 0
+      try {
+        expect(rejection(lying, limits).reason).toBe('entry-too-large')
+      } finally {
+        zipProbe.countingInflation = false
+      }
 
-      expect(performance.now() - started).toBeLessThan(250)
+      // The guard inflates in 16 KiB steps and stops as soon as the output passes the 256 KiB
+      // entry limit, so it must not have produced the whole 32 MiB the entry holds. One step of
+      // this 1000:1 archive already inflates to ~16 MiB, which is as much as a step can be
+      // blamed for: what the assertion rules out is walking the entry to the end.
+      expect(zipProbe.inflatedBytes).toBeLessThan(32 * MIB)
     })
 
     it('does not trouble an honest archive, whatever it holds or how it is stored', () => {
@@ -216,10 +274,17 @@ describe('inspectOfficeZip', () => {
       const many = zipOf(Object.fromEntries(Array.from({ length: 3000 }, (_, index) => [`f${index}.xml`, strToU8('x')])))
       const limits: OfficeZipLimits = { ...DEFAULT_OFFICE_ZIP_LIMITS, maxEntries: 10 }
 
-      const started = performance.now()
-      expect(rejection(many, limits).reason).toBe('too-many-entries')
+      zipProbe.countingFilters = true
+      zipProbe.filteredEntries = 0
+      try {
+        expect(rejection(many, limits).reason).toBe('too-many-entries')
+      } finally {
+        zipProbe.countingFilters = false
+      }
 
-      expect(performance.now() - started).toBeLessThan(250)
+      // The directory holds 3000 entries; the walk is shown one past the ten it is allowed and
+      // then stops, rather than reading the rest of the table of contents.
+      expect(zipProbe.filteredEntries).toBeLessThanOrEqual(limits.maxEntries + 1)
     })
   })
 

@@ -66,6 +66,11 @@ beforeEach(() => {
   frames = new Map()
   nextFrameId = 1
   clock = 1_000
+  // The component paints its first frame from `performance.now()` while the animation loop
+  // runs off the stubbed requestAnimationFrame timestamp. Drive both from the one fake clock,
+  // or the sweep's origin is seeded from real time and the highlight sits at a phase that
+  // depends on how loaded the machine is.
+  vi.spyOn(performance, 'now').mockImplementation(() => clock)
   disconnect = vi.fn()
   reducedMotion = false
   hidden = false
