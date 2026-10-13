@@ -125,6 +125,53 @@ describe('coverage gate helpers', () => {
     expect(parseBunTestFileCount('process terminated before summary')).toBeNull()
   })
 
+  test('reads the top-level Bun summary when a nested test process prints its own', () => {
+    // Bun prints a summary per test process. A test that forks `bun test` (or a
+    // process Bun kills as dangling) inherits stdout, so its smaller summary lands
+    // before the top-level one. The gate must match the file count it asked for.
+    const output = [
+      'src/utils/sideQuestion.integration.test.ts:',
+      'killed 1 dangling process',
+      '(fail) real fork tools/cache/current context [5462.13ms]',
+      '',
+      ' 0 pass',
+      ' 1 fail',
+      'Ran 1 test across 1 file. [5.50s]',
+      '',
+      ' src/voice/voiceModeEnabled.ts | 0.00 | 18.18 | 16-21',
+      '',
+      ' 7530 pass',
+      ' 5 skip',
+      ' 121 fail',
+      ' 41330 expect() calls',
+      'Ran 7656 tests across 629 files. [881.83s]',
+    ].join('\n')
+
+    expect(parseBunTestFileCount(output)).toBe(629)
+  })
+
+  test('reads the final Bun summary when several nested test processes print their own', () => {
+    const output = [
+      'Ran 1 test across 1 file. [4.00ms]',
+      'Ran 9 tests across 3 files. [8.00ms]',
+      'Ran 12 tests across 10 files. [12.00ms]',
+    ].join('\n')
+
+    expect(parseBunTestFileCount(output)).toBe(10)
+  })
+
+  test('keeps a lone nested summary rejected as incomplete top-level discovery', () => {
+    // Only a nested process reported a summary, so the returned count cannot equal
+    // the top-level discovery and the gate still rejects the run on the mismatch.
+    const output = [
+      'src/utils/sideQuestion.integration.test.ts:',
+      ' 1 fail',
+      'Ran 1 test across 1 file. [5.50s]',
+    ].join('\n')
+
+    expect(parseBunTestFileCount(output)).toBe(1)
+  })
+
   test('rejects empty aggregate coverage summaries', () => {
     expect(hasUsableCoverageSummary({
       lines: { total: 0, covered: 0, pct: 100 },

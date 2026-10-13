@@ -410,6 +410,57 @@ describe('background task notification persistence', () => {
     ])
   })
 
+  it('keeps distinct tasks sharing one owner and leaf tool id on the read side', async () => {
+    for (const ownerAgentId of [undefined, 'shared-owner']) {
+      const sessionId = crypto.randomUUID()
+      const projectDir = path.join(configDir, 'projects', '-tmp-shared-task-terminal')
+      const transcriptPath = path.join(projectDir, `${sessionId}.jsonl`)
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(transcriptPath, `${JSON.stringify({
+        type: 'session-meta',
+        isMeta: true,
+        workDir: '/tmp/shared-task-terminal',
+      })}\n`, 'utf8')
+      const service = new SessionService()
+      const first = {
+        taskId: 'task-a',
+        toolUseId: 'shared-tool',
+        ...(ownerAgentId ? { ownerAgentId } : {}),
+        status: 'completed' as const,
+        summary: 'first terminal',
+      }
+      const second = { ...first, taskId: 'task-b', summary: 'second terminal' }
+      await service.appendSessionTaskNotification(sessionId, first)
+      await service.appendSessionTaskNotification(sessionId, second)
+      await service.appendSessionTaskNotification(sessionId, { ...first, summary: 'replayed terminal' })
+
+      expect(await service.getSessionTaskNotifications(sessionId)).toEqual([
+        expect.objectContaining({ ...first, summary: 'replayed terminal' }),
+        expect.objectContaining(second),
+      ])
+      const raw = await fs.readFile(transcriptPath, 'utf8')
+      expect(raw.split('\n').filter(line => line.includes('cc-haha-task-notification'))).toHaveLength(3)
+    }
+  })
+
+  it('still merges historical terminals missing a task id using their leaf tool id', async () => {
+    const sessionId = crypto.randomUUID()
+    const projectDir = path.join(configDir, 'projects', '-tmp-no-task-id-terminal')
+    await fs.mkdir(projectDir, { recursive: true })
+    const entries = ['first terminal', 'replayed terminal'].map(summary => ({
+      type: 'cc-haha-task-notification',
+      isMeta: true,
+      taskNotification: { toolUseId: 'legacy-tool', status: 'completed', summary },
+      timestamp: '2026-07-18T00:00:00.000Z',
+    }))
+    await fs.writeFile(path.join(projectDir, `${sessionId}.jsonl`),
+      `${entries.map(entry => JSON.stringify(entry)).join('\n')}\n`, 'utf8')
+
+    expect(await new SessionService().getSessionTaskNotifications(sessionId)).toEqual([
+      expect.objectContaining({ taskId: 'legacy-tool', toolUseId: 'legacy-tool', summary: 'replayed terminal' }),
+    ])
+  })
+
   it('restores an owned synthetic stop without degrading it to root scope', async () => {
     const sessionId = crypto.randomUUID()
     const projectDir = path.join(configDir, 'projects', '-tmp-owned-synthetic-stop')

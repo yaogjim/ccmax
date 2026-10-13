@@ -285,13 +285,50 @@ export type SessionTaskNotification = {
   timestamp?: string
 }
 
-/** Canonical terminal identity within a session. Child agents may reuse the
- * same raw leaf tool id, so toolUseId alone is not a stable dedupe key. */
+/**
+ * Canonical terminal identity within a session. A single tool call can spawn
+ * several tasks, and child agents can reuse a leaf tool id, so both the task
+ * and its owner must participate in read-side and run-local deduplication.
+ * Historical notifications without a task id are normalized to their tool id.
+ */
 export function sessionTaskNotificationIdentity(
-  notification: Pick<SessionTaskNotification, 'ownerAgentId' | 'toolUseId'>,
+  notification: Pick<SessionTaskNotification, 'ownerAgentId' | 'taskId' | 'toolUseId'>,
 ): string {
-  return JSON.stringify([notification.ownerAgentId ?? null, notification.toolUseId])
+  return JSON.stringify([
+    notification.ownerAgentId ?? null,
+    notification.taskId,
+    notification.toolUseId,
+  ])
 }
+
+/**
+ * What actually happened to one task-notification append. Only `written`
+ * proves the terminal state reached the transcript; the remaining values are
+ * deliberate no-ops that a caller such as a scheduled run has to be able to
+ * tell apart from a successful write.
+ */
+export type SessionTaskNotificationWriteOutcome =
+  | { status: 'written' }
+  | { status: 'disabled' }
+  | { status: 'not-ready' }
+  | { status: 'cancelled' }
+  | { status: 'invalid' }
+  | { status: 'failed'; error: string }
+
+/**
+ * How long a strict append waits for a transcript that does not exist yet. An
+ * automatic scheduled run only learns the runtime session id from the CLI's own
+ * init message, so the file can trail the notification by a few milliseconds.
+ */
+const TASK_NOTIFICATION_MISSING_FILE_RETRY_MS = 500
+
+/**
+ * How long a session delete waits for the task-notification appends it just
+ * cancelled. Bounded so removing a transcript is never held by a stalled
+ * filesystem; the appends it interrupts can no longer land once the session's
+ * mutation epoch has moved.
+ */
+const TASK_NOTIFICATION_RETIREMENT_TIMEOUT_MS = 1_000
 
 export type TranscriptUsageSnapshot = {
   source: 'transcript'
@@ -720,7 +757,7 @@ export class SessionService {
     string,
     Set<{
       controller: AbortController
-      promise: Promise<void>
+      promise: Promise<unknown>
       notification: SessionTaskNotification
       persisted: boolean
     }>
@@ -1694,12 +1731,20 @@ export class SessionService {
     }
   }
 
+  /**
+   * Append one JSONL line. Returns whether the line actually reached the file:
+   * `false` means the append was a no-op (persistence disabled, or the
+   * transcript disappeared), which callers that must not report a silent
+   * success need to see. An `ENOENT` at open time stays a silent `false` so a
+   * delayed title/notification can never recreate a transcript removed by
+   * retention cleanup.
+   */
   private async appendJsonlEntry(
     filePath: string,
     entry: Record<string, unknown>,
     signal?: AbortSignal,
-  ): Promise<void> {
-    if (!this.shouldPersistSession()) return
+  ): Promise<boolean> {
+    if (!this.shouldPersistSession()) return false
     const line = JSON.stringify(entry) + '\n'
     // A delayed title/notification must not recreate a transcript removed by
     // retention cleanup after lookup. Metadata relocation opts into creation.
@@ -1708,12 +1753,13 @@ export class SessionService {
       handle = await fs.open(filePath, constants.O_WRONLY | constants.O_APPEND |
         (entry.type === 'session-meta' ? constants.O_CREAT : 0))
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
       throw error
     }
     try {
-      if (!this.shouldPersistSession()) return
+      if (!this.shouldPersistSession()) return false
       await handle.writeFile(line, { encoding: 'utf-8', signal })
+      return true
     } finally {
       await handle.close()
     }
@@ -4677,7 +4723,12 @@ export class SessionService {
       throw ApiError.notFound(`Session not found: ${sessionId}`)
     }
 
-    if (found) await fs.unlink(found.filePath)
+    await this.beginTaskNotificationRetirement(sessionId)
+    try {
+      if (found) await fs.unlink(found.filePath)
+    } finally {
+      this.clearingTaskNotificationSessions.delete(sessionId)
+    }
     this.knownSessionKeys.delete(this.memorySessionKey(sessionId))
     this.memoryLaunchInfo.delete(this.memorySessionKey(sessionId))
     this.privateTitles.delete(this.memorySessionKey(sessionId))
@@ -4827,10 +4878,20 @@ export class SessionService {
   }
 
   async deleteSessionFile(sessionId: string): Promise<void> {
-    const found = await this.findSessionFile(sessionId)
-    if (!found) return
-    await fs.unlink(found.filePath)
-    this.invalidateSessionListCache()
+    // The barrier is raised before the lookup, not after it. A strict append
+    // still inside its missing-file retry window would otherwise find the
+    // transcript a later run recreates under the same id and write the previous
+    // generation's terminal state into it — exactly the case where the file is
+    // already gone and this call would otherwise return without doing anything.
+    await this.beginTaskNotificationRetirement(sessionId)
+    let found: { filePath: string; projectDir: string } | null = null
+    try {
+      found = await this.findSessionFile(sessionId)
+      if (found) await fs.unlink(found.filePath)
+    } finally {
+      this.clearingTaskNotificationSessions.delete(sessionId)
+    }
+    if (found) this.invalidateSessionListCache()
   }
 
   async clearSessionTranscript(
@@ -5333,40 +5394,108 @@ export class SessionService {
     sessionId: string,
     notification: SessionTaskNotification,
   ): Promise<void> {
+    await this.writeSessionTaskNotification(sessionId, notification)
+  }
+
+  /**
+   * The same append, reporting whether the terminal state actually reached the
+   * transcript. A scheduled run has no second chance to persist a terminal
+   * Agent event, so it must be able to fail the run on a no-op instead of
+   * reporting success. A transcript that does not exist yet is retried for a
+   * bounded window; a cleared or deleted transcript is never recreated.
+   */
+  async appendSessionTaskNotificationStrict(
+    sessionId: string,
+    notification: SessionTaskNotification,
+  ): Promise<SessionTaskNotificationWriteOutcome> {
+    try {
+      return await this.writeSessionTaskNotification(sessionId, notification, {
+        missingFileRetryMs: TASK_NOTIFICATION_MISSING_FILE_RETRY_MS,
+      })
+    } catch (error) {
+      if ((error as { name?: unknown })?.name === 'AbortError') {
+        return { status: 'cancelled' }
+      }
+      return {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
+
+  /**
+   * Shared implementation of both appends. The default caller keeps the
+   * historical behaviour — a silent no-op when persistence is off and a
+   * propagated error when the low-level write fails — while the strict caller
+   * converts both into an inspectable outcome.
+   */
+  private async writeSessionTaskNotification(
+    sessionId: string,
+    notification: SessionTaskNotification,
+    options: { missingFileRetryMs?: number } = {},
+  ): Promise<SessionTaskNotificationWriteOutcome> {
     const normalized = this.parsePersistedTaskNotification(
       notification,
       notification.timestamp ?? new Date(this.now()).toISOString(),
     )
-    if (!normalized || !this.shouldPersistSession()) return
-    if (this.clearingTaskNotificationSessions.has(sessionId)) return
+    if (!normalized) return { status: 'invalid' }
+    if (!this.shouldPersistSession()) return { status: 'disabled' }
+    if (this.clearingTaskNotificationSessions.has(sessionId)) return { status: 'cancelled' }
 
     const epoch = this.taskNotificationMutationEpochs.get(sessionId) ?? 0
     const controller = new AbortController()
     const pending = {
       controller,
-      promise: Promise.resolve(),
+      promise: Promise.resolve() as Promise<unknown>,
       notification: normalized,
       persisted: false,
     }
-    const write = (async () => {
-      const found = await this.findSessionFile(sessionId)
-      if (
-        !found ||
-        controller.signal.aborted ||
-        this.clearingTaskNotificationSessions.has(sessionId) ||
-        (this.taskNotificationMutationEpochs.get(sessionId) ?? 0) !== epoch
-      ) {
-        return
+    const write = (async (): Promise<SessionTaskNotificationWriteOutcome> => {
+      const found = await this.findSessionFileWithRetry(
+        sessionId,
+        options.missingFileRetryMs ?? 0,
+        controller,
+      )
+      if (!found) {
+        // A clear or delete that landed during the wait is why the file is
+        // gone. That is a cancellation of this write, not a transcript that
+        // might still appear, so the caller must not read it as a retryable
+        // no-op — nor, worse, as a success.
+        return this.isTaskNotificationWriteCancelled(sessionId, epoch, controller)
+          ? { status: 'cancelled' }
+          : { status: 'not-ready' }
       }
 
-      await this.appendJsonlEntry(found.filePath, {
+      if (this.isTaskNotificationWriteCancelled(sessionId, epoch, controller)) {
+        return { status: 'cancelled' }
+      }
+
+      const appended = await this.appendJsonlEntry(found.filePath, {
         type: PERSISTED_TASK_NOTIFICATION_ENTRY_TYPE,
         isMeta: true,
         taskNotification: normalized,
         timestamp: normalized.timestamp,
       }, controller.signal)
+      // An append that wrote nothing (persistence turned off mid-flight, or the
+      // transcript vanished) must never be reported as a persisted write.
+      if (!appended) {
+        return this.shouldPersistSession()
+          ? { status: 'not-ready' }
+          : { status: 'disabled' }
+      }
+      // The line is on disk from here on, whatever the outcome below says. A
+      // clear that raced this append must know that: it only restores
+      // notifications it *interrupted*, and marking this one as persisted first
+      // is what keeps a clear that fails to replace the file from appending the
+      // same terminal a second time.
       pending.persisted = true
+      // Re-check *after* the write: a transcript clear that raced this append
+      // replaces the file, so a line written a moment earlier is gone with it.
+      if (this.isTaskNotificationWriteCancelled(sessionId, epoch, controller)) {
+        return { status: 'cancelled' }
+      }
       this.invalidateSessionListCache()
+      return { status: 'written' }
     })()
     pending.promise = write
 
@@ -5377,11 +5506,83 @@ export class SessionService {
     }
     writes.add(pending)
     try {
-      await write
+      return await write
     } finally {
       writes.delete(pending)
       if (writes.size === 0) this.pendingTaskNotificationWrites.delete(sessionId)
     }
+  }
+
+  /**
+   * Whether a write started under `epoch` has been superseded: aborted by a
+   * caller, or overtaken by a transcript clear/delete that bumped the session's
+   * mutation epoch. The clearing flag is checked too so a write stopped before
+   * its own abort signal propagates is still recognised.
+   */
+  private isTaskNotificationWriteCancelled(
+    sessionId: string,
+    epoch: number,
+    controller: AbortController,
+  ): boolean {
+    return (
+      controller.signal.aborted ||
+      this.clearingTaskNotificationSessions.has(sessionId) ||
+      (this.taskNotificationMutationEpochs.get(sessionId) ?? 0) !== epoch
+    )
+  }
+
+  /**
+   * Retire a session's in-flight task-notification appends before its
+   * transcript is removed. The strict append waits up to 500 ms for a file the
+   * CLI has not written yet, so without this barrier a delete followed by a new
+   * session under the same id would let the *old* terminal state land in the
+   * new generation. Moving the epoch and marking the session as clearing
+   * happens before the caller unlinks; the appends are then aborted and awaited
+   * within a bound. The caller clears the clearing flag; this method never
+   * recreates or restores a file.
+   */
+  private async beginTaskNotificationRetirement(sessionId: string): Promise<void> {
+    this.taskNotificationMutationEpochs.set(
+      sessionId,
+      (this.taskNotificationMutationEpochs.get(sessionId) ?? 0) + 1,
+    )
+    this.clearingTaskNotificationSessions.add(sessionId)
+    const pending = [...(this.pendingTaskNotificationWrites.get(sessionId) ?? [])]
+    for (const write of pending) write.controller.abort()
+    if (pending.length === 0) return
+    await Promise.race([
+      Promise.allSettled(pending.map((write) => write.promise)),
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, TASK_NOTIFICATION_RETIREMENT_TIMEOUT_MS)
+        if (typeof timer === 'object') timer.unref?.()
+      }),
+    ])
+  }
+
+  /**
+   * Look up the transcript, waiting a bounded time when it does not exist yet.
+   * Creation is deliberately not attempted: a session cleared or deleted while
+   * the run was in flight must stay cleared.
+   */
+  private async findSessionFileWithRetry(
+    sessionId: string,
+    retryMs: number,
+    controller: AbortController,
+  ): Promise<{ filePath: string; projectDir: string } | null> {
+    let found = await this.findSessionFile(sessionId)
+    if (found || retryMs <= 0) return found
+
+    const deadline = Date.now() + retryMs
+    while (!found && Date.now() < deadline) {
+      if (controller.signal.aborted || this.clearingTaskNotificationSessions.has(sessionId)) {
+        return null
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 50)
+      })
+      found = await this.findSessionFile(sessionId)
+    }
+    return found
   }
 
   async getSessionTaskNotifications(

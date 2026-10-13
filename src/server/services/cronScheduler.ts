@@ -18,7 +18,12 @@ import * as lockfile from '../../utils/lockfile.js'
 import { parseCronExpression } from '../../utils/cron.js'
 import { isBlankFileContent } from './blankFileContent.js'
 import { CronService, type CronTask } from './cronService.js'
-import { SessionService } from './sessionService.js'
+import {
+  SessionService,
+  sessionTaskNotificationIdentity,
+  type SessionTaskNotification,
+} from './sessionService.js'
+import { normalizeCliTaskNotification } from '../ws/cliMessageParsing.js'
 import { sendTaskNotification } from './notificationService.js'
 import type { NotificationDeliveryReport } from './notificationService.js'
 import { ProviderService } from './providerService.js'
@@ -537,6 +542,26 @@ function trimRuns(data: RunsFile): void {
 
 /** Applied when neither the task nor the environment supplies a timeout. */
 export const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes
+
+/**
+ * How long a finished scheduled run waits for the terminal task notifications
+ * it already observed to reach the transcript. Bounded on purpose: the run's
+ * own terminal record must not be held hostage by a stalled filesystem.
+ */
+export const CRON_NOTIFICATION_SETTLE_TIMEOUT_MS = 2_000
+
+/**
+ * After the child exits, how long to keep draining stdout before giving up on
+ * a descendant that inherited the pipe. Bounded so a run cannot be held at
+ * `running` forever by a process that never closes its copy of the write end.
+ */
+export const CRON_STDOUT_DRAIN_TIMEOUT_MS = 750
+
+/**
+ * A runtime session id is only trusted in the canonical UUID shape the session
+ * store accepts. Anything else must not be persisted against a session.
+ */
+const RUNTIME_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
  * Resolve the timeout for one execution, fixed for the whole run:
@@ -1146,9 +1171,253 @@ export class CronScheduler {
       const stdoutChunks: string[] = []
       let pendingLine = ''
       const reader = proc.stdout?.getReader()
+      const decoder = new TextDecoder()
+      /**
+       * Set once the run has stopped accepting stream events. Nothing read
+       * afterwards may start a write, which is what makes the settle snapshot
+       * taken later exhaustive.
+       */
+      let consumerSealed = false
+
+      // Terminal Agent notifications observed on this stream. Each write starts
+      // as soon as its notification is attributed to a session, so a slow
+      // append can never stall the stdout read; the run awaits them once, with
+      // a bound, before it settles. A notification that cannot be persisted is
+      // a failure of the run — the transcript is the only place a terminal
+      // Agent state survives.
+      const notificationWrites: Array<Promise<void>> = []
+      const seenNotifications = new Map<string, SessionTaskNotification>()
+      const notificationFailures: string[] = []
+      /** The session a CLI message claims to belong to. */
+      type ClaimedSessionId =
+        | { kind: 'absent' }
+        | { kind: 'invalid'; raw: string }
+        | { kind: 'valid'; id: string }
+      /**
+       * The session this run may write terminal Agent state into. A manual run
+       * knows it up front; an automatic run learns it from the CLI's own root
+       * `init` or root `result`.
+       */
+      let rootSessionId: string | undefined = sessionId
+      /**
+       * A root-level message naming a session this run does not belong to makes
+       * the whole stream unattributable: the run fails immediately and every
+       * later notification is dropped instead of landing in a transcript we can
+       * no longer trust.
+       */
+      let rootRefuted = false
+      /**
+       * Terminal states seen before an automatic run learned its session. They
+       * are held — never written speculatively — until the root confirms the
+       * session they belong to.
+       */
+      const unattributedNotifications: Array<{
+        notification: SessionTaskNotification
+        claimed: ClaimedSessionId
+      }> = []
+
+      const readClaimedSessionId = (message: any): ClaimedSessionId => {
+        const raw = message?.session_id
+        if (typeof raw !== 'string' || !raw.trim()) return { kind: 'absent' }
+        const trimmed = raw.trim()
+        return RUNTIME_SESSION_ID_RE.test(trimmed)
+          ? { kind: 'valid', id: trimmed }
+          : { kind: 'invalid', raw: trimmed }
+      }
+
+      /**
+       * Why a repeat of an already-persisted terminal is not a plain duplicate.
+       * The same terminal is routinely re-reported under a new event uuid, but a
+       * changed status — or a different output file for the same task — means
+       * the transcript would no longer match what the CLI says happened, so it
+       * has to fail the run instead of being dropped.
+       */
+      const describeNotificationConflict = (
+        previous: SessionTaskNotification,
+        next: SessionTaskNotification,
+      ): string | null => {
+        if (previous.status !== next.status) {
+          return `terminal state for ${next.taskId} changed from ${previous.status} to ${next.status}`
+        }
+        if (
+          previous.outputFile &&
+          next.outputFile &&
+          previous.outputFile !== next.outputFile
+        ) {
+          return `terminal data for ${next.taskId} conflicts: output file ${next.outputFile} was already reported as ${previous.outputFile}`
+        }
+        return null
+      }
+
+      const persistNotification = (notification: SessionTaskNotification) => {
+        // Only reached once the run's own session is known.
+        const targetSessionId = rootSessionId as string
+        const identity = sessionTaskNotificationIdentity(notification)
+        const previous = seenNotifications.get(identity)
+        if (previous) {
+          const conflict = describeNotificationConflict(previous, notification)
+          if (conflict) notificationFailures.push(conflict)
+          return
+        }
+        // Distinct tasks may legitimately share one leaf tool id (a single Agent
+        // tool call spawning several agents); the key carries the task id, so
+        // every such task keeps its own terminal entry.
+        seenNotifications.set(identity, notification)
+
+        notificationWrites.push(
+          this.sessionService
+            .appendSessionTaskNotificationStrict(targetSessionId, notification)
+            .then((outcome) => {
+              if (outcome.status === 'written' || outcome.status === 'disabled') return
+              notificationFailures.push(
+                outcome.status === 'failed'
+                  ? `failed to persist the task notification for ${notification.taskId}: ${outcome.error}`
+                  : `could not persist the task notification for ${notification.taskId} (${outcome.status})`,
+              )
+            })
+            .catch((error) => {
+              notificationFailures.push(
+                `failed to persist the task notification for ${notification.taskId}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              )
+            }),
+        )
+      }
+
+      const attributeNotification = (
+        notification: SessionTaskNotification,
+        claimed: ClaimedSessionId,
+      ): void => {
+        // The stream already named a session this run does not belong to;
+        // nothing from it may reach a transcript.
+        if (rootRefuted) return
+        if (claimed.kind === 'invalid') {
+          notificationFailures.push(
+            `the task notification for ${notification.taskId} reported an unusable session id (${claimed.raw})`,
+          )
+          return
+        }
+        if (rootSessionId === undefined) {
+          unattributedNotifications.push({ notification, claimed })
+          return
+        }
+        // The CLI stamps every message with the session of the process that
+        // produced it, so a notification naming another session — root-owned or
+        // owned by a child — must not be written into this run's transcript.
+        if (claimed.kind === 'valid' && claimed.id !== rootSessionId) {
+          notificationFailures.push(
+            `the task notification for ${notification.taskId} reported session ${claimed.id} instead of the run session ${rootSessionId}`,
+          )
+          return
+        }
+        persistNotification(notification)
+      }
+
+      /**
+       * Adopt the session id a root `init` or root `result` reports. The first
+       * one seen fixes the run's session; a later root message contradicting it
+       * fails the run at once and stops attribution for good. Only root messages
+       * qualify — a child's own init/result describes that child and can never
+       * redefine the run.
+       */
+      const observeRootSessionId = (reported: string, source: 'init' | 'result'): void => {
+        if (rootSessionId === undefined) {
+          rootSessionId = reported
+          for (const held of unattributedNotifications.splice(0)) {
+            attributeNotification(held.notification, held.claimed)
+          }
+          return
+        }
+        if (rootSessionId === reported) return
+        rootRefuted = true
+        unattributedNotifications.length = 0
+        notificationFailures.push(
+          sessionId
+            ? `the CLI reported session ${reported} in its ${source} instead of the requested ${sessionId}`
+            : `the CLI reported conflicting session ids (${rootSessionId}, ${reported})`,
+        )
+      }
+
+      const handleCliMessage = (message: any) => {
+        if (!message || typeof message !== 'object') return
+        const parentToolUseId =
+          typeof message.parent_tool_use_id === 'string' && message.parent_tool_use_id
+            ? message.parent_tool_use_id
+            : undefined
+
+        // Only the root init/result defines the run's own session; a nested
+        // (owned) init/result belongs to a child and must not become the root.
+        if (!parentToolUseId && message.type === 'system' && message.subtype === 'init') {
+          const claimed = readClaimedSessionId(message)
+          if (claimed.kind === 'valid') observeRootSessionId(claimed.id, 'init')
+          return
+        }
+
+        if (!parentToolUseId && message.type === 'result') {
+          // An automatic run has no init to learn its session from when the
+          // stream starts with the result; the root result names it just as
+          // authoritatively.
+          const claimed = readClaimedSessionId(message)
+          if (claimed.kind === 'valid') observeRootSessionId(claimed.id, 'result')
+          runningEntry!.resultReceived = true
+          try {
+            proc.stdin.end()
+          } catch {
+            // The child may already have exited.
+          }
+          return
+        }
+
+        // Any terminal notification — root or owned by a child agent — belongs
+        // in the session transcript with its ownerAgentId preserved.
+        const notification = normalizeCliTaskNotification(message)
+        if (notification) attributeNotification(notification, readClaimedSessionId(message))
+      }
+
+      const consumeLine = (line: string) => {
+        if (consumerSealed || !line.trim()) return
+        let message: unknown
+        try {
+          message = JSON.parse(line)
+        } catch {
+          // Non-JSON diagnostic output does not affect the run.
+          return
+        }
+        try {
+          handleCliMessage(message)
+        } catch (error) {
+          // A message we could not act on — including a notification that could
+          // not even be handed to the session store — must surface as a run
+          // failure instead of being silently swallowed.
+          notificationFailures.push(
+            `failed to process a CLI message: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          )
+        }
+      }
+
+      /**
+       * Stop accepting stream events, handing over a complete record that was
+       * already read but is not newline-terminated. Runs synchronously, so no
+       * read callback can interleave between the hand-over and the seal; a
+       * truncated record is dropped, since it carries no usable terminal state.
+       */
+      const sealCliStream = () => {
+        const tail = decoder.decode()
+        if (tail) {
+          stdoutChunks.push(tail)
+          pendingLine += tail
+        }
+        const complete = pendingLine
+        pendingLine = ''
+        if (complete.trim()) consumeLine(complete)
+        consumerSealed = true
+      }
+
       const readStdout = (async () => {
         if (!reader) return
-        const decoder = new TextDecoder()
         try {
           while (true) {
             const { done, value } = await reader.read()
@@ -1158,18 +1427,17 @@ export class CronScheduler {
             pendingLine += chunk
             const lines = pendingLine.split('\n')
             pendingLine = lines.pop() ?? ''
-            for (const line of lines) {
-              try {
-                const message = JSON.parse(line)
-                if (message.type === 'result' && !message.parent_tool_use_id) {
-                  runningEntry!.resultReceived = true
-                  proc.stdin.end()
-                }
-              } catch {
-                // Non-JSON diagnostic output does not affect the run.
-              }
-            }
+            for (const line of lines) consumeLine(line)
           }
+          // Flush a multi-byte sequence split across the last chunk, then
+          // process the final record when the child exits without a newline.
+          const tail = decoder.decode()
+          if (tail) {
+            stdoutChunks.push(tail)
+            pendingLine += tail
+          }
+          consumeLine(pendingLine)
+          pendingLine = ''
         } catch {
           // stream may be interrupted on kill
         }
@@ -1178,12 +1446,50 @@ export class CronScheduler {
       const exitCode = await proc.exited
       // Give the pipes a short chance to flush after exit, but never hold the
       // execution lock indefinitely for a descendant retaining the write end.
+      // Every wait in this drain phase shares one window, so a run can never be
+      // held past it.
+      const drainDeadline = Date.now() + CRON_STDOUT_DRAIN_TIMEOUT_MS
       const drain = <T>(result: Promise<T>, fallback: T) => Promise.race([
         result,
-        Bun.sleep(750).then(() => fallback),
+        Bun.sleep(Math.max(0, drainDeadline - Date.now())).then(() => fallback),
       ])
       const stdoutDrained = await drain(readStdout.then(() => true), false)
-      if (!stdoutDrained) void reader?.cancel().catch(() => {})
+      if (!stdoutDrained) {
+        // A descendant still holds the write end. Seal the consumer first: the
+        // stream stops accepting events, and the complete record already read
+        // (a final line with no newline) is handed over before the seal, so it
+        // is not lost to the timeout. Cancelling the reader then stops the read
+        // loop itself, and the bounded confirmation below keeps that loop from
+        // outliving the run. Anything the loop might still read is dropped: the
+        // seal is what makes the settle snapshot afterwards exhaustive.
+        sealCliStream()
+        void reader?.cancel().catch(() => {})
+        await drain(readStdout.then(() => true), false)
+      }
+
+      // A terminal state the run never managed to attribute — an automatic run
+      // whose stream carried no root session id at all — is reported as a
+      // failure rather than dropped: the transcript is its only home.
+      for (const held of unattributedNotifications.splice(0)) {
+        notificationFailures.push(
+          `could not attribute the task notification for ${held.notification.taskId} to a session`,
+        )
+      }
+
+      // A notification observed after a root result is still persisted: the
+      // result ends the turn, not the stream. Wait for the writes already
+      // started, with an explicit bound rather than indefinitely.
+      if (notificationWrites.length > 0) {
+        const settledWrites = await Promise.race([
+          Promise.allSettled(notificationWrites).then(() => true),
+          Bun.sleep(CRON_NOTIFICATION_SETTLE_TIMEOUT_MS).then(() => false),
+        ])
+        if (!settledWrites) {
+          notificationFailures.push(
+            `timed out after ${CRON_NOTIFICATION_SETTLE_TIMEOUT_MS} ms waiting for task notification writes to settle`,
+          )
+        }
+      }
 
       const completedAt = new Date().toISOString()
       const rawOutput = stdoutChunks.join('')
@@ -1198,6 +1504,9 @@ export class CronScheduler {
 
       const wasStopped = this.stoppedRunIds.has(runId)
       const migrationInterrupted = runningEntry.migrationInterrupted === true
+      const notificationError = notificationFailures.length > 0
+        ? notificationFailures.join('; ')
+        : undefined
       const completedRun: TaskRun = {
         ...run,
         completedAt,
@@ -1205,7 +1514,7 @@ export class CronScheduler {
           ? 'failed'
           : timedOut
             ? 'timeout'
-            : exitCode === 0
+            : exitCode === 0 && !notificationError
               ? 'completed'
               : 'failed',
         output: output.slice(0, 50_000), // cap after extraction
@@ -1217,6 +1526,9 @@ export class CronScheduler {
       if (wasStopped) completedRun.error = 'Stopped by user'
       else if (migrationInterrupted) completedRun.error = 'Interrupted for data migration'
       else if (timedOut) completedRun.error = `Task timed out after ${taskTimeoutMs} ms`
+      else if (notificationError) {
+        completedRun.error = `Failed to persist scheduled task notification: ${notificationError}`
+      }
       else if (exitCode !== 0) completedRun.error = stderrText.slice(0, 5_000) || `Process exited with code ${exitCode}`
 
       settled = completedRun

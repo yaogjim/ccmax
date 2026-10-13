@@ -15,6 +15,40 @@ vi.mock('../../api/trajectory', () => ({
   },
 }))
 
+type TrajectoryTableProps = Parameters<typeof import('./TrajectoryTable').TrajectoryTable>[0]
+type TrajectoryTableRange = Parameters<NonNullable<TrajectoryTableProps['onRangeChange']>>[0]
+
+/**
+ * The turn bar is derived from the range TrajectoryTable reports from its own
+ * effect, which lands one commit after the table mounts. `hold` freezes that
+ * window so the regression test can assert the ordering deterministically
+ * instead of racing the scheduler (the historical flake).
+ */
+const tableRangeGate = vi.hoisted(() => ({
+  hold: false,
+  flush: null as null | (() => void),
+}))
+
+vi.mock('./TrajectoryTable', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./TrajectoryTable')>()
+  const react = await import('react')
+  function GatedTrajectoryTable(props: TrajectoryTableProps) {
+    const held = react.useRef<TrajectoryTableRange | null>(null)
+    const report = react.useCallback((range: TrajectoryTableRange) => {
+      if (!tableRangeGate.hold) {
+        props.onRangeChange?.(range)
+        return
+      }
+      held.current = range
+      tableRangeGate.flush = () => {
+        if (held.current) props.onRangeChange?.(held.current)
+      }
+    }, [props.onRangeChange])
+    return react.createElement(actual.TrajectoryTable, { ...props, onRangeChange: report })
+  }
+  return { ...actual, TrajectoryTable: GatedTrajectoryTable }
+})
+
 import TrajectoryView from './TrajectoryView'
 import { clearTrajectoryDataCache } from './useTrajectoryData'
 import { clearTrajectoryDetailCache } from './useTrajectoryDetail'
@@ -72,10 +106,14 @@ describe('TrajectoryView', () => {
     getSnapshot.mockReset()
     useSettingsStore.setState({ locale: 'en' })
     useTrajectoryViewStore.setState({ modes: {}, opened: {}, nav: null })
+    tableRangeGate.hold = false
+    tableRangeGate.flush = null
   })
 
   afterEach(() => {
     vi.useRealTimers()
+    tableRangeGate.hold = false
+    tableRangeGate.flush = null
   })
 
   it('fetches nothing while hidden', () => {
@@ -96,8 +134,26 @@ describe('TrajectoryView', () => {
     expect(within(options[4]!).getByText('package.json')).toBeInTheDocument()
     expect(within(table).getByText('Turn 1')).toBeInTheDocument()
     // The sticky bar names the turn in view even when its first row has scrolled away.
-    expect(within(screen.getByTestId('trajectory-turn-bar')).getByText('Turn 1')).toBeInTheDocument()
+    // It is derived from the range the table reports after mounting, so wait for it.
+    expect(within(await screen.findByTestId('trajectory-turn-bar')).getByText('Turn 1')).toBeInTheDocument()
     expect(screen.getByTestId('trajectory-totals').textContent).toContain('1 turns · 1 steps · 1 tool calls')
+  })
+
+  it('regression: reads the turn bar only after the table reports its range', async () => {
+    // Historical flake: `await findByRole('listbox')` proves the table mounted, but the
+    // turn bar is derived from the range the table reports from its own effect, which
+    // lands one commit later. A synchronous getByTestId ran inside that window.
+    tableRangeGate.hold = true
+    getPage.mockResolvedValue(page(baseRows(), { snapshots: [SNAPSHOT] }))
+    renderView()
+    const table = await screen.findByRole('listbox', { name: 'Trajectory' })
+    expect(within(table).getAllByRole('option').map((option) => option.dataset.rowId)).toEqual([
+      'u:p1', 'c:skills', 's:main:0', 'a:m1', 't:toolu_1',
+    ])
+    // The window the old synchronous assertion read: table mounted, range not reported yet.
+    expect(screen.queryByTestId('trajectory-turn-bar')).toBeNull()
+    act(() => tableRangeGate.flush?.())
+    expect(within(await screen.findByTestId('trajectory-turn-bar')).getByText('Turn 1')).toBeInTheDocument()
   })
 
   it('opens a tool row in the detail panel with its input and result tabs', async () => {

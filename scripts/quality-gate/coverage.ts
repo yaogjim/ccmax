@@ -357,8 +357,14 @@ function isUsableLcovRecord(record: LcovRecord) {
 }
 
 export function parseBunTestFileCount(output: string) {
-  const match = output.match(/Ran \d+ tests? across (\d+) files?\./)
-  return match ? Number(match[1]) : null
+  // Bun prints one `Ran <tests> across <files> files.` summary per test process.
+  // A test that spawns `bun test` (or a process Bun kills as dangling) shares this
+  // stdout, so a failing nested run can print its own smaller summary before the
+  // top-level one. The gate compares this count with the files it asked Bun to run,
+  // so it must read the top-level summary, which Bun prints last.
+  const summaries = [...output.matchAll(/Ran \d+ tests? across (\d+) files?\./g)]
+  const finalSummary = summaries.at(-1)
+  return finalSummary ? Number(finalSummary[1]) : null
 }
 
 export function buildRootCoverageCommand(outputDir: string, serverFiles: string[]) {

@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test'
 import * as fs from 'fs/promises'
+import { constants } from 'node:fs'
 import * as os from 'os'
 import * as path from 'path'
 
@@ -11,6 +12,7 @@ import {
   resolveCronProjectRoot,
 } from '../services/cronScheduler.js'
 import { CronService } from '../services/cronService.js'
+import { SessionService } from '../services/sessionService.js'
 import { ProviderService } from '../services/providerService.js'
 import { resetTerminalShellEnvironmentCacheForTests } from '../../utils/terminalShellEnvironment.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
@@ -156,8 +158,12 @@ function restoreEnv(): void {
 
 describe('cron scheduler launcher resolution', () => {
   let tmpDir: string
+  let previousServerPort: number
 
   beforeEach(async () => {
+    previousServerPort = ProviderService.getServerPort()
+    // 每条用例显式固定并恢复代理端口，避免同进程中其他服务测试的端口污染。
+    ProviderService.setServerPort(3456)
     tmpDir = await createTmpDir()
     process.env.CLAUDE_CONFIG_DIR = path.join(tmpDir, 'config')
     process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV = '1'
@@ -166,6 +172,8 @@ describe('cron scheduler launcher resolution', () => {
   })
 
   afterEach(async () => {
+    mock.restore()
+    ProviderService.setServerPort(previousServerPort)
     restoreEnv()
     await cleanupTmpDir(tmpDir)
   })
@@ -1014,4 +1022,1202 @@ describe('cron scheduler launcher resolution', () => {
     expect(env.NVM_DIR).toBe(nvmDir)
     expect(env.PATH.split(path.delimiter)[0]).toBe(nodeBin)
   })
+
+  unixOnly(
+    'executeTask persists the CLI terminal task notification into the automatic run runtime session',
+    async () => {
+      const appRoot = path.join(tmpDir, 'app-root')
+      const sidecarPath = path.join(tmpDir, 'claude-sidecar')
+      const sidecarArgsPath = path.join(tmpDir, 'sidecar.args')
+      const runtimeSessionId = crypto.randomUUID()
+      const projectDir = path.join(
+        process.env.CLAUDE_CONFIG_DIR as string,
+        'projects',
+        '-tmp-cron-notification',
+      )
+      const transcriptPath = path.join(projectDir, `${runtimeSessionId}.jsonl`)
+      const sessionMetaLine = JSON.stringify({
+        type: 'session-meta',
+        isMeta: true,
+        workDir: tmpDir,
+        timestamp: '2026-08-01T00:00:00.000Z',
+      })
+      const initLine = JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        uuid: 'init-1',
+        session_id: runtimeSessionId,
+      })
+      const notificationLine = JSON.stringify({
+        type: 'system',
+        subtype: 'task_notification',
+        uuid: 'notification-1',
+        task_id: 'background-task-1',
+        tool_use_id: 'toolu_background_1',
+        status: 'completed',
+        summary: 'Background command finished',
+        result: 'background result text',
+        output_file: '/tmp/tasks/background-task-1.output',
+        timestamp: '2026-08-01T00:00:05.000Z',
+      })
+      const resultLine = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: 'scheduled answer',
+        uuid: 'result-1',
+      })
+
+      await fs.mkdir(appRoot, { recursive: true })
+      await fs.writeFile(
+        sidecarPath,
+        [
+          '#!/bin/sh',
+          `printf '%s\\n' "$@" > "${sidecarArgsPath}"`,
+          'read -r _cron_input || true',
+          `mkdir -p "${projectDir}"`,
+          // The real CLI writes the session transcript itself; the fake process
+          // emulates exactly that so the scheduler has a real JSONL to append to.
+          `printf '%s\\n' '${sessionMetaLine}' >> "${transcriptPath}"`,
+          `printf '%s\\n' '${initLine}'`,
+          `printf '%s\\n' '${notificationLine}'`,
+          `printf '%s\\n' '${resultLine}'`,
+          'exit 0',
+          '',
+        ].join('\n'),
+        'utf-8',
+      )
+      await fs.chmod(sidecarPath, 0o755)
+
+      process.env.CLAUDE_CLI_PATH = sidecarPath
+      process.env.CLAUDE_APP_ROOT = appRoot
+      process.env.HOME = tmpDir
+
+      const cronService = new CronService()
+      const scheduler = new CronScheduler(cronService)
+      const task = await cronService.createTask({
+        cron: '* * * * *',
+        prompt: 'cron notification persistence test',
+        name: 'Notification Task',
+        recurring: true,
+        folderPath: tmpDir,
+      })
+
+      const run = await scheduler.executeTask(task)
+
+      expect(run.status).toBe('completed')
+      expect(run.output).toBe('scheduled answer')
+      // An automatic run still creates no session of its own and passes no
+      // --session-id; the runtime id comes from the CLI stream.
+      expect(run.sessionId).toBeUndefined()
+      const sidecarArgs = (await fs.readFile(sidecarArgsPath, 'utf-8'))
+        .trim()
+        .split('\n')
+      expect(sidecarArgs).not.toContain('--session-id')
+
+      const entries = (await fs.readFile(transcriptPath, 'utf-8'))
+        .split('\n')
+        .filter((line) => line.trim())
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+      const notifications = entries.filter(
+        (entry) => entry.type === 'cc-haha-task-notification',
+      )
+      expect(notifications).toHaveLength(1)
+      expect(notifications[0]).toEqual({
+        type: 'cc-haha-task-notification',
+        isMeta: true,
+        taskNotification: {
+          taskId: 'background-task-1',
+          toolUseId: 'toolu_background_1',
+          status: 'completed',
+          summary: 'Background command finished',
+          result: 'background result text',
+          outputFile: '/tmp/tasks/background-task-1.output',
+          timestamp: '2026-08-01T00:00:05.000Z',
+        },
+        timestamp: '2026-08-01T00:00:05.000Z',
+      })
+    },
+  )
+
+  // ─── Scheduled-run task-notification boundaries ────────────────────────────
+  //
+  // Everything below drives the real `executeTask` against a fake CLI process
+  // and reads the resulting JSONL, so the stream parsing, the session
+  // attribution, and the persistence outcome are all exercised end to end.
+
+  /** Read the persisted task notifications out of one session transcript. */
+  async function readPersistedNotifications(
+    projectDirName: string,
+    sessionId: string,
+  ): Promise<Array<{ entry: Record<string, any>; notification: Record<string, any> }>> {
+    const transcriptPath = path.join(
+      process.env.CLAUDE_CONFIG_DIR as string,
+      'projects',
+      projectDirName,
+      `${sessionId}.jsonl`,
+    )
+    const raw = await fs.readFile(transcriptPath, 'utf-8')
+    return raw
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as Record<string, any>)
+      .filter((entry) => entry.type === 'cc-haha-task-notification')
+      .map((entry) => ({ entry, notification: entry.taskNotification }))
+  }
+
+  /** Write a fake CLI that emits exactly the given stdout fragments, in order. */
+  async function writeFakeCli(
+    name: string,
+    emits: Array<{ printf: string; args: string[] }>,
+  ): Promise<string> {
+    const cliPath = path.join(tmpDir, name)
+    await fs.writeFile(
+      cliPath,
+      [
+        '#!/bin/sh',
+        'read -r _cron_input || true',
+        ...emits.map((emit) => `printf '${emit.printf}' ${emit.args.join(' ')}`),
+        'exit 0',
+        '',
+      ].join('\n'),
+      'utf-8',
+    )
+    await fs.chmod(cliPath, 0o755)
+    return cliPath
+  }
+
+  /** Install a fake CLI and return the scheduler wired to a temporary config. */
+  async function launchSchedulerWithCli(cliPath: string) {
+    const appRoot = path.join(tmpDir, 'app-root')
+    await fs.mkdir(appRoot, { recursive: true })
+    process.env.CLAUDE_CLI_PATH = cliPath
+    process.env.CLAUDE_APP_ROOT = appRoot
+    process.env.HOME = tmpDir
+    const cronService = new CronService()
+    return { cronService, scheduler: new CronScheduler(cronService) }
+  }
+
+  /** One `writeFakeCli` emit: a shell-quoted JSON record and a newline. */
+  const emit = (record: unknown) => ({
+    printf: '%s\\n',
+    args: [`'${JSON.stringify(record).replace(/'/g, "'\\''")}'`],
+  })
+
+  /** The fields of a `task_notification` record the scheduler reads. */
+  const notificationRecord = (
+    uuid: string,
+    fields: {
+      taskId: string
+      toolUseId: string
+      sessionId?: string
+      status?: string
+      outputFile?: string
+      ownerAgentId?: string
+      parentToolUseId?: string
+    },
+  ) => ({
+    type: 'system',
+    subtype: 'task_notification',
+    uuid,
+    task_id: fields.taskId,
+    tool_use_id: fields.toolUseId,
+    status: fields.status ?? 'completed',
+    summary: `${fields.taskId} finished`,
+    ...(fields.outputFile ? { output_file: fields.outputFile } : {}),
+    ...(fields.sessionId ? { session_id: fields.sessionId } : {}),
+    ...(fields.ownerAgentId ? { owner_agent_id: fields.ownerAgentId } : {}),
+    ...(fields.parentToolUseId
+      ? { parent_tool_use_id: fields.parentToolUseId }
+      : {}),
+    timestamp: '2026-08-11T00:00:01.000Z',
+  })
+
+  const initRecord = (sessionId: string, extra: Record<string, unknown> = {}) => ({
+    type: 'system',
+    subtype: 'init',
+    uuid: 'init-record',
+    session_id: sessionId,
+    ...extra,
+  })
+
+  const resultRecord = (
+    result: string,
+    extra: Record<string, unknown> = {},
+  ) => ({ type: 'result', subtype: 'success', result, ...extra })
+
+  /**
+   * Create the project dir and transcript a fake CLI's session lives in, and
+   * return the project dir so a caller can assert what did *not* land there.
+   */
+  async function createTranscript(
+    projectDirName: string,
+    sessionId: string,
+  ): Promise<string> {
+    const projectDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR as string,
+      'projects',
+      projectDirName,
+    )
+    await fs.mkdir(projectDir, { recursive: true })
+    await fs.writeFile(
+      path.join(projectDir, `${sessionId}.jsonl`),
+      `${JSON.stringify({ type: 'session-meta', isMeta: true, workDir: tmpDir, timestamp: '2026-08-11T00:00:00.000Z' })}\n`,
+      'utf-8',
+    )
+    return projectDir
+  }
+
+  /** Create a task in the temporary work dir and run it once. */
+  async function executeFakeCli(cliPath: string, name: string) {
+    const { cronService, scheduler } = await launchSchedulerWithCli(cliPath)
+    const task = await cronService.createTask({
+      cron: '* * * * *',
+      prompt: `${name} notification test`,
+      name,
+      recurring: true,
+      folderPath: tmpDir,
+    })
+    return await scheduler.executeTask(task)
+  }
+
+  /**
+   * A fake CLI that leaves its stdout write end open after exiting, by way of a
+   * descendant holding it. EOF therefore never arrives inside the drain window,
+   * which is exactly the case the window exists for.
+   */
+  async function writeFakeCliWithInheritedStdout(
+    name: string,
+    emits: Array<{ printf: string; args: string[] }>,
+    trailingLines: string[] = [],
+  ): Promise<string> {
+    const cliPath = path.join(tmpDir, name)
+    await fs.writeFile(
+      cliPath,
+      [
+        '#!/bin/sh',
+        'read -r _cron_input || true',
+        ...emits.map((emit) => `printf '${emit.printf}' ${emit.args.join(' ')}`),
+        ...trailingLines,
+        '( sleep 5 ) &',
+        'exit 0',
+        '',
+      ].join('\n'),
+      'utf-8',
+    )
+    await fs.chmod(cliPath, 0o755)
+    return cliPath
+  }
+
+  /** The same JSON record `emit` produces, but with no trailing newline. */
+  const emitWithoutNewline = (record: unknown) => ({
+    printf: '%s',
+    args: [`'${JSON.stringify(record).replace(/'/g, "'\\''")}'`],
+  })
+
+  unixOnly(
+    'reassembles chunked UTF-8, a trailing record without a newline, and a notification before the result',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDirName = '-tmp-cron-notification-chunked'
+      const projectDir = path.join(
+        process.env.CLAUDE_CONFIG_DIR as string,
+        'projects',
+        projectDirName,
+      )
+      await fs.mkdir(projectDir, { recursive: true })
+      const transcriptPath = path.join(projectDir, `${sessionId}.jsonl`)
+      await fs.writeFile(
+        transcriptPath,
+        `${JSON.stringify({ type: 'session-meta', isMeta: true, workDir: tmpDir, timestamp: '2026-08-02T00:00:00.000Z' })}\n`,
+        'utf-8',
+      )
+
+      // The notification summary holds a multi-byte character that the fake CLI
+      // splits across two writes; the final result record has no trailing
+      // newline, which is what a CLI that exits immediately after its result
+      // actually produces.
+      const notificationLine = JSON.stringify({
+        type: 'system',
+        subtype: 'task_notification',
+        uuid: 'notification-chunked',
+        task_id: 'chunked-task',
+        tool_use_id: 'toolu_chunked',
+        status: 'completed',
+        summary: 'splitted utf8 \u00e9 summary',
+        timestamp: '2026-08-02T00:00:01.000Z',
+      })
+      const splitAt = notificationLine.indexOf('\u00e9')
+      const beforeChar = notificationLine.slice(0, splitAt)
+      const afterChar = notificationLine.slice(splitAt + 1)
+      const resultLine = JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: 'chunked answer',
+      })
+
+      const cliPath = await writeFakeCli('chunked-sidecar', [
+        {
+          printf: '%s\\n',
+          args: [`'${JSON.stringify({ type: 'system', subtype: 'init', uuid: 'init-chunked', session_id: sessionId })}'`],
+        },
+        { printf: '%s', args: [`'${beforeChar.replace(/'/g, "'\\''")}'`] },
+        { printf: '\\303', args: [] },
+        { printf: '\\251', args: [] },
+        { printf: '%s\\n', args: [`'${afterChar.replace(/'/g, "'\\''")}'`] },
+        // No trailing newline on the last record.
+        { printf: '%s', args: [`'${resultLine.replace(/'/g, "'\\''")}'`] },
+      ])
+      const { cronService, scheduler } = await launchSchedulerWithCli(cliPath)
+      const task = await cronService.createTask({
+        cron: '* * * * *',
+        prompt: 'chunked notification test',
+        name: 'Chunked Task',
+        recurring: true,
+        folderPath: tmpDir,
+      })
+
+      const run = await scheduler.executeTask(task)
+
+      expect(run.status).toBe('completed')
+      expect(run.output).toBe('chunked answer')
+      const persisted = await readPersistedNotifications(projectDirName, sessionId)
+      expect(persisted).toHaveLength(1)
+      expect(persisted[0]!.notification).toMatchObject({
+        taskId: 'chunked-task',
+        toolUseId: 'toolu_chunked',
+        status: 'completed',
+        summary: 'splitted utf8 \u00e9 summary',
+      })
+    },
+  )
+
+  unixOnly(
+    'keeps one entry per terminal when the CLI repeats it, and rejects a contradicting status',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDirName = '-tmp-cron-notification-dedupe'
+      await createTranscript(projectDirName, sessionId)
+
+      // A re-report of one terminal carries the same task id, so both events
+      // resolve to the same identity within the run.
+      const notification = (uuid: string, status: string, toolUseId: string) =>
+        emit(
+          notificationRecord(uuid, {
+            taskId: `task-${toolUseId}`,
+            toolUseId,
+            status,
+          }),
+        )
+
+      // Same terminal reported under three different event uuids: the same
+      // terminal state must land in the transcript exactly once. A fourth event
+      // contradicts it and must fail the run rather than be silently dropped.
+      const cliPath = await writeFakeCli('dedupe-sidecar', [
+        emit(initRecord(sessionId)),
+        notification('event-a', 'completed', 'toolu_same_terminal'),
+        notification('event-b', 'completed', 'toolu_same_terminal'),
+        notification('event-c', 'completed', 'toolu_same_terminal'),
+        notification('event-d', 'failed', 'toolu_same_terminal'),
+        // A distinct terminal with the same leaf shape is still its own entry.
+        notification('event-e', 'completed', 'toolu_other_terminal'),
+        // `failed` and `killed` (normalized to `stopped`) are the other two
+        // terminal states the CLI reports.
+        notification('event-f', 'failed', 'toolu_failed_terminal'),
+        notification('event-g', 'killed', 'toolu_killed_terminal'),
+        emit(resultRecord('dedupe answer')),
+      ])
+      const run = await executeFakeCli(cliPath, 'Dedupe Task')
+
+      expect(run.status).toBe('failed')
+      expect(run.error).toContain('changed from completed to failed')
+      const persisted = await readPersistedNotifications(projectDirName, sessionId)
+      expect(
+        persisted.map((entry) => ({
+          toolUseId: entry.notification.toolUseId,
+          status: entry.notification.status,
+        })),
+      ).toEqual(
+        expect.arrayContaining([
+          { toolUseId: 'toolu_same_terminal', status: 'completed' },
+          { toolUseId: 'toolu_other_terminal', status: 'completed' },
+          { toolUseId: 'toolu_failed_terminal', status: 'failed' },
+          // `killed` normalizes to `stopped`, the same as the websocket path.
+          { toolUseId: 'toolu_killed_terminal', status: 'stopped' },
+        ]),
+      )
+      expect(persisted).toHaveLength(4)
+    },
+  )
+
+  unixOnly(
+    'persists an owned notification under its child owner and never treats a nested init/result as the root',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const childSessionId = crypto.randomUUID()
+      const projectDirName = '-tmp-cron-notification-owned'
+      const projectDir = await createTranscript(projectDirName, sessionId)
+
+      const cliPath = await writeFakeCli('owned-sidecar', [
+        emit(initRecord(sessionId, { uuid: 'init-root' })),
+        // A nested init naming a different session must not become the root
+        // session (and must not be reported as a conflicting root id either).
+        emit(
+          initRecord(childSessionId, {
+            uuid: 'init-child',
+            parent_tool_use_id: 'toolu_agent_root',
+          }),
+        ),
+        // A nested result is a child's result, not the run's.
+        emit(
+          resultRecord('child result', {
+            parent_tool_use_id: 'toolu_agent_root',
+          }),
+        ),
+        emit(
+          notificationRecord('notification-child', {
+            taskId: 'child-task',
+            toolUseId: 'Agent:0',
+            ownerAgentId: 'child-a',
+            parentToolUseId: 'toolu_agent_root',
+            status: 'stopped',
+          }),
+        ),
+        // A root notification reusing the same leaf tool id stays its own entry.
+        emit(
+          notificationRecord('notification-root', {
+            taskId: 'root-task',
+            toolUseId: 'Agent:0',
+          }),
+        ),
+        // A second child owner reusing the very same leaf id is a third entry.
+        emit(
+          notificationRecord('notification-child-b', {
+            taskId: 'child-b-task',
+            toolUseId: 'Agent:0',
+            ownerAgentId: 'child-b',
+            parentToolUseId: 'toolu_agent_root',
+            status: 'failed',
+          }),
+        ),
+        emit(resultRecord('owned answer')),
+      ])
+      const run = await executeFakeCli(cliPath, 'Owned Task')
+
+      expect(run.status).toBe('completed')
+      // A child's result text is still part of the raw stream (pre-existing
+      // extraction behaviour); what must not happen is treating that result as
+      // the root for session attribution.
+      expect(run.output).toContain('owned answer')
+      const persisted = await readPersistedNotifications(projectDirName, sessionId)
+      expect(persisted.map((entry) => entry.notification)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            taskId: 'child-task',
+            toolUseId: 'Agent:0',
+            ownerAgentId: 'child-a',
+            status: 'stopped',
+          }),
+          expect.objectContaining({
+            taskId: 'root-task',
+            toolUseId: 'Agent:0',
+            status: 'completed',
+          }),
+          expect.objectContaining({
+            taskId: 'child-b-task',
+            toolUseId: 'Agent:0',
+            ownerAgentId: 'child-b',
+            status: 'failed',
+          }),
+        ]),
+      )
+      expect(persisted).toHaveLength(3)
+      // Nothing was written against the child's own session id.
+      await expect(
+        fs.readFile(path.join(projectDir, `${childSessionId}.jsonl`), 'utf-8'),
+      ).rejects.toThrow()
+    },
+  )
+
+  unixOnly(
+    'persists a notification that arrives after the root result and ignores progress events',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDirName = '-tmp-cron-notification-after-result'
+      await createTranscript(projectDirName, sessionId)
+
+      const notification = (status: string, toolUseId: string) =>
+        emit(
+          notificationRecord(`notification-${status}`, {
+            taskId: `task-${toolUseId}`,
+            toolUseId,
+            status,
+          }),
+        )
+
+      const cliPath = await writeFakeCli('after-result-sidecar', [
+        emit(initRecord(sessionId, { uuid: 'init-after' })),
+        // A progress event is not a terminal state and is never persisted.
+        notification('running', 'toolu_progress'),
+        emit(resultRecord('after answer')),
+        // The result ends the turn, not the stream.
+        notification('completed', 'toolu_after_result'),
+      ])
+      const run = await executeFakeCli(cliPath, 'After Result Task')
+
+      expect(run.status).toBe('completed')
+      expect(run.output).toBe('after answer')
+      const persisted = await readPersistedNotifications(projectDirName, sessionId)
+      expect(persisted.map((entry) => entry.notification)).toEqual([
+        expect.objectContaining({ toolUseId: 'toolu_after_result', status: 'completed' }),
+      ])
+    },
+  )
+
+  unixOnly(
+    'waits for a slow notification write instead of settling the run without it',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDirName = '-tmp-cron-notification-slow-write'
+      await createTranscript(projectDirName, sessionId)
+
+      const cliPath = await writeFakeCli('slow-write-sidecar', [
+        emit(initRecord(sessionId, { uuid: 'init-slow' })),
+        emit(
+          notificationRecord('notification-slow', {
+            taskId: 'slow-task',
+            toolUseId: 'toolu_slow',
+          }),
+        ),
+        emit(resultRecord('slow answer')),
+      ])
+
+      // A transcript append that takes ~300 ms: still well inside the settle
+      // bound, and the run must not finish before the terminal state landed.
+      const realOpen = fs.open
+      spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await realOpen(...args)
+        if (typeof args[1] !== 'number' || (args[1] & constants.O_APPEND) === 0) return handle
+        const realWriteFile = handle.writeFile.bind(handle)
+        spyOn(handle, 'writeFile').mockImplementation(async (...writeArgs) => {
+          await Bun.sleep(300)
+          return realWriteFile(...writeArgs as Parameters<typeof realWriteFile>)
+        })
+        return handle
+      })
+
+      const run = await executeFakeCli(cliPath, 'Slow Write Task')
+
+      expect(run.status).toBe('completed')
+      expect(run.output).toBe('slow answer')
+      const persisted = await readPersistedNotifications(projectDirName, sessionId)
+      expect(persisted.map((entry) => entry.notification)).toEqual([
+        expect.objectContaining({ taskId: 'slow-task', toolUseId: 'toolu_slow' }),
+      ])
+    },
+  )
+
+  unixOnly(
+    'fails the run when a terminal notification cannot be persisted',
+    async () => {
+      // A well-formed runtime id with no transcript on disk: the session was
+      // cleared or never materialized, so its terminal state has nowhere to go.
+      const sessionId = crypto.randomUUID()
+      const cliPath = await writeFakeCli('unpersistable-sidecar', [
+        emit(initRecord(sessionId, { uuid: 'init-missing' })),
+        emit(
+          notificationRecord('notification-missing', {
+            taskId: 'missing-task',
+            toolUseId: 'toolu_missing',
+          }),
+        ),
+        emit(resultRecord('unpersistable answer')),
+      ])
+      const run = await executeFakeCli(cliPath, 'Unpersistable Task')
+
+      expect(run.status).toBe('failed')
+      expect(run.error).toContain('Failed to persist scheduled task notification')
+      expect(run.error).toContain('missing-task')
+      // The transcript was not created as a side effect.
+      expect(await new SessionService().findSessionFile(sessionId)).toBeNull()
+    },
+  )
+
+  unixOnly(
+    'writes notifications into the manual session the run passed to the CLI',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDirName = '-tmp-cron-notification-manual'
+      await createTranscript(projectDirName, sessionId)
+
+      const argsPath = path.join(tmpDir, 'manual.args')
+      const cliPath = await writeFakeCli('manual-sidecar', [
+        { printf: '%s\\n', args: [`"$@" > "${argsPath}"`] },
+        emit(initRecord(sessionId, { uuid: 'init-manual' })),
+        emit(
+          notificationRecord('notification-manual', {
+            taskId: 'manual-task',
+            toolUseId: 'toolu_manual',
+            status: 'killed',
+          }),
+        ),
+        emit(resultRecord('manual answer')),
+      ])
+      const { cronService, scheduler } = await launchSchedulerWithCli(cliPath)
+      // Only the session creation boundary is faked; the append under test is
+      // the real one, writing the real JSONL.
+      const realSessionService = (scheduler as unknown as {
+        sessionService: SessionService
+      }).sessionService
+      spyOn(realSessionService, 'createSession').mockResolvedValue({ sessionId } as never)
+      spyOn(realSessionService, 'deleteSessionFile').mockResolvedValue(undefined)
+      spyOn(realSessionService, 'appendSessionMetadata').mockResolvedValue(undefined)
+      const task = await cronService.createTask({
+        cron: '* * * * *',
+        prompt: 'manual notification test',
+        name: 'Manual Task',
+        recurring: true,
+        folderPath: tmpDir,
+      })
+
+      const run = await scheduler.executeTask(task, { createSession: true })
+
+      expect(run.status).toBe('completed')
+      expect(run.sessionId).toBe(sessionId)
+      const args = (await fs.readFile(argsPath, 'utf-8')).trim().split('\n')
+      expect(args[args.indexOf('--session-id') + 1]).toBe(sessionId)
+      const persisted = await readPersistedNotifications(projectDirName, sessionId)
+      expect(persisted.map((entry) => entry.notification)).toEqual([
+        expect.objectContaining({
+          taskId: 'manual-task',
+          toolUseId: 'toolu_manual',
+          // `killed` normalizes to `stopped`, the same as the websocket path.
+          status: 'stopped',
+        }),
+      ])
+    },
+  )
+
+  unixOnly(
+    'refuses a manual run whose CLI reports a different session id',
+    async () => {
+      const requestedSessionId = crypto.randomUUID()
+      const reportedSessionId = crypto.randomUUID()
+      const requestedProjectDir = '-tmp-cron-notification-manual-mismatch'
+      const reportedProjectDir = '-tmp-cron-notification-manual-reported'
+      await createTranscript(requestedProjectDir, requestedSessionId)
+      await createTranscript(reportedProjectDir, reportedSessionId)
+
+      const cliPath = await writeFakeCli('manual-mismatch-sidecar', [
+        emit(initRecord(reportedSessionId, { uuid: 'init-mismatch' })),
+        emit(
+          notificationRecord('notification-mismatch', {
+            taskId: 'mismatch-task',
+            toolUseId: 'toolu_mismatch',
+          }),
+        ),
+        emit(resultRecord('mismatch answer')),
+      ])
+      const { cronService, scheduler } = await launchSchedulerWithCli(cliPath)
+      const realSessionService = (scheduler as unknown as {
+        sessionService: SessionService
+      }).sessionService
+      spyOn(realSessionService, 'createSession').mockResolvedValue({
+        sessionId: requestedSessionId,
+      } as never)
+      spyOn(realSessionService, 'deleteSessionFile').mockResolvedValue(undefined)
+      spyOn(realSessionService, 'appendSessionMetadata').mockResolvedValue(undefined)
+      const task = await cronService.createTask({
+        cron: '* * * * *',
+        prompt: 'manual mismatch test',
+        name: 'Manual Mismatch Task',
+        recurring: true,
+        folderPath: tmpDir,
+      })
+
+      const run = await scheduler.executeTask(task, { createSession: true })
+
+      expect(run.status).toBe('failed')
+      expect(run.error).toContain('instead of the requested')
+      expect(await readPersistedNotifications(requestedProjectDir, requestedSessionId))
+        .toHaveLength(0)
+      expect(await readPersistedNotifications(reportedProjectDir, reportedSessionId))
+        .toHaveLength(0)
+    },
+  )
+
+  // ─── Session attribution across the root init / root result ─────────────────
+  //
+  // The CLI stamps every message it emits with the id of the session that
+  // produced it, so a terminal notification may only be written once the run's
+  // own root session is known and agrees with it. These cases drive that
+  // boundary through a real child process and the real JSONL writer.
+
+  unixOnly(
+    'refuses a notification naming a session other than the root init session, root-owned and child-owned alike',
+    async () => {
+      const rootSessionId = crypto.randomUUID()
+      const foreignSessionId = crypto.randomUUID()
+      const rootProjectDir = '-tmp-cron-notification-foreign-root'
+      const foreignProjectDir = '-tmp-cron-notification-foreign-target'
+      await createTranscript(rootProjectDir, rootSessionId)
+      await createTranscript(foreignProjectDir, foreignSessionId)
+
+      const cliPath = await writeFakeCli('foreign-session-sidecar', [
+        emit(initRecord(rootSessionId)),
+        emit(
+          notificationRecord('notification-foreign-root', {
+            taskId: 'foreign-root-task',
+            toolUseId: 'toolu_foreign_root',
+            sessionId: foreignSessionId,
+          }),
+        ),
+        // Ownership makes no difference: a child-owned terminal claiming a
+        // foreign session is refused exactly the same way.
+        emit(
+          notificationRecord('notification-foreign-child', {
+            taskId: 'foreign-child-task',
+            toolUseId: 'Agent:0',
+            sessionId: foreignSessionId,
+            ownerAgentId: 'child-a',
+            parentToolUseId: 'toolu_agent_parent',
+          }),
+        ),
+        emit(resultRecord('foreign answer')),
+      ])
+      const run = await executeFakeCli(cliPath, 'Foreign Session Task')
+
+      expect(run.status).toBe('failed')
+      expect(run.error).toContain('instead of the run session')
+      expect(await readPersistedNotifications(rootProjectDir, rootSessionId))
+        .toHaveLength(0)
+      // The named session is not a fallback home either.
+      expect(await readPersistedNotifications(foreignProjectDir, foreignSessionId))
+        .toHaveLength(0)
+    },
+  )
+
+  unixOnly(
+    'fails a run whose notification reports an unusable session id instead of writing it anywhere',
+    async () => {
+      const rootSessionId = crypto.randomUUID()
+      const projectDir = '-tmp-cron-notification-unusable-claim'
+      await createTranscript(projectDir, rootSessionId)
+
+      const cliPath = await writeFakeCli('unusable-claim-sidecar', [
+        emit(initRecord(rootSessionId)),
+        emit(
+          notificationRecord('notification-unusable', {
+            taskId: 'unusable-task',
+            toolUseId: 'toolu_unusable',
+            sessionId: 'not-a-session-id',
+          }),
+        ),
+        emit(resultRecord('unusable answer')),
+      ])
+      const run = await executeFakeCli(cliPath, 'Unusable Claim Task')
+
+      expect(run.status).toBe('failed')
+      expect(run.error).toContain('unusable session id')
+      expect(await readPersistedNotifications(projectDir, rootSessionId))
+        .toHaveLength(0)
+    },
+  )
+
+  unixOnly(
+    'never lets a child init or child result define the run session',
+    async () => {
+      const rootSessionId = crypto.randomUUID()
+      const childInitSessionId = crypto.randomUUID()
+      const childResultSessionId = crypto.randomUUID()
+      const rootProjectDir = '-tmp-cron-notification-child-attribution'
+      const childInitProjectDir = '-tmp-cron-notification-child-init'
+      const childResultProjectDir = '-tmp-cron-notification-child-result'
+      await createTranscript(rootProjectDir, rootSessionId)
+      await createTranscript(childInitProjectDir, childInitSessionId)
+      await createTranscript(childResultProjectDir, childResultSessionId)
+
+      const cliPath = await writeFakeCli('child-attribution-sidecar', [
+        emit(initRecord(rootSessionId)),
+        // A child init and a child result name sessions of their own; neither
+        // may become — or contradict — the run's session.
+        emit(
+          initRecord(childInitSessionId, {
+            uuid: 'init-child',
+            parent_tool_use_id: 'toolu_agent_parent',
+          }),
+        ),
+        emit(
+          resultRecord('child result', {
+            session_id: childResultSessionId,
+            parent_tool_use_id: 'toolu_agent_parent',
+          }),
+        ),
+        emit(
+          notificationRecord('notification-root-owned', {
+            taskId: 'root-owned-task',
+            toolUseId: 'toolu_root_owned',
+            sessionId: rootSessionId,
+          }),
+        ),
+        emit(resultRecord('child attribution answer')),
+      ])
+      const run = await executeFakeCli(cliPath, 'Child Attribution Task')
+
+      expect(run.status).toBe('completed')
+      const persisted = await readPersistedNotifications(rootProjectDir, rootSessionId)
+      expect(persisted.map((entry) => entry.notification.taskId))
+        .toEqual(['root-owned-task'])
+      expect(await readPersistedNotifications(childInitProjectDir, childInitSessionId))
+        .toHaveLength(0)
+      expect(await readPersistedNotifications(childResultProjectDir, childResultSessionId))
+        .toHaveLength(0)
+    },
+  )
+
+  unixOnly(
+    'holds a terminal state until the root confirms its session, and fails rather than guessing',
+    async () => {
+      // No root message ever names a session, so the claim is all the stream
+      // offers. That is not enough to write to: the run fails and neither the
+      // claimed session nor the child's own session is touched.
+      const claimedSessionId = crypto.randomUUID()
+      const childSessionId = crypto.randomUUID()
+      const claimedProjectDir = '-tmp-cron-notification-unconfirmed'
+      const childProjectDir = '-tmp-cron-notification-unconfirmed-child'
+      await createTranscript(claimedProjectDir, claimedSessionId)
+      await createTranscript(childProjectDir, childSessionId)
+
+      const cliPath = await writeFakeCli('unconfirmed-session-sidecar', [
+        emit(
+          initRecord(childSessionId, {
+            uuid: 'init-child-only',
+            parent_tool_use_id: 'toolu_agent_parent',
+          }),
+        ),
+        emit(
+          notificationRecord('notification-unconfirmed', {
+            taskId: 'unconfirmed-task',
+            toolUseId: 'toolu_unconfirmed',
+            sessionId: claimedSessionId,
+          }),
+        ),
+      ])
+      const run = await executeFakeCli(cliPath, 'Unconfirmed Session Task')
+
+      expect(run.status).toBe('failed')
+      expect(run.error).toContain(
+        'could not attribute the task notification for unconfirmed-task',
+      )
+      expect(await readPersistedNotifications(claimedProjectDir, claimedSessionId))
+        .toHaveLength(0)
+      expect(await readPersistedNotifications(childProjectDir, childSessionId))
+        .toHaveLength(0)
+    },
+  )
+
+  unixOnly(
+    'learns the run session from the root result when the stream carries no init, before and after that result',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDir = '-tmp-cron-notification-result-only'
+      await createTranscript(projectDir, sessionId)
+
+      const cliPath = await writeFakeCli('result-only-sidecar', [
+        // Seen before the run knows its session: held until the root result
+        // confirms the session it claims.
+        emit(
+          notificationRecord('notification-before-result', {
+            taskId: 'before-result-task',
+            toolUseId: 'toolu_before_result',
+            sessionId,
+          }),
+        ),
+        emit(resultRecord('result-only answer', { session_id: sessionId })),
+        // The result ends the turn, not the stream.
+        emit(
+          notificationRecord('notification-after-result', {
+            taskId: 'after-result-task',
+            toolUseId: 'toolu_after_result',
+          }),
+        ),
+      ])
+      const run = await executeFakeCli(cliPath, 'Result Only Task')
+
+      expect(run.status).toBe('completed')
+      expect(run.output).toBe('result-only answer')
+      const persisted = await readPersistedNotifications(projectDir, sessionId)
+      expect(persisted).toHaveLength(2)
+      expect(persisted.map((entry) => entry.notification.taskId))
+        .toEqual(
+          expect.arrayContaining(['before-result-task', 'after-result-task']),
+        )
+    },
+  )
+
+  unixOnly(
+    'fails a manual run immediately when the root result reports a different session id',
+    async () => {
+      const requestedSessionId = crypto.randomUUID()
+      const reportedSessionId = crypto.randomUUID()
+      const requestedProjectDir = '-tmp-cron-notification-manual-result-mismatch'
+      const reportedProjectDir = '-tmp-cron-notification-manual-result-reported'
+      await createTranscript(requestedProjectDir, requestedSessionId)
+      await createTranscript(reportedProjectDir, reportedSessionId)
+
+      const cliPath = await writeFakeCli('manual-result-mismatch-sidecar', [
+        // The init agrees with the requested session; the result does not.
+        emit(initRecord(requestedSessionId)),
+        emit(
+          resultRecord('mismatch answer', { session_id: reportedSessionId }),
+        ),
+        // A terminal state observed after the contradiction is not accepted:
+        // the stream is no longer trusted for attribution.
+        emit(
+          notificationRecord('notification-after-refutation', {
+            taskId: 'after-refutation-task',
+            toolUseId: 'toolu_after_refutation',
+          }),
+        ),
+      ])
+      const { cronService, scheduler } = await launchSchedulerWithCli(cliPath)
+      const realSessionService = (
+        scheduler as unknown as { sessionService: SessionService }
+      ).sessionService
+      spyOn(realSessionService, 'createSession').mockResolvedValue({
+        sessionId: requestedSessionId,
+      } as never)
+      spyOn(realSessionService, 'deleteSessionFile').mockResolvedValue(undefined)
+      spyOn(realSessionService, 'appendSessionMetadata').mockResolvedValue(undefined)
+      const task = await cronService.createTask({
+        cron: '* * * * *',
+        prompt: 'manual result mismatch test',
+        name: 'Manual Result Mismatch Task',
+        recurring: true,
+        folderPath: tmpDir,
+      })
+
+      const run = await scheduler.executeTask(task, { createSession: true })
+
+      expect(run.status).toBe('failed')
+      expect(run.error).toContain('instead of the requested')
+      expect(await readPersistedNotifications(requestedProjectDir, requestedSessionId))
+        .toHaveLength(0)
+      expect(await readPersistedNotifications(reportedProjectDir, reportedSessionId))
+        .toHaveLength(0)
+    },
+  )
+
+  // ─── Terminal identity: task id plus owner and leaf tool id ────────────────
+
+  unixOnly(
+    'keeps one entry per task when several tasks report through one shared tool id',
+    async () => {
+      // A single Agent tool call can spawn several tasks that all report the
+      // same leaf tool id. Each is its own terminal, so none of them may be
+      // swallowed as a duplicate of the other.
+      const sessionId = crypto.randomUUID()
+      const projectDir = '-tmp-cron-notification-shared-tool'
+      await createTranscript(projectDir, sessionId)
+
+      const cliPath = await writeFakeCli('shared-tool-sidecar', [
+        emit(initRecord(sessionId)),
+        emit(
+          notificationRecord('notification-shared-1', {
+            taskId: 'shared-task-1',
+            toolUseId: 'toolu_shared_parent_call',
+            outputFile: '/tmp/tasks/shared-1.output',
+          }),
+        ),
+        emit(
+          notificationRecord('notification-shared-2', {
+            taskId: 'shared-task-2',
+            toolUseId: 'toolu_shared_parent_call',
+            outputFile: '/tmp/tasks/shared-2.output',
+          }),
+        ),
+        emit(resultRecord('shared tool answer')),
+      ])
+      const run = await executeFakeCli(cliPath, 'Shared Tool Task')
+
+      expect(run.status).toBe('completed')
+      const persisted = await readPersistedNotifications(projectDir, sessionId)
+      expect(persisted).toHaveLength(2)
+      expect(persisted.map((entry) => entry.notification.taskId))
+        .toEqual(
+          expect.arrayContaining(['shared-task-1', 'shared-task-2']),
+        )
+    },
+  )
+
+  unixOnly(
+    'fails a run when one task is re-reported with a conflicting output file',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDir = '-tmp-cron-notification-conflicting-payload'
+      await createTranscript(projectDir, sessionId)
+
+      const cliPath = await writeFakeCli('conflicting-payload-sidecar', [
+        emit(initRecord(sessionId)),
+        emit(
+          notificationRecord('notification-conflict-a', {
+            taskId: 'conflict-task',
+            toolUseId: 'toolu_conflict',
+            outputFile: '/tmp/tasks/conflict-first.output',
+          }),
+        ),
+        // Same task, same owner, same leaf tool id and same status, but a
+        // different output file: the transcript must not silently keep one and
+        // drop the other.
+        emit(
+          notificationRecord('notification-conflict-b', {
+            taskId: 'conflict-task',
+            toolUseId: 'toolu_conflict',
+            outputFile: '/tmp/tasks/conflict-second.output',
+          }),
+        ),
+        emit(resultRecord('conflict answer')),
+      ])
+      const run = await executeFakeCli(cliPath, 'Conflicting Payload Task')
+
+      expect(run.status).toBe('failed')
+      expect(run.error).toContain('terminal data for conflict-task conflicts')
+      const persisted = await readPersistedNotifications(projectDir, sessionId)
+      expect(persisted.map((entry) => entry.notification.outputFile))
+        .toEqual(['/tmp/tasks/conflict-first.output'])
+    },
+  )
+
+  // ─── Drain timeout: sealing the stream instead of dropping its tail ─────────
+  //
+  // A descendant that inherits stdout keeps the pipe open past the drain window.
+  // The run must then stop accepting events and still persist a complete record
+  // it had already read, instead of finishing without it — and it must await
+  // that append, whatever the append's outcome is.
+
+  unixOnly(
+    'persists a complete record the drain window cut off and awaits its slow append',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDirName = '-tmp-cron-notification-drain-slow'
+      await createTranscript(projectDirName, sessionId)
+
+      const cliPath = await writeFakeCliWithInheritedStdout('drain-slow-sidecar', [
+        emit(initRecord(sessionId, { uuid: 'init-drain-slow' })),
+        emit(resultRecord('drain answer')),
+        // The final record has no trailing newline, so it is still held in the
+        // reader when the drain window runs out.
+        emitWithoutNewline(
+          notificationRecord('notification-drain-slow', {
+            taskId: 'drain-slow-task',
+            toolUseId: 'toolu_drain_slow',
+          }),
+        ),
+      ])
+
+      // An append that takes ~300 ms: the run must not report its terminal
+      // record before the handed-over notification reached the transcript.
+      const realOpen = fs.open
+      spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await realOpen(...args)
+        if (typeof args[1] !== 'number' || (args[1] & constants.O_APPEND) === 0) return handle
+        const realWriteFile = handle.writeFile.bind(handle)
+        spyOn(handle, 'writeFile').mockImplementation(async (...writeArgs) => {
+          await Bun.sleep(300)
+          return realWriteFile(...writeArgs as Parameters<typeof realWriteFile>)
+        })
+        return handle
+      })
+
+      const startedAt = Date.now()
+      const run = await executeFakeCli(cliPath, 'Drain Slow Task')
+      const elapsed = Date.now() - startedAt
+
+      expect(run.status).toBe('completed')
+      expect(run.output).toBe('drain answer')
+      const persisted = await readPersistedNotifications(projectDirName, sessionId)
+      expect(persisted.map((entry) => entry.notification)).toEqual([
+        expect.objectContaining({
+          taskId: 'drain-slow-task',
+          toolUseId: 'toolu_drain_slow',
+          status: 'completed',
+        }),
+      ])
+      // The drain window and the append it handed over stayed bounded.
+      expect(elapsed).toBeLessThan(2_500)
+    },
+  )
+
+  unixOnly(
+    'fails the run when the record the drain window handed over cannot be persisted',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDirName = '-tmp-cron-notification-drain-reject'
+      await createTranscript(projectDirName, sessionId)
+
+      const cliPath = await writeFakeCliWithInheritedStdout('drain-reject-sidecar', [
+        emit(initRecord(sessionId, { uuid: 'init-drain-reject' })),
+        emit(resultRecord('drain reject answer')),
+        emitWithoutNewline(
+          notificationRecord('notification-drain-reject', {
+            taskId: 'drain-reject-task',
+            toolUseId: 'toolu_drain_reject',
+          }),
+        ),
+      ])
+      const realOpen = fs.open
+      spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await realOpen(...args)
+        if (typeof args[1] !== 'number' || (args[1] & constants.O_APPEND) === 0) return handle
+        spyOn(handle, 'writeFile').mockImplementation(() =>
+          Promise.reject(new Error('notification disk full')),
+        )
+        return handle
+      })
+
+      const run = await executeFakeCli(cliPath, 'Drain Reject Task')
+
+      // A terminal state that never reached the transcript is a failed run, not
+      // a silent success.
+      expect(run.status).toBe('failed')
+      expect(run.error).toContain('Failed to persist scheduled task notification')
+      expect(run.error).toContain('drain-reject-task')
+      expect(await readPersistedNotifications(projectDirName, sessionId)).toHaveLength(0)
+    },
+  )
+
+  unixOnly(
+    'accepts no event from the stream after the drain window sealed it',
+    async () => {
+      const sessionId = crypto.randomUUID()
+      const projectDirName = '-tmp-cron-notification-drain-late'
+      await createTranscript(projectDirName, sessionId)
+
+      // A descendant writes one more terminal state about a second after the run
+      // loop is gone. The run already settled by then, so that event must not be
+      // persisted: nothing may be written once the run stopped accepting events.
+      const lateNotification = notificationRecord('notification-drain-late', {
+        taskId: 'drain-late-task',
+        toolUseId: 'toolu_drain_late',
+        sessionId,
+      })
+      const cliPath = await writeFakeCliWithInheritedStdout(
+        'drain-late-sidecar',
+        [
+          emit(initRecord(sessionId, { uuid: 'init-drain-late' })),
+          emit(resultRecord('drain late answer')),
+        ],
+        [
+          `( sleep 1.5; printf '%s\\n' '${JSON.stringify(lateNotification).replace(/'/g, "'\\''")}' ) &`,
+        ],
+      )
+
+      const run = await executeFakeCli(cliPath, 'Drain Late Task')
+      expect(run.status).toBe('completed')
+
+      // Far enough past the descendant's write for it to have landed had the
+      // stream still been accepted.
+      await Bun.sleep(1_200)
+      expect(await readPersistedNotifications(projectDirName, sessionId)).toHaveLength(0)
+    },
+  )
 })
