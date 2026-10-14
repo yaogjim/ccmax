@@ -1,0 +1,75 @@
+# 构建上下文白名单。
+#
+# 默认排除一切，只显式放行构建产品镜像所必需的路径。这样任何真实运行数据
+# ——providers、会话配置、浏览器登录态、.env、本地缓存、密钥文件——都无法
+# 进入构建上下文，即使它们恰好位于仓库目录中。
+#
+# Docker 的匹配语义（两段都要用对）：
+#   1. `*` 只匹配单个路径段，不跨 `/`；`**` 匹配零个或多个路径段（含零个）。
+#      因此 `!src/` 会重新放行 `src/` 及其全部子项。
+#   2. 逐条按顺序匹配，最后命中的规则生效。因此「全层级私有状态排除」必须写在
+#      「显式放行」之后，才能把被 `!src/`、`!desktop/` 顺带放行的嵌套私有文件
+#      （例如 `src/.env`、`adapters/.../providers/*.json`）重新排掉。
+# 结论：目录级白名单本身无法保证嵌套排除，必须补齐下面整段 `**/` 排除规则。
+
+# ── 仓库根：仅构建元数据、源码与入口脚本 ──
+*
+!package.json
+!bun.lock
+!bunfig.toml
+!tsconfig.json
+!preload.ts
+!bin/
+!src/
+!stubs/
+!runtime/
+!adapters/
+!deploy/
+!desktop/
+# H5 设置页直接导入这一公开图片；精确放行，不扩大到整个 docs/。
+!docs/images/sponsors/aruhub-logo.png
+
+# ── 全层级私有状态与工具链排除（必须在放行之后）──
+# node_modules 一律在镜像内用冻结锁文件重新安装；桌面端构建产物一律由
+# web-build 阶段生成，不使用工作区里的既有产物。
+**/node_modules
+**/.git/
+**/.DS_Store
+desktop/dist
+desktop/electron-dist
+desktop/build-artifacts
+desktop/package-lock.json
+desktop/src-tauri/target
+desktop/src-tauri/gen
+desktop/src-tauri/binaries
+desktop/src-tauri/icons
+desktop/brand-assets
+
+# ── 环境密钥文件：全层级排除，且不提供任何重新放行规则 ──
+**/.env
+**/.env.*
+**/*.env
+**/credentials*.json
+**/secrets*.json
+**/*.secret
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/id_ed25519*
+**/.netrc
+**/.npmrc
+
+# ── 本机运行期状态：会话、provider 凭据、浏览器登录态、本地缓存 ──
+**/.claude/
+**/.ccmax/
+**/.agent-browser/
+**/.cursor/
+**/providers/
+**/provider-config/
+**/sessionconfig/
+**/sessions/
+**/browserstates/
+**/transcripts/
+**/*.local

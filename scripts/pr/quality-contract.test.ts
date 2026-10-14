@@ -111,6 +111,28 @@ describe('feature quality contract', () => {
     expect(rootContributing).toContain('不再自动运行本地质量门禁')
   })
 
+  test('keeps the deploy contracts wired into the policy lane', () => {
+    // `deploy/` selects the policy lane and nothing else, and the deploy contracts
+    // only run because `check:policy` chains `check:deploy`. Dropping the chain, the
+    // shell syntax gate, or the `deploy/` prefix would let deploy-only diffs pass
+    // with zero checks, so all three are asserted here.
+    const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as {
+      scripts?: Record<string, string>
+    }
+    const deploy = packageJson.scripts?.['check:deploy'] ?? ''
+
+    expect(deploy).toContain('for file in ')
+    expect(deploy).toContain('do bash -n "$file" || exit 1; done')
+    expect(deploy).toContain('deploy/build.sh')
+    expect(deploy).toContain('deploy/export.sh')
+    expect(deploy).toContain('deploy/image-smoke.sh')
+    expect(deploy).toContain('deploy/service.sh')
+    expect(deploy).toContain('deploy/scripts/common.sh')
+    expect(deploy).toContain('bun test ./deploy/image.test.ts ./deploy/service.test.ts')
+    expect(packageJson.scripts?.['check:policy']).toContain('bun run check:deploy')
+    expect(readFileSync('scripts/pr/change-policy.ts', 'utf8')).toContain("'deploy/'")
+  })
+
   test('keeps desktop native CI aligned with Electron packaging', () => {
     const prQuality = readFileSync('.github/workflows/pr-quality.yml', 'utf8')
     const buildSidecars = readFileSync('desktop/scripts/build-sidecars.ts', 'utf8')

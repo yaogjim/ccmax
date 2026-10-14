@@ -164,6 +164,15 @@ const persistencePrefixes = [
 
 const policyPrefixes = [
   '.github/workflows/',
+  // `deploy/` is the container build/export/service tooling: the Dockerfile,
+  // `Dockerfile.dockerignore`, and the shell scripts `check:deploy` runs through
+  // `bash -n` and `deploy/*.test.ts`. None of those is reachable from the import
+  // graph (`GRAPH_SOURCE_ROOTS` has no `deploy` root) and none is executable
+  // `src/`/`adapters/`/`scripts/` source, so prefix routing is the only thing that
+  // can select a lane here — before this prefix a `deploy/Dockerfile` change
+  // selected zero checks and the deploy contracts silently stopped running. Like
+  // `scripts/`, deploy is repository tooling and claims no product area.
+  'deploy/',
   // `scripts/pr/dead-imports.ts` owns these three source roots — every root no
   // compiler checks for unreferenced imports. The lane is selected by prefix, and
   // that check reads its files rather than importing them, so the import graph

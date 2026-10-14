@@ -199,6 +199,49 @@ describe('evaluateChangePolicy', () => {
     expect(evaluateChangePolicy(['desktop/src/pages/Settings.tsx']).checks.policy).toBe(false)
   })
 
+  test('routes deployment tooling to the policy lane', () => {
+    // `deploy/` holds the container Dockerfile, `Dockerfile.dockerignore`, and the
+    // build/export/service shell tooling whose contracts are `deploy/*.test.ts`. The
+    // tests run inside `check:policy` through `check:deploy`, but none of these paths
+    // is reachable from the import graph (`GRAPH_SOURCE_ROOTS` has no `deploy` root)
+    // and none is executable `src/`/`adapters/`/`scripts/` source, so prefix routing
+    // is the only thing that can select a lane: before `deploy/` was a policy prefix
+    // a deploy-only diff selected zero checks and the deploy contracts never ran.
+    const deployPaths = [
+      'deploy/Dockerfile',
+      'deploy/Dockerfile.dockerignore',
+      'deploy/build.sh',
+      'deploy/export.sh',
+      'deploy/image-smoke.sh',
+      'deploy/service.sh',
+      'deploy/scripts/common.sh',
+      'deploy/image.test.ts',
+      'deploy/service.test.ts',
+      // The optional product file `export.sh` extracts from the image; deploy ships it.
+      'deploy/README.md',
+    ]
+
+    for (const path of deployPaths) {
+      expect({ path, policy: evaluateChangePolicy([path]).checks.policy }).toEqual({
+        path,
+        policy: true,
+      })
+    }
+
+    // Additive only: deploy tooling claims no product area and pulls in no surface
+    // lane, so it needs neither a missing-test override nor a coverage run.
+    const result = evaluateChangePolicy(['deploy/Dockerfile', 'deploy/service.sh'])
+    expect(result.areas).toEqual([])
+    expect(result.checks.desktop).toBe(false)
+    expect(result.checks.desktopNative).toBe(false)
+    expect(result.checks.server).toBe(false)
+    expect(result.checks.adapters).toBe(false)
+    expect(result.checks.docs).toBe(false)
+    expect(result.checks.coverage).toBe(false)
+    expect(result.missingTestSignals).toEqual([])
+    expect(result.blocked).toBe(false)
+  })
+
   test('keeps quality ownership and contributor contracts on the policy lane', () => {
     const result = evaluateChangePolicy([
       '.github/CODEOWNERS',
