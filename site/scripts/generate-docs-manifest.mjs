@@ -19,7 +19,7 @@ export const paths = {
   siteDir
 }
 
-/** docs/agents/ 是内部项目材料（适配声明、上游移除记录），不随站点发布。 */
+/** docs/agents/ 是内部项目材料（上游移除记录），不随站点发布。 */
 const excludedDirectoryNames = new Set(['agents', 'superpowers', 'ui-clone', 'public', 'images'])
 const excludedFiles = new Set(['AGENTS.md'])
 

@@ -651,7 +651,7 @@ describe('deploy/Dockerfile.dockerignore 白名单', () => {
     expect(existsSync(path.join(REPO_ROOT, asset))).toBe(true)
     expect(isExcluded(asset, rules)).toBe(false)
     for (const denied of [
-      'docs/agents/project.md',
+      'docs/agents/upstream-removals.md',
       'docs/images/private.png',
       'docs/images/sponsors/other.png',
       'docs/images/sponsors/.env',

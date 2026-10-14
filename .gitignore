@@ -77,12 +77,9 @@ runtime/__pycache__
 .opencode/
 graphify-out/
 
-# CLAUDE.md is the committed project entrypoint, not a local artifact.
 CLAUDE.md
-!CLAUDE.md
 
 .learnings/
-task/todo.md
 .cursor/
 .history/
 .specstory

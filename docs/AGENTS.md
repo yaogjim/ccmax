@@ -11,7 +11,7 @@ Two audiences, nothing else. If a page serves neither, it does not belong here.
 
 Internal process artefacts (migration task lists, validation checklists, design proposals, release runbooks) are not documentation. Keep them out of `docs/`, or fold the durable part into `internals/contributing.md`.
 
-`docs/agents/` is the one deliberate exception: it holds the project's agent-instruction adaptation (`project.md`) and the upstream removal record (`upstream-removals.md`). It stays in the repository but is never published — keep `agents` in the generator's `excludedDirectoryNames`.
+`docs/agents/` 是唯一例外：保留上游内容移除记录（`upstream-removals.md`）。它留在仓库中但不对外发布；生成器的 `excludedDirectoryNames` 必须保留 `agents`。
 
 ## Structure
 
