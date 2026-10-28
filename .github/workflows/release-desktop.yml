@@ -259,7 +259,7 @@ jobs:
             -addext "basicConstraints=critical,CA:false" \
             -addext "keyUsage=critical,digitalSignature" \
             -addext "extendedKeyUsage=critical,codeSigning"
-          openssl pkcs12 -export \
+          openssl pkcs12 -export -legacy \
             -out "$work_dir/cert.p12" \
             -inkey "$work_dir/key.pem" \
             -in "$work_dir/cert.pem" \
@@ -274,6 +274,7 @@ jobs:
             -s \
             -k "$keychain_password" \
             "$keychain_path"
+          security add-trusted-cert -r trustRoot -p codeSign -k "$keychain_path" "$work_dir/cert.pem"
           security list-keychains -d user -s "$keychain_path" $(security list-keychains -d user | tr -d '"')
           identity="$(
             security find-identity -v -p codesigning "$keychain_path" \
