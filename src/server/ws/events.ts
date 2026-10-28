@@ -146,7 +146,7 @@ export type ServerMessage =
   | { type: 'background_task_stop_failed'; taskId: string; message: string }
   | { type: 'system_notification'; subtype: string; message?: string; data?: unknown }
   | { type: 'pong' }
-  | { type: 'team_update'; teamName: string; members: TeamMemberStatus[]; incarnationId?: string; leadSessionId?: string; createdAt?: number }
+  | { type: 'team_update'; teamName: string; members: TeamMemberStatus[]; incarnationId?: string; leadSessionId?: string; createdAt?: number; stopEpoch?: number }
   | { type: 'team_plan_updated'; teamName: string; sessionId: string; planId: string; incarnationId: string; revision: number; state: string }
   | { type: 'team_created'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'team_workbench_updated'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
@@ -204,6 +204,16 @@ export type TeamMemberStatus = {
    * full team read established rather than being told the member went quiet.
    */
   activity?: 'active' | 'idle' | 'exited' | 'stopped' | 'unknown'
+  /**
+   * Approved, waiting for its first ready task: instructions held, no process.
+   * Always sent by the live roster, absent from older server payloads.
+   */
+  awaitingDependencies?: boolean
+  /**
+   * Approved but never started: its first start is a new conversation, not a
+   * resume, and it must not be shown as a stopped member.
+   */
+  initialStartPending?: boolean
   currentTask?: string
   /**
    * Why the member's last turn failed; `null` says it has recovered. Only the

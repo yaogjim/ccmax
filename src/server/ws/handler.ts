@@ -1110,10 +1110,15 @@ async function handleUserMessage(
 
     bindAllClientSessionOutputs(sessionId, {
       shouldForward: (cliMsg) => {
+        // Keep pre-turn foreground chatter muted until this turn is enqueued.
+        // A background task's terminal state is not that chatter: it closes a
+        // card the previous turn opened, and letting the mute window drop it
+        // also skips persistence, so history would lose the outcome.
         if (
           userMessageSent ||
           (cliMsg.type === 'result' && cliMsg.is_error) ||
-          isAgentRunMessageFrame(cliMsg)
+          isAgentRunMessageFrame(cliMsg) ||
+          isBackgroundTaskTerminalFrame(cliMsg)
         ) {
           return true
         }
@@ -5082,6 +5087,21 @@ function hasStoppedTurnBoundary(sessionId: string): boolean {
 
 function isAgentRunMessageFrame(cliMsg: any): boolean {
   return cliMsg?.type === 'system' && cliMsg.subtype === 'agent_run_message'
+}
+
+/**
+ * A background task that started before this turn reaches its terminal state.
+ * The lifecycle is per task id, not per foreground generation, so the frame is
+ * a legal terminal for an Activity card this turn did not open. Only terminal
+ * statuses qualify: running/progress frames belong to whichever turn owns the
+ * task and must stay muted while this turn's send is unacknowledged.
+ */
+function isBackgroundTaskTerminalFrame(cliMsg: any): boolean {
+  if (cliMsg?.type !== 'system' || cliMsg.subtype !== 'task_notification') return false
+  return cliMsg.status === 'completed' ||
+    cliMsg.status === 'failed' ||
+    cliMsg.status === 'stopped' ||
+    cliMsg.status === 'killed'
 }
 
 function isAgentScopedPermissionRequest(cliMsg: any): boolean {

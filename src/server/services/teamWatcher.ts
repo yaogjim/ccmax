@@ -233,6 +233,9 @@ export class TeamWatcher {
             type: 'team_update',
             teamName,
             members: allMembers,
+            // Sent only when recorded: a team from before Stop was counted must
+            // not look like one whose last Stop was epoch zero.
+            ...(typeof config.stopEpoch === 'number' ? { stopEpoch: config.stopEpoch } : {}),
             ...currentIdentity,
           }, leadSessionId)
         } catch {
@@ -400,6 +403,11 @@ export class TeamWatcher {
         // Always present so a recovered member clears what the last read set.
         lastError: failure.lastError ?? null,
         autoRetry: failure.autoRetry ?? null,
+        // An approved member with no ready task owns no process and its
+        // instructions are held; a member that never ran is not a stopped one.
+        // Explicit booleans so a cleared wait also reaches the desktop.
+        awaitingDependencies: m.awaitingDependencies === true,
+        initialStartPending: m.initialStartPending === true,
       }
     })
   }

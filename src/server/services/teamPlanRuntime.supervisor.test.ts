@@ -57,20 +57,24 @@ async function startHarness(memberNames: string[], options: {
   tasks?: Array<{ id: string; subject: string; ownerId: string; dependencies: string[] }>
   /** Members expected to get their instructions at launch (default: all). */
   instructedAtLaunch?: string[]
+  beforeLaunch?: (teamName: string) => void
 } = {}) {
   const { conversationService: service } = await import('./conversationService.js')
   const { ProviderService } = await import('./providerService.js')
   const { launchTeamPlanRuntime } = await import('./teamPlanRuntime.js')
   const { writeTeamFileAsync, getTeamDir } = await import('../../utils/swarm/teamHelpers.js')
   const { beginTaskListLifecycle, withTaskListLifecycleLock, getCanonicalTeamTaskListId } = await import('../../utils/tasks.js')
-  const requests: Array<{ resumed: string | null; prompt: string }> = []
+  const requests: Array<{ resumed: string | null; prompt: string; presetType?: string }> = []
   const replies: string[] = []
   let held: Promise<void> | undefined
   const upstream = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
-    const body = await request.json() as { resumed?: string | null; prompt?: unknown }
-    requests.push({ resumed: body.resumed ?? null, prompt: JSON.stringify(body.prompt ?? '') })
+    const body = await request.json() as { resumed?: string | null; prompt?: unknown; presetType?: string }
+    requests.push({ resumed: body.resumed ?? null, prompt: JSON.stringify(body.prompt ?? ''), presetType: body.presetType })
     await held
-    return new Response(replies.shift() ?? 'fixture result')
+    // Scripted failures belong to member work, not the independently queued
+    // launch/update notifications sent to the lead. Otherwise scheduling can
+    // consume the failure on the lead and leave the intended member successful.
+    return new Response(body.presetType === 'leader' ? 'fixture result' : replies.shift() ?? 'fixture result')
   } })
   const bridge = Bun.serve<{ id: string }>({ hostname: '127.0.0.1', port: 0,
     fetch(request, server) {
@@ -97,6 +101,7 @@ async function startHarness(memberNames: string[], options: {
   const planId = crypto.randomUUID()
   const plan = { schemaVersion: 1, planId, sessionId: parentId, teamName, incarnationId: createHash('sha256').update(JSON.stringify([teamName, parentId, createdAt])).digest('hex'), revision: 2, state: 'launching', workDir: home, members, tasks, leaderRuntime: members[0]!.runtime, createdAt, updatedAt: createdAt, approvedSnapshot: { revision: 1, members, tasks, leaderRuntime: members[0]!.runtime, approvedAt: Date.now(), requestId: 'approve' } } as any
   await writeFile(join(getTeamDir(teamName), 'plan.json'), JSON.stringify(plan))
+  options.beforeLaunch?.(teamName)
   const { memberIds } = await launchTeamPlanRuntime(plan)
   // The service records the running state the way TeamPlanService does after launch.
   await writeFile(join(getTeamDir(teamName), 'plan.json'), JSON.stringify({ ...plan, state: 'running', revision: 3, launch: { status: 'running', memberIds } }))
@@ -109,6 +114,7 @@ async function startHarness(memberNames: string[], options: {
   await waitFor(() => instructed.every(name => requests.some(request => request.prompt.includes(`Work as ${name}`))), 'initial member turns')
   return {
     service, teamName, parentId, planId, memberIds, requests, replies, waitFor,
+    upstreamUrl: upstream.url,
     /** Keeps model replies (and so member turns) pending until released. */
     holdReplies() {
       let release!: () => void
@@ -157,10 +163,224 @@ async function userMessagesLead(h: Harness, toLead: string[] = []) {
   return toLead
 }
 
-async function messageMember(h: Harness, to: string, from: string, text: string) {
+async function messageMember(h: Harness, to: string, from: string, text: string, id?: string) {
   const { writeToMailbox } = await import('../../utils/teammateMailbox.js')
-  await writeToMailbox(to, { from, text, timestamp: new Date().toISOString() }, h.teamName)
+  await writeToMailbox(to, {
+    ...(id ? { id } : {}),
+    from,
+    text,
+    timestamp: new Date().toISOString(),
+  }, h.teamName)
 }
+
+test.each(['review initialization', 'member registration', 'runtime stop'] as const)(
+  '%s preserves a mutation committed before it acquires the config lock',
+  async stage => {
+    const helpers = await import('../../utils/swarm/teamHelpers.js')
+    const locks = await import('../../utils/lockfile.js')
+    const realLock = locks.lock
+    const pausedAt = 1_790_000_012_345
+    const externalMember = {
+      agentId: 'external@fixture', name: 'external', agentType: 'research', joinedAt: 1,
+      tmuxPaneId: '', cwd: home, subscriptions: [], sessionId: 'external-session', backendType: 'process' as const,
+    }
+    let spy: ReturnType<typeof spyOn> | undefined
+    let intervened = false
+    const installBarrier = (teamName: string, targetAttempt: number) => {
+      let attempts = 0
+      spy = spyOn(locks, 'lock').mockImplementation(async (file, options) => {
+        if (file === join(helpers.getTeamDir(teamName), 'config.json') && !intervened && ++attempts === targetAttempt) {
+          // The runtime has reached its config-lock boundary. Commit a separate
+          // writer first; an out-of-lock snapshot must not overwrite its fields.
+          intervened = true
+          await helpers.mutateTeamFileAsync(teamName, team => ({
+            ...team, pausedAt, members: [...team.members, externalMember],
+          }))
+        }
+        return realLock(file, options)
+      })
+    }
+    let h: Harness | undefined
+    try {
+      h = await startHarness(['reader'], {
+        tasks: [], instructedAtLaunch: [],
+        ...(stage === 'runtime stop' ? {} : {
+          beforeLaunch: (teamName: string) => installBarrier(teamName, stage === 'review initialization' ? 1 : 2),
+        }),
+      })
+      if (stage === 'runtime stop') {
+        installBarrier(h.teamName, 1)
+        const runtime = await import('./teamPlanRuntime.js')
+        await runtime.stopTeamPlanRuntime(h.planId)
+      }
+      const current = helpers.readTeamFile(h.teamName)!
+      expect(intervened).toBe(true)
+      expect(current.pausedAt).toBe(pausedAt)
+      expect(current.members.find(member => member.sessionId === externalMember.sessionId)).toEqual(externalMember)
+      expect(current.reviewRequired).toBe(true)
+      expect(current.members.find(member => member.name === 'reader')).toMatchObject(
+        stage === 'runtime stop'
+          ? { sessionId: h.memberIds.reader, isActive: false, terminated: true }
+          : { sessionId: h.memberIds.reader, initialStartPending: true },
+      )
+    } finally {
+      spy?.mockRestore()
+      await h?.cleanup()
+    }
+  },
+  20_000,
+)
+
+test('a lead notification cannot consume a scripted member failure in the harness', async () => {
+  const h = await startHarness(['reader'])
+  try {
+    const failure = 'FIXTURE_ERROR:API Error: 401 synthetic member failure'
+    h.replies.push(failure)
+    const response = await fetch(h.upstreamUrl, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ presetType: 'leader', prompt: 'A late lead launch notification' }),
+    })
+    expect(await response.text()).toBe('fixture result')
+    expect(h.replies).toEqual([failure])
+  } finally {
+    await h.cleanup()
+  }
+}, 20_000)
+
+test('approved process registration assigns a stable consumer instance and publishes the fixed lead scope', async () => {
+  const { conversationService } = await import('./conversationService.js')
+  const control = spyOn(conversationService, 'requestControl')
+  let h: Harness | undefined
+  try {
+    h = await startHarness(['reader'])
+    const member = await h.teamMember('reader')
+    expect(member?.consumerInstanceId).toBeString()
+    expect(member?.consumerInstanceId?.length).toBeGreaterThan(0)
+    const request = control.mock.calls.find(([id, request]) => id === h!.parentId && request.subtype === 'team_runtime_snapshot')?.[1]
+    expect(request?.consumer_scope).toMatchObject({ version: 1, teamName: h.teamName, ownerSessionId: h.parentId, recipient: { kind: 'lead' } })
+    const { rehydrateTeamPlanRuntime, forgetTeamPlanRuntimesForTests } = await import('./teamPlanRuntime.js')
+    const { readTeamPlan } = await import('../../utils/swarm/teamPlanStore.js')
+    const plan = await readTeamPlan(h.teamName)
+    forgetTeamPlanRuntimesForTests()
+    expect(await rehydrateTeamPlanRuntime(plan!)).toBe(true)
+    expect((await h.teamMember('reader'))?.consumerInstanceId).toBe(member?.consumerInstanceId)
+  } finally {
+    control.mockRestore()
+    await h?.cleanup()
+  }
+}, 20_000)
+
+test('legacy process restoration requires its durable approved worker session and preserves unknown roster fields', async () => {
+  const h = await startHarness(['reader'])
+  try {
+    const runtime = await import('./teamPlanRuntime.js')
+    const helpers = await import('../../utils/swarm/teamHelpers.js')
+    const { readTeamPlan } = await import('../../utils/swarm/teamPlanStore.js')
+    await h.service.stopSessionAndWait(h.memberIds.reader!)
+    runtime.forgetTeamPlanRuntimesForTests()
+    const plan = (await readTeamPlan(h.teamName))!
+    await helpers.mutateTeamFileAsync(h.teamName, team => ({ ...team, futureTeamField: 'keep', members: team.members.map(({ consumerInstanceId: _legacy, ...member }) => ({ ...member, futureMemberField: { keep: true } })) }))
+    expect(await runtime.rehydrateTeamPlanRuntime({ ...plan, launch: { ...plan.launch!, memberIds: { reader: 'not-original-session' } } })).toBe(false)
+    expect((await h.teamMember('reader'))?.consumerInstanceId).toBeUndefined()
+    expect(await runtime.rehydrateTeamPlanRuntime(plan)).toBe(true)
+    const migrated = await h.teamMember('reader')
+    expect(migrated?.consumerInstanceId).toBeString()
+    expect(migrated?.sessionId).toBe(h.memberIds.reader)
+    expect((migrated as any).futureMemberField).toEqual({ keep: true })
+    expect((helpers.readTeamFile(h.teamName) as any).futureTeamField).toBe('keep')
+    runtime.forgetTeamPlanRuntimesForTests()
+    expect(await runtime.rehydrateTeamPlanRuntime(plan)).toBe(true)
+    expect((await h.teamMember('reader'))?.consumerInstanceId).toBe(migrated?.consumerInstanceId)
+  } finally {
+    await h.cleanup()
+  }
+}, 20_000)
+
+test('sent mailbox batches retain the consumption slot through ACK failures and Stop without resending', async () => {
+  const h = await startHarness(['reader'])
+  const scoped = await import('../../utils/swarm/consumerScope.js')
+  const claim = scoped.claimScopedMailbox
+  let ackAttempts = 0
+  let allowAck = false
+  const ack = spyOn(scoped, 'claimScopedMailbox').mockImplementation(async (scope, messages) => {
+    if (messages.some(message => message.id === 'ack-pending-1')) {
+      ackAttempts++
+      if (!allowAck) return { status: 'retryable_io' }
+    }
+    return claim(scope, messages)
+  })
+  try {
+    const { readUnreadMessages } = await import('../../utils/teammateMailbox.js')
+    await messageMember(h, 'reader', 'user', 'first fenced batch', 'ack-pending-1')
+    await h.waitFor(() => ackAttempts >= 2, 'repeated ACK only')
+    await messageMember(h, 'reader', 'task-list', 'second batch waits', 'ack-pending-2')
+    h.service.sendInterrupt(h.parentId)
+    await h.service.waitForTeamWorkersStopped(h.parentId)
+    const before = ackAttempts
+    await h.waitFor(() => ackAttempts > before, 'ACK retry while stopped')
+    expect(h.requests.filter(request => request.prompt.includes('ack-pending-1'))).toHaveLength(1)
+    expect(h.requests.some(request => request.prompt.includes('ack-pending-2'))).toBe(false)
+    expect((await readUnreadMessages('reader', h.teamName)).map(message => message.id)).toContain('ack-pending-1')
+    allowAck = true
+    await h.waitFor(async () => !(await readUnreadMessages('reader', h.teamName)).some(message => message.id === 'ack-pending-1'), 'safe ACK settles after Stop')
+    expect((await readUnreadMessages('reader', h.teamName)).map(message => message.id)).toContain('ack-pending-2')
+  } finally {
+    ack.mockRestore()
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('member replacement after scoped read does not reach the old socket or ACK the replacement inbox', async () => {
+  const h = await startHarness(['reader'])
+  const helpers = await import('../../utils/swarm/teamHelpers.js')
+  const scoped = await import('../../utils/swarm/consumerScope.js')
+  const read = scoped.readScopedMailbox
+  let replaced = false
+  const barrier = spyOn(scoped, 'readScopedMailbox').mockImplementation(async scope => {
+    const result = await read(scope)
+    if (!replaced && result.status === 'current' && result.value.some(message => message.id === 'same-id')) {
+      replaced = true
+      await helpers.mutateTeamFileAsync(h.teamName, team => ({ ...team, members: team.members.map(member => member.name === 'reader' ? { ...member, consumerInstanceId: 'replacement-instance', sessionId: 'replacement-session' } : member) }))
+    }
+    return result
+  })
+  try {
+    const { readUnreadMessages, readMailboxHistory } = await import('../../utils/teammateMailbox.js')
+    await messageMember(h, 'reader', 'user', 'must remain unread', 'same-id')
+    await h.waitFor(() => replaced, 'member replacement barrier')
+    // A second loop proves that the old consumer stops rather than rebinding by name.
+    await h.waitFor(() => h.service.getRecentSdkMessages(h.memberIds.reader!).some(message => message.type === 'result'), 'old member initial turn')
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(h.requests.some(request => request.prompt.includes('same-id'))).toBe(false)
+    expect((await readUnreadMessages('reader', h.teamName)).map(message => message.id)).toContain('same-id')
+    expect((await readMailboxHistory('reader', h.teamName)).filter(message => message.id === 'same-id' && message.read)).toEqual([])
+    expect((await h.teamMember('reader'))?.sessionId).toBe('replacement-session')
+  } finally {
+    barrier.mockRestore()
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('delivers the mailbox envelope id into the member prompt', async () => {
+  const h = await startHarness(['reader'])
+  try {
+    const before = h.requests.length
+    // Two envelopes written back to back: whether the runtime hands them over
+    // as one batch or one at a time, neither correlation id may be dropped.
+    await messageMember(h, 'reader', 'user', 'status?', 'client-direct-1')
+    await messageMember(h, 'reader', 'task-list', 'ready', 'client-direct-2')
+    await h.waitFor(
+      () => h.requests.slice(before).some(request => request.prompt.includes('client-direct-2')),
+      'delivered direct messages',
+    )
+    const prompts = h.requests.slice(before).map(request => request.prompt).join('\n')
+    expect(prompts).toContain('teammate_id=\\"user\\"')
+    expect(prompts).toContain('id=\\"client-direct-1\\"')
+    expect(prompts).toContain('id=\\"client-direct-2\\"')
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
 
 test('a member whose process died restarts from its own transcript when the lead messages it', async () => {
   const h = await startHarness(['reader'])
@@ -170,6 +390,12 @@ test('a member whose process died restarts from its own transcript when the lead
     await messageMember(h, 'reader', 'team-lead', 'Check one more file')
     await h.waitFor(async () => (await h.teamMember('reader'))?.terminated === true, 'crash to be recorded')
     expect(h.service.hasSession(sessionId)).toBe(false)
+    // Roster persistence precedes the asynchronous mailbox notification. Wait
+    // for that separate boundary instead of treating terminated as delivery.
+    await h.waitFor(
+      async () => (await h.leadNotifications()).some(item => item.type === 'idle_notification' && item.idleReason === 'failed'),
+      'crash notification to be delivered',
+    )
     const crashNotice = (await h.leadNotifications()).find(item => item.type === 'idle_notification' && item.idleReason === 'failed')
     expect(crashNotice?.failureReason).toContain('restarts it from its saved conversation')
 
@@ -193,10 +419,13 @@ test('transient turn failures are continued automatically and only exhausted ret
     const truncated = 'FIXTURE_ERROR:API Error: {"type":"error","error":{"type":"stream_truncated","message":"OpenAI Chat upstream stream ended without finish_reason"}}'
     h.replies.push(truncated, truncated, truncated)
     const before = h.requests.length
+    const continuations = () => h.requests.slice(before).filter(request => request.prompt.includes('[Team runtime notice]'))
     await messageMember(h, 'reader', 'team-lead', 'Review the runner')
-    await h.waitFor(() => h.requests.length >= before + 3, 'two automatic continuations')
-    const continuations = h.requests.slice(before + 1).filter(request => request.prompt.includes('[Team runtime notice]'))
-    expect(continuations).toHaveLength(2)
+    // Wait on the continuation notices themselves: a lead notice may still land
+    // after the member's first turn, so request counts are not a stable index.
+    await h.waitFor(() => continuations().length === 2, 'two automatic continuations')
+    expect(continuations()).toHaveLength(2)
+    expect(h.requests.length).toBeGreaterThanOrEqual(before + 3)
     await h.waitFor(async () => (await h.leadNotifications()).some(item => item.idleReason === 'failed'), 'exhaustion notice')
     const failures = (await h.leadNotifications()).filter(item => item.idleReason === 'failed')
     expect(failures).toHaveLength(1)
@@ -217,7 +446,9 @@ test('a successful turn reports its result to the lead and resets the retry budg
     const before = h.requests.length
     await messageMember(h, 'reader', 'team-lead', 'Review the runner')
     await h.waitFor(async () => (await h.leadNotifications()).some(item => item.result === 'Found 3 issues in runner.ts'), 'result notification')
-    expect(h.requests.length).toBe(before + 2)
+    // The member's own turns only: a lead notice can land at any time.
+    const memberTurns = () => h.requests.slice(before).filter(request => request.prompt.includes('Review the runner') || request.prompt.includes('[Team runtime notice]'))
+    expect(memberTurns()).toHaveLength(2)
     expect((await h.leadNotifications()).filter(item => item.idleReason === 'failed')).toHaveLength(0)
     const entry = await h.teamMember('reader') as any
     expect(entry.lastError).toBeUndefined()
@@ -255,9 +486,9 @@ test('an automatic continuation that cannot be sent reports the failure instead 
   const h = await startHarness(['reader'])
   try {
     h.replies.push('FIXTURE_ERROR:API Error: {"type":"error","error":{"type":"stream_truncated","message":"upstream stream ended without finish_reason"}}')
-    const send = h.service.sendMessage.bind(h.service)
-    const spy = spyOn(h.service, 'sendMessage').mockImplementation(async (...args: Parameters<typeof send>) =>
-      String(args[1]).includes('[Team runtime notice]') ? false : send(...args))
+    const send = h.service.sendScopedMessage.bind(h.service)
+    const spy = spyOn(h.service, 'sendScopedMessage').mockImplementation(async (...args: Parameters<typeof send>) =>
+      String(args[1]).includes('[Team runtime notice]') ? { status: 'rejected', reason: 'transport' } : send(...args))
     try {
       await messageMember(h, 'reader', 'team-lead', 'Review the runner')
       await h.waitFor(async () => (await h.leadNotifications()).some(item => item.idleReason === 'failed'), 'failure notice')
@@ -606,6 +837,8 @@ test('a member whose tasks all wait on other tasks gets its instructions only on
     expect(await h.teamMember('analyst')).toMatchObject({ isActive: false, awaitingDependencies: true })
     await new Promise(resolve => setTimeout(resolve, 600))
     expect(h.analystBriefs()).toHaveLength(0)
+    // An approved dependency wait costs no process: only its ready task starts it.
+    expect(h.service.hasSession(h.memberIds.analyst!)).toBe(false)
 
     await updateTask(h.taskListId, h.map, { status: 'completed' })
     await h.waitFor(() => h.analystBriefs().length > 0, 'instructions once the review is ready')
@@ -613,6 +846,7 @@ test('a member whose tasks all wait on other tasks gets its instructions only on
     // recon completed without sending anything: the analyst is told, so it
     // asks instead of working without the result it depends on.
     expect(h.analystBriefs()[0]!.prompt).toContain('Nothing has reached you from recon yet')
+    expect(h.analystBriefs()[0]!.resumed).toBeNull()
     await h.waitFor(async () => (await h.teamMember('analyst'))?.awaitingDependencies === undefined, 'instructions recorded as delivered')
     await new Promise(resolve => setTimeout(resolve, 600))
     expect(h.requests.filter(request => request.prompt.includes(`#${h.review}`))).toHaveLength(1)
@@ -724,10 +958,13 @@ test('members written before deferred instructions rehydrate as already instruct
     runtime.forgetTeamPlanRuntimesForTests()
     expect(await runtime.rehydrateTeamPlanRuntimesForSession(h.parentId)).toBe(true)
     const before = h.requests.length
+    const resumedTurns = () => h.requests.slice(before).filter(request => (
+      request.presetType === 'reader' && request.resumed === h.memberIds.reader
+    ))
     await messageMember(h, 'reader', 'team-lead', 'Resume after restart')
-    await h.waitFor(() => h.requests.length > before, 'restarted member turn')
-    expect(h.requests.at(-1)?.prompt).toContain('Resume after restart')
-    expect(h.requests.at(-1)?.prompt).not.toContain('Work as reader')
+    await h.waitFor(() => resumedTurns().length > 0, 'restarted member turn')
+    expect(resumedTurns()[0]!.prompt).toContain('Resume after restart')
+    expect(resumedTurns()[0]!.prompt).not.toContain('Work as reader')
   } finally {
     await h.cleanup()
   }
@@ -777,10 +1014,27 @@ test('the release-review plan that started its second layer first now runs layer
     instructedAtLaunch: ['recon'],
   })
   try {
-    const { listTasks, updateTask, getCanonicalTeamTaskListId } = await import('../../utils/tasks.js')
+    const { listTasks, getTask, getCanonicalTeamTaskListId } = await import('../../utils/tasks.js')
+    const { applyTaskDeliveryAction } = await import('../../utils/taskDelivery.js')
     const taskListId = getCanonicalTeamTaskListId(h.teamName)
     const id = Object.fromEntries((await listTasks(taskListId)).map(task => [task.subject, task.id]))
-    const complete = (subject: string) => updateTask(taskListId, id[subject]!, { status: 'completed' })
+    const deliver = async (subject: string, version = 1) => {
+      const task = (await getTask(taskListId, id[subject]!))!
+      return applyTaskDeliveryAction(h.teamName, task.id, task.owner!, {
+        action: 'submit', version, requestId: `submit-${subject}-${version}`,
+        expectedRevision: task.delivery?.revision ?? 0,
+        artifact: `${subject} artifact v${version}`, criteria: 'Synthetic verification passed',
+      })
+    }
+    const complete = async (subject: string) => {
+      const task = (await getTask(taskListId, id[subject]!))!
+      if (!task.delivery?.submissions.length) await deliver(subject)
+      const submitted = (await getTask(taskListId, task.id))!
+      return applyTaskDeliveryAction(h.teamName, task.id, 'user', {
+        action: 'accept', version: submitted.delivery!.submissions.at(-1)!.version,
+        requestId: `accept-${subject}`, expectedRevision: submitted.delivery!.revision,
+      })
+    }
     const briefs = (name: string) => h.requests.filter(request => request.prompt.includes(`Work as ${name}`))
     const instructed = () => names.filter(name => briefs(name).length > 0)
     const settle = () => new Promise(resolve => setTimeout(resolve, 600))
@@ -790,11 +1044,23 @@ test('the release-review plan that started its second layer first now runs layer
     // Each member is told who waits on its task, and to hand its result over
     // before completing it: the inventory goes to the three analysts.
     expect(briefs('recon')[0]!.prompt).toContain(`\\"handOffTo\\":[\\"perf-analyst\\",\\"sec-analyst\\",\\"ux-analyst\\"]`)
-    expect(briefs('recon')[0]!.prompt).toContain('first SendMessage its result to each member listed there, then mark it completed')
+    expect(briefs('recon')[0]!.prompt).toContain('first SendMessage its result to each member listed there, then submit its versioned artifact for independent acceptance')
     await h.waitFor(() => h.requests.some(request => request.prompt.includes(`Approved team ${h.teamName} is running`)), 'launch notice to the lead')
     expect(h.requests.find(request => request.prompt.includes(`Approved team ${h.teamName} is running`))!.prompt)
       .toContain('Every task of perf-analyst, sec-analyst, ux-analyst, verifier waits on other tasks')
 
+    await deliver('Inventory')
+    await settle()
+    expect(instructed()).toEqual(['recon'])
+    await applyTaskDeliveryAction(h.teamName, id.Inventory!, 'user', {
+      action: 'return', version: 1, expectedRevision: 1,
+      requestId: 'return-inventory', reason: 'Add the missing fixture evidence',
+    })
+    await settle()
+    expect(instructed()).toEqual(['recon'])
+    await deliver('Inventory', 2)
+    await settle()
+    expect(instructed()).toEqual(['recon'])
     await complete('Inventory')
     await h.waitFor(() => instructed().length === 4, 'the three analysts to start')
     await settle()
@@ -858,6 +1124,466 @@ test('a member that leaves after approving a shutdown request is not reported as
     await messageMember(h, 'reader', 'team-lead', 'And another')
     await h.waitFor(async () => (await h.leadNotifications()).some(item => item.from === 'reader' && item.idleReason === 'failed'), 'failure notice for the later crash')
     expect((await h.teamMember('reader'))?.lastError).toBeTruthy()
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+// ── S3.2: approved members stand by until there is work or an instruction ──
+
+test('an approved member with no task gets no process until a ready task starts it for the first time', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    const sessionId = h.memberIds.analyst!
+    await new Promise(resolve => setTimeout(resolve, 700))
+    // Approval without a task must not cost a process or a turn.
+    expect(h.service.hasSession(sessionId)).toBe(false)
+    expect(h.requests.some(request => request.prompt.includes('Work as analyst'))).toBe(false)
+    // The member still has a stable identity, and has not been terminated.
+    expect(await h.teamMember('analyst')).toMatchObject({ isActive: false, awaitingDependencies: true })
+    expect((await h.teamMember('analyst'))?.sessionId).toBe(sessionId)
+    expect((await h.teamMember('analyst'))?.terminated).toBeUndefined()
+
+    const { createTask, getCanonicalTeamTaskListId } = await import('../../utils/tasks.js')
+    const task = await createTask(getCanonicalTeamTaskListId(h.teamName), { subject: 'Analyse the runner', description: '', status: 'pending', owner: 'analyst', blocks: [], blockedBy: [] })
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('Analyse the runner')), 'first start for a ready task')
+    const turn = h.requests.find(request => request.prompt.includes('Analyse the runner'))!
+    expect(turn.prompt).toContain('Work as analyst')
+    expect(turn.prompt).toContain(`#${task}`)
+    // A first start begins its own conversation: it is not a restart or a resume.
+    expect(turn.resumed).toBeNull()
+    await h.waitFor(async () => (await h.teamMember('analyst'))?.awaitingDependencies === undefined, 'instructions recorded as delivered')
+    expect(h.service.hasSession(sessionId)).toBe(true)
+    // Now that it runs, "terminated: false" is accurate; it was never true.
+    expect((await h.teamMember('analyst'))?.terminated).toBe(false)
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test.each(['missing dependency', 'unsupported delivery'])('a standby member cannot first-start for %s', async (problem) => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    const { getCanonicalTeamTaskListId } = await import('../../utils/tasks.js')
+    const taskListId = getCanonicalTeamTaskListId(h.teamName)
+    const { mkdir } = await import('node:fs/promises')
+    const taskDir = join(home, 'tasks', taskListId)
+    await mkdir(taskDir, { recursive: true })
+    const taskPath = join(taskDir, '1.json')
+    const task = { id: '1', subject: 'Only executable work starts the role', description: '', owner: 'analyst', status: 'pending', blocks: [], blockedBy: problem === 'missing dependency' ? ['404'] : [],
+      ...(problem === 'unsupported delivery' ? { delivery: { schemaVersion: 99 } } : {}),
+    }
+    await writeFile(taskPath, JSON.stringify(task))
+    await new Promise(resolve => setTimeout(resolve, 800))
+    expect(h.service.hasSession(h.memberIds.analyst!)).toBe(false)
+    expect(h.requests.some(request => request.prompt.includes('Work as analyst'))).toBe(false)
+    // Positive control: the same supervisor starts the approved role as soon
+    // as its task is actually readable and every dependency is satisfied.
+    await writeFile(taskPath, JSON.stringify({ ...task, blockedBy: [], delivery: undefined }))
+    await h.waitFor(() => h.service.hasSession(h.memberIds.analyst!), 'start after the task becomes executable')
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('Work as analyst')), 'approved first instructions')
+  } finally {
+    await h.cleanup()
+  }
+}, 20_000)
+
+test('an idle started member is woken only by a task whose dependencies are present and completed', async () => {
+  const { setTeamRuntimeTimingForTests } = await import('./teamPlanRuntime.js')
+  setTeamRuntimeTimingForTests({ unblockedTaskWakeDelayMs: 0 })
+  const h = await startHarness(['reader'])
+  try {
+    const { createTask, updateTask, getCanonicalTeamTaskListId } = await import('../../utils/tasks.js')
+    const taskListId = getCanonicalTeamTaskListId(h.teamName)
+    await h.waitFor(async () => (await h.teamMember('reader'))?.isActive === false, 'member idle')
+    const before = h.requests.length
+    // A dependency whose task file does not exist is not finished work: the
+    // dangling edge keeps the task unready exactly like an unfinished one.
+    const dangling = await createTask(taskListId, { subject: 'Waits on a deleted task', description: '', status: 'pending', owner: 'reader', blocks: [], blockedBy: ['404'] })
+    const blocker = await createTask(taskListId, { subject: 'Blocker', description: '', status: 'pending', blocks: [], blockedBy: [] })
+    const follow = await createTask(taskListId, { subject: 'Waits on a real task', description: '', status: 'pending', owner: 'reader', blocks: [], blockedBy: [blocker] })
+    await new Promise(resolve => setTimeout(resolve, 900))
+    expect(h.requests.length).toBe(before)
+
+    // Only a dependency that exists and is completed makes the task ready.
+    await updateTask(taskListId, blocker, { status: 'completed' })
+    await h.waitFor(() => h.requests.length > before, 'wake for the completed dependency')
+    expect(h.requests.at(-1)?.prompt).toContain(`Task #${follow}`)
+    expect(h.requests.at(-1)?.prompt).not.toContain(`Task #${dangling}`)
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(h.requests.filter(request => request.prompt.includes(`Task #${dangling}`))).toHaveLength(0)
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('an explicit lead instruction still first-starts a standby member with no task', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    // Readiness never starts it; the lead's explicit instruction still does.
+    expect(h.service.hasSession(h.memberIds.analyst!)).toBe(false)
+    await messageMember(h, 'analyst', 'team-lead', 'The user wants you to continue')
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('The user wants you to continue')), 'first start on the lead instruction')
+    expect(h.requests.find(request => request.prompt.includes('The user wants you to continue'))!.prompt).toContain('Work as analyst')
+    expect(h.service.hasSession(h.memberIds.analyst!)).toBe(true)
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('an explicit instruction first-starts a standby member with its approved instructions', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    const sessionId = h.memberIds.analyst!
+    await messageMember(h, 'analyst', 'user', 'Please start now')
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('Please start now')), 'first start on the user instruction')
+    const turn = h.requests.find(request => request.prompt.includes('Please start now'))!
+    expect(turn.prompt).toContain('Work as analyst')
+    expect(turn.resumed).toBeNull()
+    expect(h.service.hasSession(sessionId)).toBe(true)
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('a member that never started keeps its identity and is not terminated by a restart', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    const runtime = await import('./teamPlanRuntime.js')
+    runtime.forgetTeamPlanRuntimesForTests()
+    expect(await runtime.rehydrateTeamPlanRuntimesForSession(h.parentId)).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 700))
+    // Not started is not the same as terminated.
+    expect(await h.teamMember('analyst')).toMatchObject({ isActive: false, awaitingDependencies: true })
+    expect((await h.teamMember('analyst'))?.terminated).toBeUndefined()
+    expect(h.service.hasSession(h.memberIds.analyst!)).toBe(false)
+
+    const before = h.requests.length
+    await messageMember(h, 'analyst', 'user', 'Start after the restart')
+    await h.waitFor(() => h.requests.length > before, 'first start after the restart')
+    expect(h.requests.at(-1)?.resumed).toBeNull()
+    expect(h.service.hasSession(h.memberIds.analyst!)).toBe(true)
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('a first start reads the approved preset, not one edited after approval', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    const { getTeamDir } = await import('../../utils/swarm/teamHelpers.js')
+    const path = join(getTeamDir(h.teamName), 'plan.json')
+    const stored = JSON.parse(await readFile(path, 'utf8'))
+    await writeFile(path, JSON.stringify({ ...stored,
+      members: stored.members.map((member: { id: string }) => ({ ...member, agentSnapshot: { systemPrompt: 'EDITED PRESET' } })),
+      agentCatalog: { ...(stored.agentCatalog ?? {}), research: { systemPrompt: 'EDITED PRESET' } },
+    }))
+    const start = spyOn(h.service, 'startSession')
+    try {
+      await messageMember(h, 'analyst', 'user', 'Start with what was approved')
+      await h.waitFor(() => h.service.hasSession(h.memberIds.analyst!), 'first start')
+      const options = start.mock.calls.find(([id]) => id === h.memberIds.analyst)?.[3] as { teamWorker?: { systemPrompt?: string } } | undefined
+      expect(options?.teamWorker?.systemPrompt).toBe('Read only')
+    } finally {
+      start.mockRestore()
+    }
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('a failed first start waits for a newer instruction instead of retrying every supervisor pass', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    const real = h.service.startSession.bind(h.service)
+    let attempts = 0
+    const spy = spyOn(h.service, 'startSession').mockImplementation(async (...args: Parameters<typeof real>) => {
+      if (args[0] === h.memberIds.analyst) {
+        attempts += 1
+        throw new Error('provider unavailable')
+      }
+      return real(...args)
+    })
+    try {
+      await messageMember(h, 'analyst', 'user', 'Start now')
+      await h.waitFor(() => attempts === 1, 'first start attempt')
+      await new Promise(resolve => setTimeout(resolve, 900))
+      // No retry storm, and the member is still a standby member, not exited.
+      expect(attempts).toBe(1)
+      expect(h.service.hasSession(h.memberIds.analyst!)).toBe(false)
+      expect((await h.teamMember('analyst'))?.awaitingDependencies).toBe(true)
+      expect((await h.teamMember('analyst'))?.terminated).toBeUndefined()
+      expect(((await h.teamMember('analyst')) as { lastError?: string }).lastError).toContain('Start failed')
+    } finally {
+      spy.mockRestore()
+    }
+    // A newer instruction is a new attempt.
+    await messageMember(h, 'analyst', 'user', 'Try again now')
+    await h.waitFor(() => h.service.hasSession(h.memberIds.analyst!), 'first start on the newer message')
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('a Stop keeps a standby member unstarted for background work and ordinary notices', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    h.service.sendInterrupt(h.parentId)
+    await h.service.waitForTeamWorkersStopped(h.parentId)
+    await new Promise(resolve => setTimeout(resolve, 300))
+    const { createTask, getCanonicalTeamTaskListId } = await import('../../utils/tasks.js')
+    await createTask(getCanonicalTeamTaskListId(h.teamName), { subject: 'Background follow-up', description: '', status: 'pending', owner: 'analyst', blocks: [], blockedBy: [] })
+    // A ready task, a peer note and a task-list notice are not the user continuing.
+    await messageMember(h, 'analyst', 'recon', 'A peer note')
+    await messageMember(h, 'analyst', 'task-list', 'Task is ready')
+    await new Promise(resolve => setTimeout(resolve, 1_000))
+    expect(h.service.hasSession(h.memberIds.analyst!)).toBe(false)
+    expect(h.requests.some(request => request.prompt.includes('Background follow-up'))).toBe(false)
+    expect((await h.teamMember('analyst'))?.terminated).toBeUndefined()
+
+    await messageMember(h, 'analyst', 'user', 'Resume from my instruction')
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('Resume from my instruction')), 'first start after the user continues')
+    const turn = h.requests.find(request => request.prompt.includes('Resume from my instruction'))!
+    expect(turn.prompt).toContain('Work as analyst')
+    expect(turn.resumed).toBeNull()
+    expect(h.service.hasSession(h.memberIds.analyst!)).toBe(true)
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('every user Stop advances the durable stop epoch and nothing else does', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  const { readTeamFile } = await import('../../utils/swarm/teamHelpers.js')
+  const runtime = await import('./teamPlanRuntime.js')
+  try {
+    expect(readTeamFile(h.teamName)?.stopEpoch).toBeUndefined()
+    h.service.sendInterrupt(h.parentId)
+    await h.service.waitForTeamWorkersStopped(h.parentId)
+    await h.waitFor(() => readTeamFile(h.teamName)?.stopEpoch === 1, 'first durable stop epoch')
+
+    // Tearing the runtime down is not another user Stop.
+    await runtime.stopTeamPlanRuntime(h.planId)
+    expect(readTeamFile(h.teamName)?.stopEpoch).toBe(1)
+
+    // Restarting and continuing keeps the same count: the value counts Stops,
+    // not runs, so a pending send from before the Stop stays settled.
+    runtime.forgetTeamPlanRuntimesForTests()
+    runtime.rehydrateTeamPlanRuntimesForSession(h.parentId)
+    await messageMember(h, 'analyst', 'user', 'Continue after the stop')
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('Continue after the stop')), 'restart after a Stop')
+    expect(readTeamFile(h.teamName)?.stopEpoch).toBe(1)
+
+    h.service.sendInterrupt(h.parentId)
+    await h.service.waitForTeamWorkersStopped(h.parentId)
+    await h.waitFor(() => readTeamFile(h.teamName)?.stopEpoch === 2, 'second durable stop epoch')
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('a Stop outlives the runtime: the restored team stays paused until a new instruction', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    h.service.sendInterrupt(h.parentId)
+    await h.service.waitForTeamWorkersStopped(h.parentId)
+    // The pause must be durable before the process that holds it can vanish.
+    const { readTeamFile } = await import('../../utils/swarm/teamHelpers.js')
+    await h.waitFor(() => readTeamFile(h.teamName)?.pausedAt !== undefined, 'durable Stop record')
+
+    const runtime = await import('./teamPlanRuntime.js')
+    runtime.forgetTeamPlanRuntimesForTests()
+    expect(await runtime.rehydrateTeamPlanRuntimesForSession(h.parentId)).toBe(true)
+    expect(await h.service.hasSession(h.memberIds.analyst!)).toBe(false)
+
+    const { createTask, getCanonicalTeamTaskListId } = await import('../../utils/tasks.js')
+    await createTask(getCanonicalTeamTaskListId(h.teamName), { subject: 'Background follow-up', description: '', status: 'pending', owner: 'analyst', blocks: [], blockedBy: [] })
+    await messageMember(h, 'analyst', 'task-list', 'Task is ready')
+    await new Promise(resolve => setTimeout(resolve, 1_000))
+    // Restoring the team is not the user continuing it.
+    expect(h.service.hasSession(h.memberIds.analyst!)).toBe(false)
+    expect(h.requests.some(request => request.prompt.includes('Background follow-up'))).toBe(false)
+
+    await messageMember(h, 'analyst', 'user', 'Resume from my instruction')
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('Resume from my instruction')), 'first start after the user continues')
+    // Resuming clears the durable pause, so a later restart does not re-pause it.
+    await h.waitFor(() => readTeamFile(h.teamName)?.pausedAt === undefined, 'durable pause cleared on resume')
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+// ── S3.2 compatibility: initialStartPending is the only "never ran" marker ──
+
+test('a standby member recorded before initialStartPending resumes its saved transcript when its task becomes ready', async () => {
+  const h = await startDependentTeam()
+  try {
+    const runtime = await import('./teamPlanRuntime.js')
+    const { mutateTeamFileAsync } = await import('../../utils/swarm/teamHelpers.js')
+    const { updateTask } = await import('../../utils/tasks.js')
+    runtime.forgetTeamPlanRuntimesForTests()
+    // The legacy member had a process, so it has a transcript. Losing it is the
+    // failure this test exists for.
+    const { mkdir } = await import('node:fs/promises')
+    const { sanitizePath } = await import('../../utils/sessionStoragePortable.js')
+    const transcriptDir = join(process.env.CLAUDE_CONFIG_DIR!, 'projects', sanitizePath(home))
+    await mkdir(transcriptDir, { recursive: true })
+    const sessionId = h.memberIds.analyst!
+    const line = {
+      type: 'assistant', uuid: crypto.randomUUID(), timestamp: new Date().toISOString(), sessionId,
+      cwd: home, teamName: h.teamName, agentName: 'analyst',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Earlier research notes' }] },
+    }
+    await writeFile(join(transcriptDir, sessionId + '.jsonl'), JSON.stringify(line) + '\n')
+    await mutateTeamFileAsync(h.teamName, team => ({
+      ...team,
+      members: team.members.map(member => member.name === 'analyst'
+        ? { ...member, isActive: true, awaitingDependencies: true, initialStartPending: undefined }
+        : member),
+    }))
+    expect(await h.teamMember('analyst')).not.toHaveProperty('initialStartPending')
+    expect(await runtime.rehydrateTeamPlanRuntimesForSession(h.parentId)).toBe(true)
+    await updateTask(h.taskListId, h.map, { status: 'completed' })
+    await h.waitFor(() => h.analystBriefs().length > 0, 'instructions once the review is ready')
+    const turn = h.analystBriefs()[0]!
+    // It already had a process and a transcript: resume it, never start over.
+    expect(turn.resumed).toBe(h.memberIds.analyst!)
+    expect(turn.prompt).toContain(`#${h.review} Review the release`)
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('an approved member is persisted as initialStartPending until its first start records it', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    // The identity exists now; the first start does not.
+    expect(await h.teamMember('analyst')).toMatchObject({ isActive: false, awaitingDependencies: true, initialStartPending: true })
+    await messageMember(h, 'analyst', 'user', 'Start now')
+    await h.waitFor(async () => (await h.teamMember('analyst'))?.initialStartPending === false, 'first start recorded')
+    // The held instructions arrive on the pass after the process is up.
+    await h.waitFor(async () => (await h.teamMember('analyst'))?.awaitingDependencies === undefined, 'instructions delivered')
+    const entry = await h.teamMember('analyst')
+    expect(entry?.terminated).toBe(false)
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('a Stop that lands during the first spawn aborts it without recording a failure', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    const real = h.service.startSession.bind(h.service)
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const spawning = new Promise<void>(resolve => { entered = resolve })
+    let attempts = 0
+    const spy = spyOn(h.service, 'startSession').mockImplementation(async (...args: Parameters<typeof real>) => {
+      if (args[0] !== h.memberIds.analyst) return real(...args)
+      attempts += 1
+      if (attempts > 1) return real(...args)
+      entered()
+      await gate
+      // The Stop killed the CLI while it was still spawning.
+      throw new Error('CLI session exited during startup')
+    })
+    try {
+      await messageMember(h, 'analyst', 'user', 'Start now')
+      await spawning
+      h.service.sendInterrupt(h.parentId)
+      await h.service.waitForTeamWorkersStopped(h.parentId)
+      release()
+      await new Promise(resolve => setTimeout(resolve, 500))
+      const entry = await h.teamMember('analyst') as { lastError?: string; initialStartPending?: boolean; terminated?: boolean }
+      // A Stop is not a failed start: nothing to report, nothing to retry, and
+      // the member is still waiting rather than exited.
+      expect(entry.lastError).toBeUndefined()
+      expect(entry.initialStartPending).toBe(true)
+      expect(entry.terminated).toBeUndefined()
+      expect(h.requests.some(request => request.prompt.includes('Start now'))).toBe(false)
+    } finally {
+      spy.mockRestore()
+    }
+    // The user continuing afterwards still first-starts it, with the held brief.
+    await messageMember(h, 'analyst', 'user', 'Continue now')
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('Continue now')), 'first start after the stop')
+    expect(h.requests.find(request => request.prompt.includes('Continue now'))!.resumed).toBeNull()
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('ending the team during the first spawn stops the reserved member in the same pass', async () => {
+  const h = await startHarness(['analyst'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    const runtime = await import('./teamPlanRuntime.js')
+    const real = h.service.startSession.bind(h.service)
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const spawned = new Promise<void>(resolve => { entered = resolve })
+    const spy = spyOn(h.service, 'startSession').mockImplementation(async (...args: Parameters<typeof real>) => {
+      if (args[0] !== h.memberIds.analyst) return real(...args)
+      await real(...args)
+      entered()
+      await gate
+    })
+    try {
+      await messageMember(h, 'analyst', 'user', 'Start now')
+      await spawned
+      expect(h.service.hasSession(h.memberIds.analyst!)).toBe(true)
+      await runtime.stopTeamPlanRuntime(h.planId)
+      // The process id was reserved before the process existed, so this kill
+      // pass owns it instead of leaving it behind a deleted launch.
+      expect(h.service.hasSession(h.memberIds.analyst!)).toBe(false)
+      release()
+      await new Promise(resolve => setTimeout(resolve, 200))
+      expect((await h.teamMember('analyst'))?.initialStartPending).not.toBe(false)
+    } finally {
+      spy.mockRestore()
+    }
+  } finally {
+    await h.cleanup()
+  }
+}, 30_000)
+
+test('approved standby dynamic delivery return Stop continue and server recovery form one lifecycle', async () => {
+  const h = await startHarness(['builder', 'reviewer'], { tasks: [], instructedAtLaunch: [] })
+  try {
+    const runtime = await import('./teamPlanRuntime.js')
+    const { createTask, getCanonicalTeamTaskListId, getTask } = await import('../../utils/tasks.js')
+    const { applyTaskDeliveryAction } = await import('../../utils/taskDelivery.js')
+    const list = getCanonicalTeamTaskListId(h.teamName)
+    expect(h.service.hasSession(h.memberIds.builder!)).toBe(false)
+    expect(h.service.hasSession(h.memberIds.reviewer!)).toBe(false)
+    const taskId = await createTask(list, { subject: 'Versioned dynamic delivery', description: '', owner: 'builder', status: 'pending', blockedBy: [], blocks: [] })
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('Versioned dynamic delivery')), 'dynamic task first launch')
+    expect(h.requests.find(request => request.prompt.includes('Versioned dynamic delivery'))?.resumed).toBeNull()
+    await h.waitFor(async () => (await h.teamMember('builder'))?.isActive === false, 'owner finishes first turn')
+    await applyTaskDeliveryAction(h.teamName, taskId, 'builder', { action: 'submit', expectedRevision: 0, version: 1, requestId: 'submit-v1', artifact: 'dynamic@v1 digest:fixture', criteria: 'Regression and boundary evidence' })
+    const pendingCount = h.requests.length
+    await new Promise(resolve => setTimeout(resolve, 650))
+    expect(h.requests.length).toBe(pendingCount)
+    expect(h.service.hasSession(h.memberIds.reviewer!)).toBe(false)
+    h.service.sendInterrupt(h.parentId)
+    await h.service.waitForTeamWorkersStopped(h.parentId)
+    await applyTaskDeliveryAction(h.teamName, taskId, 'user', { action: 'return', expectedRevision: 1, version: 1, requestId: 'return-v1', reason: 'Add boundary regression' })
+    await new Promise(resolve => setTimeout(resolve, 400))
+    expect(h.service.hasSession(h.memberIds.builder!)).toBe(false)
+    await messageMember(h, 'builder', 'user', 'Continue rework after Stop')
+    await h.waitFor(() => h.requests.some(request => request.prompt.includes('Continue rework after Stop') && request.prompt.includes('Add boundary regression')), 'explicit continuation with rework reason')
+    await applyTaskDeliveryAction(h.teamName, taskId, 'builder', { action: 'submit', expectedRevision: 2, version: 2, requestId: 'submit-v2', artifact: 'dynamic@v2 digest:fixture-with-boundary', criteria: 'Regression and boundary evidence' })
+    runtime.forgetTeamPlanRuntimesForTests()
+    await h.service.stopSessionAndWait(h.memberIds.builder!)
+    expect(await runtime.rehydrateTeamPlanRuntimesForSession(h.parentId)).toBe(true)
+    const beforeAcceptance = h.requests.length
+    await applyTaskDeliveryAction(h.teamName, taskId, 'user', { action: 'accept', expectedRevision: 3, version: 2, requestId: 'accept-v2' })
+    await new Promise(resolve => setTimeout(resolve, 550))
+    expect(h.requests.length).toBe(beforeAcceptance)
+    expect((await getTask(list, taskId))?.status).toBe('completed')
+    expect((await getTask(list, taskId))?.delivery?.submissions.map(item => item.review?.decision)).toEqual(['return', 'accept'])
+    expect((await h.teamMember('reviewer'))?.initialStartPending).toBe(true)
+    expect((await h.teamMember('reviewer'))?.terminated).toBeUndefined()
   } finally {
     await h.cleanup()
   }

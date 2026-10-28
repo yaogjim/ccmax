@@ -19,6 +19,7 @@ import { readMemberFailure } from '../../utils/swarm/turnFailure.js'
 import { unescapeXmlAttr } from '../../utils/xml.js'
 import {
   MAILBOX_HISTORY_SUFFIX,
+  USER_MESSAGE_SENDER,
   readMailboxHistoryAtPath,
   writeToMailbox,
 } from '../../utils/teammateMailbox.js'
@@ -38,7 +39,12 @@ import {
   withTaskListLifecycleLock,
 } from '../../utils/tasks.js'
 import type { TaskListLifecycleState } from '../../utils/tasks.js'
-import { cleanupTeamDirectories } from '../../utils/swarm/teamHelpers.js'
+import { cleanupTeamDirectories, withTeamFileLock } from '../../utils/swarm/teamHelpers.js'
+import {
+  emptyTaskDelivery,
+  isTaskDeliveryUnsupported,
+  TASK_DELIVERY_UNSUPPORTED_ERROR,
+} from '../../shared/taskDelivery.js'
 import type { TaskInfo } from './taskService.js'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
@@ -73,6 +79,16 @@ export type TeamMember = {
    * readers fall back to `status` rather than assuming a member went quiet.
    */
   activity?: TeamMemberActivity
+  /**
+   * Approved, waiting for its first ready task: instructions held, no process
+   * yet. Sent as a boolean by the live roster so a cleared wait is visible too.
+   */
+  awaitingDependencies?: boolean
+  /**
+   * Approved but never started: its first start is a new conversation, not a
+   * resume, and it is not a stopped member.
+   */
+  initialStartPending?: boolean
   /** Why the last turn failed, when no automatic retry is pending. */
   lastError?: string
   /** An automatic continuation is scheduled after a transient provider failure. */
@@ -95,6 +111,8 @@ export type TeamDetail = TeamSummary & {
   leadAgentId: string
   leadSessionId?: string
   members: TeamMember[]
+  /** How many times this team has been stopped; absent means never recorded. */
+  stopEpoch?: number
 }
 
 export type TeamWorkbenchMessage = {
@@ -870,6 +888,26 @@ function cloneTask(task: TaskInfo): TaskInfo {
 }
 
 /**
+ * A task whose on-disk delivery history could not be interpreted is read-only,
+ * and only the neutral reason crosses the API boundary. The raw record stays
+ * beside it in task memory so a supported version can still interpret it; it
+ * must never reach the desktop, which would render it as history and could
+ * then offer accept/return for a record this server cannot read. `delivery` is
+ * restated as the protocol's empty history so no snapshot carries a half-read
+ * record that looks like "nothing submitted yet".
+ */
+function projectTaskDelivery(task: TaskInfo): TaskInfo {
+  if (!isTaskDeliveryUnsupported(task)) return task
+  const projected: TaskInfo & { deliveryUnsupported?: unknown } = {
+    ...task,
+    delivery: emptyTaskDelivery(),
+    deliveryError: task.deliveryError ?? TASK_DELIVERY_UNSUPPORTED_ERROR,
+  }
+  delete projected.deliveryUnsupported
+  return projected
+}
+
+/**
  * Replays only successful task mutations that completed after the last disk
  * snapshot and before the next Team incarnation. TeamDelete can remove the
  * task directory before TeamWatcher observes its final contents, while the
@@ -895,7 +933,7 @@ function terminalLifecycleTasks(
   return {
     tasks: terminal.tasks
       .filter(task => !task.metadata?._internal)
-      .map(task => ({
+      .map(task => projectTaskDelivery({
         ...task,
         blocks: [...task.blocks],
         blockedBy: [...task.blockedBy],
@@ -1437,6 +1475,17 @@ type TeamFileRaw = {
     backendType?: string
     isActive?: boolean
     terminated?: boolean
+    /**
+     * Approved, still waiting for its first ready task: its instructions are
+     * held, not lost. Absent once it was instructed.
+     */
+    awaitingDependencies?: boolean
+    /**
+     * Approved but its process has never run, so messaging it starts a new
+     * conversation rather than resuming one. Absent on members recorded before
+     * this field existed and on members that have started.
+     */
+    initialStartPending?: boolean
     lastError?: string
     autoRetry?: { attempt: number; max: number; nextAt: number }
     mode?: string
@@ -1557,6 +1606,11 @@ export class TeamService {
         backendType: m.backendType,
         status: failure.lastError && !failure.autoRetry ? 'failed' : this.deriveStatus(m.isActive),
         activity: m.terminated === true ? 'stopped' : this.deriveActivity(m.isActive, lastWrites.get(m.name), now),
+        // An approved member with no ready task has no process yet. Say so, and
+        // say it explicitly, so a cleared wait does not leave the UI's previous
+        // "waiting" state in place.
+        awaitingDependencies: m.awaitingDependencies === true,
+        initialStartPending: m.initialStartPending === true,
         ...failure,
         joinedAt: m.joinedAt,
         cwd: m.cwd,
@@ -1608,6 +1662,9 @@ export class TeamService {
         (m) => m.status === 'running',
       ).length,
       members,
+      // Absent on teams that never recorded a Stop. Omitting it keeps a client
+      // from reading a zero as "no Stop is outstanding".
+      ...(config.stopEpoch !== undefined ? { stopEpoch: config.stopEpoch } : {}),
     }
   }
 
@@ -1797,42 +1854,77 @@ export class TeamService {
     teamName: string,
     agentId: string,
     content: string,
-  ): Promise<void> {
+    options: { messageId?: string; incarnationId?: string; memberSessionId?: string } = {},
+  ): Promise<{ stopEpoch?: number }> {
     const text = content.trim()
     if (!text) {
       throw ApiError.badRequest('content (string) is required in request body')
     }
-
-    const config = await this.loadTeamConfig(teamName)
-    const recipientName = await this.resolveMemberName(
-      config,
-      teamName,
-      agentId,
-    )
-
-    if (!recipientName) {
-      throw ApiError.notFound(
-        `Team member not found: ${agentId} in team ${teamName}`,
+    // REL-003-M1：请求必须绑定原团队与成员实例；拒绝缺身份请求，
+    // 不从当前同名团队补身份，避免迟到消息被静默转投。
+    if (!options.incarnationId || !options.memberSessionId) {
+      throw ApiError.badRequest(
+        'incarnationId and memberSessionId are required; refresh the member and send again',
       )
     }
 
-    const delivered = await writeToMailbox(
-      recipientName,
-      {
-        from: 'user',
-        text,
-        timestamp: new Date().toISOString(),
-      },
-      teamName,
-    )
-    if (!delivered) {
-      // The composer keeps the draft only if the request fails.
-      throw new ApiError(
-        503,
-        `Could not deliver the message to ${recipientName}. Try again.`,
-        'MAILBOX_UNAVAILABLE',
-      )
-    }
+    return await withTaskListLifecycleLock(getCanonicalTeamTaskListId(teamName), async () => {
+      // lifecycle 保护目录存活，config 保护从身份读取到邮箱提交的整个区间。
+      await this.loadTeamConfig(teamName)
+      return await withTeamFileLock(teamName, async () => {
+        const config = await this.loadTeamConfig(teamName)
+        if (teamIncarnationId(config) !== options.incarnationId) {
+          throw ApiError.conflict(
+            'This team was replaced. Refresh and send again to the current team.',
+          )
+        }
+        const configMember = config.members.find((member) => member.agentId === agentId)
+        if (!configMember) {
+          throw ApiError.notFound(`Team member not found: ${agentId} in team ${teamName}`)
+        }
+        if (!configMember.sessionId || configMember.sessionId !== options.memberSessionId) {
+          throw ApiError.conflict(
+            'This member was replaced. Refresh and send again to the current member.',
+          )
+        }
+        const recipientName = await this.resolveMemberName(
+          config,
+          teamName,
+          agentId,
+        )
+
+        if (!recipientName) {
+          throw ApiError.notFound(
+            `Team member not found: ${agentId} in team ${teamName}`,
+          )
+        }
+
+        const delivered = await writeToMailbox(
+          recipientName,
+          {
+            // A retried HTTP request reuses this id, so the mailbox appends the
+            // instruction once and the member transcript keeps one stable
+            // correlation id for the echo.
+            ...(options.messageId ? { id: options.messageId } : {}),
+            from: USER_MESSAGE_SENDER,
+            text,
+            timestamp: new Date().toISOString(),
+          },
+          teamName,
+        )
+        if (!delivered) {
+          // The composer keeps the draft only if the request fails.
+          throw new ApiError(
+            503,
+            `Could not deliver the message to ${recipientName}. Try again.`,
+            'MAILBOX_UNAVAILABLE',
+          )
+        }
+        // The epoch this send committed against. A Stop that lands later gets a
+        // bigger one, so the client can tell this wait ended with it.
+        return { stopEpoch: config.stopEpoch ?? 0 }
+      })
+    })
   }
 
   // ── Get Agent Teams workbench snapshot ──────────────────────────────────────
@@ -1859,7 +1951,7 @@ export class TeamService {
       const taskSnapshot = await readTaskListSnapshot(taskListId)
       const tasks: TaskInfo[] = taskSnapshot.tasks
         .filter(task => !task.metadata?._internal)
-        .map(task => ({ ...task, taskListId }))
+        .map(task => projectTaskDelivery({ ...task, taskListId }))
         .sort((left, right) => {
           const leftNumber = Number.parseInt(left.id, 10)
           const rightNumber = Number.parseInt(right.id, 10)

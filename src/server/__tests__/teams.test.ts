@@ -20,6 +20,7 @@ import { getSessionCreatedTeams } from '../../bootstrap/state.js'
 import {
   cleanupSessionTeams,
   cleanupTeamDirectories,
+  mutateTeamFileAsync,
   registerTeamForSessionCleanup,
   unregisterTeamForSessionCleanup,
 } from '../../utils/swarm/teamHelpers.js'
@@ -1091,6 +1092,34 @@ describe('TeamService', () => {
     detail = await service.getTeam('status-team')
     expect(detail.members.find((m) => m.agentId === 'agent-lead')).toMatchObject({ status: 'failed', lastError: 'API Error: 401 authentication_error' })
     expect(detail.members.find((m) => m.agentId === 'agent-lead')?.autoRetry).toBeUndefined()
+  })
+
+  it('passes an approved standby member through as waiting for its first start', async () => {
+    const config = makeTeamConfig({ name: 'status-team' })
+    const [, worker] = config.members as Array<Record<string, unknown>>
+    Object.assign(worker!, { isActive: false, awaitingDependencies: true, initialStartPending: true })
+    await writeTeamConfig('status-team', config)
+
+    const detail = await service.getTeam('status-team')
+    // Waiting, not stopped: it has no process to lose and no transcript yet.
+    expect(detail.members.find((m) => m.agentId === 'agent-worker')).toMatchObject({
+      status: 'idle',
+      activity: 'idle',
+      awaitingDependencies: true,
+      initialStartPending: true,
+    })
+    // Explicit false on everyone else, so a cleared wait reaches the client too.
+    expect(detail.members.find((m) => m.agentId === 'agent-lead')).toMatchObject({
+      awaitingDependencies: false,
+      initialStartPending: false,
+    })
+
+    Object.assign(worker!, { awaitingDependencies: undefined, initialStartPending: false })
+    await writeTeamConfig('status-team', config)
+    expect((await service.getTeam('status-team')).members.find((m) => m.agentId === 'agent-worker')).toMatchObject({
+      awaitingDependencies: false,
+      initialStartPending: false,
+    })
   })
 
   it('keeps delivered reports visible after the leader reads its mailbox', async () => {
@@ -4353,6 +4382,271 @@ describe('TeamService', () => {
   // sendMemberMessage
   // --------------------------------------------------------------------------
 
+  it('holds the member instance through mailbox commit while replacement waits', async () => {
+    const name = 'locked-send-team'
+    const config = makeTeamConfig({ name })
+    await writeTeamConfig(name, config)
+    const identity = { incarnationId: teamIncarnationId(config), memberSessionId: 'session-worker-001' }
+    const internals = service as unknown as { resolveMemberName: (...args: unknown[]) => Promise<string | null> }
+    const originalResolve = internals.resolveMemberName
+    let release!: () => void
+    let reached!: () => void
+    let attempted!: () => void
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    const resolved = new Promise<void>(resolve => { reached = resolve })
+    const lockAttempt = new Promise<void>(resolve => { attempted = resolve })
+    internals.resolveMemberName = async function (...args) {
+      const result = await originalResolve.apply(this, args)
+      reached()
+      await barrier
+      return result
+    }
+    let replacement: Promise<unknown> | undefined
+    const send = service.sendMemberMessage(name, 'agent-worker', 'bound instruction', identity)
+    await resolved
+    const originalLock = lockfile.lock
+    const observeLock = spyOn(lockfile, 'lock').mockImplementation(async (...args) => {
+      if (String(args[0]).endsWith(`${name}/config.json`)) attempted()
+      return originalLock(...args)
+    })
+    let inboxAtReplacement = ''
+    try {
+      replacement = mutateTeamFileAsync(name, current => {
+        inboxAtReplacement = require('node:fs').readFileSync(path.join(tmpDir, 'teams', name, 'inboxes', 'Worker-Agent.json'), 'utf8')
+        current.members.find(member => member.agentId === 'agent-worker')!.sessionId = 'replacement-session'
+      })
+      // 替换确已请求 config 锁；发送持锁时它只能等待，不能先改身份。
+      void replacement.catch(() => {})
+      await lockAttempt
+      release()
+      await send
+      await replacement
+      expect(inboxAtReplacement).toContain('bound instruction')
+      const inboxPath = path.join(tmpDir, 'teams', name, 'inboxes', 'Worker-Agent.json')
+      const before = await fs.readFile(inboxPath, 'utf8')
+      await expect(service.sendMemberMessage(name, 'agent-worker', 'late retry', identity)).rejects.toMatchObject({ statusCode: 409 })
+      expect(await fs.readFile(inboxPath, 'utf8')).toBe(before)
+    } finally {
+      release()
+      await Promise.allSettled([send, ...(replacement ? [replacement] : [])])
+      observeLock.mockRestore()
+      internals.resolveMemberName = originalResolve
+    }
+  })
+
+  it('commits to the old mailbox before waiting cleanup and rejects retries after same-name recreation', async () => {
+    const name = 'send-before-cleanup-team'
+    const config = makeTeamConfig({ name, leadSessionId: 'send-before-cleanup-lead' })
+    const lifecycle = await beginTaskListLifecycle(name, {
+      teamName: name,
+      createdAt: config.createdAt,
+      leadSessionId: config.leadSessionId as string,
+    })
+    await writeTeamConfig(name, config)
+    await resetTaskList(name)
+    await writeTeamInbox(name, 'Worker-Agent', [{
+      id: 'old-read', from: 'user', text: 'Old instance history',
+      timestamp: '2026-01-01T00:00:00.000Z', read: true,
+    }])
+    const identity = {
+      incarnationId: teamIncarnationId(config),
+      memberSessionId: 'session-worker-001',
+      messageId: 'old-send',
+    }
+    const inboxPath = path.join(tmpDir, 'teams', name, 'inboxes', 'Worker-Agent.json')
+    const historyPath = path.join(tmpDir, 'teams', name, 'inboxes', 'Worker-Agent.history.jsonl')
+    const lifecycleLockPath = path.join(tmpDir, 'tasks', '.lifecycle-locks', `${name}.lock`)
+    const internals = service as unknown as { resolveMemberName: (...args: unknown[]) => Promise<string | null> }
+    const originalResolve = internals.resolveMemberName
+    let release!: () => void
+    let reached!: () => void
+    let attempted!: () => void
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    const resolved = new Promise<void>(resolve => { reached = resolve })
+    const lockAttempt = new Promise<void>(resolve => { attempted = resolve })
+    internals.resolveMemberName = async function (...args) {
+      const result = await originalResolve.apply(this, args)
+      reached()
+      await barrier
+      return result
+    }
+    const send = service.sendMemberMessage(name, 'agent-worker', 'Old instance instruction', identity)
+    let cleanup: ReturnType<typeof cleanupTeamDirectories> | undefined
+    let observeLock: ReturnType<typeof spyOn<typeof lockfile, 'lock'>> | undefined
+    let cleanupAcquired = false
+    let mailboxAtCleanup: { live: string; history: string } | undefined
+    try {
+      await resolved
+      const originalLock = lockfile.lock
+      observeLock = spyOn(lockfile, 'lock').mockImplementation(async (...args) => {
+        if (String(args[0]) !== lifecycleLockPath) return originalLock(...args)
+        attempted()
+        const unlock = await originalLock(...args)
+        cleanupAcquired = true
+        try {
+          // Capture the real mailbox at cleanup's lock boundary, before rm.
+          // Without send's lifecycle lease this sees the uncommitted fixture.
+          mailboxAtCleanup = {
+            live: await fs.readFile(inboxPath, 'utf8'),
+            history: await fs.readFile(historyPath, 'utf8'),
+          }
+          return unlock
+        } catch (error) {
+          await unlock()
+          throw error
+        }
+      })
+      cleanup = cleanupTeamDirectories(name, lifecycle)
+      void cleanup.catch(() => {})
+      await lockAttempt
+      expect(cleanupAcquired).toBe(false)
+      expect(JSON.parse(await fs.readFile(inboxPath, 'utf8'))).toEqual([
+        expect.objectContaining({ id: 'old-read', read: true }),
+      ])
+
+      release()
+      await send
+      const terminal = await cleanup
+      observeLock.mockRestore()
+      expect(terminal.generation).toBe(lifecycle.generation)
+      expect(JSON.parse(mailboxAtCleanup!.live)).toEqual([
+        expect.objectContaining({ id: 'old-send', text: 'Old instance instruction', read: false }),
+      ])
+      expect(mailboxAtCleanup!.history.trim().split('\n').map(line => JSON.parse(line))).toEqual([
+        expect.objectContaining({ id: 'old-read', read: true }),
+      ])
+      await expect(fs.stat(inboxPath)).rejects.toThrow()
+      await expect(fs.stat(historyPath)).rejects.toThrow()
+
+      // Reuse both the Team/member names and member session id: only the Team
+      // incarnation changes, and neither old live nor history may survive.
+      const recreatedConfig = { ...config, createdAt: config.createdAt + 1_000 }
+      const recreatedLifecycle = await beginTaskListLifecycle(name, {
+        teamName: name,
+        createdAt: recreatedConfig.createdAt,
+        leadSessionId: config.leadSessionId as string,
+      })
+      await writeTeamConfig(name, recreatedConfig)
+      await resetTaskList(name)
+      expect(recreatedLifecycle.generation).toBe(lifecycle.generation + 1)
+      await writeTeamInbox(name, 'Worker-Agent', [{
+        id: 'new-read', from: 'user', text: 'New instance history',
+        timestamp: '2026-01-01T00:00:01.000Z', read: true,
+      }])
+      await service.sendMemberMessage(name, 'agent-worker', 'New instance instruction', {
+        ...identity,
+        incarnationId: teamIncarnationId(recreatedConfig),
+        messageId: 'new-send',
+      })
+      const beforeRetry = {
+        live: await fs.readFile(inboxPath, 'utf8'),
+        history: await fs.readFile(historyPath, 'utf8'),
+      }
+      expect(JSON.parse(beforeRetry.live)).toEqual([
+        expect.objectContaining({ id: 'new-send', text: 'New instance instruction', read: false }),
+      ])
+      expect(beforeRetry.history.trim().split('\n').map(line => JSON.parse(line))).toEqual([
+        expect.objectContaining({ id: 'new-read', read: true }),
+      ])
+      await expect(service.sendMemberMessage(
+        name, 'agent-worker', 'Old instance instruction', identity,
+      )).rejects.toMatchObject({ statusCode: 409 })
+      expect(await fs.readFile(inboxPath, 'utf8')).toBe(beforeRetry.live)
+      expect(await fs.readFile(historyPath, 'utf8')).toBe(beforeRetry.history)
+    } finally {
+      release()
+      await Promise.allSettled([send, ...(cleanup ? [cleanup] : [])])
+      observeLock?.mockRestore()
+      internals.resolveMemberName = originalResolve
+    }
+  })
+
+  it('refuses an old consumer claiming a recreated same-name mailbox', async () => {
+    // Characterization probe, not an isolation acceptance test: call the real
+    // public consumer with retained runtime identity, without running a model.
+    const { takeTeammateMailbox } = await import('../../utils/swarm/inProcessRunner.js')
+    const { memberConsumerScope } = await import('../../utils/swarm/consumerScope.js')
+    const name = 'reused-consumer-team'
+    const config = makeTeamConfig({ name, leadSessionId: 'old-consumer-lead' })
+    const lifecycle = await beginTaskListLifecycle(name, {
+      teamName: name,
+      createdAt: config.createdAt,
+      leadSessionId: config.leadSessionId as string,
+    })
+    await writeTeamConfig(name, config)
+    await resetTaskList(name)
+    const oldConsumer = {
+      agentId: 'agent-worker',
+      agentName: 'Worker Agent',
+      teamName: name,
+      planModeRequired: false,
+      parentSessionId: 'old-consumer-lead',
+      resumableAgentId: 'old-consumer-transcript',
+    }
+    await expect(takeTeammateMailbox(oldConsumer)).rejects.toThrow('消费实例 unbound')
+    await cleanupTeamDirectories(name, lifecycle)
+
+    const recreatedConfig = makeTeamConfig({
+      name,
+      createdAt: config.createdAt + 1_000,
+      leadSessionId: 'new-consumer-lead',
+    })
+    recreatedConfig.members[1]!.sessionId = 'new-consumer-transcript'
+    const recreatedLifecycle = await beginTaskListLifecycle(name, {
+      teamName: name,
+      createdAt: recreatedConfig.createdAt,
+      leadSessionId: recreatedConfig.leadSessionId as string,
+    })
+    await writeTeamConfig(name, recreatedConfig)
+    await resetTaskList(name)
+    expect(recreatedLifecycle.generation).toBe(lifecycle.generation + 1)
+    await service.sendMemberMessage(name, 'agent-worker', 'Only for the new consumer', {
+      incarnationId: teamIncarnationId(recreatedConfig),
+      memberSessionId: 'new-consumer-transcript',
+      messageId: 'new-consumer-message',
+    })
+    const inboxPath = path.join(tmpDir, 'teams', name, 'inboxes', 'Worker-Agent.json')
+    const historyPath = path.join(tmpDir, 'teams', name, 'inboxes', 'Worker-Agent.history.jsonl')
+    expect(JSON.parse(await fs.readFile(inboxPath, 'utf8'))).toEqual([
+      expect.objectContaining({ id: 'new-consumer-message', read: false }),
+    ])
+
+    // The old runtime carries no instance identity, so the recreated team's
+    // inbox is not its to claim: nothing is delivered and nothing is archived.
+    await expect(takeTeammateMailbox(oldConsumer)).rejects.toThrow('消费实例 unbound')
+    expect(JSON.parse(await fs.readFile(inboxPath, 'utf8'))).toEqual([
+      expect.objectContaining({ id: 'new-consumer-message', read: false }),
+    ])
+
+    // The new incarnation's own binding still consumes it.
+    recreatedConfig.members[1]!.consumerInstanceId = 'new-consumer-instance'
+    recreatedConfig.members[1]!.backendType = 'in-process'
+    await writeTeamConfig(name, recreatedConfig)
+    const newConsumer = {
+      ...oldConsumer,
+      parentSessionId: 'new-consumer-lead',
+      resumableAgentId: 'new-consumer-transcript',
+      consumerScope: memberConsumerScope({
+        team: recreatedConfig,
+        generation: recreatedLifecycle.generation,
+        ownerSessionId: 'new-consumer-transcript',
+        backend: 'in-process',
+        agentName: 'Worker Agent',
+        memberInstanceId: 'new-consumer-instance',
+      }),
+    }
+    expect(await takeTeammateMailbox(newConsumer)).toEqual({
+      type: 'new_messages',
+      messages: [expect.objectContaining({
+        id: 'new-consumer-message', text: 'Only for the new consumer', read: false,
+      })],
+    })
+    expect(JSON.parse(await fs.readFile(inboxPath, 'utf8'))).toEqual([])
+    expect((await fs.readFile(historyPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))).toEqual([
+      expect.objectContaining({ id: 'new-consumer-message', read: true }),
+    ])
+  })
+
   it('should write member messages into the teammate inbox', async () => {
     await writeTeamConfig('mailbox-team', makeTeamConfig({ name: 'mailbox-team' }))
 
@@ -4360,6 +4654,7 @@ describe('TeamService', () => {
       'mailbox-team',
       'agent-worker',
       'Please review the latest diff',
+      { incarnationId: teamIncarnationId(makeTeamConfig({ name: 'mailbox-team' })), memberSessionId: 'session-worker-001' },
     )
 
     const inboxPath = path.join(
@@ -4384,6 +4679,38 @@ describe('TeamService', () => {
     })
   })
 
+  it('keeps one mailbox envelope when the client retries a message id', async () => {
+    await writeTeamConfig('retry-mailbox-team', makeTeamConfig({ name: 'retry-mailbox-team' }))
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await service.sendMemberMessage(
+        'retry-mailbox-team',
+        'agent-worker',
+        'Please review the latest diff',
+        { messageId: 'client-retry-1', incarnationId: teamIncarnationId(makeTeamConfig({ name: 'retry-mailbox-team' })), memberSessionId: 'session-worker-001' },
+      )
+    }
+
+    const inboxPath = path.join(
+      tmpDir,
+      'teams',
+      'retry-mailbox-team',
+      'inboxes',
+      'Worker-Agent.json',
+    )
+    const inbox = JSON.parse(await fs.readFile(inboxPath, 'utf-8')) as Array<{
+      id?: string
+      from: string
+      text: string
+    }>
+
+    expect(inbox).toEqual([expect.objectContaining({
+      id: 'client-retry-1',
+      from: 'user',
+      text: 'Please review the latest diff',
+    })])
+  })
+
   it('reports a member message that could not be written instead of claiming it was sent', async () => {
     await writeTeamConfig('blocked-mailbox-team', makeTeamConfig({ name: 'blocked-mailbox-team' }))
     // An inbox that cannot be read back can never take the message.
@@ -4396,27 +4723,29 @@ describe('TeamService', () => {
       'blocked-mailbox-team',
       'agent-worker',
       'Please review the latest diff',
+      { incarnationId: teamIncarnationId(makeTeamConfig({ name: 'blocked-mailbox-team' })), memberSessionId: 'session-worker-001' },
     )).rejects.toMatchObject({ statusCode: 503, code: 'MAILBOX_UNAVAILABLE' })
   })
 
-  it('should send messages to inbox-discovered members', async () => {
+  it('refuses inbox-only members without a registered instance and preserves their history', async () => {
     await writeTeamConfig('inbox-team', makeTeamConfig({ name: 'inbox-team' }))
     const inboxDir = path.join(tmpDir, 'teams', 'inbox-team', 'inboxes')
     await fs.mkdir(inboxDir, { recursive: true })
     await fs.writeFile(path.join(inboxDir, 'security-reviewer.json'), '[]', 'utf-8')
 
-    await service.sendMemberMessage(
+    await expect(service.sendMemberMessage(
       'inbox-team',
       'security-reviewer@inbox-team',
       'Check the auth changes',
-    )
+      { incarnationId: teamIncarnationId(makeTeamConfig({ name: 'inbox-team' })), memberSessionId: 'invented-session' },
+    )).rejects.toMatchObject({ statusCode: 404 })
 
     const rawInbox = await fs.readFile(
       path.join(inboxDir, 'security-reviewer.json'),
       'utf-8',
     )
-    const inbox = JSON.parse(rawInbox) as Array<{ text: string }>
-    expect(inbox.at(-1)?.text).toBe('Check the auth changes')
+    expect(rawInbox).toBe('[]')
+    expect(await fs.readdir(inboxDir)).toEqual(['security-reviewer.json'])
   })
 
   // --------------------------------------------------------------------------
@@ -4984,6 +5313,104 @@ describe('Teams API', () => {
     expect(res.status).toBe(404)
   })
 
+  it('rejects missing and stale message identities without changing live or historical mail', async () => {
+    const name = 'identity-send-team'
+    const config = makeTeamConfig({ name })
+    await writeTeamConfig(name, config)
+    const identity = { incarnationId: teamIncarnationId(config), memberSessionId: 'session-worker-001' }
+    const post = (fields: Record<string, unknown>) => fetch(
+      `${baseUrl}/api/teams/${name}/members/agent-worker/messages`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: 'status?', messageId: 'identity-request', ...fields }) },
+    )
+    // 缺身份请求连目录都不得创建，重试也不例外。
+    for (const fields of [{}, {}, { incarnationId: identity.incarnationId }, { memberSessionId: identity.memberSessionId }]) {
+      expect((await post(fields)).status).toBe(400)
+    }
+    const teamDir = path.join(tmpDir, 'teams', name)
+    expect(await fs.readdir(teamDir)).toEqual(['config.json'])
+    expect((await post(identity)).status).toBe(200)
+    const files = await fs.readdir(teamDir, { recursive: true })
+    const before = new Map<string, string>()
+    for (const file of files) {
+      const location = path.join(teamDir, file)
+      if ((await fs.stat(location)).isFile()) before.set(file, await fs.readFile(location, 'utf8'))
+    }
+    for (const fields of [
+      {},
+      { ...identity, incarnationId: 'old-team' },
+      { ...identity, memberSessionId: 'old-member' },
+    ]) {
+      expect((await post(fields)).status).toBe('incarnationId' in fields ? 409 : 400)
+      for (const [file, bytes] of before) expect(await fs.readFile(path.join(teamDir, file), 'utf8')).toBe(bytes)
+      expect(await fs.readdir(teamDir, { recursive: true })).toEqual(files)
+    }
+  })
+
+  it('rejects delayed messages after a team or member replacement even with a reused message id', async () => {
+    const name = 'replaced-send-team'
+    const original = makeTeamConfig({ name })
+    await writeTeamConfig(name, original)
+    const body = { content: 'old instruction', messageId: 'old-send', incarnationId: teamIncarnationId(original), memberSessionId: 'session-worker-001' }
+    const post = () => fetch(`${baseUrl}/api/teams/${name}/members/agent-worker/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })
+    const replacedMember = makeTeamConfig({ name })
+    replacedMember.members[1]!.sessionId = 'replacement-session'
+    await writeTeamConfig(name, replacedMember)
+    expect((await post()).status).toBe(409)
+    expect(await fs.readdir(path.join(tmpDir, 'teams', name))).toEqual(['config.json'])
+    await writeTeamConfig(name, makeTeamConfig({ name, createdAt: original.createdAt + 1 }))
+    expect((await post()).status).toBe(409)
+    expect(await fs.readdir(path.join(tmpDir, 'teams', name))).toEqual(['config.json'])
+  })
+
+  it('rejects malformed member-message bodies before mailbox writes', async () => {
+    const name = 'malformed-send-team'
+    await writeTeamConfig(name, makeTeamConfig({ name }))
+    for (const body of [null, [], 'message', { content: 42 }, { content: {} }]) {
+      const response = await fetch(`${baseUrl}/api/teams/${name}/members/agent-worker/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      })
+      expect(response.status).toBe(400)
+    }
+    expect(await fs.readdir(path.join(tmpDir, 'teams', name))).toEqual(['config.json'])
+  })
+
+  it('rejects a registered legacy member without a session identity', async () => {
+    const name = 'legacy-send-team'
+    const config = makeTeamConfig({ name })
+    delete (config.members[1] as { sessionId?: string }).sessionId
+    await writeTeamConfig(name, config)
+    const response = await fetch(`${baseUrl}/api/teams/${name}/members/agent-worker/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'status?', incarnationId: teamIncarnationId(config), memberSessionId: 'guessed-session' }),
+    })
+    expect(response.status).toBe(409)
+    expect(await fs.readdir(path.join(tmpDir, 'teams', name))).toEqual(['config.json'])
+  })
+
+  it('returns the stop epoch the send committed against', async () => {
+    const name = 'epoch-send-team'
+    const config = { ...makeTeamConfig({ name }), stopEpoch: 3 }
+    await writeTeamConfig(name, config)
+    const response = await fetch(`${baseUrl}/api/teams/${name}/members/agent-worker/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'status?', incarnationId: teamIncarnationId(config), memberSessionId: 'session-worker-001' }),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ ok: true, stopEpoch: 3 })
+
+    // A pre-Stop config starts at epoch zero, so the first Stop (epoch one)
+    // can settle this send. This is distinct from an older service response.
+    const legacyName = 'epoch-legacy-team'
+    await writeTeamConfig(legacyName, makeTeamConfig({ name: legacyName }))
+    const legacy = await fetch(`${baseUrl}/api/teams/${legacyName}/members/agent-worker/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'status?', incarnationId: teamIncarnationId(makeTeamConfig({ name: legacyName })), memberSessionId: 'session-worker-001' }),
+    })
+    expect(await legacy.json()).toEqual({ ok: true, stopEpoch: 0 })
+  })
+
   it('POST /api/teams/:name/members/:id/messages should enqueue a mailbox message', async () => {
     await writeTeamConfig('send-team', makeTeamConfig({ name: 'send-team' }))
 
@@ -4992,7 +5419,7 @@ describe('Teams API', () => {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: 'Please continue with the failing test' }),
+        body: JSON.stringify({ content: 'Please continue with the failing test', incarnationId: teamIncarnationId(makeTeamConfig({ name: 'send-team' })), memberSessionId: 'session-worker-001' }),
       },
     )
 
@@ -5006,6 +5433,63 @@ describe('Teams API', () => {
     )
     const inbox = JSON.parse(rawInbox) as Array<{ text: string }>
     expect(inbox.at(-1)?.text).toBe('Please continue with the failing test')
+  })
+
+  it('POST /api/teams/:name/members/:id/messages stores a well-formed message id verbatim', async () => {
+    await writeTeamConfig('id-team', makeTeamConfig({ name: 'id-team' }))
+    const post = (messageId: unknown) => fetch(
+      `${baseUrl}/api/teams/id-team/members/agent-worker/messages`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'status?', messageId, incarnationId: teamIncarnationId(makeTeamConfig({ name: 'id-team' })), memberSessionId: 'session-worker-001' }),
+      },
+    )
+    const inboxPath = path.join(tmpDir, 'teams', 'id-team', 'inboxes', 'Worker-Agent.json')
+
+    expect((await post('client-1a2b.3c:4d-5e')).status).toBe(200)
+    expect(JSON.parse(await fs.readFile(inboxPath, 'utf-8'))).toEqual([
+      expect.objectContaining({ id: 'client-1a2b.3c:4d-5e', from: 'user' }),
+    ])
+
+    // A client may not claim an id this module generates for its own envelopes.
+    expect((await post('mailbox-4d5e')).status).toBe(400)
+    expect(JSON.parse(await fs.readFile(inboxPath, 'utf-8'))).toHaveLength(1)
+  })
+
+  it('POST /api/teams/:name/members/:id/messages rejects an id XML escaping would rewrite', async () => {
+    await writeTeamConfig('bad-id-team', makeTeamConfig({ name: 'bad-id-team' }))
+    const post = (messageId: unknown) => fetch(
+      `${baseUrl}/api/teams/bad-id-team/members/agent-worker/messages`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'status?', messageId }),
+      },
+    )
+
+    // Each of these would come back from the `id="..."` scan as a different
+    // string than the caller sent, so the echo could never settle its bubble --
+    // and a quote or angle bracket could end the attribute.
+    for (const messageId of [
+      '',
+      ' client',
+      'client"x',
+      "client'x",
+      'client<x',
+      'client>x',
+      'client&x',
+      'client\nx',
+      'client\u0007x',
+      'x'.repeat(201),
+      42,
+      null,
+    ]) {
+      expect((await post(messageId)).status).toBe(400)
+    }
+    expect(await fs.readdir(
+      path.join(tmpDir, 'teams', 'bad-id-team', 'inboxes'),
+    ).catch(() => 'ENOENT')).toBe('ENOENT')
   })
 
   it('DELETE /api/teams/:name should delete team', async () => {

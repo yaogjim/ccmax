@@ -32,6 +32,10 @@ import { SessionService, sessionService } from '../services/sessionService.js'
 import { createRepositoryBranch } from '../services/repositoryLaunchService.js'
 import { ProviderService } from '../services/providerService.js'
 import { SettingsService } from '../services/settingsService.js'
+import {
+  normalizeJsonObject,
+  readRecoverableJsonFile,
+} from '../services/recoverableJsonFile.js'
 import { hahaOAuthService } from '../services/hahaOAuthService.js'
 import { resetTerminalShellEnvironmentCacheForTests } from '../../utils/terminalShellEnvironment.js'
 import * as openAIModelCatalog from '../../services/openaiAuth/modelCatalog.js'
@@ -51,6 +55,44 @@ async function rmWithRetry(targetPath: string): Promise<void> {
       }
       await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)))
     }
+  }
+}
+
+// ============================================================================
+// settings.json 夹具：原子替换
+// ============================================================================
+
+/**
+ * 测试夹具写入 settings.json 时的确定性屏障。
+ * 只在原子替换写完临时文件、尚未 rename 时触发一次，用于验证并发读取
+ * 只能看到旧快照或新快照，绝不会看到半截 JSON。
+ */
+let settingsFixtureWriteBarrier: (() => Promise<void>) | undefined
+
+/**
+ * 用「同目录唯一临时文件 + rename」替换整个 settings.json 夹具。
+ *
+ * 直接 fs.writeFile(settings.json) 会先截断再写，服务端并发读取
+ * （readRecoverableJsonFile / SettingsService）可能读到半截 JSON，进而把原文件
+ * 隔离成 .invalid-* 备份。rename 在同一文件系统内是原子的，读取方只会看到
+ * 完整的旧内容或完整的新内容。这里始终整体替换，不做 merge。
+ */
+async function writeSettingsFixture(
+  filePath: string,
+  contents: string,
+): Promise<void> {
+  const dir = path.dirname(filePath)
+  const tmpFile = path.join(
+    dir,
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${crypto.randomUUID()}.tmp`,
+  )
+  await fs.mkdir(dir, { recursive: true })
+  try {
+    await fs.writeFile(tmpFile, contents, 'utf-8')
+    await settingsFixtureWriteBarrier?.()
+    await fs.rename(tmpFile, filePath)
+  } finally {
+    await fs.unlink(tmpFile).catch(() => {})
   }
 }
 
@@ -2671,6 +2713,99 @@ describe('WebSocket Chat Integration', () => {
     expect(title).toBe('ship the desktop goal card')
   })
 
+  it('keeps settings.json readers on a complete snapshot during an atomic fixture replace', async () => {
+    const settingsPath = path.join(tmpDir, 'settings.json')
+    const previousRaw = await fs
+      .readFile(settingsPath, 'utf-8')
+      .catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return undefined
+        throw error
+      })
+    const initialSettings = {
+      alwaysThinkingEnabled: true,
+      model: 'atomic-fixture-before',
+    }
+    const nextSettings = {
+      alwaysThinkingEnabled: false,
+      model: 'atomic-fixture-after',
+    }
+    const readsDuringWrite: Array<{
+      raw: string
+      recoverable: Record<string, unknown>
+      service: Record<string, unknown>
+      originalExists: boolean
+      invalidBackups: string[]
+    }> = []
+
+    const listInvalidBackups = async (): Promise<string[]> =>
+      (await fs.readdir(tmpDir)).filter((name) => name.includes('.invalid-'))
+
+    await writeSettingsFixture(
+      settingsPath,
+      JSON.stringify(initialSettings, null, 2) + '\n',
+    )
+
+    // 确定性屏障：临时文件已写完、rename 还没发生时读取一次，无需重试或 sleep
+    settingsFixtureWriteBarrier = async () => {
+      const raw = await fs.readFile(settingsPath, 'utf-8')
+      const recoverable = await readRecoverableJsonFile({
+        filePath: settingsPath,
+        label: 'settings',
+        defaultValue: {},
+        normalize: normalizeJsonObject,
+      })
+      const service = await new SettingsService().getUserSettings()
+      const originalExists = await fs
+        .access(settingsPath)
+        .then(() => true)
+        .catch(() => false)
+      readsDuringWrite.push({
+        raw,
+        recoverable,
+        service,
+        originalExists,
+        invalidBackups: await listInvalidBackups(),
+      })
+    }
+
+    try {
+      await writeSettingsFixture(
+        settingsPath,
+        JSON.stringify(nextSettings, null, 2) + '\n',
+      )
+    } finally {
+      settingsFixtureWriteBarrier = undefined
+    }
+
+    expect(readsDuringWrite).toHaveLength(1)
+    const duringWrite = readsDuringWrite[0]!
+    // 替换过程中读取方只能看到完整的旧快照，绝不会拿到半截 JSON
+    expect(JSON.parse(duringWrite.raw)).toEqual(initialSettings)
+    expect(duringWrite.recoverable).toEqual(initialSettings)
+    expect(duringWrite.service).toMatchObject(initialSettings)
+    // 原文件没有被隔离成 .invalid-* 备份
+    expect(duringWrite.originalExists).toBe(true)
+    expect(duringWrite.invalidBackups).toEqual([])
+
+    // rename 之后立刻只看到完整的新快照
+    const afterRaw = await fs.readFile(settingsPath, 'utf-8')
+    expect(JSON.parse(afterRaw)).toEqual(nextSettings)
+    await expect(new SettingsService().getUserSettings()).resolves.toMatchObject(
+      nextSettings,
+    )
+    expect(await listInvalidBackups()).toEqual([])
+    expect(
+      (await fs.readdir(tmpDir)).filter((name) => name.endsWith('.tmp')),
+    ).toEqual([])
+
+    // 整体替换回调用方留下的夹具状态，不做 merge
+    if (previousRaw === undefined) {
+      await fs.rm(settingsPath, { force: true })
+    } else {
+      await writeSettingsFixture(settingsPath, previousRaw)
+    }
+  })
+
   it('should start desktop sessions with disabled thinking when configured', async () => {
     const sessionId = `chat-thinking-disabled-${crypto.randomUUID()}`
     const originalStartSession = conversationService.startSession.bind(conversationService)
@@ -2689,10 +2824,9 @@ describe('WebSocket Chat Integration', () => {
     }) as typeof conversationService.startSession
 
     try {
-      await fs.writeFile(
+      await writeSettingsFixture(
         path.join(tmpDir, 'settings.json'),
-        JSON.stringify({ alwaysThinkingEnabled: false }, null, 2),
-        'utf-8',
+        JSON.stringify({ alwaysThinkingEnabled: false }, null, 2) + '\n',
       )
 
       const messages = await runTurn(sessionId, 'Hello without thinking')
@@ -2702,7 +2836,7 @@ describe('WebSocket Chat Integration', () => {
     } finally {
       conversationService.startSession = originalStartSession as typeof conversationService.startSession
       conversationService.stopSession(sessionId)
-      await fs.writeFile(path.join(tmpDir, 'settings.json'), '{}\n', 'utf-8')
+      await writeSettingsFixture(path.join(tmpDir, 'settings.json'), '{}\n')
     }
   })
 
@@ -2750,20 +2884,18 @@ describe('WebSocket Chat Integration', () => {
     try {
       const disabledSessionId = `ds-think-off-${crypto.randomUUID()}`
       sessionIds.push(disabledSessionId)
-      await fs.writeFile(
+      await writeSettingsFixture(
         path.join(tmpDir, 'settings.json'),
-        JSON.stringify({ alwaysThinkingEnabled: false }, null, 2),
-        'utf-8',
+        JSON.stringify({ alwaysThinkingEnabled: false }, null, 2) + '\n',
       )
       const disabledMessages = await runTurn(disabledSessionId, 'DeepSeek with global thinking off')
       expect(disabledMessages.some((m) => m.type === 'message_complete')).toBe(true)
 
       const enabledSessionId = `ds-think-on-${crypto.randomUUID()}`
       sessionIds.push(enabledSessionId)
-      await fs.writeFile(
+      await writeSettingsFixture(
         path.join(tmpDir, 'settings.json'),
-        JSON.stringify({ alwaysThinkingEnabled: true }, null, 2),
-        'utf-8',
+        JSON.stringify({ alwaysThinkingEnabled: true }, null, 2) + '\n',
       )
       const enabledMessages = await runTurn(enabledSessionId, 'DeepSeek with global thinking on')
       expect(enabledMessages.some((m) => m.type === 'message_complete')).toBe(true)
@@ -2787,7 +2919,7 @@ describe('WebSocket Chat Integration', () => {
       }
       await providerService.activateOfficial()
       await providerService.deleteProvider(provider.id)
-      await fs.writeFile(path.join(tmpDir, 'settings.json'), '{}\n', 'utf-8')
+      await writeSettingsFixture(path.join(tmpDir, 'settings.json'), '{}\n')
     }
   }, 20_000)
 
@@ -3570,10 +3702,9 @@ describe('WebSocket Chat Integration', () => {
       conversationService.startSession = originalStartSession
       conversationService.stopSession(sessionId)
       await hahaOAuthService.deleteTokens()
-      await fs.writeFile(
+      await writeSettingsFixture(
         path.join(tmpDir, 'settings.json'),
-        JSON.stringify(previousSettings, null, 2),
-        'utf-8',
+        JSON.stringify(previousSettings, null, 2) + '\n',
       )
     }
   }, 20_000)
@@ -3718,10 +3849,9 @@ describe('WebSocket Chat Integration', () => {
       conversationService.stopSession(sessionId)
       conversationService.stopSession(persistedSessionId)
       await providerService.activateOfficial()
-      await fs.writeFile(
+      await writeSettingsFixture(
         path.join(tmpDir, 'settings.json'),
-        JSON.stringify(previousSettings, null, 2),
-        'utf-8',
+        JSON.stringify(previousSettings, null, 2) + '\n',
       )
     }
   }, 20_000)
@@ -5813,7 +5943,7 @@ describe('WebSocket Chat Integration', () => {
       conversationService.stopSession(sessionId)
       await providerService.activateOfficial()
       await providerService.deleteProvider(activeProvider.id)
-      await fs.writeFile(path.join(tmpDir, 'settings.json'), JSON.stringify(previousSettings), 'utf-8')
+      await writeSettingsFixture(path.join(tmpDir, 'settings.json'), JSON.stringify(previousSettings) + '\n')
       await providerService.updateManagedSettings({ model: undefined, modelContext: undefined, ...previousManagedSettings })
     }
   }, 20_000)

@@ -139,6 +139,8 @@ describe('TeamWatcher.extractMemberStatuses', () => {
       currentTask: undefined,
       lastError: null,
       autoRetry: null,
+      awaitingDependencies: false,
+      initialStartPending: false,
     })
     expect(statuses[1]).toEqual({
       agentId: 'agent-worker',
@@ -148,6 +150,28 @@ describe('TeamWatcher.extractMemberStatuses', () => {
       currentTask: undefined,
       lastError: null,
       autoRetry: null,
+      awaitingDependencies: false,
+      initialStartPending: false,
+    })
+  })
+
+  it('reports an approved member with no process yet, and clears the wait once it starts', () => {
+    const config = makeTeamConfig()
+    const [, worker] = config.members as Array<Record<string, unknown>>
+    Object.assign(worker!, { isActive: false, awaitingDependencies: true, initialStartPending: true })
+    // A standby member is waiting, not stopped: it has never run.
+    expect(watcher.extractMemberStatuses(config)[1]).toMatchObject({
+      status: 'idle',
+      activity: 'idle',
+      awaitingDependencies: true,
+      initialStartPending: true,
+    })
+
+    Object.assign(worker!, { awaitingDependencies: undefined, initialStartPending: false })
+    // Explicit false so the desktop clears what the previous push said.
+    expect(watcher.extractMemberStatuses(config)[1]).toMatchObject({
+      awaitingDependencies: false,
+      initialStartPending: false,
     })
   })
 
@@ -542,6 +566,45 @@ describe('TeamWatcher polling', () => {
       expect.objectContaining({ type: 'team_created', teamName: 'My Team' }),
       expect.objectContaining({ type: 'team_deleted', teamName: 'My Team' }),
     ])
+  })
+
+  it('marks an inbox-discovered member as an unknown turn, never as an active one', async () => {
+    const deliveries: Array<{ message: ServerMessage; sessionId?: string }> = []
+    watcher = new TeamWatcher(
+      (message, sessionId) => deliveries.push({ message, sessionId }),
+      {
+        getWorkbench: async () => ({}) as never,
+        markWorkbenchArchiveDeleted: async () => {},
+      },
+    )
+    const config = makeTeamConfig({
+      name: 'inbox-team',
+      leadSessionId: 'lead-session-inbox',
+    })
+    await writeTeamConfig('inbox-team', config)
+    await watcher.checkNow()
+    deliveries.length = 0
+
+    // `reader` only ever reached disk as an inbox file: no config row, no
+    // transcript write. The watcher reports it as `running` because the status
+    // has no value for "not known", so the activity must stay `unknown` -- the
+    // desktop model turns `unknown` into idle and must not be told `active`.
+    await writeJsonFile('teams/inbox-team/inboxes/reader.json', [{
+      from: 'team-lead',
+      text: 'Please take task 2',
+      timestamp: '2026-08-08T00:00:00.000Z',
+    }])
+    await writeTeamConfig('inbox-team', { ...config, description: 'updated' })
+    await watcher.checkNow()
+
+    const update = deliveries.find(({ message }) => message.type === 'team_update')
+    if (update?.message.type !== 'team_update') throw new Error('Expected team_update')
+    expect(update.message.members.find((member) => member.role === 'reader'))
+      .toMatchObject({
+        agentId: 'reader@inbox-team',
+        status: 'running',
+        activity: 'unknown',
+      })
   })
 
   it('should detect team deletion', async () => {

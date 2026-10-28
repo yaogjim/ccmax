@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test'
 import type { ServerWebSocket } from 'bun'
+import * as fs from 'node:fs/promises'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import {
   __enqueueRuntimeTransitionForTests,
   __markPrewarmPendingForTests,
+  __persistCliTaskNotificationForTests,
   __markActiveTurnForTests,
   __refreshDisconnectedTurnCleanupWatcherForTests,
   __registerPendingUserTurnForTests,
@@ -902,6 +906,158 @@ describe('WebSocket handler session isolation', () => {
 
     resolveSend(true)
     await flushMicrotasks(30)
+  })
+
+  it('keeps a background task terminal visible and readable while a foreground send awaits acknowledgement', async () => {
+    // Transcript lookup requires a bare UUID, so persistence keys stay realistic.
+    const sessionId = crypto.randomUUID()
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-haha-admission-terminal-'))
+    process.env.CLAUDE_CONFIG_DIR = configDir
+    resetSettingsCache()
+    const projectDir = path.join(configDir, 'projects', '-tmp-admission-terminal')
+    const transcriptPath = path.join(projectDir, `${sessionId}.jsonl`)
+    await fs.mkdir(projectDir, { recursive: true })
+    await fs.writeFile(transcriptPath, `${JSON.stringify({
+      type: 'session-meta',
+      isMeta: true,
+      workDir: '/tmp/admission-terminal',
+      timestamp: '2026-10-08T00:00:00.000Z',
+    })}\n`, 'utf8')
+    expect(await sessionService.getSessionTaskNotifications(sessionId)).toEqual([])
+
+    try {
+      const first = makeClientSocket(sessionId)
+      const second = makeClientSocket(sessionId)
+      const outputCallbacks: Array<(cliMsg: any) => void> = []
+      let resolveSend!: (sent: boolean) => void
+      spyOn(conversationService, 'hasSession').mockReturnValue(true)
+      spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+      spyOn(conversationService, 'onOutput').mockImplementation((_sid, callback) => {
+        outputCallbacks.push(callback)
+      })
+      spyOn(conversationService, 'removeOutputCallback').mockImplementation((_sid, callback) => {
+        const index = outputCallbacks.indexOf(callback)
+        if (index >= 0) outputCallbacks.splice(index, 1)
+      })
+      spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
+      spyOn(conversationService, 'sendMessage').mockImplementation(
+        () => new Promise<boolean>((resolve) => {
+          resolveSend = resolve
+        }),
+      )
+
+      handleWebSocket.open(first)
+      handleWebSocket.open(second)
+      first.sent.length = 0
+      second.sent.length = 0
+
+      handleWebSocket.message(first, JSON.stringify({
+        type: 'user_message',
+        content: 'Follow up while the background check finishes',
+      }))
+      await flushMicrotasks(30)
+
+      // The foreground send is still waiting for its acknowledgement, so the
+      // pre-turn output mute window is open for every bound observer.
+      expect(typeof resolveSend).toBe('function')
+      expect(outputCallbacks.length).toBeGreaterThanOrEqual(2)
+
+      // Old foreground content from the previous generation must stay muted.
+      for (const callback of [...outputCallbacks]) {
+        callback({
+          type: 'assistant',
+          message: {
+            id: 'stale-foreground-message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'stale foreground reply' }],
+          },
+        })
+      }
+
+      // Activity is not a terminal: a running frame for the same task must stay
+      // muted, because this turn's send is still unacknowledged.
+      for (const callback of [...outputCallbacks]) {
+        callback({
+          type: 'system',
+          subtype: 'task_notification',
+          uuid: 'background-running-during-admission-1',
+          task_id: 'background-task-1',
+          tool_use_id: 'background-tool-1',
+          task_type: 'local_agent',
+          status: 'running',
+          summary: 'Background verification is still running',
+        })
+      }
+
+      // A background task that started before this turn reaches its terminal
+      // state. Its outcome is a legal terminal, not foreground chatter.
+      const completed = {
+        type: 'system',
+        subtype: 'task_notification',
+        uuid: 'background-terminal-during-admission-1',
+        task_id: 'background-task-1',
+        tool_use_id: 'background-tool-1',
+        task_type: 'local_agent',
+        status: 'completed',
+        summary: 'Background verification completed',
+        timestamp: '2026-10-08T00:01:00.000Z',
+      }
+      for (const callback of [...outputCallbacks]) callback(completed)
+      await flushMicrotasks(30)
+
+      // 文件可读早于 append 的收尾及转发；等待同一事件的既有持久化
+      // Promise，再排空转发回调，不用文件出现代替发送完成。
+      await __persistCliTaskNotificationForTests(sessionId, completed)
+      await flushMicrotasks(30)
+      const readPersistedTerminals = async (): Promise<string[]> =>
+        (await fs.readFile(transcriptPath, 'utf8'))
+          .split('\n')
+          .filter((line) => line.includes('cc-haha-task-notification'))
+      let persisted = await readPersistedTerminals()
+
+      for (const ws of [first, second]) {
+        const sent = ws.sent.map((payload) => JSON.parse(payload))
+        expect(sent).not.toContainEqual(expect.objectContaining({
+          type: 'content_delta',
+          text: 'stale foreground reply',
+        }))
+        expect(sent).not.toContainEqual(expect.objectContaining({
+          subtype: 'task_notification',
+          data: expect.objectContaining({ status: 'running' }),
+        }))
+        expect(sent).toContainEqual({
+          type: 'system_notification',
+          subtype: 'task_notification',
+          data: completed,
+        })
+      }
+
+      // Both observers share a single durable record, and history can read it.
+      expect(persisted).toHaveLength(1)
+      expect(await sessionService.getSessionTaskNotifications(sessionId)).toEqual([
+        expect.objectContaining({
+          taskId: 'background-task-1',
+          toolUseId: 'background-tool-1',
+          status: 'completed',
+          summary: 'Background verification completed',
+        }),
+      ])
+
+      // The same terminal replayed (both observers, then a duplicate event)
+      // must not append a second durable record.
+      for (const callback of [...outputCallbacks]) callback(completed)
+      await flushMicrotasks(30)
+      expect(await readPersistedTerminals()).toHaveLength(1)
+
+      resolveSend(true)
+      await flushMicrotasks(30)
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      resetSettingsCache()
+      await fs.rm(configDir, { recursive: true, force: true })
+    }
   })
 
   it('lets directed Agent terminals through the stop fence after suppressing late content', () => {

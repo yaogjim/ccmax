@@ -25,6 +25,19 @@ afterEach(async () => {
 
 const worker = { parentSessionId: 'parent', teamName: 'approved', memberId: 'research', name: 'researcher', systemPrompt: 'Read only research', tools: ['Read'], agentDefinition: { disallowedTools: ['Bash'], maxTurns: 3 } }
 
+test('consumer scope is issued only to its team worker and never inherited by ordinary or pinned children', async () => {
+  const service = new ConversationService() as any
+  const scope = { version: 1, teamName: 'approved', generation: 1, createdAt: 1, leadSessionId: 'parent', ownerSessionId: 'child', recipient: { kind: 'member', backend: 'process', agentName: 'researcher', memberInstanceId: 'original', memberSessionId: 'child' } }
+  process.env.CC_HAHA_TEAM_CONSUMER_SCOPE = 'untrusted inherited value'
+  const ordinary = await service.buildChildEnv(home, undefined, {})
+  const pinned = await service.buildChildEnv(home, undefined, { agentWorker: { parentSessionId: 'parent', agentType: 'reader', runId: 'run', systemPrompt: 'read' } })
+  const team = await service.buildChildEnv(home, undefined, { teamWorker: { ...worker, consumerScope: scope } })
+  expect(ordinary.CC_HAHA_TEAM_CONSUMER_SCOPE).toBeUndefined()
+  expect(pinned.CC_HAHA_TEAM_CONSUMER_SCOPE).toBeUndefined()
+  expect(JSON.parse(team.CC_HAHA_TEAM_CONSUMER_SCOPE)).toEqual(scope)
+  expect(process.env.CC_HAHA_TEAM_CONSUMER_SCOPE).toBe('untrusted inherited value')
+})
+
 test('worker CLI has its own SDK identity and applies the approved preset and model', () => {
   const service = new ConversationService() as any
   service.resolveCliArgs = (args: string[]) => args

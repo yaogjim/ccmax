@@ -8,6 +8,7 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
+import { migrateTaskDeliveryRecord, taskDeliverySchema, type TaskDelivery } from '../../shared/taskDelivery.js'
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed'
 
@@ -22,6 +23,8 @@ export type TaskInfo = {
   blockedBy: string[]
   metadata?: Record<string, unknown>
   taskListId: string
+  delivery?: TaskDelivery
+  deliveryError?: string
 }
 
 export type TaskListSummary = {
@@ -125,6 +128,7 @@ export class TaskService {
 
     // Skip internal tasks
     if (data.metadata?._internal) return null
+    data = migrateTaskDeliveryRecord(data)
 
     return {
       id: String(data.id),
@@ -138,6 +142,8 @@ export class TaskService {
       blocks: Array.isArray(data.blocks) ? data.blocks : [],
       blockedBy: Array.isArray(data.blockedBy) ? data.blockedBy : [],
       metadata: data.metadata,
+      delivery: taskDeliverySchema.parse(data.delivery),
+      ...(data.deliveryError ? { deliveryError: String(data.deliveryError) } : {}),
       taskListId,
     }
   }

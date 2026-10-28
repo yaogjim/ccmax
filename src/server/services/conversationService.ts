@@ -1,4 +1,5 @@
 import { PINNED_AGENT_ENTRYPOINT, TEAM_WORKER_ENTRYPOINT } from '../../shared/workerSession.js'
+import { parseConsumerScope, withConsumerScope, type ConsumerScope } from '../../utils/swarm/consumerScope.js'
 import { closeSideChatsForParent, getSideChat, isSideChatId, SIDE_CHAT_BOUNDARY } from './sideChatRegistry.js'
 import { migrationMaintenance, waitForMigrationExit } from '../migrationMaintenance.js'
 /**
@@ -174,6 +175,22 @@ type SendMessageOptions = {
   onCommitted?: () => void
 }
 
+export type ScopedSendOutcome = { status: 'sent' } | { status: 'rejected'; reason: string }
+export type ScopedSendReceipt = ScopedSendOutcome | { status: 'queued'; completion: Promise<ScopedSendOutcome> }
+type ScopedOutbound = {
+  line: string
+  scope: ConsumerScope
+  canSend?: () => boolean
+  settled: boolean
+  resolve: (outcome: ScopedSendOutcome) => void
+}
+
+function scopeIdentityKey(scope: ConsumerScope): string {
+  const recipient = scope.recipient
+  return JSON.stringify([scope.version, scope.teamName, scope.generation, scope.createdAt, scope.leadSessionId, scope.ownerSessionId,
+    recipient.kind, ...(recipient.kind === 'member' ? [recipient.backend, recipient.agentName, recipient.memberInstanceId, recipient.memberSessionId ?? null] : [])])
+}
+
 type HandleSdkPayloadOptions = {
   canAcceptPermissionRequest?: (message: any) => boolean
 }
@@ -285,7 +302,10 @@ type SessionProcess = {
   sdkSocket: { send(data: string): void } | null
   sdkAttached: Promise<void>
   resolveSdkAttached: (() => void) | null
-  pendingOutbound: string[]
+  pendingOutbound: (string | ScopedOutbound)[]
+  scopedOutbound?: Set<ScopedOutbound>
+  outboundDrain?: Promise<void>
+  scopedStopGeneration?: number
   startupPending: boolean
   startupExitCode: number | null
   stdoutLines: string[]
@@ -318,6 +338,7 @@ export type PendingPermissionRequest = {
 }
 
 export type TeamWorkerStart = {
+  consumerScope?: ConsumerScope
   parentSessionId: string
   teamName: string
   memberId: string
@@ -1028,6 +1049,116 @@ export class ConversationService {
     return sent
   }
 
+  /** Team consumption has its own receipt: enqueue is never an ACK. */
+  async sendScopedMessage(
+    sessionId: string,
+    content: string,
+    rawScope: unknown,
+    options?: SendMessageOptions,
+  ): Promise<ScopedSendReceipt> {
+    const parsed = parseConsumerScope(rawScope)
+    if (parsed.status !== 'bound') return { status: 'rejected', reason: parsed.status }
+    if (parsed.scope.ownerSessionId !== sessionId || parsed.scope.recipient.kind !== 'member' || parsed.scope.recipient.backend !== 'process' || parsed.scope.recipient.memberSessionId !== sessionId) return { status: 'rejected', reason: 'stale' }
+    const session = this.sessions.get(sessionId)
+    if (!session) return { status: 'rejected', reason: 'session_ended' }
+    const generation = session.scopedStopGeneration ?? 0
+    const userContent = await this.buildUserContent(content, sessionId)
+    if (!await this.refreshNetworkEnvironmentBeforeTurn(sessionId, session)) return { status: 'rejected', reason: 'transport' }
+    await this.refreshOfficialOAuthTokenBeforeTurn(sessionId, session)
+    if (this.sessions.get(sessionId) !== session) return { status: 'rejected', reason: 'session_replaced' }
+    if (migrationMaintenance.isActive || generation !== (session.scopedStopGeneration ?? 0) || options?.canSend?.() === false) {
+      return { status: 'rejected', reason: 'cancelled' }
+    }
+    let resolve!: (outcome: ScopedSendOutcome) => void
+    const completion = new Promise<ScopedSendOutcome>(done => { resolve = done })
+    const item: ScopedOutbound = {
+      line: JSON.stringify({ type: 'user', ...(options?.messageUuid ? { uuid: options.messageUuid } : {}), message: { role: 'user', content: userContent }, parent_tool_use_id: null, session_id: '' }) + '\n',
+      scope: parsed.scope, canSend: options?.canSend, settled: false, resolve,
+    }
+    session.scopedOutbound ??= new Set()
+    session.scopedOutbound.add(item)
+    session.pendingOutbound.push(item)
+    this.drainOutbound(sessionId, session)
+    // A disconnected item stays queued, with a single completion owned here.
+    return { status: 'queued', completion }
+  }
+
+  cancelScopedMessages(sessionId: string, scope: ConsumerScope, reason = 'cancelled'): void {
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+    for (const item of [...(session.scopedOutbound ?? [])]) {
+      if (scopeIdentityKey(item.scope) === scopeIdentityKey(scope)) this.settleScoped(session, item, { status: 'rejected', reason })
+    }
+  }
+
+  private settleScoped(session: SessionProcess, item: ScopedOutbound, outcome: ScopedSendOutcome): void {
+    if (item.settled) return
+    item.settled = true
+    session.scopedOutbound?.delete(item)
+    const index = session.pendingOutbound.indexOf(item)
+    if (index !== -1) session.pendingOutbound.splice(index, 1)
+    item.resolve(outcome)
+  }
+
+  private rejectScopedOutbound(session: SessionProcess, reason: string): void {
+    session.scopedStopGeneration = (session.scopedStopGeneration ?? 0) + 1
+    for (const item of [...(session.scopedOutbound ?? [])]) this.settleScoped(session, item, { status: 'rejected', reason })
+  }
+
+  retryScopedMessages(sessionId: string): void {
+    const session = this.sessions.get(sessionId)
+    if (session) this.drainOutbound(sessionId, session)
+  }
+
+  private drainOutbound(sessionId: string, session: SessionProcess): void {
+    if (session.outboundDrain || !session.sdkSocket) return
+    session.outboundDrain = (async () => {
+      while (session.pendingOutbound.length > 0) {
+        const item = session.pendingOutbound[0]!
+        if (this.sessions.get(sessionId) !== session) {
+          this.rejectScopedOutbound(session, 'session_replaced')
+          return
+        }
+        const socket = session.sdkSocket
+        if (!socket) return
+        if (typeof item === 'string') {
+          socket.send(item)
+          session.pendingOutbound.shift()
+          continue
+        }
+        const checked = await withConsumerScope(item.scope, () => {
+          if (item.settled) return 'settled' as const
+          if (this.sessions.get(sessionId) !== session) return 'session_replaced' as const
+          if (migrationMaintenance.isActive || item.canSend?.() === false) return 'cancelled' as const
+          if (session.sdkSocket !== socket) return 'reconnect' as const
+          try {
+            socket.send(item.line)
+            this.settleScoped(session, item, { status: 'sent' })
+            return 'sent' as const
+          } catch {
+            this.settleScoped(session, item, { status: 'rejected', reason: 'transport' })
+            return 'transport' as const
+          }
+        })
+        if (checked.status !== 'current') {
+          if (checked.status === 'retryable_io') return
+          this.settleScoped(session, item, { status: 'rejected', reason: checked.status })
+        } else if (checked.value === 'transport') {
+          // The synchronous send may have partially reached the peer. Do not
+          // replay it or ACK; end this transport through the normal stop path.
+          if (this.sessions.get(sessionId) === session) this.stopSession(sessionId)
+          return
+        } else if (checked.value === 'reconnect') {
+          continue
+        } else if (checked.value !== 'sent' && checked.value !== 'settled' && checked.value !== 'transport') {
+          this.settleScoped(session, item, { status: 'rejected', reason: checked.value })
+        }
+      }
+    })().catch(error => {
+      console.warn('[ConversationService] SDK outbound drain failed', error instanceof Error ? error.message : 'transport error')
+    }).finally(() => { session.outboundDrain = undefined })
+  }
+
   private async refreshNetworkEnvironmentBeforeTurn(
     sessionId: string,
     session: SessionProcess,
@@ -1253,6 +1384,8 @@ export class ConversationService {
     // already working is paused rather than destroyed: the runtime marks its
     // members as user-stopped before their processes die, and a later message
     // from the lead or the user resumes each member from its own transcript.
+    const interrupted = this.sessions.get(sessionId)
+    if (interrupted) this.rejectScopedOutbound(interrupted, 'cancelled')
     let pausedTeam = false
     for (const listener of this.teamRuntimeListeners) {
       try {
@@ -1464,12 +1597,7 @@ export class ConversationService {
     session.sdkSocket = socket
     session.resolveSdkAttached?.()
     session.resolveSdkAttached = null
-    while (session.pendingOutbound.length > 0) {
-      const line = session.pendingOutbound.shift()
-      if (line) {
-        socket.send(line)
-      }
-    }
+    this.drainOutbound(sessionId, session)
     return true
   }
 
@@ -1753,6 +1881,7 @@ export class ConversationService {
     session: SessionProcess,
     reason = new Error('CLI session stopped'),
   ): void {
+    this.rejectScopedOutbound(session, 'session_ended')
     const parentId = getWorkerParentId(session)
     if (parentId) {
       const parent = this.sessions.get(parentId)
@@ -2140,6 +2269,10 @@ export class ConversationService {
         !cleanEnv.CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS
       networkRuntimeMetadata.streamMaxDurationDerived =
         !cleanEnv.CLAUDE_STREAM_MAX_DURATION_MS
+    }
+    delete cleanEnv.CC_HAHA_TEAM_CONSUMER_SCOPE
+    if (options?.teamWorker?.consumerScope) {
+      cleanEnv.CC_HAHA_TEAM_CONSUMER_SCOPE = JSON.stringify(options.teamWorker.consumerScope)
     }
     delete cleanEnv.CC_HAHA_SESSION_COLLABORATION_TOKEN
     delete cleanEnv.CC_HAHA_SESSION_ID
