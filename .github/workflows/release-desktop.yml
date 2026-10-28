@@ -260,7 +260,7 @@ jobs:
             -addext "basicConstraints=critical,CA:false" \
             -addext "keyUsage=critical,digitalSignature" \
             -addext "extendedKeyUsage=critical,codeSigning"
-          openssl pkcs12 -export -legacy \
+          openssl pkcs12 -export -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 \
             -out "$work_dir/cert.p12" \
             -inkey "$work_dir/key.pem" \
             -in "$work_dir/cert.pem" \

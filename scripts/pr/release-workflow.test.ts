@@ -437,7 +437,8 @@ describe('release desktop workflow', () => {
     expect(temporaryIdentity).toContain("matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed != 'true'")
     expect(temporaryIdentity).toContain('cu-helper-dev')
     expect(temporaryIdentity).toContain('CC_HAHA_SIGN_IDENTITY')
-    expect(temporaryIdentity).toContain('openssl pkcs12 -export -legacy')
+    expect(temporaryIdentity).toContain('openssl pkcs12 -export -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1')
+    expect(temporaryIdentity).not.toContain('-legacy')
     expect(temporaryIdentity).toContain('sudo -n security add-trusted-cert -d -r trustRoot -p codeSign -k "$keychain_path" "$work_dir/cert.pem"')
     expect(temporaryIdentity).toContain('timeout-minutes: 3')
     for (const name of ['Sign Windows application executables with SignPath', 'Sign Windows installer with SignPath']) {
