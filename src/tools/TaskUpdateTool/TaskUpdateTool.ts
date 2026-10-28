@@ -1,9 +1,12 @@
 import { feature } from 'bun:bundle'
 import { z } from 'zod/v4'
+import { taskDeliveryActionSchema, TASK_DELIVERY_UNSUPPORTED_ERROR } from '../../shared/taskDelivery.js'
+import { applyTaskDeliveryAction } from '../../utils/taskDelivery.js'
 import { isTeamExecutionApproved, readTeamPlan } from '../../utils/swarm/teamPlanStore.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
 import { buildTool, type ToolDef } from '../../Tool.js'
 import { isAgentSwarmsEnabled } from '../../utils/agentSwarmsEnabled.js'
+import { errorMessage } from '../../utils/errors.js'
 import {
   executeTaskCompletedHooks,
   getTaskCompletedHookMessage,
@@ -11,12 +14,18 @@ import {
 import { lazySchema } from '../../utils/lazySchema.js'
 import {
   deleteTaskWithCommit,
+  findUnsatisfiedBlockers,
+  formatTaskDependencyBlockedError,
   getTask,
   getTaskListId,
   isTodoV2Enabled,
   listTasks,
+  type AtomicTaskUpdateResult,
   type Task,
+  type TaskDeletionResult,
   TaskStatusSchema,
+  TASK_DELIVERY_REASSIGN_ERROR,
+  TASK_DELIVERY_STATUS_UPDATE_ERROR,
   updateTaskAtomically,
 } from '../../utils/tasks.js'
 import {
@@ -37,6 +46,7 @@ const inputSchema = lazySchema(() => {
 
   return z.strictObject({
     taskId: z.string().describe('The ID of the task to update'),
+    deliveryAction: taskDeliveryActionSchema.optional().describe('Versioned artifact protocol: owner submits artifact and acceptance criteria; a different reviewer accepts or returns it with a reason. Use the current delivery.revision from TaskGet. Do not combine with ordinary task edits.'),
     subject: z.string().optional().describe('New subject for the task'),
     description: z.string().optional().describe('New description for the task'),
     activeForm: z
@@ -88,6 +98,16 @@ type OutputSchema = ReturnType<typeof outputSchema>
 
 export type Output = z.infer<OutputSchema>
 
+/**
+ * Raised inside the atomic update when an abort landed after the completion
+ * hooks returned. The resolver runs before any write, so throwing here leaves
+ * the task exactly as it was instead of reporting a cancelled completion as a
+ * success.
+ */
+class TaskCompletionCancelledError extends Error {}
+
+const COMPLETION_CANCELLED_MESSAGE = 'Task completion was cancelled before it was committed; the task was not marked completed. If the work is finished, run TaskUpdate again once the turn is active.'
+
 export const TaskUpdateTool = buildTool({
   name: TASK_UPDATE_TOOL_NAME,
   searchHint: 'update a task',
@@ -126,6 +146,7 @@ export const TaskUpdateTool = buildTool({
   async call(
     {
       taskId,
+      deliveryAction,
       subject,
       description,
       activeForm,
@@ -148,7 +169,41 @@ export const TaskUpdateTool = buildTool({
     // Check if task exists
     const existingTask = await getTask(taskListId, taskId)
     const teamName = getTeamName() ?? context.getAppState().teamContext?.teamName
-    if (teamName && (status === 'in_progress' || status === 'completed')) {
+    if (deliveryAction) {
+      try {
+        if (!teamName) throw new Error('Artifact delivery requires a team')
+        if (isTeammate() && getAgentName() === 'user') throw new Error('The user identity is reserved for human review')
+        if ([subject, description, activeForm, status, owner, addBlocks, addBlockedBy, metadata].some(value => value !== undefined)) throw new Error('Keep delivery actions separate from ordinary task edits')
+        const mutation = await applyTaskDeliveryAction(teamName, taskId, getAgentName() || 'team-lead', deliveryAction, undefined, { context })
+        return { data: { success: true, taskId, updatedFields: mutation.updated ? ['delivery', 'status'] : [], taskListMutationAt: mutation.committedAt, taskListMutationRevision: mutation.revision } }
+      } catch (error) {
+        return { data: { success: false, taskId, updatedFields: [], error: error instanceof Error ? error.message : String(error) } }
+      }
+    }
+    if (existingTask?.delivery?.submissions.length && (owner !== undefined || (status !== undefined && status !== 'deleted'))) {
+      const latest = existingTask.delivery.submissions.at(-1)
+      // A returned, still-open artifact may change hands so rework can be
+      // scheduled with a fresh owner. Everything else stays with the delivery
+      // protocol: a version under review keeps the owner whose work is being
+      // judged, generic status edits cannot complete or reopen a task, and
+      // deletion is refused by the storage guard instead.
+      const returnedAndOpen = latest?.review?.decision === 'return' && existingTask.status !== 'completed'
+      if (!(owner !== undefined && status === undefined && returnedAndOpen)) {
+        const error = existingTask.status === 'completed'
+          ? 'This task is completed; an accepted artifact cannot be reopened or reassigned.'
+          : latest?.review === undefined
+            ? 'This task is awaiting independent review; its owner cannot change until the artifact is returned.'
+            : 'Use deliveryAction for independent review and rework; only a task whose artifact was returned and is still open can be reassigned.'
+        return { data: { success: false, taskId, updatedFields: [], error } }
+      }
+    }
+    if (teamName && (
+      status === 'in_progress' ||
+      status === 'completed' ||
+      // Handing returned rework to a new owner is execution, so the same plan
+      // approval the status paths require applies to that owner.
+      (owner !== undefined && owner !== existingTask?.owner && existingTask?.delivery?.submissions.length)
+    )) {
       const plan = await readTeamPlan(teamName)
       if (plan && !await isTeamExecutionApproved(teamName, owner ?? existingTask?.owner)) {
         return { data: { success: false, taskId, updatedFields: [], error: 'The team is awaiting human review. Submit the plan with TeamPlan and wait for approval before executing tasks.' } }
@@ -169,34 +224,55 @@ export const TaskUpdateTool = buildTool({
     // without this the list's dependencies are only a suggestion, and a member
     // marks its blocked task in progress while the work it needs is unwritten.
     // The lead is not held to it: it coordinates, and may decide a dependency
-    // no longer matters.
+    // no longer matters. Passing the same gate to the atomic update lets it be
+    // rechecked after the completion hooks and the lock wait.
+    const enforceDependencyOrder = isTeammate()
     if (
-      isTeammate() &&
+      enforceDependencyOrder &&
       (status === 'in_progress' || status === 'completed') &&
       status !== existingTask.status &&
       existingTask.blockedBy.length > 0
     ) {
-      const unresolved = new Set(
-        (await listTasks(taskListId)).filter(task => task.status !== 'completed').map(task => task.id),
+      // A dependency that is not in the list is not evidence of finished work,
+      // so a dangling edge counts as unfinished instead of vanishing from the
+      // unresolved set.
+      const tasksById = new Map(
+        (await listTasks(taskListId)).map(task => [task.id, task]),
       )
-      const waitingOn = existingTask.blockedBy.filter(id => unresolved.has(id))
+      const waitingOn = findUnsatisfiedBlockers(existingTask, tasksById)
       if (waitingOn.length > 0) {
         return {
           data: {
             success: false,
             taskId,
             updatedFields: [],
-            error: `Task #${taskId} waits on ${waitingOn.map(id => `#${id}`).join(', ')}, not completed yet. Do not work on it or change its status until then; TaskList shows which of your tasks are ready.`,
+            error: formatTaskDependencyBlockedError(taskId, waitingOn),
           },
         }
       }
     }
 
     const updatedFields: string[] = []
+    const abortSignal = context?.abortController?.signal
+    const completionCancelled = () => ({
+      data: {
+        success: false,
+        taskId,
+        updatedFields: [],
+        error: COMPLETION_CANCELLED_MESSAGE,
+      },
+    })
     if (status !== undefined) {
       // Handle deletion - delete the task file and return early
       if (status === 'deleted') {
-        const deletion = await deleteTaskWithCommit(taskListId, taskId)
+        let deletion: TaskDeletionResult
+        try {
+          deletion = await deleteTaskWithCommit(taskListId, taskId)
+        } catch (error) {
+          // The delete guard owns the refusal message, including for a damaged
+          // or newer delivery schema.
+          return { data: { success: false, taskId, updatedFields: [], error: errorMessage(error) } }
+        }
         const deleted = deletion.deleted
         return {
           data: {
@@ -219,6 +295,10 @@ export const TaskUpdateTool = buildTool({
       if (status !== existingTask.status) {
         // Run TaskCompleted hooks when marking a task as completed
         if (status === 'completed') {
+          // A hook runner returns nothing once its signal is aborted, which
+          // used to look like "no blocking error" and completed a turn the
+          // user had already cancelled.
+          if (abortSignal?.aborted) return completionCancelled()
           const blockingErrors: string[] = []
 
           const generator = executeTaskCompletedHooks(
@@ -228,7 +308,7 @@ export const TaskUpdateTool = buildTool({
             getAgentName(),
             getTeamName(),
             undefined,
-            context?.abortController?.signal,
+            abortSignal,
             undefined,
             context,
           )
@@ -241,6 +321,7 @@ export const TaskUpdateTool = buildTool({
             }
           }
 
+          if (abortSignal?.aborted) return completionCancelled()
           if (blockingErrors.length > 0) {
             return {
               data: {
@@ -266,36 +347,60 @@ export const TaskUpdateTool = buildTool({
       (status === 'in_progress' || status === 'completed') &&
       owner === undefined
     ) ? getAgentName() : undefined
-    const mutation = await updateTaskAtomically(taskListId, taskId, (current) => {
-      const updates: Partial<Omit<Task, 'id'>> = {}
-      if (subject !== undefined && subject !== current.subject) updates.subject = subject
-      if (description !== undefined && description !== current.description) {
-        updates.description = description
-      }
-      if (activeForm !== undefined && activeForm !== current.activeForm) {
-        updates.activeForm = activeForm
-      }
-      if (owner !== undefined && owner !== current.owner) {
-        updates.owner = owner
-      } else if (owner === undefined && automaticOwner && !current.owner) {
-        updates.owner = automaticOwner
-      }
-      if (metadata !== undefined) {
-        const merged = { ...(current.metadata ?? {}) }
-        for (const [key, value] of Object.entries(metadata)) {
-          if (value === null) delete merged[key]
-          else merged[key] = value
+    let mutation: AtomicTaskUpdateResult | null
+    try {
+      mutation = await updateTaskAtomically(taskListId, taskId, (current) => {
+        // The hooks and the lock wait both happen outside this transaction.
+        // This check runs before the first write, so a cancellation that landed
+        // in between cannot be committed and reported as a completed task.
+        if (status === 'completed' && abortSignal?.aborted) throw new TaskCompletionCancelledError()
+        const updates: Partial<Omit<Task, 'id'>> = {}
+        if (subject !== undefined && subject !== current.subject) updates.subject = subject
+        if (description !== undefined && description !== current.description) {
+          updates.description = description
         }
-        updates.metadata = merged
+        if (activeForm !== undefined && activeForm !== current.activeForm) {
+          updates.activeForm = activeForm
+        }
+        if (owner !== undefined && owner !== current.owner) {
+          updates.owner = owner
+        } else if (owner === undefined && automaticOwner && !current.owner) {
+          updates.owner = automaticOwner
+        }
+        if (metadata !== undefined) {
+          const merged = { ...(current.metadata ?? {}) }
+          for (const [key, value] of Object.entries(metadata)) {
+            if (value === null) delete merged[key]
+            else merged[key] = value
+          }
+          updates.metadata = merged
+        }
+        if (status !== undefined && status !== 'deleted' && status !== current.status) {
+          updates.status = status
+        }
+        return updates
+      }, {
+        addBlocks,
+        addBlockedBy,
+        requireCompletedDependencies: enforceDependencyOrder,
+      })
+    } catch (error) {
+      if (error instanceof TaskCompletionCancelledError) return completionCancelled()
+      // A concurrent delivery submit/return can invalidate the decision this
+      // call was made on. The storage guard owns that race; surface it as a
+      // normal failure so the caller refreshes instead of retrying blindly.
+      if (
+        error instanceof Error &&
+        (
+          error.message === TASK_DELIVERY_STATUS_UPDATE_ERROR ||
+          error.message === TASK_DELIVERY_REASSIGN_ERROR ||
+          error.message === TASK_DELIVERY_UNSUPPORTED_ERROR
+        )
+      ) {
+        return { data: { success: false, taskId, updatedFields: [], error: error.message } }
       }
-      if (status !== undefined && status !== 'deleted' && status !== current.status) {
-        updates.status = status
-      }
-      return updates
-    }, {
-      addBlocks,
-      addBlockedBy,
-    })
+      throw error
+    }
     if (!mutation) {
       return {
         data: {
@@ -303,6 +408,18 @@ export const TaskUpdateTool = buildTool({
           taskId,
           updatedFields: [],
           error: 'Task not found',
+        },
+      }
+    }
+    if (mutation.refused) {
+      // The transaction refused before writing, so report the dependency gate
+      // as an ordinary failure; nothing was committed and no revision moved.
+      return {
+        data: {
+          success: false,
+          taskId,
+          updatedFields: [],
+          error: mutation.refused.error,
         },
       }
     }

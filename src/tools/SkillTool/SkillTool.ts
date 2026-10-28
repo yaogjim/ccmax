@@ -49,7 +49,7 @@ import {
 import { getAgentContext } from '../../utils/agentContext.js'
 import { errorMessage } from '../../utils/errors.js'
 import {
-  extractResultText,
+  extractResultTextOutcome,
   prepareForkedCommandContext,
 } from '../../utils/forkedAgent.js'
 import { parseFrontmatter } from '../../utils/frontmatterParser.js'
@@ -261,25 +261,25 @@ async function executeForkedSkill(
       }
     }
 
-    const resultText = extractResultText(
-      agentMessages,
-      'Skill execution completed',
-    )
+    const outcome = extractResultTextOutcome(agentMessages)
     // Release message memory after extracting result
     agentMessages.length = 0
 
     const durationMs = Date.now() - startTime
     logForDebugging(
-      `SkillTool forked skill ${commandName} completed in ${durationMs}ms`,
+      `SkillTool forked skill ${commandName} finished in ${durationMs}ms (status: ${outcome.status})`,
     )
 
+    // The outcome status is part of the reported result: an API error,
+    // cancellation, or empty tail must not reach the caller as success.
     return {
       data: {
-        success: true,
+        success: outcome.status === 'ok',
         commandName,
         status: 'forked',
         agentId,
-        result: resultText,
+        result: outcome.text,
+        resultStatus: outcome.status,
       },
     }
   } finally {
@@ -320,6 +320,19 @@ export const outputSchema = lazySchema(() => {
       .string()
       .describe('The ID of the sub-agent that executed the skill'),
     result: z.string().describe('The result from the forked skill execution'),
+    // Optional for replay compatibility with results recorded before the
+    // terminal state was reported. Absent means the older success-only shape.
+    resultStatus: z
+      .enum([
+        'ok',
+        'no_assistant',
+        'cancelled',
+        'api_error',
+        'incomplete_tool_use',
+        'empty',
+      ])
+      .optional()
+      .describe('Why the forked execution did or did not produce a result'),
   })
 
   return z.union([inlineOutputSchema, forkedOutputSchema])
@@ -846,6 +859,20 @@ export const SkillTool: Tool<InputSchema, Output, Progress> = buildTool({
   ): ToolResultBlockParam {
     // Handle forked skill result
     if ('status' in result && result.status === 'forked') {
+      const failed =
+        result.success === false ||
+        (result.resultStatus !== undefined && result.resultStatus !== 'ok')
+      // An error, cancellation, or empty tail is reported as a failed tool
+      // result. Calling it "completed" would tell the model the skill worked.
+      if (failed) {
+        const reason = result.resultStatus ?? 'incomplete'
+        return {
+          type: 'tool_result' as const,
+          tool_use_id: toolUseID,
+          content: `Skill "${result.commandName}" did not complete (forked execution): ${reason}.${result.result ? `\n\n${result.result}` : ''}`,
+          is_error: true,
+        }
+      }
       return {
         type: 'tool_result' as const,
         tool_use_id: toolUseID,

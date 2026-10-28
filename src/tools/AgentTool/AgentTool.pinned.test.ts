@@ -4,12 +4,14 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { getDefaultAppState } from '../../state/AppStateStore.js'
 import type { ToolUseContext } from '../../Tool.js'
+import type { Message } from '../../types/message.js'
 import * as localAgentTask from '../../tasks/LocalAgentTask/LocalAgentTask.js'
-import { createAssistantMessage } from '../../utils/messages.js'
+import { createAssistantAPIErrorMessage, createAssistantMessage } from '../../utils/messages.js'
 import * as sessionStorage from '../../utils/sessionStorage.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
 import { AbortError } from '../../utils/errors.js'
 import { resetCommandQueue } from '../../utils/messageQueueManager.js'
+import * as sdkEventQueue from '../../utils/sdkEventQueue.js'
 import { AgentTool, outputSchema } from './AgentTool.js'
 import { GENERAL_PURPOSE_AGENT } from './built-in/generalPurposeAgent.js'
 import type { AgentDefinition } from './loadAgentsDir.js'
@@ -269,7 +271,7 @@ describe('AgentTool pinned runtime', () => {
 
   describe('background execution', () => {
     /** A pinned run held open until `release()`, so a test can act while it is in flight. */
-    function gatedPinnedRun(texts: string[]) {
+    function gatedPinnedRun(texts: string[], terminal?: () => Message) {
       let release!: () => void
       const gate = new Promise<void>(resolve => { release = resolve })
       const signals: AbortSignal[] = []
@@ -285,7 +287,11 @@ describe('AgentTool pinned runtime', () => {
             gate,
             new Promise<void>((_, reject) => params.signal.addEventListener('abort', () => reject(new AbortError()), { once: true })),
           ])
-          for (const text of texts) yield createAssistantMessage({ content: text })
+          if (terminal) {
+            yield terminal()
+          } else {
+            for (const text of texts) yield createAssistantMessage({ content: text })
+          }
         } finally {
           closed = true
         }
@@ -466,6 +472,30 @@ describe('AgentTool pinned runtime', () => {
       expect(run.runs()).toBe(1)
     })
 
+    test('a backgrounded run whose final response is an API error fails instead of completing', async () => {
+      await pin('niuma')
+      connectBridge()
+      const run = gatedPinnedRun([], () => createAssistantAPIErrorMessage({ content: 'API Error: 500' }) as Message)
+      const notifySpy = spyOn(localAgentTask, 'enqueueAgentNotification')
+      const context = makeContext()
+
+      const pending = call({}, context)
+      await until(() => Object.keys(context.getAppState().tasks).length === 1)
+      const agentId = Object.keys(context.getAppState().tasks)[0]!
+      await until(() => run.signals.length === 1)
+      expect(localAgentTask.backgroundAgentTask(agentId, context.getAppState, context.setAppState as never)).toBe(true)
+      const result = await pending
+      expect((result.data as any)).toMatchObject({ status: 'async_launched', agentId })
+
+      run.release()
+      await until(() => taskOf(context, agentId)?.status !== 'running')
+      // The error body must not become a completed task's result.
+      expect(taskOf(context, agentId).status).toBe('failed')
+      expect(taskOf(context, agentId).error).toBe('API Error: 500')
+      expect(taskOf(context, agentId).result).toBeUndefined()
+      expect(notifySpy.mock.calls[0]![0]).toMatchObject({ taskId: agentId, status: 'failed', error: 'API Error: 500' })
+    })
+
     test('a backgrounded foreground run is stopped by killing its task', async () => {
       await pin('niuma')
       connectBridge()
@@ -498,5 +528,96 @@ describe('AgentTool pinned runtime', () => {
       await until(() => runAgentSpy.mock.calls.length === 1)
       expect(pinnedSpy).not.toHaveBeenCalled()
     })
+  })
+})
+
+describe('AgentTool sync terminal outcomes', () => {
+  const syncNotifications = () =>
+    sdkEventQueue
+      .drainSdkEvents()
+      .filter(
+        (event): event is Extract<typeof event, { subtype: 'task_notification' }> =>
+          'subtype' in event && event.subtype === 'task_notification',
+      )
+
+  test('an API error tail reports the panel notification as failed', async () => {
+    connectBridge()
+    sdkEventQueue.drainSdkEvents()
+    spyOn(runAgentModule, 'runAgent').mockImplementation(
+      (async function* () {
+        yield createAssistantMessage({ content: 'The report' })
+        yield createAssistantAPIErrorMessage({ content: 'API Error: 500' })
+      }) as typeof runAgentModule.runAgent,
+    )
+
+    await expect(call({})).rejects.toThrow('API Error: 500')
+    // The model got a tool error, so the card must not close as completed.
+    expect(syncNotifications().map(event => event.status)).toEqual(['failed'])
+  })
+
+  test('a sync abort reports the panel notification as stopped', async () => {
+    connectBridge()
+    sdkEventQueue.drainSdkEvents()
+    spyOn(runAgentModule, 'runAgent').mockImplementation(
+      (async function* () {
+        yield createAssistantMessage({ content: 'Partial progress' })
+        throw new AbortError()
+      }) as typeof runAgentModule.runAgent,
+    )
+
+    await expect(call({})).rejects.toBeInstanceOf(AbortError)
+    expect(syncNotifications().map(event => event.status)).toEqual(['stopped'])
+  })
+
+  test('a finished turn still reports the panel notification as completed', async () => {
+    connectBridge()
+    sdkEventQueue.drainSdkEvents()
+    spyOn(runAgentModule, 'runAgent').mockImplementation(
+      (async function* () {
+        yield createAssistantMessage({ content: 'The report' })
+      }) as typeof runAgentModule.runAgent,
+    )
+
+    await call({})
+
+    expect(syncNotifications().map(event => event.status)).toEqual(['completed'])
+  })
+
+  test('an API error tail fails the tool instead of returning a completed result', async () => {
+    connectBridge()
+    spyOn(runAgentModule, 'runAgent').mockImplementation(
+      (async function* () {
+        yield createAssistantMessage({ content: 'The report' })
+        yield createAssistantAPIErrorMessage({ content: 'API Error: 500' })
+      }) as typeof runAgentModule.runAgent,
+    )
+
+    await expect(call({})).rejects.toThrow('API Error: 500')
+  })
+
+  test('a sync loop error after text still fails both the tool and panel', async () => {
+    connectBridge()
+    sdkEventQueue.drainSdkEvents()
+    spyOn(runAgentModule, 'runAgent').mockImplementation(
+      (async function* () {
+        yield createAssistantMessage({ content: 'Partial progress, not a final result' })
+        throw new Error('socket hang up after text')
+      }) as typeof runAgentModule.runAgent,
+    )
+
+    await expect(call({})).rejects.toThrow('socket hang up after text')
+    expect(syncNotifications().map(event => event.status)).toEqual(['failed'])
+  })
+
+  test('a sync loop error keeps its own message when the tail never finished', async () => {
+    connectBridge()
+    spyOn(runAgentModule, 'runAgent').mockImplementation(
+      (async function* () {
+        yield createAssistantMessage({ content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: {} }] as never })
+        throw new Error('socket hang up')
+      }) as typeof runAgentModule.runAgent,
+    )
+
+    await expect(call({})).rejects.toThrow('socket hang up')
   })
 })

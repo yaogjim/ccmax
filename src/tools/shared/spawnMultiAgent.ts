@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto'
 import { resolveTeammateModel } from '../../utils/swarm/resolveTeammateModel.js'
 export { resolveTeammateModel } from '../../utils/swarm/resolveTeammateModel.js'
 /**
@@ -18,6 +19,7 @@ import type { AppState } from '../../state/AppState.js'
 import { createTaskStateBase, generateTaskId } from '../../Task.js'
 import type { ToolUseContext } from '../../Tool.js'
 import type { InProcessTeammateTaskState } from '../../tasks/InProcessTeammateTask/types.js'
+import { createAgentId } from '../../utils/uuid.js'
 import { formatAgentId } from '../../utils/agentId.js'
 import { quote } from '../../utils/bash/shellQuote.js'
 import { isInBundledMode } from '../../utils/bundledMode.js'
@@ -45,6 +47,8 @@ import {
   TMUX_COMMAND,
 } from '../../utils/swarm/constants.js'
 import { It2SetupPrompt } from '../../utils/swarm/It2SetupPrompt.js'
+import { memberConsumerScope, mutateScopedTeam, parseConsumerScope, removeScopedMember, withConsumerScope, type ConsumerScope } from '../../utils/swarm/consumerScope.js'
+import { getConsumerScope } from '../../utils/teammate.js'
 import { startInProcessTeammate } from '../../utils/swarm/inProcessRunner.js'
 import {
   type InProcessSpawnConfig,
@@ -52,9 +56,7 @@ import {
 } from '../../utils/swarm/spawnInProcess.js'
 import { buildInheritedEnvVars } from '../../utils/swarm/spawnUtils.js'
 import {
-  mutateTeamFileAsync,
   readTeamFileAsync,
-  removeMemberByAgentId,
   sanitizeAgentName,
   sanitizeName,
 } from '../../utils/swarm/teamHelpers.js'
@@ -121,6 +123,8 @@ export type SpawnTeammateConfig = {
 
 // Internal input type matching TeammateTool's spawn parameters
 type SpawnInput = {
+  /** Captured at the tool entry, never issued from the current roster. */
+  callerScope?: ConsumerScope
   name: string
   prompt: string
   team_name?: string
@@ -314,6 +318,56 @@ function pickUniqueTeammateName(
   return `${baseName}-${suffix}`
 }
 
+async function reservePaneRegistration(
+  input: SpawnInput,
+  teamName: string,
+  backendType: BackendType,
+  model: string | undefined,
+  workingDir: string,
+) {
+  const consumerInstanceId = randomUUID()
+  const sessionId = randomUUID()
+  const reservation = await mutateScopedTeam(input.callerScope, (team, caller) => {
+    const sanitizedName = pickUniqueTeammateName(sanitizeAgentName(input.name), team.members)
+    const teammateId = formatAgentId(sanitizedName, teamName)
+    const teammateColor = assignTeammateColor(teammateId)
+    team.members.push({
+      agentId: teammateId, name: sanitizedName, consumerInstanceId, sessionId,
+      agentType: input.agent_type, model, prompt: input.prompt, color: teammateColor,
+      planModeRequired: input.plan_mode_required, joinedAt: Date.now(),
+      tmuxPaneId: '', cwd: workingDir, subscriptions: [], backendType,
+    })
+    const consumerScope = memberConsumerScope({
+      team, generation: caller.generation, ownerSessionId: sessionId,
+      backend: 'pane', agentName: sanitizedName, memberInstanceId: consumerInstanceId,
+    })
+    return { sanitizedName, teammateId, teammateColor, sessionId, consumerScope }
+  }, { expectedOwnerSessionId: getSessionId() })
+  if (reservation.status !== 'current') {
+    throw new Error(`Cannot register teammate: ${reservation.status}`)
+  }
+  return reservation.value
+}
+
+async function bindPaneRegistration(scope: ConsumerScope, paneId: string): Promise<void> {
+  const bound = await mutateScopedTeam(scope, team => {
+    const recipient = scope.recipient
+    const member = team.members.find(member => recipient.kind === 'member' &&
+      member.consumerInstanceId === recipient.memberInstanceId)
+    if (member) member.tmuxPaneId = paneId
+  })
+  if (bound.status !== 'current') throw new Error(`Cannot start teammate: ${bound.status}`)
+}
+
+async function sendPaneInstructions(scope: ConsumerScope, prompt: string): Promise<void> {
+  const sent = await withConsumerScope(scope, () => writeToMailbox(
+    scope.recipient.kind === 'member' ? scope.recipient.agentName : TEAM_LEAD_NAME,
+    { from: TEAM_LEAD_NAME, text: prompt, timestamp: new Date().toISOString() },
+    scope.teamName,
+  ))
+  if (sent.status !== 'current') throw new Error(`Cannot instruct teammate: ${sent.status}`)
+}
+
 // ============================================================================
 // Spawn Handlers
 // ============================================================================
@@ -354,14 +408,6 @@ async function handleSpawnSplitPane(
     )
   }
 
-  // Generate unique name if duplicate exists in team
-  const uniqueName = await generateUniqueTeammateName(name, teamName)
-
-  // Sanitize the name to prevent @ in agent IDs (would break agentName@teamName format)
-  const sanitizedName = sanitizeAgentName(uniqueName)
-
-  // Generate deterministic agent ID from name and team
-  const teammateId = formatAgentId(sanitizedName, teamName)
   const workingDir = cwd || getCwd()
 
   // Detect the appropriate backend and check if setup is needed
@@ -406,161 +452,146 @@ async function handleSpawnSplitPane(
   // Check if we're inside tmux to determine session naming
   const insideTmux = await isInsideTmux()
 
-  // Assign a unique color to this teammate
-  const teammateColor = assignTeammateColor(teammateId)
+  const { sanitizedName, teammateId, teammateColor, sessionId, consumerScope } =
+    await reservePaneRegistration(input, teamName, detectionResult.backend.type, model, workingDir)
+  let createdPaneId: string | undefined
+  try {
+    // Create a pane in the swarm view
+    // - Inside tmux: splits current window (leader on left, teammates on right)
+    // - In iTerm2 with it2: uses native iTerm2 split panes
+    // - Outside both: creates claude-swarm session with tiled teammates
+    const { paneId, isFirstTeammate } = await createTeammatePaneInSwarmView(
+      sanitizedName,
+      teammateColor,
+    )
 
-  // Create a pane in the swarm view
-  // - Inside tmux: splits current window (leader on left, teammates on right)
-  // - In iTerm2 with it2: uses native iTerm2 split panes
-  // - Outside both: creates claude-swarm session with tiled teammates
-  const { paneId, isFirstTeammate } = await createTeammatePaneInSwarmView(
-    sanitizedName,
-    teammateColor,
-  )
+    createdPaneId = paneId
+    await bindPaneRegistration(consumerScope, paneId)
 
-  // Enable pane border status on first teammate when inside tmux
-  // (outside tmux, this is handled in createTeammatePaneInSwarmView)
-  if (isFirstTeammate && insideTmux) {
-    await enablePaneBorderStatus()
-  }
+    // Enable pane border status on first teammate when inside tmux
+    // (outside tmux, this is handled in createTeammatePaneInSwarmView)
+    if (isFirstTeammate && insideTmux) {
+      await enablePaneBorderStatus()
+    }
 
-  // Build the command to spawn Claude Code with teammate identity
-  // Note: We spawn without a prompt - initial instructions are sent via mailbox
-  const binaryPath = getTeammateCommand()
+    // Build the command to spawn Claude Code with teammate identity
+    // Note: We spawn without a prompt - initial instructions are sent via mailbox
+    const binaryPath = getTeammateCommand()
 
-  // Build teammate identity CLI args (replaces CLAUDE_CODE_* env vars)
-  const teammateArgs = [
-    `--agent-id ${quote([teammateId])}`,
-    `--agent-name ${quote([sanitizedName])}`,
-    `--team-name ${quote([teamName])}`,
-    `--agent-color ${quote([teammateColor])}`,
-    `--parent-session-id ${quote([getSessionId()])}`,
-    plan_mode_required ? '--plan-mode-required' : '',
-    agent_type ? `--agent-type ${quote([agent_type])}` : '',
-  ]
-    .filter(Boolean)
-    .join(' ')
-
-  // Build CLI flags to propagate to teammate
-  // Pass plan_mode_required to prevent inheriting bypass permissions
-  let inheritedFlags = buildInheritedCliFlags({
-    planModeRequired: plan_mode_required,
-    permissionMode: appState.toolPermissionContext.mode,
-    effort: selectedAgentDefinition?.effort ?? appState.effortValue,
-    thinkingConfig: context.options.thinkingConfig,
-  })
-
-  // If teammate has a custom model, add --model flag (or replace inherited one)
-  if (model) {
-    // Remove any inherited --model flag first
-    inheritedFlags = inheritedFlags
-      .split(' ')
-      .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
+    // Build teammate identity CLI args (replaces CLAUDE_CODE_* env vars)
+    const teammateArgs = [
+      `--session-id ${quote([sessionId])}`,
+      `--agent-id ${quote([teammateId])}`,
+      `--agent-name ${quote([sanitizedName])}`,
+      `--team-name ${quote([teamName])}`,
+      `--agent-color ${quote([teammateColor])}`,
+      `--parent-session-id ${quote([getSessionId()])}`,
+      plan_mode_required ? '--plan-mode-required' : '',
+      agent_type ? `--agent-type ${quote([agent_type])}` : '',
+    ]
+      .filter(Boolean)
       .join(' ')
-    // Add the teammate's model
-    inheritedFlags = inheritedFlags
-      ? `${inheritedFlags} --model ${quote([model])}`
-      : `--model ${quote([model])}`
-  }
 
-  const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
-  // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
-  // Includes CLAUDECODE, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, and API provider vars.
-  const envStr = buildInheritedEnvVars()
-  const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
+    // Build CLI flags to propagate to teammate
+    // Pass plan_mode_required to prevent inheriting bypass permissions
+    let inheritedFlags = buildInheritedCliFlags({
+      planModeRequired: plan_mode_required,
+      permissionMode: appState.toolPermissionContext.mode,
+      effort: selectedAgentDefinition?.effort ?? appState.effortValue,
+      thinkingConfig: context.options.thinkingConfig,
+    })
 
-  // Send the command to the new pane
-  // Use swarm socket when running outside tmux (external swarm session)
-  await sendCommandToPane(paneId, spawnCommand, !insideTmux)
+    // If teammate has a custom model, add --model flag (or replace inherited one)
+    if (model) {
+      // Remove any inherited --model flag first
+      inheritedFlags = inheritedFlags
+        .split(' ')
+        .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
+        .join(' ')
+      // Add the teammate's model
+      inheritedFlags = inheritedFlags
+        ? `${inheritedFlags} --model ${quote([model])}`
+        : `--model ${quote([model])}`
+    }
 
-  // Determine session/window names for output
-  const sessionName = insideTmux ? 'current' : SWARM_SESSION_NAME
-  const windowName = insideTmux ? 'current' : 'swarm-view'
+    const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
+    // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
+    // Includes CLAUDECODE, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, and API provider vars.
+    const envStr = `${buildInheritedEnvVars()} CC_HAHA_TEAM_CONSUMER_SCOPE=${quote([JSON.stringify(consumerScope)])}`
+    const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
 
-  // Track the teammate in AppState's teamContext with color
-  // If spawning without spawnTeam, set up the leader as team lead
-  setAppState(prev => ({
-    ...prev,
-    teamContext: {
-      ...prev.teamContext,
-      teamName: teamName ?? prev.teamContext?.teamName ?? 'default',
-      teamFilePath: prev.teamContext?.teamFilePath ?? '',
-      leadAgentId: prev.teamContext?.leadAgentId ?? '',
-      teammates: {
-        ...(prev.teamContext?.teammates || {}),
-        [teammateId]: {
-          name: sanitizedName,
-          agentType: agent_type,
-          color: teammateColor,
-          tmuxSessionName: sessionName,
-          tmuxPaneId: paneId,
-          cwd: workingDir,
-          spawnedAt: Date.now(),
+    // Send the command to the new pane
+    // Use swarm socket when running outside tmux (external swarm session)
+    await sendCommandToPane(paneId, spawnCommand, !insideTmux)
+
+    // Determine session/window names for output
+    const sessionName = insideTmux ? 'current' : SWARM_SESSION_NAME
+    const windowName = insideTmux ? 'current' : 'swarm-view'
+
+    await sendPaneInstructions(consumerScope, prompt)
+
+    // Track the teammate in AppState's teamContext with color
+    // If spawning without spawnTeam, set up the leader as team lead
+    setAppState(prev => ({
+      ...prev,
+      teamContext: {
+        ...prev.teamContext,
+        teamName: teamName ?? prev.teamContext?.teamName ?? 'default',
+        teamFilePath: prev.teamContext?.teamFilePath ?? '',
+        leadAgentId: prev.teamContext?.leadAgentId ?? '',
+        teammates: {
+          ...(prev.teamContext?.teammates || {}),
+          [teammateId]: {
+            name: sanitizedName,
+            agentType: agent_type,
+            color: teammateColor,
+            tmuxSessionName: sessionName,
+            tmuxPaneId: paneId,
+            cwd: workingDir,
+            spawnedAt: Date.now(),
+          },
         },
       },
-    },
-  }))
+    }))
 
-  // Register background task so teammates appear in the tasks pill/dialog
-  registerOutOfProcessTeammateTask(setAppState, {
-    teammateId,
-    sanitizedName,
-    teamName,
-    teammateColor,
-    prompt,
-    plan_mode_required,
-    paneId,
-    insideTmux,
-    backendType: detectionResult.backend.type,
-    toolUseId: context.toolUseId,
-  })
-
-  // Register agent in the team file using atomic read-modify-write to avoid
-  // concurrent spawn clobbering other members.
-  await mutateTeamFileAsync(teamName, (teamFile) => {
-    teamFile.members.push({
-      agentId: teammateId,
-      name: sanitizedName,
-      agentType: agent_type,
-      model,
+    // Register background task so teammates appear in the tasks pill/dialog
+    registerOutOfProcessTeammateTask(setAppState, {
+      teammateId,
+      sanitizedName,
+      teamName,
+      consumerScope,
+      teammateColor,
       prompt,
-      color: teammateColor,
-      planModeRequired: plan_mode_required,
-      joinedAt: Date.now(),
-      tmuxPaneId: paneId,
-      cwd: workingDir,
-      subscriptions: [],
-      backendType: detectionResult.backend.type,
-    })
-  })
-
-  // Send initial instructions to teammate via mailbox
-  // The teammate's inbox poller will pick this up and submit it as their first turn
-  await writeToMailbox(
-    sanitizedName,
-    {
-      from: TEAM_LEAD_NAME,
-      text: prompt,
-      timestamp: new Date().toISOString(),
-    },
-    teamName,
-  )
-
-  return {
-    data: {
-      teammate_id: teammateId,
-      agent_id: teammateId,
-      agent_type,
-      model,
-      name: sanitizedName,
-      color: teammateColor,
-      tmux_session_name: sessionName,
-      tmux_window_name: windowName,
-      tmux_pane_id: paneId,
-      team_name: teamName,
-      is_splitpane: true,
       plan_mode_required,
-    },
+      paneId,
+      insideTmux,
+      backendType: detectionResult.backend.type,
+      toolUseId: context.toolUseId,
+    })
+
+    return {
+      data: {
+        teammate_id: teammateId,
+        agent_id: teammateId,
+        agent_type,
+        model,
+        name: sanitizedName,
+        color: teammateColor,
+        tmux_session_name: sessionName,
+        tmux_window_name: windowName,
+        tmux_pane_id: paneId,
+        team_name: teamName,
+        is_splitpane: true,
+        plan_mode_required,
+      },
+    }
+  } catch (error) {
+    await removeScopedMember(consumerScope, teammateId)
+    if (createdPaneId && isPaneBackend(detectionResult.backend.type)) {
+      await getBackendByType(detectionResult.backend.type).killPane(createdPaneId, !insideTmux)
+        .catch(() => {})
+    }
+    throw error
   }
 }
 
@@ -599,185 +630,160 @@ async function handleSpawnSeparateWindow(
     )
   }
 
-  // Generate unique name if duplicate exists in team
-  const uniqueName = await generateUniqueTeammateName(name, teamName)
-
-  // Sanitize the name to prevent @ in agent IDs (would break agentName@teamName format)
-  const sanitizedName = sanitizeAgentName(uniqueName)
-
-  // Generate deterministic agent ID from name and team
-  const teammateId = formatAgentId(sanitizedName, teamName)
-  const windowName = `teammate-${sanitizeName(sanitizedName)}`
   const workingDir = cwd || getCwd()
+  const { sanitizedName, teammateId, teammateColor, sessionId, consumerScope } =
+    await reservePaneRegistration(input, teamName, 'tmux', model, workingDir)
+  const windowName = `teammate-${sanitizeName(sanitizedName)}`
+  let createdPaneId: string | undefined
+  try {
+    await ensureSession(SWARM_SESSION_NAME)
 
-  // Ensure the swarm session exists
-  await ensureSession(SWARM_SESSION_NAME)
+    // Create a new window for this teammate
+    const createWindowResult = await execFileNoThrow(TMUX_COMMAND, [
+      'new-window',
+      '-t',
+      SWARM_SESSION_NAME,
+      '-n',
+      windowName,
+      '-P',
+      '-F',
+      '#{pane_id}',
+    ])
 
-  // Assign a unique color to this teammate
-  const teammateColor = assignTeammateColor(teammateId)
+    if (createWindowResult.code !== 0) {
+      throw new Error(
+        `Failed to create tmux window: ${createWindowResult.stderr}`,
+      )
+    }
 
-  // Create a new window for this teammate
-  const createWindowResult = await execFileNoThrow(TMUX_COMMAND, [
-    'new-window',
-    '-t',
-    SWARM_SESSION_NAME,
-    '-n',
-    windowName,
-    '-P',
-    '-F',
-    '#{pane_id}',
-  ])
+    const paneId = createWindowResult.stdout.trim()
+    createdPaneId = paneId
+    await bindPaneRegistration(consumerScope, paneId)
 
-  if (createWindowResult.code !== 0) {
-    throw new Error(
-      `Failed to create tmux window: ${createWindowResult.stderr}`,
-    )
-  }
+    // Build the command to spawn Claude Code with teammate identity
+    // Note: We spawn without a prompt - initial instructions are sent via mailbox
+    const binaryPath = getTeammateCommand()
 
-  const paneId = createWindowResult.stdout.trim()
-
-  // Build the command to spawn Claude Code with teammate identity
-  // Note: We spawn without a prompt - initial instructions are sent via mailbox
-  const binaryPath = getTeammateCommand()
-
-  // Build teammate identity CLI args (replaces CLAUDE_CODE_* env vars)
-  const teammateArgs = [
-    `--agent-id ${quote([teammateId])}`,
-    `--agent-name ${quote([sanitizedName])}`,
-    `--team-name ${quote([teamName])}`,
-    `--agent-color ${quote([teammateColor])}`,
-    `--parent-session-id ${quote([getSessionId()])}`,
-    plan_mode_required ? '--plan-mode-required' : '',
-    agent_type ? `--agent-type ${quote([agent_type])}` : '',
-  ]
-    .filter(Boolean)
-    .join(' ')
-
-  // Build CLI flags to propagate to teammate
-  // Pass plan_mode_required to prevent inheriting bypass permissions
-  let inheritedFlags = buildInheritedCliFlags({
-    planModeRequired: plan_mode_required,
-    permissionMode: appState.toolPermissionContext.mode,
-    effort: selectedAgentDefinition?.effort ?? appState.effortValue,
-    thinkingConfig: context.options.thinkingConfig,
-  })
-
-  // If teammate has a custom model, add --model flag (or replace inherited one)
-  if (model) {
-    // Remove any inherited --model flag first
-    inheritedFlags = inheritedFlags
-      .split(' ')
-      .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
+    // Build teammate identity CLI args (replaces CLAUDE_CODE_* env vars)
+    const teammateArgs = [
+      `--session-id ${quote([sessionId])}`,
+      `--agent-id ${quote([teammateId])}`,
+      `--agent-name ${quote([sanitizedName])}`,
+      `--team-name ${quote([teamName])}`,
+      `--agent-color ${quote([teammateColor])}`,
+      `--parent-session-id ${quote([getSessionId()])}`,
+      plan_mode_required ? '--plan-mode-required' : '',
+      agent_type ? `--agent-type ${quote([agent_type])}` : '',
+    ]
+      .filter(Boolean)
       .join(' ')
-    // Add the teammate's model
-    inheritedFlags = inheritedFlags
-      ? `${inheritedFlags} --model ${quote([model])}`
-      : `--model ${quote([model])}`
-  }
 
-  const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
-  // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
-  // Includes CLAUDECODE, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, and API provider vars.
-  const envStr = buildInheritedEnvVars()
-  const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
+    // Build CLI flags to propagate to teammate
+    // Pass plan_mode_required to prevent inheriting bypass permissions
+    let inheritedFlags = buildInheritedCliFlags({
+      planModeRequired: plan_mode_required,
+      permissionMode: appState.toolPermissionContext.mode,
+      effort: selectedAgentDefinition?.effort ?? appState.effortValue,
+      thinkingConfig: context.options.thinkingConfig,
+    })
 
-  // Send the command to the new window
-  const sendKeysResult = await execFileNoThrow(TMUX_COMMAND, [
-    'send-keys',
-    '-t',
-    `${SWARM_SESSION_NAME}:${windowName}`,
-    spawnCommand,
-    'Enter',
-  ])
+    // If teammate has a custom model, add --model flag (or replace inherited one)
+    if (model) {
+      // Remove any inherited --model flag first
+      inheritedFlags = inheritedFlags
+        .split(' ')
+        .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
+        .join(' ')
+      // Add the teammate's model
+      inheritedFlags = inheritedFlags
+        ? `${inheritedFlags} --model ${quote([model])}`
+        : `--model ${quote([model])}`
+    }
 
-  if (sendKeysResult.code !== 0) {
-    throw new Error(
-      `Failed to send command to tmux window: ${sendKeysResult.stderr}`,
-    )
-  }
+    const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
+    // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
+    // Includes CLAUDECODE, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, and API provider vars.
+    const envStr = `${buildInheritedEnvVars()} CC_HAHA_TEAM_CONSUMER_SCOPE=${quote([JSON.stringify(consumerScope)])}`
+    const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
 
-  // Track the teammate in AppState's teamContext
-  setAppState(prev => ({
-    ...prev,
-    teamContext: {
-      ...prev.teamContext,
-      teamName: teamName ?? prev.teamContext?.teamName ?? 'default',
-      teamFilePath: prev.teamContext?.teamFilePath ?? '',
-      leadAgentId: prev.teamContext?.leadAgentId ?? '',
-      teammates: {
-        ...(prev.teamContext?.teammates || {}),
-        [teammateId]: {
-          name: sanitizedName,
-          agentType: agent_type,
-          color: teammateColor,
-          tmuxSessionName: SWARM_SESSION_NAME,
-          tmuxPaneId: paneId,
-          cwd: workingDir,
-          spawnedAt: Date.now(),
+    // Send the command to the new window
+    const sendKeysResult = await execFileNoThrow(TMUX_COMMAND, [
+      'send-keys',
+      '-t',
+      `${SWARM_SESSION_NAME}:${windowName}`,
+      spawnCommand,
+      'Enter',
+    ])
+
+    if (sendKeysResult.code !== 0) {
+      throw new Error(
+        `Failed to send command to tmux window: ${sendKeysResult.stderr}`,
+      )
+    }
+
+    await sendPaneInstructions(consumerScope, prompt)
+
+    // Track the teammate in AppState's teamContext
+    setAppState(prev => ({
+      ...prev,
+      teamContext: {
+        ...prev.teamContext,
+        teamName: teamName ?? prev.teamContext?.teamName ?? 'default',
+        teamFilePath: prev.teamContext?.teamFilePath ?? '',
+        leadAgentId: prev.teamContext?.leadAgentId ?? '',
+        teammates: {
+          ...(prev.teamContext?.teammates || {}),
+          [teammateId]: {
+            name: sanitizedName,
+            agentType: agent_type,
+            color: teammateColor,
+            tmuxSessionName: SWARM_SESSION_NAME,
+            tmuxPaneId: paneId,
+            cwd: workingDir,
+            spawnedAt: Date.now(),
+          },
         },
       },
-    },
-  }))
+    }))
 
-  // Register background task so tmux teammates appear in the tasks pill/dialog
-  // Separate window spawns are always outside tmux (external swarm session)
-  registerOutOfProcessTeammateTask(setAppState, {
-    teammateId,
-    sanitizedName,
-    teamName,
-    teammateColor,
-    prompt,
-    plan_mode_required,
-    paneId,
-    insideTmux: false,
-    backendType: 'tmux',
-    toolUseId: context.toolUseId,
-  })
-
-  await mutateTeamFileAsync(teamName, (teamFile) => {
-    teamFile.members.push({
-      agentId: teammateId,
-      name: sanitizedName,
-      agentType: agent_type,
-      model,
+    // Register background task so tmux teammates appear in the tasks pill/dialog
+    // Separate window spawns are always outside tmux (external swarm session)
+    registerOutOfProcessTeammateTask(setAppState, {
+      teammateId,
+      sanitizedName,
+      teamName,
+      consumerScope,
+      teammateColor,
       prompt,
-      color: teammateColor,
-      planModeRequired: plan_mode_required,
-      joinedAt: Date.now(),
-      tmuxPaneId: paneId,
-      cwd: workingDir,
-      subscriptions: [],
-      backendType: 'tmux', // This handler always uses tmux directly
-    })
-  })
-
-  // Send initial instructions to teammate via mailbox
-  // The teammate's inbox poller will pick this up and submit it as their first turn
-  await writeToMailbox(
-    sanitizedName,
-    {
-      from: TEAM_LEAD_NAME,
-      text: prompt,
-      timestamp: new Date().toISOString(),
-    },
-    teamName,
-  )
-
-  return {
-    data: {
-      teammate_id: teammateId,
-      agent_id: teammateId,
-      agent_type,
-      model,
-      name: sanitizedName,
-      color: teammateColor,
-      tmux_session_name: SWARM_SESSION_NAME,
-      tmux_window_name: windowName,
-      tmux_pane_id: paneId,
-      team_name: teamName,
-      is_splitpane: false,
       plan_mode_required,
-    },
+      paneId,
+      insideTmux: false,
+      backendType: 'tmux',
+      toolUseId: context.toolUseId,
+    })
+
+    return {
+      data: {
+        teammate_id: teammateId,
+        agent_id: teammateId,
+        agent_type,
+        model,
+        name: sanitizedName,
+        color: teammateColor,
+        tmux_session_name: SWARM_SESSION_NAME,
+        tmux_window_name: windowName,
+        tmux_pane_id: paneId,
+        team_name: teamName,
+        is_splitpane: false,
+        plan_mode_required,
+      },
+    }
+  } catch (error) {
+    await removeScopedMember(consumerScope, teammateId)
+    if (createdPaneId) {
+      await getBackendByType('tmux').killPane(createdPaneId, true).catch(() => {})
+    }
+    throw error
   }
 }
 
@@ -792,6 +798,7 @@ function registerOutOfProcessTeammateTask(
     teammateId,
     sanitizedName,
     teamName,
+    consumerScope,
     teammateColor,
     prompt,
     plan_mode_required,
@@ -803,6 +810,7 @@ function registerOutOfProcessTeammateTask(
     teammateId: string
     sanitizedName: string
     teamName: string
+    consumerScope: ConsumerScope
     teammateColor: string
     prompt: string
     plan_mode_required?: boolean
@@ -833,6 +841,7 @@ function registerOutOfProcessTeammateTask(
       color: teammateColor,
       planModeRequired: plan_mode_required ?? false,
       parentSessionId: getSessionId(),
+      consumerScope,
     },
     prompt,
     abortController,
@@ -923,7 +932,11 @@ async function handleSpawnInProcess(
   let sanitizedName = baseName
   let teammateId = formatAgentId(baseName, teamName)
   let teammateColor: ReturnType<typeof assignTeammateColor> | undefined
-  await mutateTeamFileAsync(teamName, (teamFile) => {
+  // The consumer identity is minted together with the roster entry that
+  // carries it, so the runner can prove it still owns this name before
+  // draining mail that a replacement of the same name would also match.
+  const consumerInstanceId = createAgentId()
+  const registration = await mutateScopedTeam(input.callerScope, (teamFile, caller) => {
     sanitizedName = pickUniqueTeammateName(baseName, teamFile.members)
     // Generate deterministic agent ID from name and team
     teammateId = formatAgentId(sanitizedName, teamName)
@@ -932,6 +945,7 @@ async function handleSpawnInProcess(
     teamFile.members.push({
       agentId: teammateId,
       name: sanitizedName,
+      consumerInstanceId,
       agentType: agent_type,
       model,
       prompt,
@@ -943,7 +957,19 @@ async function handleSpawnInProcess(
       subscriptions: [],
       backendType: 'in-process',
     })
-  })
+    return memberConsumerScope({
+      team: teamFile,
+      generation: caller.generation,
+      ownerSessionId: getSessionId(),
+      backend: 'in-process',
+      agentName: sanitizedName,
+      memberInstanceId: consumerInstanceId,
+    })
+  }, { expectedOwnerSessionId: getSessionId() })
+  if (registration.status !== 'current') {
+    throw new Error(`Cannot register teammate: ${registration.status}`)
+  }
+  const consumerScope = registration.value
 
   // Spawn in-process teammate
   const config: InProcessSpawnConfig = {
@@ -953,18 +979,20 @@ async function handleSpawnInProcess(
     color: teammateColor,
     planModeRequired: plan_mode_required ?? false,
     model,
+    consumerScope,
+    resumableAgentId: consumerInstanceId,
+    isResume: false,
   }
 
-  const result = await spawnInProcessTeammate(config, context)
-
-  if (!result.success) {
-    // Give the reserved name back
-    await removeMemberByAgentId(teamName, teammateId).catch(error =>
-      logForDebugging(
-        `[handleSpawnInProcess] could not release ${teammateId}: ${errorMessage(error)}`,
-      ),
-    )
-    throw new Error(result.error ?? 'Failed to spawn in-process teammate')
+  let result: Awaited<ReturnType<typeof spawnInProcessTeammate>>
+  try {
+    result = await spawnInProcessTeammate(config, context)
+    if (!result.success) {
+      throw new Error(result.error ?? 'Failed to spawn in-process teammate')
+    }
+  } catch (error) {
+    await removeScopedMember(consumerScope, teammateId)
+    throw error
   }
 
   // Debug: log what spawn returned
@@ -982,6 +1010,8 @@ async function handleSpawnInProcess(
         color: teammateColor,
         planModeRequired: plan_mode_required ?? false,
         parentSessionId: result.teammateContext.parentSessionId,
+        consumerScope,
+        resumableAgentId: consumerInstanceId,
       },
       taskId: result.taskId,
       prompt,
@@ -1131,7 +1161,12 @@ export async function spawnTeammate(
   config: SpawnTeammateConfig,
   context: ToolUseContext,
 ): Promise<{ data: SpawnOutput }> {
+  const parsedCaller = parseConsumerScope(getConsumerScope(context.getAppState().teamContext))
+  const callerScope = parsedCaller.status === 'bound' ? parsedCaller.scope : undefined
   const teamName = config.team_name ?? context.getAppState().teamContext?.teamName
+  if (callerScope && callerScope.teamName !== teamName) {
+    throw new Error('Cannot register teammate: stale team scope')
+  }
   const existingPlan = teamName ? await readTeamPlan(teamName) : null
   if (isTeamReviewRequired() || existingPlan) {
     if (!teamName) throw new Error('Create a team before proposing teammates.')
@@ -1174,5 +1209,6 @@ export async function spawnTeammate(
       tmux_pane_id: '',
     } }
   }
-  return handleSpawn(config, context)
+  if (!callerScope) throw new Error(`Cannot register teammate: ${parsedCaller.status}`)
+  return handleSpawn({ ...config, team_name: teamName, callerScope }, context)
 }

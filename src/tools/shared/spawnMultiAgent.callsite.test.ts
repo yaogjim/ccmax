@@ -1,4 +1,10 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { getSessionId, resetStateForTests } from '../../bootstrap/state.js'
+import { beginTaskListLifecycle, getCanonicalTeamTaskListId, withTaskListLifecycleLock } from '../../utils/tasks.js'
+import { leadConsumerScope, type ConsumerScope } from '../../utils/swarm/consumerScope.js'
 import type { AppState } from '../../state/AppState.js'
 import type { ToolUseContext } from '../../Tool.js'
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
@@ -13,14 +19,20 @@ let spawnMode: SpawnMode = 'split-pane'
 const paneCommands: string[] = []
 const tmuxCalls: string[][] = []
 const originalSubagentModel = process.env.CLAUDE_CODE_SUBAGENT_MODEL
+let originalConfigDir: string | undefined
+let configDir: string
+let callerScope: ConsumerScope
+let beforePaneStart: (() => Promise<void> | void) | undefined
 
 const sendCommandToPaneMock = mock(
   async (_paneId: string, command: string) => {
+    await beforePaneStart?.()
     paneCommands.push(command)
   },
 )
 const execFileNoThrowMock = mock(
   async (_command: string, args: string[]) => {
+    if (args[0] === 'send-keys') await beforePaneStart?.()
     tmuxCalls.push(args)
     if (args[0] === 'new-window') {
       return { code: 0, stdout: '%window\n', stderr: '' }
@@ -95,19 +107,6 @@ mock.module('../../utils/swarm/spawnInProcess.js', () => ({
 
 mock.module('../../utils/swarm/teamHelpers.js', () => ({
   ...teamHelpersModule,
-  mutateTeamFileAsync: async (
-    teamName: string,
-    mutate: (teamFile: { members: unknown[] }) => void,
-  ) => {
-    if (teamName !== 'review-team') {
-      return mutateTeamFileAsyncActual(teamName, mutate)
-    }
-    mutate({ members: [] })
-  },
-  readTeamFileAsync: async (teamName: string) =>
-    teamName === 'review-team'
-      ? null
-      : readTeamFileAsyncActual(teamName),
   sanitizeAgentName: (name: string) => name.replaceAll('@', '-'),
   sanitizeName: (name: string) =>
     name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase(),
@@ -129,7 +128,19 @@ mock.module('../../utils/execFileNoThrow.js', () => ({
 
 const { spawnTeammate } = await import('./spawnMultiAgent.js')
 
-beforeEach(() => {
+beforeEach(async () => {
+  originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+  configDir = await mkdtemp(join(tmpdir(), 'cc-spawn-callsite-'))
+  process.env.CLAUDE_CONFIG_DIR = configDir
+  resetStateForTests()
+  const team = { name: 'review-team', createdAt: 100, leadAgentId: 'team-lead@review-team', leadSessionId: getSessionId(), members: [] }
+  await teamHelpersModule.writeTeamFileAsync(team.name, team)
+  const listId = getCanonicalTeamTaskListId(team.name)
+  const lifecycle = await withTaskListLifecycleLock(listId, () => beginTaskListLifecycle(listId, {
+    teamName: team.name, createdAt: team.createdAt, leadSessionId: team.leadSessionId,
+  }))
+  callerScope = leadConsumerScope({ team, generation: lifecycle.generation, ownerSessionId: getSessionId() })
+  beforePaneStart = undefined
   delete process.env.CLAUDE_CODE_SUBAGENT_MODEL
   spawnMode = 'split-pane'
   paneCommands.length = 0
@@ -138,6 +149,13 @@ beforeEach(() => {
   execFileNoThrowMock.mockClear()
   spawnInProcessTeammateMock.mockClear()
   startInProcessTeammateMock.mockClear()
+})
+
+afterEach(async () => {
+  resetStateForTests()
+  if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+  else process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+  await rm(configDir, { recursive: true, force: true })
 })
 
 afterAll(() => {
@@ -153,6 +171,59 @@ afterAll(() => {
 })
 
 describe('Agent Teams custom Agent runtime call sites', () => {
+  test('split-pane has a fixed registration before the child command starts', async () => {
+    beforePaneStart = async () => {
+      const member = (await readTeamFileAsyncActual('review-team'))?.members[0]
+      expect(member).toMatchObject({ name: 'worker', backendType: 'tmux', tmuxPaneId: '%split' })
+      expect(member?.consumerInstanceId).toBeString()
+      expect(member?.sessionId).toBeString()
+    }
+    await spawnTeammate(makeConfig(true), makeContext())
+    const member = (await readTeamFileAsyncActual('review-team'))!.members[0]!
+    expect(paneCommands[0]).toContain(`--session-id ${member.sessionId}`)
+    expect(paneCommands[0]).toContain('CC_HAHA_TEAM_CONSUMER_SCOPE=')
+    expect(paneCommands[0]).toContain(member.consumerInstanceId!)
+    expect(paneCommands[0]).toContain(`"ownerSessionId":"${member.sessionId}"`)
+  })
+
+  test('separate-window reserves a unique instance and session before starting the child', async () => {
+    spawnMode = 'separate-window'
+    beforePaneStart = async () => {
+      const member = (await readTeamFileAsyncActual('review-team'))?.members[0]
+      expect(member).toMatchObject({ name: 'worker', backendType: 'tmux', tmuxPaneId: '%window' })
+      expect(member?.consumerInstanceId).toBeString()
+      expect(member?.sessionId).toBeString()
+    }
+    await spawnTeammate(makeConfig(false), makeContext())
+    const member = (await readTeamFileAsyncActual('review-team'))!.members[0]!
+    const command = tmuxCalls.find(args => args[0] === 'send-keys')!.find(arg => arg.includes('CLAUDECODE=1'))!
+    expect(command).toContain(`--session-id ${member.sessionId}`)
+    expect(command).toContain('CC_HAHA_TEAM_CONSUMER_SCOPE=')
+    expect(command).toContain(member.consumerInstanceId!)
+  })
+
+  test('pane startup rollback preserves a replacement member', async () => {
+    beforePaneStart = async () => {
+      await mutateTeamFileAsyncActual('review-team', team => {
+        team.members[0]!.consumerInstanceId = 'replacement-instance'
+      })
+      throw new Error('fixture pane startup failed')
+    }
+    await expect(spawnTeammate(makeConfig(true), makeContext()))
+      .rejects.toThrow('fixture pane startup failed')
+    expect((await readTeamFileAsyncActual('review-team'))?.members[0]?.consumerInstanceId)
+      .toBe('replacement-instance')
+  })
+
+  test('unbound pane callers cannot start even when a matching roster exists', async () => {
+    const context = makeContext()
+    delete context.getAppState().teamContext!.consumerScope
+    await expect(spawnTeammate(makeConfig(true), context)).rejects.toThrow('unbound')
+    expect(paneCommands).toEqual([])
+    expect(tmuxCalls).toEqual([])
+    expect((await readTeamFileAsyncActual('review-team'))?.members).toEqual([])
+  })
+
   test('split-pane command receives definition model, effort, and inherited thinking', async () => {
     const result = await spawnTeammate(
       makeConfig(true),
@@ -279,6 +350,7 @@ function makeContext(
     toolPermissionContext: { mode: 'default' },
     teamContext: {
       teamName: 'review-team',
+      consumerScope: callerScope,
       teamFilePath: '',
       leadAgentId: 'team-lead@review-team',
       teammates: {},

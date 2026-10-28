@@ -1,3 +1,4 @@
+import { taskDeliverySchema } from '../../shared/taskDelivery.js'
 import { z } from 'zod/v4'
 import { buildTool, type ToolDef } from '../../Tool.js'
 import { lazySchema } from '../../utils/lazySchema.js'
@@ -27,6 +28,15 @@ const outputSchema = lazySchema(() =>
         status: TaskStatusSchema(),
         blocks: z.array(z.string()),
         blockedBy: z.array(z.string()),
+        owner: z.string().optional(),
+        delivery: taskDeliverySchema.optional(),
+        /**
+         * Present when the on-disk history is from a newer version or damaged.
+         * `delivery` is then the protocol's empty history, so this reason is
+         * what says the task is read-only rather than unreviewed; the raw
+         * record itself never leaves the task store.
+         */
+        deliveryError: z.string().optional(),
       })
       .nullable(),
   }),
@@ -92,6 +102,9 @@ export const TaskGetTool = buildTool({
           status: task.status,
           blocks: task.blocks,
           blockedBy: task.blockedBy,
+          owner: task.owner,
+          delivery: task.delivery,
+          ...(task.deliveryError ? { deliveryError: task.deliveryError } : {}),
         },
       },
     }
@@ -112,6 +125,12 @@ export const TaskGetTool = buildTool({
       `Description: ${task.description}`,
     ]
 
+    // An unreadable history is reported as the read-only reason, never as the
+    // empty history that stands in for it: printing that would read as "no
+    // review yet" and invite a write the task rejects.
+    if (task.deliveryError) lines.push(`Delivery: read-only (${task.deliveryError})`)
+    else if (task.delivery) lines.push(`Delivery: ${JSON.stringify(task.delivery)}`)
+    if (task.owner) lines.push(`Owner: ${task.owner}`)
     if (task.blockedBy.length > 0) {
       lines.push(`Blocked by: ${task.blockedBy.map(id => `#${id}`).join(', ')}`)
     }

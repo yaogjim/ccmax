@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
+  getSessionId,
   resetStateForTests,
   setIsInteractive,
   switchSession,
@@ -36,7 +37,11 @@ import { readMailbox } from '../../utils/teammateMailbox.js'
 import * as runAgentModule from '../AgentTool/runAgent.js'
 import { spawnTeammate } from '../shared/spawnMultiAgent.js'
 import { SendMessageTool } from './SendMessageTool.js'
+import { beginTaskListLifecycle, getCanonicalTeamTaskListId, withTaskListLifecycleLock } from '../../utils/tasks.js'
 
+import { leadConsumerScope, type ConsumerScope } from '../../utils/swarm/consumerScope.js'
+
+let callerScope: ConsumerScope
 const TEAM = 'msg-team'
 type RunAgentInput = Parameters<typeof runAgentModule.runAgent>[0]
 
@@ -57,8 +62,15 @@ async function writeTeam(members: TeamFile['members']): Promise<void> {
     name: TEAM,
     createdAt: Date.now(),
     leadAgentId: `team-lead@${TEAM}`,
+    leadSessionId: getSessionId(),
     members,
   })
+  const team = readTeamFile(TEAM)!
+  const listId = getCanonicalTeamTaskListId(TEAM)
+  const lifecycle = await withTaskListLifecycleLock(listId, () => beginTaskListLifecycle(listId, {
+    teamName: TEAM, createdAt: team.createdAt, leadSessionId: getSessionId(),
+  }))
+  callerScope = leadConsumerScope({ team, generation: lifecycle.generation, ownerSessionId: getSessionId() })
 }
 
 /** A desktop team plan whose members have no roster entry yet. */
@@ -131,6 +143,7 @@ function leadContext() {
     mainLoopModel: 'claude-sonnet-4-6',
     toolPermissionContext: { mode: 'default' },
     teamContext: {
+      consumerScope: callerScope,
       teamName: TEAM,
       teamFilePath: '',
       leadAgentId: `team-lead@${TEAM}`,
@@ -227,12 +240,13 @@ describe('SendMessage to an in-process teammate that is not running', () => {
     expect(result).toEqual({
       success: true,
       message:
-        'Teammate "worker" was not running; resumed it as an in-process teammate with 2 prior messages and your message as its next prompt.',
+        'Teammate "worker" rejoined with a new runtime identity, using 2 prior messages as context and your message as its next prompt.',
     })
     expect(transcriptId).toBeString()
     await waitFor(() => calls.length === 2)
     const resumed = calls[1]!
-    expect(resumed.override?.agentId).toBe(asAgentId(transcriptId!))
+    expect(resumed.override?.agentId).not.toBe(asAgentId(transcriptId!))
+    expect(resumed.extraMetadata?.consumerScope).toMatchObject({ recipient: { memberInstanceId: resumed.override?.agentId } })
     expect(resumed.forkContextMessages?.map(message => message.uuid)).toEqual(
       earlier.map(message => message.uuid),
     )

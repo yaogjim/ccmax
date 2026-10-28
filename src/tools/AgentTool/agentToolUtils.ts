@@ -41,7 +41,12 @@ import { isAgentSwarmsEnabled } from '../../utils/agentSwarmsEnabled.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isInProtectedNamespace } from '../../utils/envUtils.js'
 import { AbortError, errorMessage } from '../../utils/errors.js'
-import type { CacheSafeParams } from '../../utils/forkedAgent.js'
+import {
+  extractResultTextOutcome,
+  getFinalResponseAssistantMessages,
+  type CacheSafeParams,
+  type ResultTextOutcome,
+} from '../../utils/forkedAgent.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import {
   extractTextContent,
@@ -275,6 +280,38 @@ export function countToolUses(messages: MessageType[]): number {
   return count
 }
 
+/**
+ * The reason a final response that never finished cannot be settled as a
+ * completed agent.
+ *
+ * Returning a success-shaped result for these outcomes hands the parent an
+ * empty or error-body "success" while the background task is marked
+ * completed. Every caller already turns a thrown error into the right failure
+ * (a sync tool error, or an async `failed` notification), so the terminal
+ * reason is raised here instead. Cancellation reuses `AbortError` so async
+ * callers keep mapping it onto their existing `killed` path.
+ */
+function terminalOutcomeError(outcome: ResultTextOutcome): Error | undefined {
+  switch (outcome.status) {
+    case 'ok':
+      return undefined
+    case 'cancelled':
+      return new AbortError()
+    case 'api_error':
+      // The API's own message is the only place the failure reason survives.
+      return new Error(
+        outcome.text ||
+          'Agent stopped: the API returned an error with no message',
+      )
+    case 'incomplete_tool_use':
+      return new Error('Agent stopped before its final tool call completed')
+    case 'empty':
+      return new Error('Agent finished without a result')
+    case 'no_assistant':
+      return new Error('No assistant messages found')
+  }
+}
+
 export function finalizeAgentTool(
   agentMessages: MessageType[],
   agentId: string,
@@ -300,23 +337,32 @@ export function finalizeAgentTool(
   if (lastAssistantMessage === undefined) {
     throw new Error('No assistant messages found')
   }
-  // Extract text content from the agent's response. If the final assistant
-  // message is a pure tool_use block (loop exited mid-turn), fall back to
-  // the most recent assistant message that has text content.
-  let content = lastAssistantMessage.message.content.filter(
-    _ => _.type === 'text',
-  )
-  if (content.length === 0) {
-    for (let i = agentMessages.length - 1; i >= 0; i--) {
-      const m = agentMessages[i]!
-      if (m.type !== 'assistant') continue
-      const textBlocks = m.message.content.filter(_ => _.type === 'text')
-      if (textBlocks.length > 0) {
-        content = textBlocks
-        break
-      }
-    }
+  // Signal to inference that this subagent's cache chain can be evicted. Done
+  // before the terminal check below: the chain is evictable whether the turn
+  // succeeded or failed.
+  const lastRequestId = lastAssistantMessage.requestId
+  if (lastRequestId) {
+    logEvent('tengu_cache_eviction_hint', {
+      scope:
+        'subagent_end' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      last_request_id:
+        lastRequestId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    })
   }
+  // Only the final API response can supply the agent's result. The streaming
+  // API splits one response into several assistant segments that share
+  // `message.id`; a different id is a different request whose text may be an
+  // older success. Never reach across that boundary, and never replace a
+  // newer error, cancellation, or unfinished tool turn with old text.
+  const outcome = extractResultTextOutcome(agentMessages)
+  // A turn that did not finish is a failure, not a result with empty content.
+  const terminalError = terminalOutcomeError(outcome)
+  if (terminalError) {
+    throw terminalError
+  }
+  const content = getFinalResponseAssistantMessages(agentMessages).flatMap(
+    message => message.message.content.filter(_ => _.type === 'text'),
+  )
 
   const totalTokens = getTokenCountFromUsage(lastAssistantMessage.message.usage)
   const totalToolUseCount = countToolUses(agentMessages)
@@ -335,17 +381,6 @@ export function finalizeAgentTool(
     is_built_in_agent: isBuiltInAgent,
     is_async: isAsync,
   })
-
-  // Signal to inference that this subagent's cache chain can be evicted.
-  const lastRequestId = lastAssistantMessage.requestId
-  if (lastRequestId) {
-    logEvent('tengu_cache_eviction_hint', {
-      scope:
-        'subagent_end' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-      last_request_id:
-        lastRequestId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-    })
-  }
 
   return {
     agentId,

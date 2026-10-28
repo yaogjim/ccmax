@@ -22,6 +22,11 @@ export const PROMPT = `Use this tool to update a task in the task list.
 **Delete tasks:**
 - When a task is no longer relevant or was created in error
 - Setting status to \`deleted\` permanently removes the task
+- A task with artifact delivery history cannot be deleted: review or return the artifact with \`deliveryAction\` instead
+
+**Artifact delivery:**
+- A task with artifact delivery history is completed only when a different reviewer accepts the artifact with \`deliveryAction\`; marking it \`completed\` is not a substitute for independent review
+- Only after a reviewer returns the artifact may its owner change, so rework can be handed to another member
 
 **Update task details:**
 - When requirements change or become clearer

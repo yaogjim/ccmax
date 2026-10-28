@@ -21,7 +21,7 @@ import { getCwd, runWithCwdOverride } from '../../utils/cwd.js';
 import { logForDebugging } from '../../utils/debug.js';
 import { isEnvTruthy } from '../../utils/envUtils.js';
 import { AbortError, errorMessage, toError } from '../../utils/errors.js';
-import type { CacheSafeParams } from '../../utils/forkedAgent.js';
+import { extractResultTextOutcome, type CacheSafeParams } from '../../utils/forkedAgent.js';
 import { lazySchema } from '../../utils/lazySchema.js';
 import { createUserMessage, extractTextContent, isSyntheticMessage, normalizeMessages } from '../../utils/messages.js';
 import { getAgentModel } from '../../utils/model/agent.js';
@@ -1335,12 +1335,19 @@ export const AgentTool = buildTool({
             // NOT trigger the print.ts XML task_notification parser or the LLM loop.
             if (!wasBackgrounded) {
               const progress = getProgressUpdate(syncTracker);
+              // The card must agree with the tool result the model sees. The
+              // terminal check below fails the turn on a final response that
+              // never finished (API error, cancelled, unfinished tool use,
+              // empty), so the notification cannot be unconditional:
+              // syncAgentError/other -> failed, aborted/cancelled -> stopped,
+              // ok -> completed.
+              const outcomeStatus = syncAgentError ? 'api_error' : wasAborted ? 'cancelled' : extractResultTextOutcome(agentMessages).status;
               enqueueSdkEvent({
                 type: 'system',
                 subtype: 'task_notification',
                 task_id: foregroundTaskId,
                 tool_use_id: toolUseContext.toolUseId,
-                status: syncAgentError ? 'failed' : wasAborted ? 'stopped' : 'completed',
+                status: outcomeStatus === 'ok' ? 'completed' : outcomeStatus === 'cancelled' ? 'stopped' : 'failed',
                 output_file: '',
                 summary: description,
                 usage: {
@@ -1387,25 +1394,14 @@ export const AgentTool = buildTool({
           throw new AbortError();
         }
 
-        // If an error occurred during iteration, try to return a result with
-        // whatever messages we have. If we have no assistant messages,
-        // re-throw the error so it's properly handled by the tool framework.
-        if (syncAgentError) {
-          // A pinned agent's failure must reach the caller as a failure. The
-          // partial-result recovery below would present the last progress
-          // message as if the agent had finished.
-          if (pinnedBinding) throw syncAgentError;
-          // Check if we have any assistant messages to return
-          const hasAssistantMessages = agentMessages.some(msg => msg.type === 'assistant');
-          if (!hasAssistantMessages) {
-            // No messages collected, re-throw the error
-            throw syncAgentError;
-          }
+        // A loop failure is authoritative even if it yielded text first. That
+        // text is partial progress, not evidence of a completed result; keep
+        // the original reason consistent with the failed panel notification.
+        if (syncAgentError) throw syncAgentError;
 
-          // We have some messages, try to finalize and return them
-          // This allows the parent agent to see partial progress even after an error
-          logForDebugging(`Sync agent recovering from error with ${agentMessages.length} messages`);
-        }
+        // Only a successfully finished loop can settle its final response.
+        // The finalizer also rejects API errors, cancellation and incomplete
+        // or empty responses that arrived without a thrown loop error.
         const agentResult = finalizeAgentTool(agentMessages, syncAgentId, metadata);
         if (feature('TRANSCRIPT_CLASSIFIER')) {
           const currentAppState = toolUseContext.getAppState();

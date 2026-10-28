@@ -17,11 +17,18 @@ import {
   getCommandQueue,
   resetCommandQueue,
 } from '../../utils/messageQueueManager.js'
-import { createAssistantMessage, createUserMessage } from '../../utils/messages.js'
+import {
+  createAssistantAPIErrorMessage,
+  createAssistantMessage,
+  createUserMessage,
+  INTERRUPT_MESSAGE,
+} from '../../utils/messages.js'
+import { AbortError } from '../../utils/errors.js'
 import { registerTask } from '../../utils/task/framework.js'
 import {
   emitAgentToolActivitiesForMessage,
   extractAgentToolActivities,
+  finalizeAgentTool,
   runAsyncAgentLifecycle,
 } from './agentToolUtils.js'
 import { SYNTHETIC_OUTPUT_TOOL_NAME } from '../SyntheticOutputTool/SyntheticOutputTool.js'
@@ -379,6 +386,312 @@ describe('runAsyncAgentLifecycle', () => {
       sdkEventQueue.drainSdkEvents()
       resetStateForTests()
     }
+  })
+})
+
+describe('finalizeAgentTool', () => {
+  const metadata = {
+    prompt: 'Probe',
+    resolvedAgentModel: 'test-model',
+    isBuiltInAgent: true,
+    startTime: Date.now(),
+    agentType: 'general-purpose',
+    isAsync: false,
+  }
+
+  const inResponse = (responseId: string, message: Message): Message => {
+    if (message.type === 'assistant') {
+      message.message.id = responseId
+    }
+    return message
+  }
+  const textAssistant = (responseId: string, text: string): Message =>
+    inResponse(responseId, createAssistantMessage({ content: text }) as Message)
+  const emptyAssistant = (responseId: string): Message =>
+    inResponse(responseId, createAssistantMessage({ content: [] }) as Message)
+  const toolUseAssistant = (
+    responseId: string,
+    toolUseId: string,
+  ): Message =>
+    inResponse(
+      responseId,
+      createAssistantMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: toolUseId,
+            name: 'Bash',
+            input: { command: 'ls' },
+          },
+        ],
+      }) as Message,
+    )
+
+  const textOf = (content: Message['message']['content']): string =>
+    content
+      .filter(block => block.type === 'text')
+      .map(block => (block as { text: string }).text)
+      .join('\n')
+
+  test('recovers text from an earlier segment of the final response', () => {
+    const result = finalizeAgentTool(
+      [textAssistant('msg_1', 'All done'), emptyAssistant('msg_1')],
+      'agent-1',
+      metadata,
+    )
+
+    expect(textOf(result.content)).toBe('All done')
+  })
+
+  const captureThrow = (run: () => unknown): Error => {
+    try {
+      run()
+    } catch (error) {
+      return error as Error
+    }
+    throw new Error('expected finalizeAgentTool to throw')
+  }
+
+  test('keeps every text segment of the final response', () => {
+    const result = finalizeAgentTool(
+      [
+        textAssistant('msg_1', 'First'),
+        textAssistant('msg_1', 'Second'),
+        emptyAssistant('msg_1'),
+      ],
+      'agent-multi',
+      metadata,
+    )
+
+    expect(textOf(result.content)).toBe('First\nSecond')
+  })
+
+  test('fails instead of settling an empty final response as a result', () => {
+    const error = captureThrow(() =>
+      finalizeAgentTool(
+        [textAssistant('msg_1', 'Old success'), emptyAssistant('msg_2')],
+        'agent-2',
+        metadata,
+      ),
+    )
+
+    expect(error.message).toBe('Agent finished without a result')
+  })
+
+  test('fails with the final API error text instead of an earlier success', () => {
+    const error = captureThrow(() =>
+      finalizeAgentTool(
+        [
+          textAssistant('msg_1', 'Old success'),
+          inResponse(
+            'msg_2',
+            createAssistantAPIErrorMessage({ content: 'API Error: 500' }) as Message,
+          ),
+        ],
+        'agent-3',
+        metadata,
+      ),
+    )
+
+    expect(error.message).toBe('API Error: 500')
+  })
+
+  test('fails when the API error tail has no text', () => {
+    const apiError = inResponse(
+      'msg_2',
+      createAssistantAPIErrorMessage({ content: 'placeholder' }) as Message,
+    )
+    if (apiError.type === 'assistant') {
+      apiError.message.content = []
+    }
+    const error = captureThrow(() =>
+      finalizeAgentTool(
+        [textAssistant('msg_1', 'Old success'), apiError],
+        'agent-3b',
+        metadata,
+      ),
+    )
+
+    expect(error.message).toBe(
+      'Agent stopped: the API returned an error with no message',
+    )
+  })
+
+  test('fails on an unfinished tool use instead of reaching an earlier success', () => {
+    const error = captureThrow(() =>
+      finalizeAgentTool(
+        [
+          textAssistant('msg_1', 'Old success'),
+          toolUseAssistant('msg_2', 'toolu_unfinished'),
+        ],
+        'agent-4',
+        metadata,
+      ),
+    )
+
+    expect(error.message).toBe(
+      'Agent stopped before its final tool call completed',
+    )
+  })
+
+  test('reports a cancelled turn as an abort instead of a result', () => {
+    const error = captureThrow(() =>
+      finalizeAgentTool(
+        [
+          textAssistant('msg_1', 'Old success'),
+          createUserMessage({ content: INTERRUPT_MESSAGE }) as Message,
+        ],
+        'agent-5',
+        metadata,
+      ),
+    )
+
+    expect(error).toBeInstanceOf(AbortError)
+  })
+
+  test('settles a final response whose tool call completed', () => {
+    const result = finalizeAgentTool(
+      [
+        inResponse(
+          'msg_1',
+          createAssistantMessage({
+            content: [
+              { type: 'text', text: 'Checked the tree' },
+              {
+                type: 'tool_use',
+                id: 'toolu_done',
+                name: 'Bash',
+                input: { command: 'ls' },
+              },
+            ],
+          }) as Message,
+        ),
+        createUserMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_done',
+              content: 'files',
+              is_error: false,
+            },
+          ],
+        }) as Message,
+      ],
+      'agent-6',
+      metadata,
+    )
+
+    expect(textOf(result.content)).toBe('Checked the tree')
+  })
+})
+
+describe('runAsyncAgentLifecycle terminal outcomes', () => {
+  afterEach(() => {
+    resetCommandQueue()
+  })
+
+  async function runToTerminal(messages: Message[]): Promise<{
+    state: LocalAgentTaskState
+    notification: string
+  }> {
+    const taskId = 'agent-terminal'
+    const abortController = new AbortController()
+    const task: LocalAgentTaskState = {
+      ...createTaskStateBase(taskId, 'local_agent', 'Probe', 'toolu_agent'),
+      status: 'running',
+      agentId: taskId,
+      prompt: 'Probe',
+      agentType: 'general-purpose',
+      abortController,
+      retrieved: false,
+      lastReportedToolCount: 0,
+      lastReportedTokenCount: 0,
+      isBackgrounded: true,
+      pendingMessages: [],
+      retain: false,
+      diskLoaded: false,
+    }
+    let appState = {
+      tasks: { [taskId]: task },
+      toolPermissionContext: getEmptyToolPermissionContext(),
+      speculation: IDLE_SPECULATION_STATE,
+    } as unknown as AppState
+    const setAppState = (updater: (prev: AppState) => AppState): void => {
+      appState = updater(appState)
+    }
+
+    async function* makeStream(): AsyncGenerator<Message, void> {
+      for (const message of messages) {
+        yield message
+      }
+    }
+
+    await runAsyncAgentLifecycle({
+      taskId,
+      abortController,
+      makeStream,
+      metadata: {
+        prompt: 'Probe',
+        resolvedAgentModel: 'test-model',
+        isBuiltInAgent: true,
+        startTime: Date.now(),
+        agentType: 'general-purpose',
+        isAsync: true,
+      },
+      description: 'Probe',
+      parentToolUseId: 'toolu_agent',
+      toolUseContext: {
+        options: { tools: [] },
+        toolUseId: 'toolu_agent',
+        getAppState: () => appState,
+      } as unknown as ToolUseContext,
+      rootSetAppState: setAppState,
+      agentIdForCleanup: taskId,
+      enableSummarization: false,
+      getWorktreeResult: async () => ({}),
+    })
+
+    return {
+      state: appState.tasks[taskId] as LocalAgentTaskState,
+      notification: String(getCommandQueue()[0]?.value ?? ''),
+    }
+  }
+
+  test('fails the background task when the final response is an API error', async () => {
+    const { state, notification } = await runToTerminal([
+      createAssistantMessage({ content: 'Old success' }) as Message,
+      createAssistantAPIErrorMessage({ content: 'API Error: 500' }) as Message,
+    ])
+
+    expect(state.status).toBe('failed')
+    expect(state.error).toBe('API Error: 500')
+    expect(state.result).toBeUndefined()
+    expect(notification).toContain('<status>failed</status>')
+    expect(notification).not.toContain('<status>completed</status>')
+  })
+
+  test('fails the background task when the final response has no text', async () => {
+    const { state, notification } = await runToTerminal([
+      createAssistantMessage({ content: [] }) as Message,
+    ])
+
+    expect(state.status).toBe('failed')
+    expect(state.error).toBe('Agent finished without a result')
+    expect(state.result).toBeUndefined()
+    expect(notification).toContain('<status>failed</status>')
+    expect(notification).not.toContain('<status>completed</status>')
+  })
+
+  test('stops the background task when the turn was cancelled', async () => {
+    const { state, notification } = await runToTerminal([
+      createAssistantMessage({ content: 'Old success' }) as Message,
+      createUserMessage({ content: INTERRUPT_MESSAGE }) as Message,
+    ])
+
+    expect(state.status).toBe('killed')
+    expect(state.result).toBeUndefined()
+    expect(notification).toContain('<status>killed</status>')
+    expect(notification).not.toContain('<status>completed</status>')
   })
 })
 

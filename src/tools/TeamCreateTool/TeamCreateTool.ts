@@ -15,6 +15,7 @@ import {
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { getResolvedTeammateMode } from '../../utils/swarm/backends/registry.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
+import { leadConsumerScope } from '../../utils/swarm/consumerScope.js'
 import type { TeamFile } from '../../utils/swarm/teamHelpers.js'
 import {
   getTeamFilePath,
@@ -157,6 +158,7 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
       finalTeamName: string
       leadAgentId: string
       teamFile: TeamFile
+      generation: number
     } | undefined
     while (!created) {
       const finalTeamName = candidateName
@@ -211,12 +213,12 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
         // Project = TaskList). This ensures task numbering starts fresh at 1.
         await resetTaskList(taskListId)
         await ensureTasksDir(taskListId)
-        return { finalTeamName, leadAgentId, teamFile }
+        return { finalTeamName, leadAgentId, teamFile, generation: lifecycle.generation }
       })
       if (!created) candidateName = generateWordSlug()
     }
 
-    const { finalTeamName, leadAgentId, teamFile } = created
+    const { finalTeamName, leadAgentId, teamFile, generation } = created
     const teamFilePath = getTeamFilePath(finalTeamName)
     const draft = leaderRuntime ? await ensureTeamDraft(finalTeamName, getSessionId(), leaderRuntime, {
       workDir: getCwd(),
@@ -235,6 +237,14 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
       teamContext: {
         teamName: finalTeamName,
         teamFilePath,
+        // The creation transaction is the only place a lead identity is
+        // minted: a recreated same-name team gets a new generation and the
+        // previous lead's polls must stop instead of reading its inbox.
+        consumerScope: leadConsumerScope({
+          team: teamFile,
+          generation,
+          ownerSessionId: getSessionId(),
+        }),
         leadAgentId,
         teammates: {
           [leadAgentId]: {

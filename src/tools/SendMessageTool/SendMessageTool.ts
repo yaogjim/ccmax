@@ -23,6 +23,7 @@ import { semanticBoolean } from '../../utils/semanticBoolean.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import type { BackendType } from '../../utils/swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
+import { withConsumerScope } from '../../utils/swarm/consumerScope.js'
 import {
   hasResumableInProcessTeammate,
   resumeInProcessTeammate,
@@ -329,12 +330,13 @@ async function resumeTeammateWithMessage(
       context,
     })
     if (outcome.kind === 'already_running') {
-      const queued = await handleMessage(
-        recipientName,
-        content,
-        summary,
-        context,
-      )
+      const committed = await withConsumerScope(outcome.consumerScope, () => handleMessage(
+        recipientName, content, summary, context,
+      ))
+      if (committed.status !== 'current') {
+        return { data: { success: false, message: `消费实例 ${committed.status}，消息未转投；历史仍可查看。` } }
+      }
+      const queued = committed.value
       if (!queued.data.success) return queued
       return {
         data: {
@@ -346,8 +348,9 @@ async function resumeTeammateWithMessage(
     return {
       data: {
         success: true,
-        message:
-          outcome.resumedMessageCount > 0
+        message: outcome.restoredAs === 'rejoined'
+          ? `Teammate "${recipientName}" rejoined with a new runtime identity, using ${outcome.resumedMessageCount} prior messages as context and your message as its next prompt.`
+          : outcome.resumedMessageCount > 0
             ? `Teammate "${recipientName}" was not running; resumed it as an in-process teammate with ${outcome.resumedMessageCount} prior messages and your message as its next prompt.`
             : `Teammate "${recipientName}" was not running; resumed it as an in-process teammate (no prior transcript) with your message as its next prompt.`,
       },
