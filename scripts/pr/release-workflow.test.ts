@@ -39,7 +39,7 @@ describe('release desktop workflow', () => {
         })
         expect(await result.exited).toBe(0)
         const matrix = JSON.parse(readFileSync(output, 'utf8').trim().slice('matrix='.length))
-        expect(matrix.include.find((entry: { label: string }) => entry.label === 'macOS-x64').platform).toBe('macos-15-intel')
+        expect(matrix.include.find((entry: { label: string }) => entry.label === 'macOS-x64').platform).toBe('macos-latest')
         expect(matrix.include.find((entry: { label: string }) => entry.label === 'macOS-ARM64').platform).toBe('macos-latest')
         expect(matrix.include.map((entry: { label: string }) => entry.label)).toEqual(
           skip === 'true'
