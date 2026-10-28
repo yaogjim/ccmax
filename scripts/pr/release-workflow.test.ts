@@ -23,6 +23,33 @@ describe('release desktop workflow', () => {
 
   const electronBuilderCli = 'node ./node_modules/electron-builder/out/cli/cli.js ${{ matrix.builder_args }} --publish never'
 
+  test('manual platform selection filters Windows before matrix expansion', async () => {
+    const workflow = parse(readReleaseWorkflow())
+    expect(workflow.jobs.build.if ?? '').not.toContain('matrix.')
+    expect(workflow.jobs.build.strategy.matrix).toBe('${{ fromJSON(needs.signing-preflight.outputs.matrix) }}')
+    const step = workflow.jobs['signing-preflight'].steps.find((step: { id?: string }) => step.id === 'matrix')
+    expect(step.env.SKIP_WINDOWS_BUILD).toBe('${{ github.event_name == \'workflow_dispatch\' && inputs.skip_windows_build == true }}')
+    for (const skip of ['false', 'true']) {
+      const directory = mkdtempSync(join(tmpdir(), 'release-matrix-'))
+      try {
+        const output = join(directory, 'output')
+        const result = Bun.spawn(['bash', '-e', '-c', step.run], {
+          env: { PATH: process.env.PATH, HOME: directory, GITHUB_OUTPUT: output, SKIP_WINDOWS_BUILD: skip },
+          stdout: 'pipe', stderr: 'pipe',
+        })
+        expect(await result.exited).toBe(0)
+        const matrix = JSON.parse(readFileSync(output, 'utf8').trim().slice('matrix='.length))
+        expect(matrix.include.map((entry: { label: string }) => entry.label)).toEqual(
+          skip === 'true'
+            ? ['macOS-ARM64', 'macOS-x64', 'Linux-x64', 'Linux-ARM64']
+            : ['macOS-ARM64', 'macOS-x64', 'Linux-x64', 'Linux-ARM64', 'Windows-x64', 'Windows-ARM64'],
+        )
+      } finally {
+        rmSync(directory, { recursive: true, force: true })
+      }
+    }
+  })
+
   test('release packaging does not run the PR-quality gate', () => {
     const workflow = readReleaseWorkflow()
 
@@ -205,8 +232,8 @@ describe('release desktop workflow', () => {
     const signedBuildStep = extractStep(workflow, 'Build signed macOS Electron release artifacts')
     const unsignedBuildStep = extractStep(workflow, 'Build unsigned Electron release artifacts')
 
-    expect(workflow).toContain('app_bundle_dir: mac-arm64')
-    expect(workflow).toContain('app_bundle_dir: mac')
+    expect(workflow).toContain('"app_bundle_dir":"mac-arm64"')
+    expect(workflow).toContain('"app_bundle_dir":"mac"')
     expect(signedBuildStep).toContain("if: matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed == 'true'")
     expect(importIdentityStep).toContain('CSC_LINK: ${{ secrets.MACOS_CERTIFICATE }}')
     expect(importIdentityStep).toContain('CSC_KEY_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}')
@@ -430,10 +457,10 @@ describe('release desktop workflow', () => {
     const refreshMetadataStep = extractStep(workflow, 'Refresh signed Windows blockmap and update metadata')
 
     expect(workflow).toContain('actions: read')
-    expect(workflow).toContain('builder_arch_arg: --x64')
-    expect(workflow).toContain('builder_arch_arg: --arm64')
-    expect(workflow).toContain('unpacked_dir: win-unpacked')
-    expect(workflow).toContain('unpacked_dir: win-arm64-unpacked')
+    expect(workflow).toContain('"builder_arch_arg":"--x64"')
+    expect(workflow).toContain('"builder_arch_arg":"--arm64"')
+    expect(workflow).toContain('"unpacked_dir":"win-unpacked"')
+    expect(workflow).toContain('"unpacked_dir":"win-arm64-unpacked"')
     expect(applicationBuildStep).toContain('--win nsis ${{ matrix.builder_arch_arg }}')
     expect(applicationBuildStep).toContain("CSC_IDENTITY_AUTO_DISCOVERY: 'false'")
     expect(verifyUpdaterConfigStep).toContain('${{ matrix.unpacked_dir }}/resources/app-update.yml')
@@ -492,10 +519,10 @@ describe('release desktop workflow', () => {
     for (const label of ['macOS-ARM64', 'macOS-x64', 'Linux-x64', 'Linux-ARM64', 'Windows-x64', 'Windows-ARM64']) {
       expect(buildJob).toContain(`${label})`)
     }
-    expect(buildJob).toContain('target_triple: aarch64-pc-windows-msvc')
-    expect(buildJob).toContain('builder_args: --win nsis --arm64')
-    expect(buildJob).toContain('builder_args: --linux AppImage deb rpm --x64')
-    expect(buildJob).toContain('builder_args: --linux AppImage deb rpm --arm64')
+    expect(workflow).toContain('"target_triple":"aarch64-pc-windows-msvc"')
+    expect(workflow).toContain('"builder_args":"--win nsis --arm64"')
+    expect(workflow).toContain('"builder_args":"--linux AppImage deb rpm --x64"')
+    expect(workflow).toContain('"builder_args":"--linux AppImage deb rpm --arm64"')
     expect(buildJob).toContain('ccmax-${APP_VERSION}-win-arm64.exe')
     expect(buildJob).toContain('Upload release artifacts for final publish')
     expect(buildJob).toContain('actions/upload-artifact@v4')
@@ -531,13 +558,7 @@ describe('release desktop workflow', () => {
     expect(publishJob).toContain('bun run scripts/release-update-metadata.ts --metadata-dir artifacts/update-metadata --out-dir artifacts/update-metadata-standard')
     expect(publishJob).toContain('Validate standard update metadata set')
     expect(publishJob).toContain('softprops/action-gh-release@v2')
-    expect(publishJob).toContain('artifacts/release-assets/**/*.dmg')
-    expect(publishJob).toContain('artifacts/release-assets/**/*.zip')
-    expect(publishJob).toContain('artifacts/release-assets/**/*.exe')
-    expect(publishJob).toContain('artifacts/release-assets/**/*.AppImage')
-    expect(publishJob).toContain('artifacts/release-assets/**/*.deb')
-    expect(publishJob).toContain('artifacts/release-assets/**/*.rpm')
-    expect(publishJob).toContain('artifacts/release-assets/**/*.blockmap')
+    expect(publishJob).toContain('artifacts/release-assets/*')
     expect(publishJob).toContain('artifacts/update-metadata-standard/*.yml')
     expect(publishJob).toContain('desktop/scripts/install-macos-unsigned.sh')
     expect(publishJob).toContain('draft: true')

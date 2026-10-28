@@ -50,6 +50,7 @@ jobs:
     outputs:
       macos_signed: ${{ steps.validate.outputs.macos_signed }}
       windows_signed: ${{ steps.validate.outputs.windows_signed }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Validate release signing and notarization secrets
         id: validate
@@ -119,56 +120,24 @@ jobs:
             echo "windows_signed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Select release build matrix
+        id: matrix
+        shell: bash
+        env:
+          SKIP_WINDOWS_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_windows_build == true }}
+        run: |
+          node <<'NODE' >> "$GITHUB_OUTPUT"
+          const platforms = [{"platform":"macos-latest","target_triple":"aarch64-apple-darwin","builder_args":"--mac dmg zip --arm64","app_bundle_dir":"mac-arm64","label":"macOS-ARM64","smoke_platform":"macos","arch":"arm64"},{"platform":"macos-latest","target_triple":"x86_64-apple-darwin","builder_args":"--mac dmg zip --x64","app_bundle_dir":"mac","label":"macOS-x64","smoke_platform":"macos","arch":"x64"},{"platform":"ubuntu-22.04","target_triple":"x86_64-unknown-linux-gnu","builder_args":"--linux AppImage deb rpm --x64","label":"Linux-x64","smoke_platform":"linux","arch":"x64"},{"platform":"ubuntu-22.04-arm","target_triple":"aarch64-unknown-linux-gnu","builder_args":"--linux AppImage deb rpm --arm64","label":"Linux-ARM64","smoke_platform":"linux","arch":"arm64"},{"platform":"windows-latest","target_triple":"x86_64-pc-windows-msvc","builder_args":"--win nsis --x64","builder_arch_arg":"--x64","unpacked_dir":"win-unpacked","label":"Windows-x64","smoke_platform":"windows","arch":"x64"},{"platform":"windows-latest","target_triple":"aarch64-pc-windows-msvc","builder_args":"--win nsis --arm64","builder_arch_arg":"--arm64","unpacked_dir":"win-arm64-unpacked","label":"Windows-ARM64","smoke_platform":"windows","arch":"arm64"}]
+          const include = platforms.filter(entry => process.env.SKIP_WINDOWS_BUILD !== 'true' || entry.smoke_platform !== 'windows')
+          console.log(`matrix=${JSON.stringify({ include })}`)
+          NODE
+
   build:
     needs:
       - signing-preflight
-    if: ${{ !(matrix.smoke_platform == 'windows' && github.event_name == 'workflow_dispatch' && inputs.skip_windows_build == true) }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            target_triple: aarch64-apple-darwin
-            builder_args: --mac dmg zip --arm64
-            app_bundle_dir: mac-arm64
-            label: macOS-ARM64
-            smoke_platform: macos
-            arch: arm64
-          - platform: macos-latest
-            target_triple: x86_64-apple-darwin
-            builder_args: --mac dmg zip --x64
-            app_bundle_dir: mac
-            label: macOS-x64
-            smoke_platform: macos
-            arch: x64
-          - platform: ubuntu-22.04
-            target_triple: x86_64-unknown-linux-gnu
-            builder_args: --linux AppImage deb rpm --x64
-            label: Linux-x64
-            smoke_platform: linux
-            arch: x64
-          - platform: ubuntu-22.04-arm
-            target_triple: aarch64-unknown-linux-gnu
-            builder_args: --linux AppImage deb rpm --arm64
-            label: Linux-ARM64
-            smoke_platform: linux
-            arch: arm64
-          - platform: windows-latest
-            target_triple: x86_64-pc-windows-msvc
-            builder_args: --win nsis --x64
-            builder_arch_arg: --x64
-            unpacked_dir: win-unpacked
-            label: Windows-x64
-            smoke_platform: windows
-            arch: x64
-          - platform: windows-latest
-            target_triple: aarch64-pc-windows-msvc
-            builder_args: --win nsis --arm64
-            builder_arch_arg: --arm64
-            unpacked_dir: win-arm64-unpacked
-            label: Windows-ARM64
-            smoke_platform: windows
-            arch: arm64
+      matrix: ${{ fromJSON(needs.signing-preflight.outputs.matrix) }}
 
     runs-on: ${{ matrix.platform }}
     name: Build (${{ matrix.label }})
@@ -919,6 +888,7 @@ jobs:
         shell: bash
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
+          SKIP_WINDOWS_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_windows_build == true }}
         run: |
           expected=(
             "ccmax-${APP_VERSION}-mac-arm64.dmg"
@@ -935,11 +905,15 @@ jobs:
             "ccmax-${APP_VERSION}-linux-arm64.AppImage"
             "ccmax-${APP_VERSION}-linux-arm64.deb"
             "ccmax-${APP_VERSION}-linux-aarch64.rpm"
-            "ccmax-${APP_VERSION}-win-x64.exe"
-            "ccmax-${APP_VERSION}-win-x64.exe.blockmap"
-            "ccmax-${APP_VERSION}-win-arm64.exe"
-            "ccmax-${APP_VERSION}-win-arm64.exe.blockmap"
           )
+          if [ "$SKIP_WINDOWS_BUILD" != "true" ]; then
+            expected+=(
+              "ccmax-${APP_VERSION}-win-x64.exe"
+              "ccmax-${APP_VERSION}-win-x64.exe.blockmap"
+              "ccmax-${APP_VERSION}-win-arm64.exe"
+              "ccmax-${APP_VERSION}-win-arm64.exe.blockmap"
+            )
+          fi
 
           missing=()
           for file in "${expected[@]}"; do
@@ -962,13 +936,17 @@ jobs:
 
       - name: Validate standard update metadata set
         shell: bash
+        env:
+          SKIP_WINDOWS_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_windows_build == true }}
         run: |
           expected=(
             "latest-mac.yml"
             "latest-linux.yml"
             "latest-linux-arm64.yml"
-            "latest.yml"
           )
+          if [ "$SKIP_WINDOWS_BUILD" != "true" ]; then
+            expected+=("latest.yml")
+          fi
           missing=()
           for file in "${expected[@]}"; do
             [ -f "artifacts/update-metadata-standard/$file" ] || missing+=("$file")
@@ -988,13 +966,7 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: true
           files: |
-            artifacts/release-assets/**/*.dmg
-            artifacts/release-assets/**/*.zip
-            artifacts/release-assets/**/*.exe
-            artifacts/release-assets/**/*.AppImage
-            artifacts/release-assets/**/*.deb
-            artifacts/release-assets/**/*.rpm
-            artifacts/release-assets/**/*.blockmap
+            artifacts/release-assets/*
             artifacts/update-metadata-standard/*.yml
             desktop/scripts/install-macos-unsigned.sh
 
