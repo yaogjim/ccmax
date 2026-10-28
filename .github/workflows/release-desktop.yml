@@ -20,6 +20,11 @@ on:
         required: false
         default: false
         type: boolean
+      skip_windows_build:
+        description: 'Skip Windows builds for a manual release that cannot sign or pass the installer self-test'
+        required: false
+        default: false
+        type: boolean
       skip_windows_signing:
         description: 'Build unsigned Windows artifacts while SignPath onboarding is pending'
         required: false
@@ -117,6 +122,7 @@ jobs:
   build:
     needs:
       - signing-preflight
+    if: ${{ !(matrix.smoke_platform == 'windows' && github.event_name == 'workflow_dispatch' && inputs.skip_windows_build == true) }}
     strategy:
       fail-fast: false
       matrix:
@@ -264,6 +270,55 @@ jobs:
           echo "CC_HAHA_CI_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
           echo "CC_HAHA_CI_CERTIFICATE=$certificate_path" >> "$GITHUB_ENV"
           echo "Imported native-runtime signing identity: $identity"
+
+      - name: Create temporary self-signed cu-helper identity
+        if: matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain_path="${RUNNER_TEMP}/ccmax-cu-helper.keychain-db"
+          keychain_password="$(uuidgen)"
+          work_dir="${RUNNER_TEMP}/ccmax-cu-helper-cert"
+          mkdir -p "$work_dir"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 2 -nodes \
+            -keyout "$work_dir/key.pem" \
+            -out "$work_dir/cert.pem" \
+            -subj "/CN=cu-helper-dev" \
+            -addext "basicConstraints=critical,CA:false" \
+            -addext "keyUsage=critical,digitalSignature" \
+            -addext "extendedKeyUsage=critical,codeSigning"
+          openssl pkcs12 -export \
+            -out "$work_dir/cert.p12" \
+            -inkey "$work_dir/key.pem" \
+            -in "$work_dir/cert.pem" \
+            -name "cu-helper-dev" \
+            -passout pass:"$keychain_password"
+          security import "$work_dir/cert.p12" \
+            -k "$keychain_path" \
+            -P "$keychain_password" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" $(security list-keychains -d user | tr -d '"')
+          identity="$(
+            security find-identity -v -p codesigning "$keychain_path" \
+              | sed -n 's/.*"\(cu-helper-dev\)".*/\1/p' \
+              | head -1
+          )"
+          if [ -z "$identity" ]; then
+            echo "::error::Temporary self-signed cu-helper identity could not be imported."
+            exit 1
+          fi
+          echo "CC_HAHA_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "CC_HAHA_CI_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+          echo "CC_HAHA_CI_CERTIFICATE=$work_dir" >> "$GITHUB_ENV"
+          echo "::warning::Using a temporary self-signed cu-helper identity for this unsigned release; Computer Use permissions must be granted again after each upgrade."
 
       - name: Prepare bundled ripgrep
         working-directory: desktop
@@ -737,14 +792,14 @@ jobs:
           fi
 
       - name: Remove temporary macOS signing keychain
-        if: always() && matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed == 'true'
+        if: always() && matrix.smoke_platform == 'macos'
         shell: bash
         run: |
           if [ -n "${CC_HAHA_CI_KEYCHAIN:-}" ]; then
             security delete-keychain "$CC_HAHA_CI_KEYCHAIN" 2>/dev/null || true
           fi
           if [ -n "${CC_HAHA_CI_CERTIFICATE:-}" ]; then
-            rm -f "$CC_HAHA_CI_CERTIFICATE"
+            rm -rf "$CC_HAHA_CI_CERTIFICATE"
           fi
 
       - name: Namespace update metadata assets

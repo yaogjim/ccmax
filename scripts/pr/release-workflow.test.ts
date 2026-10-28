@@ -11,7 +11,7 @@ describe('release desktop workflow', () => {
 
   function extractJob(workflow: string, jobName: string) {
     return workflow.match(
-      new RegExp(`${jobName}:[\\s\\S]*?(?:\\n {2}[a-zA-Z0-9_-]+:|$)`),
+      new RegExp(`\\n {2}${jobName}:[\\s\\S]*?(?:\\n {2}[a-zA-Z0-9_-]+:|$)`),
     )?.[0]
   }
 
@@ -335,8 +335,8 @@ describe('release desktop workflow', () => {
     expect(signingJob).toContain('if [ "$RELEASE_DRAFT" != "true" ]; then')
     expect(signingJob).toContain('exit 1')
     expect(buildJob).toContain('- signing-preflight')
-    expect(workflow.indexOf('signing-preflight:')).toBeLessThan(workflow.indexOf('build:'))
-    expect(workflow.indexOf('signing-preflight:')).toBeLessThan(workflow.indexOf('Upload release artifacts for final publish'))
+    expect(workflow.indexOf('\n  signing-preflight:')).toBeLessThan(workflow.indexOf('\n  build:'))
+    expect(workflow.indexOf('\n  signing-preflight:')).toBeLessThan(workflow.indexOf('Upload release artifacts for final publish'))
   })
 
   test('an explicit manual Windows signing skip preserves macOS and default release requirements', async () => {
@@ -349,6 +349,12 @@ describe('release desktop workflow', () => {
     })
     expect(workflow.on.workflow_dispatch.inputs.allow_unsigned_macos).toEqual({
       description: 'Build an unsigned macOS artifact when signing secrets are absent (manual releases only)',
+      required: false,
+      default: false,
+      type: 'boolean',
+    })
+    expect(workflow.on.workflow_dispatch.inputs.skip_windows_build).toEqual({
+      description: 'Skip Windows builds for a manual release that cannot sign or pass the installer self-test',
       required: false,
       default: false,
       type: 'boolean',
@@ -398,6 +404,10 @@ describe('release desktop workflow', () => {
 
     const unsignedBuild = extractStep(readReleaseWorkflow(), 'Build unsigned Electron release artifacts')
     expect(unsignedBuild).toContain("matrix.smoke_platform == 'windows' && needs.signing-preflight.outputs.windows_signed != 'true'")
+    const temporaryIdentity = extractStep(readReleaseWorkflow(), 'Create temporary self-signed cu-helper identity')
+    expect(temporaryIdentity).toContain("matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed != 'true'")
+    expect(temporaryIdentity).toContain('cu-helper-dev')
+    expect(temporaryIdentity).toContain('CC_HAHA_SIGN_IDENTITY')
     for (const name of ['Sign Windows application executables with SignPath', 'Sign Windows installer with SignPath']) {
       expect(extractStep(readReleaseWorkflow(), name)).toContain("needs.signing-preflight.outputs.windows_signed == 'true'")
     }
