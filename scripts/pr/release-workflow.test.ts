@@ -441,6 +441,9 @@ describe('release desktop workflow', () => {
     expect(temporaryIdentity).not.toContain('-legacy')
     expect(temporaryIdentity).toContain('sudo -n security add-trusted-cert -d -r trustRoot -p codeSign -k "$keychain_path" "$work_dir/cert.pem"')
     expect(temporaryIdentity).toContain('timeout-minutes: 3')
+    expect(temporaryIdentity).toContain('security default-keychain -d user -s "$keychain_path"')
+    expect(temporaryIdentity).toContain('codesign --force --sign "$identity" --timestamp=none "$work_dir/signing-probe"')
+    expect(temporaryIdentity).toContain('codesign --verify --strict "$work_dir/signing-probe"')
     for (const name of ['Sign Windows application executables with SignPath', 'Sign Windows installer with SignPath']) {
       expect(extractStep(readReleaseWorkflow(), name)).toContain("needs.signing-preflight.outputs.windows_signed == 'true'")
     }

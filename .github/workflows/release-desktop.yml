@@ -277,6 +277,7 @@ jobs:
             "$keychain_path"
           sudo -n security add-trusted-cert -d -r trustRoot -p codeSign -k "$keychain_path" "$work_dir/cert.pem"
           security list-keychains -d user -s "$keychain_path" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -d user -s "$keychain_path"
           identity="$(
             security find-identity -v -p codesigning "$keychain_path" \
               | sed -n 's/.*"\(cu-helper-dev\)".*/\1/p' \
@@ -289,6 +290,9 @@ jobs:
           echo "CC_HAHA_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
           echo "CC_HAHA_CI_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
           echo "CC_HAHA_CI_CERTIFICATE=$work_dir" >> "$GITHUB_ENV"
+          cp /usr/bin/true "$work_dir/signing-probe"
+          codesign --force --sign "$identity" --timestamp=none "$work_dir/signing-probe"
+          codesign --verify --strict "$work_dir/signing-probe"
           echo "::warning::Using a temporary self-signed cu-helper identity for this unsigned release; Computer Use permissions must be granted again after each upgrade."
 
       - name: Prepare bundled ripgrep
