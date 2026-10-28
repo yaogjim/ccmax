@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { fireEvent, render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useSettingsStore } from '../../stores/settingsStore'
-import type { TeamWorkbenchSnapshot, TeamWorkbenchTask } from '../../types/team'
+import type { TeamMember, TeamWorkbenchSnapshot, TeamWorkbenchTask } from '../../types/team'
 import { AgentTeamsCanvas, type AgentTeamsCanvasProps } from './AgentTeamsCanvas'
 
 function task(
@@ -193,6 +193,70 @@ describe('AgentTeamsCanvas', () => {
     expect(screen.getByTestId('agent-teams-canvas-task-2').textContent).not.toContain('Just unlocked')
   })
 
+  it('shows an approved role waiting for its first assignment on standby', () => {
+    const current = snapshot('current')
+    const writer: TeamMember = {
+      agentId: 'writer@canvas-team',
+      name: 'writer',
+      role: 'Writer',
+      status: 'idle',
+      activity: 'idle',
+      sessionId: 'reserved-writer',
+      awaitingDependencies: true,
+    }
+    const withStandby: TeamWorkbenchSnapshot = {
+      ...current,
+      team: { ...current.team, members: [...current.team.members, writer] },
+    }
+    render(<AgentTeamsCanvas {...props({
+      snapshots: [withStandby],
+      selectedIndex: 0,
+      snapshot: withStandby,
+      previousSnapshot: undefined,
+      activeMessageId: null,
+    })} />)
+
+    const node = screen.getByTestId('agent-teams-canvas-member-writer@canvas-team')
+    expect(node.getAttribute('data-member-state')).toBe('standby')
+    // An older payload says the member waits for a ready task; it does not say
+    // the member never started.
+    expect(node.textContent).toContain('Standby · waiting for a ready task')
+    // Standby is not a finished turn and not a gone process.
+    expect(node.textContent).not.toContain('Idle ·')
+    expect(node.textContent).not.toContain('Exited')
+    // It borrows the resting character animation, not the working one.
+    expect(node.querySelector('.agent-teams-character-idle')).toBeTruthy()
+  })
+
+  it('says a member with the newer marker has never started', () => {
+    const current = snapshot('current')
+    const writer: TeamMember = {
+      agentId: 'writer@canvas-team',
+      name: 'writer',
+      role: 'Writer',
+      status: 'idle',
+      activity: 'idle',
+      sessionId: 'reserved-writer',
+      awaitingDependencies: true,
+      initialStartPending: true,
+    }
+    const withStandby: TeamWorkbenchSnapshot = {
+      ...current,
+      team: { ...current.team, members: [...current.team.members, writer] },
+    }
+    render(<AgentTeamsCanvas {...props({
+      snapshots: [withStandby],
+      selectedIndex: 0,
+      snapshot: withStandby,
+      previousSnapshot: undefined,
+      activeMessageId: null,
+    })} />)
+
+    const node = screen.getByTestId('agent-teams-canvas-member-writer@canvas-team')
+    expect(node.getAttribute('data-member-state')).toBe('standby')
+    expect(node.textContent).toContain('Not started · starts on demand')
+  })
+
   it('uses accessible controls and calls the task and member selection contracts', () => {
     const onSelectMember = vi.fn()
     const onSelectTask = vi.fn()
@@ -353,6 +417,56 @@ describe('AgentTeamsCanvas', () => {
     expect(css).toMatch(
       /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.agent-teams-task-running-fill\s*\{[^}]*opacity:\s*0;/,
     )
+  })
+
+  it('shows a member whose turn markers are missing as unknown, with no running claim', () => {
+    // An inbox file proves the member exists, not that it is mid-turn. The
+    // board used to read the watcher's `running` compatibility default back as
+    // work: the character pulsed and the label said "Executing #1". It must
+    // instead say the state is unknown, and say nothing it cannot prove.
+    const current = snapshot('current')
+    const unknownFrame: TeamWorkbenchSnapshot = {
+      ...current,
+      team: {
+        ...current.team,
+        members: current.team.members.map(member => (
+          member.agentId === 'builder@canvas-team'
+            ? { ...member, status: 'running' as const, activity: 'unknown' as const }
+            : member
+        )),
+      },
+      tasks: [task('1', 'in_progress', [], 'builder')],
+      messages: [],
+    }
+
+    render(<AgentTeamsCanvas {...props({
+      snapshots: [unknownFrame],
+      selectedIndex: 0,
+      snapshot: unknownFrame,
+      previousSnapshot: undefined,
+      activeMessageId: null,
+    })} />)
+
+    const card = screen.getByTestId('agent-teams-canvas-member-builder@canvas-team')
+    expect(card.getAttribute('data-member-state')).toBe('unknown')
+    expect(card.textContent).toContain('Unknown')
+
+    // Nothing about a live turn, and nothing borrowed from idle to fill the gap.
+    // (The reviewer card in the same frame is genuinely idle, so these are
+    // scoped to the member under test.)
+    expect(card.textContent).not.toContain('Executing #')
+    expect(card.textContent).not.toContain('waiting for work')
+    expect(card.textContent).not.toContain('waiting for shutdown')
+    expect(card.textContent).not.toContain('waiting for #')
+    expect(card.textContent).not.toContain('zZ')
+
+    // Neutral and still: neither the work pulse nor the idle breathing.
+    const character = card.querySelector('img.agent-teams-character')
+    expect(character).not.toBeNull()
+    expect(character!.className).not.toContain('agent-teams-character-working')
+    expect(character!.className).not.toContain('agent-teams-character-idle')
+    // No tether is drawn to a task it was never shown to be working on.
+    expect(document.querySelector('[data-testid^="agent-teams-canvas-tether-builder"]')).toBeNull()
   })
 
   it('chips each member card with its model family and keeps the full id on hover', () => {

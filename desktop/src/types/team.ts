@@ -1,5 +1,7 @@
 // Source: src/server/services/teamService.ts, src/server/ws/events.ts
 
+import type { TaskDelivery } from '../../../src/shared/taskDelivery'
+
 export type TeamSummary = {
   name: string
   memberCount: number
@@ -34,6 +36,24 @@ export type TeamMember = {
   role: string
   status: 'running' | 'idle' | 'completed' | 'error'
   activity?: TeamMemberActivity
+  /**
+   * The runtime's own statement that this approved member waits for its first
+   * ready task: it holds a reserved address but no process, and has never run.
+   * It is removed once the member really starts, so it never describes a member
+   * that merely finished a turn -- which is what `idle` would claim. A member
+   * carrying it is not terminated: there was no process to lose. Payloads that
+   * predate the field simply omit it; the board then falls back to roster
+   * evidence (see `standbyMember`), so this must stay optional.
+   */
+  awaitingDependencies?: boolean
+  /**
+   * The runtime's explicit statement that this member has never run: its
+   * approved instructions are held and its first start is a new conversation.
+   * Absent on team files written before the field existed — those members had
+   * already started, even when their instructions were deferred — so absence
+   * must not be read as "never started".
+   */
+  initialStartPending?: boolean
   /** Why the member's last turn failed. Kept while an automatic retry is pending. */
   lastError?: string
   autoRetry?: TeamMemberAutoRetry
@@ -52,6 +72,12 @@ export type TeamDetail = {
   leadSessionId?: string
   members: TeamMember[]
   createdAt?: string
+  /**
+   * How many times the user has stopped this team, as the server recorded it.
+   * Absent on a server that does not count Stops; a pending message is then
+   * never settled by one.
+   */
+  stopEpoch?: number
 }
 
 export type TeamWorkbenchTask = {
@@ -65,6 +91,15 @@ export type TeamWorkbenchTask = {
   blockedBy: string[]
   metadata?: Record<string, unknown>
   taskListId: string
+  /** Owner submissions and the independent review that settles each version. */
+  delivery?: TaskDelivery
+  /**
+   * Present when the server could not interpret the stored history (a newer
+   * schema version, or damage on disk). `delivery` is then the protocol's empty
+   * history, so this reason — not the absence of submissions — is what says the
+   * task is read-only. The raw record never reaches the desktop.
+   */
+  deliveryError?: string
 }
 
 export type TeamWorkbenchMessage = {

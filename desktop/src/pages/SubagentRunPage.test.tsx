@@ -1255,6 +1255,7 @@ describe('SubagentRunPage', () => {
   it('renders and streams an Agent Teams member in the shared run desktop', async () => {
     const member = {
       agentId: 'reviewer@review-team',
+      sessionId: 'reviewer-session',
       name: 'reviewer',
       role: 'security-reviewer',
       status: 'running' as const,
@@ -1432,7 +1433,7 @@ describe('SubagentRunPage', () => {
     expect(screen.queryByTestId('team-member-readonly-note')).not.toBeInTheDocument()
     const activityPanel = await screen.findByRole('dialog', { name: 'Activity' })
     expect(await within(activityPanel).findByText('In-process member workflow')).toBeInTheDocument()
-    expect(workflowSessionRunsMock).toHaveBeenCalledWith('lead-session')
+    expect(workflowSessionRunsMock).toHaveBeenCalledWith(member.sessionId)
 
     setComposerText('Please check the regression path.', 33)
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
@@ -1441,6 +1442,8 @@ describe('SubagentRunPage', () => {
         'review-team',
         'reviewer@review-team',
         'Please check the regression path.',
+        { incarnationId: snapshot.team.incarnationId, memberSessionId: member.sessionId },
+        { messageId: expect.stringMatching(/^msg-/) },
       )
     })
 
@@ -1718,6 +1721,7 @@ describe('SubagentRunPage', () => {
   it('settles a completed member task without losing direct-message activity', async () => {
     const member = {
       agentId: 'ui-designer@review-team',
+      sessionId: 'designer-session',
       name: 'ui-designer',
       role: 'ui-designer',
       status: 'running' as const,
@@ -1735,6 +1739,7 @@ describe('SubagentRunPage', () => {
       generatedAt: `2026-08-09T00:00:0${version.slice(-1)}.000Z`,
       team: {
         name: 'review-team',
+        incarnationId: 'review-instance',
         leadSessionId: 'lead-session',
         members: [{ ...member, activity }],
       },
@@ -1823,7 +1828,7 @@ describe('SubagentRunPage', () => {
 
     render(
       <TeamMemberRunPage
-        tabId="team-member:ui-designer@review-team"
+        tabId={memberSessionId(member.agentId, 'review-instance')}
         leadSessionId="lead-session"
         agentId={member.agentId}
         title="ui-designer"
@@ -1861,11 +1866,13 @@ describe('SubagentRunPage', () => {
         'review-team',
         member.agentId,
         'Please verify the final tokens.',
+        { incarnationId: 'review-instance', memberSessionId: member.sessionId },
+        { messageId: expect.stringMatching(/^msg-/) },
       )
     })
-    const memberSessionId = 'team-member:ui-designer@review-team'
+    const memberTabId = memberSessionId(member.agentId, 'review-instance')
     await waitFor(() => {
-      const matchingPrompts = useChatStore.getState().sessions[memberSessionId]?.messages
+      const matchingPrompts = useChatStore.getState().sessions[memberTabId]?.messages
         .filter((message) => message.type === 'user_text' && message.content === 'Please verify the final tokens.')
       expect(matchingPrompts).toHaveLength(1)
       expect(matchingPrompts?.[0]).toMatchObject({ pending: true })
@@ -1882,15 +1889,15 @@ describe('SubagentRunPage', () => {
     expect(await screen.findByText('Historical reset marker.')).toBeInTheDocument()
     expect(screen.getByTestId('turn-status-indicator')).toHaveTextContent('Thinking...')
     expect(
-      useChatStore.getState().sessions[memberSessionId]?.messages
+      useChatStore.getState().sessions[memberTabId]?.messages
         .find((message) => message.type === 'user_text' && message.content === 'Please verify the final tokens.'),
     ).toMatchObject({ pending: true })
 
     await act(async () => {
-      await useTeamStore.getState().refreshMemberSession(memberSessionId)
+      await useTeamStore.getState().refreshMemberSession(memberTabId)
     })
     await waitFor(() => {
-      const matchingPrompts = useChatStore.getState().sessions[memberSessionId]?.messages
+      const matchingPrompts = useChatStore.getState().sessions[memberTabId]?.messages
         .filter((message) => message.type === 'user_text' && message.content === 'Please verify the final tokens.')
       expect(matchingPrompts).toHaveLength(1)
       expect(matchingPrompts?.[0]).toMatchObject({ id: 'direct-message-echo' })
@@ -1900,7 +1907,7 @@ describe('SubagentRunPage', () => {
     expect(screen.getByTestId('turn-status-indicator')).toHaveTextContent('Thinking...')
 
     await act(async () => {
-      await useTeamStore.getState().refreshMemberSession(memberSessionId)
+      await useTeamStore.getState().refreshMemberSession(memberTabId)
     })
     expect(await screen.findByText('The final tokens are verified.')).toBeInTheDocument()
     expect(getMemberTranscriptMock).toHaveBeenCalledTimes(4)

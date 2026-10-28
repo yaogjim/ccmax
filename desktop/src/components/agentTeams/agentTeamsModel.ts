@@ -276,7 +276,7 @@ export function resolveTeamMemberIdentity(
   return { member, isLead }
 }
 
-export type MemberWorkState = 'working' | 'idle' | 'retrying' | 'stopped' | 'exited' | 'error'
+export type MemberWorkState = 'working' | 'idle' | 'retrying' | 'stopped' | 'exited' | 'error' | 'unknown' | 'standby'
 
 /**
  * What the member itself is doing, which is never what its tasks say. A task
@@ -287,6 +287,25 @@ export type MemberWorkState = 'working' | 'idle' | 'retrying' | 'stopped' | 'exi
  *
  * The lead has no runner writing turn markers for it, so its caller supplies
  * whether its session is streaming.
+ *
+ * `unknown` is a state of its own, not a synonym for idle. The backend reports
+ * it where it has no turn marker at all -- a member discovered only through its
+ * inbox file, or a config row written without `isActive` -- and the roster
+ * `running` it reports alongside is a compatibility default, not evidence.
+ * Collapsing that to `idle` claimed the member was known to be waiting; keeping
+ * it distinct lets the board say only what it can prove.
+ *
+ * `standby` is likewise its own state: an approved member that was given an
+ * address but no process because no task of its own was ready. The roster files
+ * it under `idle`, which would claim it had finished a turn; it is also not
+ * `stopped` or `exited`, because no process existed to lose.
+ *
+ * The two standby markers are not interchangeable. `initialStartPending` says
+ * the member never ran, so its first start is a new conversation. The older
+ * `awaitingDependencies` says its instructions are held until a task is ready,
+ * and team files written before `initialStartPending` existed can carry it for
+ * a member that already ran. Treating absence of work as "never started" would
+ * invent that second meaning for old payloads.
  *
  * Only `exited` is final. A stopped, retrying or failed member is still on the
  * team, and a message is what brings it back.
@@ -308,13 +327,69 @@ export function getMemberWorkState(
   if (member.activity === 'stopped') return 'stopped'
   if (member.autoRetry) return 'retrying'
   if (member.status === 'error') return 'error'
+  // Approved, waiting for a first assignment. A failed first start also keeps
+  // the marker but records `lastError`, so `error` above still wins.
+  if (standbyReason(member)) return 'standby'
   if (member.activity === 'idle') return 'idle'
-  // `unknown` means the backend records no turn markers and left no transcript
-  // to date, so fall back to the coarser roster status.
+  // The backend said, explicitly, that it has no turn marker. That is missing
+  // evidence, so report it as such: neither `working` (the roster `running` is
+  // a compatibility default) nor `idle` (nobody observed the member waiting).
+  // It is deliberately not `stopped` either -- inferring a gone process is what
+  // offers a restart.
+  if (member.activity === 'unknown') return 'unknown'
+  // A roster without any activity field predates the turn marker. Keep the
+  // coarse fallback for that legacy shape only.
   return member.status === 'running' ? 'working' : 'idle'
 }
 
 export type StalledTaskOwnerState = Extract<MemberWorkState, 'stopped' | 'error' | 'retrying'>
+
+/**
+ * Identity match for one roster member, using the same aliases as the feed and
+ * inspector: a sender may be a bare name or a full `name@team` id.
+ */
+export function memberMatchesIdentity(member: TeamMember, identity: string | undefined): boolean {
+  const aliases = identityAliases(identity ?? '')
+  if (aliases.length === 0) return false
+  const memberAliases = [
+    ...identityAliases(member.agentId),
+    ...(member.name ? identityAliases(member.name) : []),
+  ]
+  return aliases.some(alias => memberAliases.includes(alias))
+}
+
+/**
+ * Which runtime marker makes this member a standby wait.
+ *
+ * `pendingStart` is the runtime's explicit statement that the member never ran.
+ * `waitingDependencies` is the older marker: its instructions are held until a
+ * task of its own is ready, which is also true of a member that already ran and
+ * resumed. Absence of both is not evidence of either — an idle member with no
+ * task and no mailbox traffic stays idle (or `unknown`) rather than becoming a
+ * claim that it never started.
+ */
+export type StandbyReason = 'pendingStart' | 'waitingDependencies'
+
+export function standbyReason(member: TeamMember): StandbyReason | undefined {
+  if (member.initialStartPending === true) return 'pendingStart'
+  if (member.awaitingDependencies === true) return 'waitingDependencies'
+  return undefined
+}
+
+/**
+ * An approved member that waits for a first assignment rather than for a turn
+ * to end. Only the runtime markers decide it; the board never reconstructs this
+ * state from missing tasks or messages.
+ */
+export function standbyMember(
+  member: TeamMember,
+  snapshot: TeamWorkbenchSnapshot,
+  options: { isLead?: boolean } = {},
+): boolean {
+  if (options.isLead || snapshot.deletedAt) return false
+  return standbyReason(member) !== undefined &&
+    getMemberWorkState(member, { isLead: false }) === 'standby'
+}
 
 /**
  * Why a task still marked in progress is not moving: its owner was stopped,

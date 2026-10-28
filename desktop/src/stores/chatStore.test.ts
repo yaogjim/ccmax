@@ -4458,6 +4458,61 @@ describe('chatStore history mapping', () => {
     expect(mapped[2]).not.toHaveProperty('teammateFrom')
   })
 
+  it('keeps every envelope id in a batched teammate transcript row', () => {
+    const messages: MessageEntry[] = [{
+      id: 'user-batch',
+      type: 'user',
+      timestamp: '2026-04-06T00:00:00.000Z',
+      content: [
+        {
+          type: 'text',
+          text: '<teammate-message teammate_id="task-list" id="mailbox-system">ready</teammate-message>',
+        },
+        {
+          type: 'text',
+          text: '<teammate-message teammate_id="user" id="client-direct-1">status?</teammate-message>',
+        },
+      ],
+    }]
+
+    const [mapped] = mapHistoryMessagesToUiMessages(messages, {
+      includeTeammateMessages: true,
+    })
+
+    expect(mapped).toMatchObject({
+      type: 'user_text',
+      teammateFrom: 'task-list',
+      teammateMessageIds: ['mailbox-system', 'client-direct-1'],
+      teammateUserMessageIds: ['client-direct-1'],
+    })
+  })
+
+  it('attributes the operator\'s own direct send as the operator, not a teammate', () => {
+    const messages: MessageEntry[] = [{
+      id: 'user-direct',
+      type: 'user',
+      timestamp: '2026-04-06T00:00:00.000Z',
+      content: [{
+        type: 'text',
+        text: '<teammate-message teammate_id="user" id="client-direct-1">status?</teammate-message>',
+      }],
+    }]
+
+    const [mapped] = mapHistoryMessagesToUiMessages(messages, {
+      includeTeammateMessages: true,
+    })
+
+    // The echo of a message the person at the keyboard typed belongs to them:
+    // a teammate chip labelled "user" would claim a peer wrote it.
+    expect(mapped).toMatchObject({
+      type: 'user_text',
+      content: 'status?',
+      teammateMessageIds: ['client-direct-1'],
+      teammateUserMessageIds: ['client-direct-1'],
+    })
+    expect(mapped).not.toHaveProperty('teammateFrom')
+  })
+
   it('preserves source user ids when restoring array-content user prompts', () => {
     const messages: MessageEntry[] = [
       {

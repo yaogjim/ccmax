@@ -97,6 +97,11 @@ export function AgentTeamsPlanCard({ sessionId }: { sessionId: string }) {
   const activeMember = members.find(member => member.id === activeMemberId) ?? members[0]
   const difficultyLabel = (member: TeamPlanMember) => member.difficulty === 'high' ? t('teamPlan.high') : member.difficulty === 'low' ? t('teamPlan.low') : member.difficulty === 'medium' ? t('teamPlan.medium') : t('teamPlan.unspecified')
   const hasUnassignedTasks = tasks.some(task => !members.some(member => member.id === task.ownerId))
+  // Approval authorizes roles, not a task each: a member with no task waits on
+  // standby for a ready task or an instruction. That is not an error and must
+  // not block approval -- only a task without a valid owner does.
+  const assignedTaskCount = (member: TeamPlanMember) => tasks.filter(task => task.ownerId === member.id).length
+  const standbyMembers = members.filter(member => assignedTaskCount(member) === 0)
   const invalidNames = members.filter(member => !isValidTeamMemberName(member.name)).map(member => member.name)
   const presetChanged = members.some(member => plan.members.find(previous => previous.id === member.id)?.agentType !== member.agentType)
   const canStop = Boolean(plan.parentPlanId)
@@ -200,10 +205,12 @@ export function AgentTeamsPlanCard({ sessionId }: { sessionId: string }) {
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-medium text-[var(--color-text-primary)]">{member.name}</span>
                       <span className="mt-1 block truncate text-[11px] text-[var(--color-text-secondary)]">{runtimeName(member.runtime)}</span>
+                      {assignedTaskCount(member) === 0 && <span className="mt-0.5 block truncate text-[11px] text-[var(--color-text-tertiary)]">{t('teamPlan.memberStandby')}</span>}
                     </span>
                   </button>
                 </div>)}
               </nav>
+              {standbyMembers.length > 0 && <p data-testid="team-plan-standby-hint" className="mt-3 text-[11px] leading-relaxed text-[var(--color-text-tertiary)]">{t('teamPlan.standbyHint')}</p>}
               <div className="mt-6 border-t border-[var(--color-border-separator)] pt-4">
                 <p className="text-xs leading-relaxed text-[var(--color-text-secondary)]">{t('teamPlan.leader')}: {runtimeName(leaderRuntime)}</p>
               </div>
@@ -224,6 +231,7 @@ export function AgentTeamsPlanCard({ sessionId }: { sessionId: string }) {
                     <h3 className="text-lg font-semibold text-[var(--color-text-primary)]">{activeMember.name}</h3>
                   </div>
                   <Badge size="sm">{t('teamPlan.difficulty')}: {difficultyLabel(activeMember)}</Badge>
+                  {assignedTaskCount(activeMember) === 0 && <Badge size="sm" tone="neutral">{t('teamPlan.standbyBadge')}</Badge>}
                 </div>
                 <div className="grid gap-5 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
                   <div className="min-w-0 space-y-2">

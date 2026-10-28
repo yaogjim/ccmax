@@ -5686,6 +5686,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
           msg.teamName,
           msg.members,
           teamLifecycleIdentity(msg.incarnationId, msg.createdAt),
+          msg.stopEpoch,
         )
         break
       case 'team_workbench_updated':
@@ -7164,19 +7165,24 @@ function buildAbortedHistoryLoadUpdate(
   }
 }
 
-const TEAMMATE_CONTENT_REGEX = /<teammate-message\s+teammate_id="([^"]+)"[^>]*>\n?([\s\S]*?)\n?<\/teammate-message>/g
+const TEAMMATE_CONTENT_REGEX = /<teammate-message\s+teammate_id="([^"]+)"([^>]*)>\n?([\s\S]*?)\n?<\/teammate-message>/g
+const TEAMMATE_MESSAGE_ID_ATTR_REGEX = /\bid="([^"]*)"/
+/** Sender the member transcript records for a message the operator typed. */
+const HUMAN_TEAMMATE_SENDER = 'user'
 
-export type VisibleTeammateMessage = { from: string; content: string }
+export type VisibleTeammateMessage = { from: string; content: string; id?: string }
 
 /**
  * Teammate turns carry the sender in the tag; keeping it lets the transcript
  * attribute the message instead of rendering it as an anonymous user turn.
+ * The optional envelope id is what lets a direct user send settle its
+ * optimistic bubble after any amount of time or batching.
  */
 function extractVisibleTeammateMessages(text: string): VisibleTeammateMessage[] {
   const messages: VisibleTeammateMessage[] = []
 
   for (const match of text.matchAll(TEAMMATE_CONTENT_REGEX)) {
-    const content = match[2]?.trim()
+    const content = match[3]?.trim()
     if (!content) continue
 
     if (content.startsWith('{') && content.endsWith('}')) {
@@ -7190,7 +7196,12 @@ function extractVisibleTeammateMessages(text: string): VisibleTeammateMessage[] 
       }
     }
 
-    messages.push({ from: match[1] ?? '', content })
+    const id = match[2]?.match(TEAMMATE_MESSAGE_ID_ATTR_REGEX)?.[1]
+    messages.push({
+      from: match[1] ?? '',
+      content,
+      ...(id ? { id } : {}),
+    })
   }
 
   return messages
@@ -7904,13 +7915,25 @@ export function mapHistoryMessagesToUiMessages(
         if (!includeTeammateMessages) continue
         const teammateMessages = extractVisibleTeammateMessages(msg.content)
         if (teammateMessages.length === 0) continue
-        const sender = teammateMessages[0]!.from
+        // A row can batch envelopes. The operator's own send is not teammate
+        // traffic, so the chip goes to the first peer that actually wrote.
+        const sender = teammateMessages
+          .find((message) => message.from && message.from !== HUMAN_TEAMMATE_SENDER)?.from
+        const teammateMessageIds = teammateMessages
+          .map((message) => message.id)
+          .filter((id): id is string => Boolean(id))
+        const teammateUserMessageIds = teammateMessages
+          .filter((message) => message.from === HUMAN_TEAMMATE_SENDER)
+          .map((message) => message.id)
+          .filter((id): id is string => Boolean(id))
         uiMessages.push({
           id: msg.id || nextId(),
           type: 'user_text',
           content: teammateMessages.map((message) => message.content).join('\n\n'),
           ...(msg.id ? { transcriptMessageId: msg.id } : {}),
           ...(sender ? { teammateFrom: sender } : {}),
+          ...(teammateMessageIds.length ? { teammateMessageIds } : {}),
+          ...(teammateUserMessageIds.length ? { teammateUserMessageIds } : {}),
           timestamp,
         })
         continue
@@ -7965,13 +7988,23 @@ export function mapHistoryMessagesToUiMessages(
       const attachments: UIAttachment[] = []
       const imageSourcePaths: string[] = []
       let teammateSender: string | undefined
+      const teammateMessageIds: string[] = []
+      const teammateUserMessageIds: string[] = []
       const hasImageBlock = (msg.content as UserHistoryBlock[]).some((block) => block.type === 'image')
       for (const [blockIndex, block] of (msg.content as UserHistoryBlock[]).entries()) {
         if (block.type === 'text' && block.text && isTeammateMessage(block.text)) {
           modelTextParts.push(block.text)
           if (!includeTeammateMessages) continue
           const teammateMessages = extractVisibleTeammateMessages(block.text)
-          teammateSender ??= teammateMessages.find((message) => message.from)?.from
+          teammateSender ??= teammateMessages
+            .find((message) => message.from && message.from !== HUMAN_TEAMMATE_SENDER)?.from
+          for (const teammateMessage of teammateMessages) {
+            if (!teammateMessage.id) continue
+            teammateMessageIds.push(teammateMessage.id)
+            if (teammateMessage.from === HUMAN_TEAMMATE_SENDER) {
+              teammateUserMessageIds.push(teammateMessage.id)
+            }
+          }
           visibleTextParts.push(...teammateMessages.map((message) => message.content))
         } else if (block.type === 'text' && block.text) {
           modelTextParts.push(block.text)
@@ -8025,6 +8058,8 @@ export function mapHistoryMessagesToUiMessages(
           ...(msg.id ? { transcriptMessageId: msg.id } : {}),
           ...(modelContent ? { modelContent } : {}),
           ...(teammateSender ? { teammateFrom: teammateSender } : {}),
+          ...(teammateMessageIds.length ? { teammateMessageIds } : {}),
+          ...(teammateUserMessageIds.length ? { teammateUserMessageIds } : {}),
           attachments: allAttachments.length > 0 ? allAttachments : undefined,
           timestamp,
         })

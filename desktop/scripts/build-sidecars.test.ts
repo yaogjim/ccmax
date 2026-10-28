@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import path, { join as joinPath } from 'node:path'
 import { promisify } from 'node:util'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   ADAPTER_FLAGS,
   reserveLocalPort,
@@ -506,27 +506,33 @@ describe('build-sidecars Windows x64 target mapping', () => {
       headers: { 'content-type': 'application/json' },
     })) as typeof fetch
 
-    const startedAt = performance.now()
-    let guardTimer: ReturnType<typeof setTimeout> | undefined
+    // 仅推进请求时钟；真实子进程退出和文件清理不属于 25 ms 请求预算。
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    const onSettled = vi.fn()
     try {
-      await expect(Promise.race([
-        waitForCompiledSidecar({
-          baseUrl: 'http://127.0.0.1:1',
-          expectedSessionId: 'never-ready',
-          deadlineMs: 25,
-          exited,
-          logs: processHandle.logs,
-          localAccessToken: 'hung-sidecar-local-access-token',
-        }),
-        new Promise<never>((_resolve, reject) => {
-          guardTimer = setTimeout(
-            () => reject(new Error('never-ending response body guard fired')),
-            250,
-          )
-        }),
-      ])).rejects.toThrow('compiled sidecar did not become ready')
+      const readiness = waitForCompiledSidecar({
+        baseUrl: 'http://127.0.0.1:1',
+        expectedSessionId: 'never-ready',
+        deadlineMs: 25,
+        exited,
+        logs: processHandle.logs,
+        localAccessToken: 'hung-sidecar-local-access-token',
+      })
+      void readiness.then(onSettled, onSettled)
+
+      await vi.advanceTimersByTimeAsync(24)
+      expect(onSettled).not.toHaveBeenCalled()
+      expect(bodyCancelCount).toBe(0)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(onSettled).toHaveBeenCalledOnce()
+      await expect(readiness).rejects.toThrow('compiled sidecar did not become ready')
+      expect(bodyCancelCount).toBeGreaterThan(0)
+      // 取消尚未完成时调用方已失败；晚到的取消拒绝必须被消费。
+      rejectCancellation?.(new Error('late body cancellation rejection'))
+      await vi.advanceTimersByTimeAsync(0)
     } finally {
-      if (guardTimer) clearTimeout(guardTimer)
+      vi.clearAllTimers()
+      vi.useRealTimers()
       globalThis.fetch = originalFetch
       try {
         await terminateCompiledSidecar(processHandle)
@@ -535,10 +541,6 @@ describe('build-sidecars Windows x64 target mapping', () => {
       }
     }
 
-    expect(performance.now() - startedAt).toBeLessThan(150)
-    expect(bodyCancelCount).toBeGreaterThan(0)
-    rejectCancellation?.(new Error('late body cancellation rejection'))
-    await new Promise(resolveWait => setTimeout(resolveWait, 0))
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
     expect(await stat(rootDir).then(() => true, () => false)).toBe(false)
     expect(process.env.HOME).toBe(originalEnvironment.HOME)

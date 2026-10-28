@@ -65,8 +65,24 @@ function workbench(version: string, taskStatus: 'pending' | 'in_progress' | 'com
       leadAgentId: 'lead@team-workbench',
       leadSessionId: 'lead-session',
       members: [
-        { agentId: 'lead@team-workbench', name: 'lead', role: 'lead', status: 'running' },
-        { agentId: 'worker@team-workbench', name: 'worker', role: 'worker', status: 'running' },
+        // The live roster always sends both standby markers as booleans, and
+        // the store normalizes an omitted one to `false`.
+        {
+          agentId: 'lead@team-workbench',
+          name: 'lead',
+          role: 'lead',
+          status: 'running',
+          awaitingDependencies: false,
+          initialStartPending: false,
+        },
+        {
+          agentId: 'worker@team-workbench',
+          name: 'worker',
+          role: 'worker',
+          status: 'running',
+          awaitingDependencies: false,
+          initialStartPending: false,
+        },
       ],
     },
     tasks: [{
@@ -80,6 +96,17 @@ function workbench(version: string, taskStatus: 'pending' | 'in_progress' | 'com
       taskListId: 'team-workbench',
     }],
     messages: [],
+  }
+}
+
+function withMessageIdentity(snapshot: TeamWorkbenchSnapshot): TeamWorkbenchSnapshot {
+  return {
+    ...snapshot,
+    team: {
+      ...snapshot.team,
+      incarnationId: 'incarnation-send',
+      members: snapshot.team.members.map(member => ({ ...member, sessionId: `${member.agentId}-session` })),
+    },
   }
 }
 
@@ -127,6 +154,92 @@ describe('teamStore incremental transcript polling', () => {
     )
 
     expect(merged.map(message => message.id)).toEqual(['server-1', 'pending-2'])
+  })
+
+  it('consumes a direct message echo the member records as sent by the user', () => {
+    const existing = [userMessage('pending-user-1', 'please review', 1_000, true)]
+    const delta = [{
+      ...userMessage('server-user-echo', 'please review', 1_000),
+      teammateFrom: 'user',
+    }]
+
+    const merged = mergeMemberTranscriptDelta(existing, delta)
+
+    expect(merged.map(message => message.id)).toEqual(['server-user-echo'])
+  })
+
+  it('settles a pending direct send by envelope id after the content window', () => {
+    const pending = userMessage('pending-client-1', 'status?', 1_000, true)
+    const echo = {
+      ...userMessage('server-batch-echo', 'status?', 1_000 + 10 * 60_000),
+      teammateFrom: 'user',
+      teammateMessageIds: ['pending-client-1'],
+    }
+
+    const merged = mergeMemberTranscriptDelta([pending], [echo])
+
+    expect(merged.map(message => message.id)).toEqual(['server-batch-echo'])
+  })
+
+  it('settles only the send its envelope id names when two messages share text', () => {
+    const first = userMessage('pending-client-1', 'same text', 1_000, true)
+    const second = userMessage('pending-client-2', 'same text', 1_001, true)
+    const echo = {
+      ...userMessage('server-echo-1', 'same text', 1_100),
+      teammateFrom: 'user',
+      teammateMessageIds: ['pending-client-1'],
+    }
+
+    const merged = mergeMemberTranscriptDelta([first, second], [echo])
+
+    expect(merged.map(message => message.id)).toEqual(['server-echo-1', 'pending-client-2'])
+  })
+
+  it('does not let a new echo with another envelope id swallow a pending send', () => {
+    const pending = userMessage('pending-client-1', 'same text', 1_000, true)
+    const echo = {
+      ...userMessage('server-echo-other', 'same text', 1_100),
+      teammateFrom: 'user',
+      teammateMessageIds: ['someone-elses-message'],
+    }
+
+    const merged = mergeMemberTranscriptDelta([pending], [echo])
+
+    expect(merged.map(message => message.id)).toEqual(['server-echo-other', 'pending-client-1'])
+  })
+
+  it('does not let another member echo with the same text settle a pending send', () => {
+    const pending = userMessage('pending-client-1', 'same text', 1_000, true)
+    const echo = {
+      ...userMessage('server-teammate-echo', 'same text', 1_100),
+      teammateFrom: 'other-member',
+    }
+
+    const merged = mergeMemberTranscriptDelta([pending], [echo])
+
+    expect(merged.map(message => message.id)).toEqual(['server-teammate-echo', 'pending-client-1'])
+  })
+
+  it('falls back to content and time only for a legacy echo without ids', () => {
+    const pending = userMessage('pending-client-1', 'legacy prompt', 1_000, true)
+    const echo = {
+      ...userMessage('server-legacy-echo', 'legacy prompt', 1_000 + 30_000),
+      teammateFrom: 'user',
+    }
+
+    expect(mergeMemberTranscriptDelta([pending], [echo]).map(message => message.id))
+      .toEqual(['server-legacy-echo'])
+  })
+
+  it('keeps a pending send when a legacy echo falls outside the content window', () => {
+    const pending = userMessage('pending-client-1', 'legacy prompt', 1_000, true)
+    const echo = {
+      ...userMessage('server-legacy-echo', 'legacy prompt', 1_000 + 10 * 60_000),
+      teammateFrom: 'user',
+    }
+
+    expect(mergeMemberTranscriptDelta([pending], [echo]).map(message => message.id))
+      .toEqual(['server-legacy-echo', 'pending-client-1'])
   })
 
   it('deduplicates a full transcript by identity without dropping a genuine repeat', () => {
@@ -670,7 +783,7 @@ describe('teamStore incremental transcript polling', () => {
     sendMemberMessageMock
       .mockReturnValueOnce(firstDelivery.promise)
       .mockReturnValueOnce(secondDelivery.promise)
-    getWorkbenchMock.mockResolvedValue(workbench('v1', 'completed'))
+    getWorkbenchMock.mockResolvedValue(withMessageIdentity(workbench('v1', 'completed')))
     getMemberTranscriptMock
       .mockResolvedValueOnce({
         messages: [],
@@ -711,7 +824,7 @@ describe('teamStore incremental transcript polling', () => {
       })
 
     await useTeamStore.getState().fetchWorkbench('team-workbench')
-    const sessionId = 'team-member:worker@team-workbench'
+    const sessionId = memberSessionId('worker@team-workbench', 'incarnation-send')
     await useTeamStore.getState().refreshMemberSession(sessionId)
 
     useChatStore.getState().sendMessage(sessionId, 'Repeat follow-up')
@@ -758,11 +871,11 @@ describe('teamStore incremental transcript polling', () => {
     vi.useFakeTimers()
     const delivery = deferred<{ ok: true }>()
     sendMemberMessageMock.mockReturnValue(delivery.promise)
-    getWorkbenchMock.mockResolvedValue(workbench('v1', 'in_progress'))
+    getWorkbenchMock.mockResolvedValue(withMessageIdentity(workbench('v1', 'in_progress')))
     getMemberTranscriptMock.mockResolvedValue({ messages: [] })
 
     await useTeamStore.getState().fetchWorkbench('team-workbench')
-    const sessionId = 'team-member:worker@team-workbench'
+    const sessionId = memberSessionId('worker@team-workbench', 'incarnation-send')
     await useTeamStore.getState().refreshMemberSession(sessionId)
     const send = useTeamStore.getState().sendMessageToMember(sessionId, 'Final check')
 
@@ -1942,13 +2055,128 @@ describe('teamStore workbench timeline', () => {
   })
 })
 
+describe('teamStore member message identity', () => {
+  const identity = { incarnationId: 'incarnation-original', memberSessionId: 'member-original' }
+  const content = 'Keep this draft\nexactly as typed'
+
+  function currentTeam() {
+    const snapshot = workbench('v1', 'in_progress')
+    return {
+      ...snapshot.team,
+      incarnationId: identity.incarnationId,
+      createdAt: '2026-08-08T00:00:00.000Z',
+      members: [{ ...snapshot.team.members[1]!, sessionId: identity.memberSessionId }],
+    }
+  }
+
+  beforeEach(() => {
+    getMemberTranscriptMock.mockReset()
+    getMemberTranscriptMock.mockResolvedValue({ messages: [] })
+    getWorkbenchMock.mockReset()
+    getTeamMock.mockReset()
+    sendMemberMessageMock.mockReset()
+    sendMemberMessageMock.mockResolvedValue({ ok: true })
+    useTeamStore.getState().clearTeam()
+    useChatStore.setState({ sessions: {} })
+  })
+
+  afterEach(() => useTeamStore.getState().clearTeam())
+
+  it('sends the current snapshot identity rather than the lead or synthetic tab identity', async () => {
+    const team = currentTeam()
+    useTeamStore.setState({ activeTeam: team })
+    const sessionId = memberSessionId(team.members[0]!.agentId, team.incarnationId)
+
+    await useTeamStore.getState().sendMessageToMember(sessionId, content)
+
+    expect(sendMemberMessageMock).toHaveBeenCalledExactlyOnceWith(
+      team.name,
+      team.members[0]!.agentId,
+      content,
+      identity,
+      { messageId: expect.any(String) },
+    )
+  })
+
+  it.each([
+    { incarnationId: undefined, memberSessionId: 'member-original' },
+    { incarnationId: '', memberSessionId: 'member-original' },
+    { incarnationId: '   ', memberSessionId: 'member-original' },
+    { incarnationId: 'incarnation-original', memberSessionId: undefined },
+    { incarnationId: 'incarnation-original', memberSessionId: '' },
+    { incarnationId: 'incarnation-original', memberSessionId: '   ' },
+  ])('rejects missing identity without fetching, guessing or losing the body: %j', async missing => {
+    const team = {
+      ...currentTeam(),
+      incarnationId: missing.incarnationId,
+      members: [{ ...currentTeam().members[0]!, sessionId: missing.memberSessionId }],
+    }
+    useTeamStore.setState({ activeTeam: team })
+    // The tab may still have a legacy display key. That key must never become
+    // a delivery identity, even when a lead and creation time are available.
+    const tabIdentity = team.incarnationId || `legacy:${team.name}:${team.leadSessionId}:${team.createdAt}`
+    const sessionId = memberSessionId(team.members[0]!.agentId, tabIdentity)
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+    getMemberTranscriptMock.mockClear()
+
+    useChatStore.getState().sendMessage(sessionId, content)
+
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().sessions[sessionId]?.messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'error', code: 'TEAM_MEMBER_MESSAGE_FAILED', message: expect.stringContaining('identity is unavailable') }),
+      ]))
+    })
+    expect(useChatStore.getState().sessions[sessionId]).toMatchObject({
+      chatState: 'idle',
+      messages: expect.arrayContaining([expect.objectContaining({ type: 'user_text', content })]),
+    })
+    expect(sendMemberMessageMock).not.toHaveBeenCalled()
+    expect(getMemberTranscriptMock).not.toHaveBeenCalled()
+    expect(getTeamMock).not.toHaveBeenCalled()
+    expect(getWorkbenchMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps the rejected body and never resubmits to a replacement member', async () => {
+    const team = currentTeam()
+    useTeamStore.setState({ activeTeam: team })
+    const sessionId = memberSessionId(team.members[0]!.agentId, team.incarnationId)
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+    getMemberTranscriptMock.mockClear()
+    const delivery = deferred<{ ok: true }>()
+    sendMemberMessageMock.mockReturnValueOnce(delivery.promise)
+
+    useChatStore.getState().sendMessage(sessionId, content)
+    const replacement = { ...team, members: [{ ...team.members[0]!, sessionId: 'member-replacement' }] }
+    useTeamStore.setState({ activeTeam: replacement })
+    delivery.reject(new Error('TEAM_MEMBER_IDENTITY_CONFLICT'))
+
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('idle')
+    })
+    expect(useChatStore.getState().sessions[sessionId]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'user_text', content }),
+      expect.objectContaining({ type: 'error', message: 'TEAM_MEMBER_IDENTITY_CONFLICT' }),
+    ]))
+    expect(sendMemberMessageMock).toHaveBeenCalledExactlyOnceWith(
+      team.name,
+      team.members[0]!.agentId,
+      content,
+      identity,
+      { messageId: expect.any(String) },
+    )
+    expect(getMemberTranscriptMock).not.toHaveBeenCalled()
+    expect(getTeamMock).not.toHaveBeenCalled()
+    expect(getWorkbenchMock).not.toHaveBeenCalled()
+  })
+})
+
 describe('teamStore member recovery states', () => {
   const WORKER_ID = 'worker@team-workbench'
   const retry = { attempt: 2, max: 5, nextAt: 1_790_000_045_000 }
 
   /** A workbench whose worker carries server-shaped fields, e.g. `status: 'failed'`. */
   function workbenchWithWorker(version: string, worker: Record<string, unknown>): TeamWorkbenchSnapshot {
-    const base = workbench(version, 'in_progress')
+    const base = withMessageIdentity(workbench(version, 'in_progress'))
     return {
       ...base,
       team: {
@@ -2056,6 +2284,68 @@ describe('teamStore member recovery states', () => {
     expect(latestWorker()?.lastError).toBeUndefined()
   })
 
+  it('carries the runtime standby markers through snapshots and watcher patches', async () => {
+    getWorkbenchMock.mockResolvedValueOnce(workbenchWithWorker('v1', {
+      status: 'idle',
+      activity: 'idle',
+      awaitingDependencies: true,
+      initialStartPending: true,
+    }))
+    await useTeamStore.getState().fetchWorkbench('team-workbench')
+    expect(latestWorker()).toMatchObject({
+      awaitingDependencies: true,
+      initialStartPending: true,
+    })
+
+    // A later frame records the first start: both markers clear.
+    getWorkbenchMock.mockResolvedValueOnce(workbenchWithWorker('v2', {
+      status: 'idle',
+      activity: 'idle',
+      awaitingDependencies: false,
+      initialStartPending: false,
+    }))
+    await useTeamStore.getState().fetchWorkbench('team-workbench')
+    expect(latestWorker()).toMatchObject({
+      awaitingDependencies: false,
+      initialStartPending: false,
+    })
+
+    // The live watcher always sends both. An older payload omits them, and an
+    // absent field must not erase what the full read knew.
+    useTeamStore.getState().handleTeamUpdate('team-workbench', [{
+      agentId: WORKER_ID,
+      role: 'worker',
+      status: 'idle',
+      awaitingDependencies: true,
+    }])
+    expect(latestWorker()).toMatchObject({
+      awaitingDependencies: true,
+      initialStartPending: false,
+    })
+    useTeamStore.getState().handleTeamUpdate('team-workbench', [{
+      agentId: WORKER_ID,
+      role: 'worker',
+      status: 'idle',
+    }])
+    expect(latestWorker()).toMatchObject({
+      awaitingDependencies: true,
+      initialStartPending: false,
+    })
+
+    // An explicit false clears the wait instead of leaving it on screen.
+    useTeamStore.getState().handleTeamUpdate('team-workbench', [{
+      agentId: WORKER_ID,
+      role: 'worker',
+      status: 'idle',
+      awaitingDependencies: false,
+      initialStartPending: false,
+    }])
+    expect(latestWorker()).toMatchObject({
+      awaitingDependencies: false,
+      initialStartPending: false,
+    })
+  })
+
   it('applies watcher patches to every view, clearing on null and keeping what was omitted', () => {
     const snapshot = workbench('v1', 'in_progress')
     const memberSession = memberSessionId(WORKER_ID)
@@ -2125,7 +2415,7 @@ describe('teamStore member recovery states', () => {
       lastError: 'Credit balance is too low',
     }))
     await useTeamStore.getState().fetchWorkbench('team-workbench')
-    const sessionId = memberSessionId(WORKER_ID)
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
     await useTeamStore.getState().refreshMemberSession(sessionId)
     expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('idle')
 
@@ -2151,7 +2441,7 @@ describe('teamStore member recovery states', () => {
       lastError: 'Credit balance is too low',
     }))
     await useTeamStore.getState().fetchWorkbench('team-workbench')
-    const sessionId = memberSessionId(WORKER_ID)
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
     await useTeamStore.getState().refreshMemberSession(sessionId)
     expect(getMemberTranscriptMock).toHaveBeenCalledTimes(1)
 
@@ -2161,6 +2451,8 @@ describe('teamStore member recovery states', () => {
       'team-workbench',
       WORKER_ID,
       'Credits topped up, please continue',
+      { incarnationId: 'incarnation-send', memberSessionId: `${WORKER_ID}-session` },
+      expect.objectContaining({ messageId: expect.any(String) }),
     )
     // The conversation keeps following the transcript, and the failure still
     // on record is the one this message answers, so it does not end the wait.
@@ -2179,11 +2471,93 @@ describe('teamStore member recovery states', () => {
     expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('idle')
   })
 
+  it.each([0, 4])('ends a pending reply when Stop advances from epoch %s', async (initialEpoch) => {
+    getMemberTranscriptMock.mockResolvedValue({ messages: [] })
+    getWorkbenchMock.mockResolvedValue(workbenchWithWorker('v1', { status: 'running', activity: 'idle' }))
+    await useTeamStore.getState().fetchWorkbench('team-workbench')
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+
+    sendMemberMessageMock.mockResolvedValue({ ok: true, stopEpoch: initialEpoch })
+    await useTeamStore.getState().sendMessageToMember(sessionId, 'Ship the fix')
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('thinking')
+
+    // The Stop was recorded after this send, so it ends this wait: the member
+    // is stopped, and the prompt stays in the conversation without an answer
+    // or an error being invented for it.
+    const stopped = (stopEpoch?: number) => useTeamStore.getState().handleTeamUpdate(
+      'team-workbench',
+      [{ agentId: WORKER_ID, role: 'worker', status: 'idle', activity: 'stopped' }],
+      undefined,
+      stopEpoch,
+    )
+    // The conversation itself is untouched: ending the wait must not invent an
+    // answer or an error for the prompt the user already sees.
+    const before = useChatStore.getState().sessions[sessionId]?.messages
+    stopped(initialEpoch + 1)
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('idle')
+    expect(useChatStore.getState().sessions[sessionId]?.messages).toEqual(before)
+
+    // A message sent while the team is already stopped is a real wake request:
+    // that Stop and any older snapshot must not settle it, only a newer one.
+    sendMemberMessageMock.mockResolvedValue({ ok: true, stopEpoch: initialEpoch + 1 })
+    await useTeamStore.getState().sendMessageToMember(sessionId, 'Carry on from here')
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('thinking')
+    stopped(initialEpoch + 1)
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('thinking')
+    stopped(initialEpoch)
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('thinking')
+    stopped(initialEpoch + 2)
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('idle')
+  })
+
+  it('settles a Stop received before the send receipt arrives', async () => {
+    getMemberTranscriptMock.mockResolvedValue({ messages: [] })
+    getWorkbenchMock.mockResolvedValue(workbenchWithWorker('v1', { status: 'running', activity: 'idle' }))
+    await useTeamStore.getState().fetchWorkbench('team-workbench')
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+
+    let accept!: (value: { ok: true; stopEpoch: number }) => void
+    sendMemberMessageMock.mockReturnValue(new Promise(resolve => { accept = resolve }))
+    const send = useTeamStore.getState().sendMessageToMember(sessionId, 'Ship the fix')
+    useTeamStore.getState().handleTeamUpdate(
+      'team-workbench',
+      [{ agentId: WORKER_ID, role: 'worker', status: 'idle', activity: 'stopped' }],
+      undefined,
+      1,
+    )
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('thinking')
+    accept({ ok: true, stopEpoch: 0 })
+    await send
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('idle')
+  })
+
+  it('keeps waiting when the server does not report a stop epoch', async () => {
+    getMemberTranscriptMock.mockResolvedValue({ messages: [] })
+    getWorkbenchMock.mockResolvedValue(workbenchWithWorker('v1', { status: 'running', activity: 'idle' }))
+    await useTeamStore.getState().fetchWorkbench('team-workbench')
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+
+    // A server from before Stop was counted accepts the send but reports no
+    // epoch; the client must not guess one and clear the wait on a Stop it
+    // cannot place relative to this send.
+    await useTeamStore.getState().sendMessageToMember(sessionId, 'Ship the fix')
+    useTeamStore.getState().handleTeamUpdate(
+      'team-workbench',
+      [{ agentId: WORKER_ID, role: 'worker', status: 'idle', activity: 'stopped' }],
+      undefined,
+      5,
+    )
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('thinking')
+  })
+
   it('stops waiting for a reply once the member fails after the message', async () => {
     getMemberTranscriptMock.mockResolvedValue({ messages: [] })
     getWorkbenchMock.mockResolvedValue(workbenchWithWorker('v1', { status: 'idle', activity: 'idle' }))
     await useTeamStore.getState().fetchWorkbench('team-workbench')
-    const sessionId = memberSessionId(WORKER_ID)
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
     await useTeamStore.getState().refreshMemberSession(sessionId)
 
     await useTeamStore.getState().sendMessageToMember(sessionId, 'Please review the API routes')
@@ -2197,6 +2571,227 @@ describe('teamStore member recovery states', () => {
       lastError: 'Credit balance is too low',
       autoRetry: null,
     }])
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('idle')
+  })
+
+  it('settles the waiting state from the batched user echo envelope id', async () => {
+    const startedAt = Date.parse('2026-10-24T00:00:00.000Z')
+    getMemberTranscriptMock
+      .mockResolvedValueOnce({ messages: [] })
+      // The member's turn took longer than the legacy content window; the row
+      // is a delivery batch whose first envelope is not the user's message.
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'batched-echo',
+          type: 'user',
+          content:
+            '<teammate-message teammate_id="task-list" id="mailbox-system">ready</teammate-message>\n\n' +
+            '<teammate-message teammate_id="user" id="client-direct-1">status?</teammate-message>',
+          timestamp: new Date(startedAt + 10 * 60_000).toISOString(),
+        }, {
+          id: 'batched-reply',
+          type: 'assistant',
+          content: [{ type: 'text', text: 'Still reviewing.' }],
+          timestamp: new Date(startedAt + 10 * 60_000 + 1_000).toISOString(),
+        }],
+      })
+    getWorkbenchMock.mockResolvedValue(workbenchWithWorker('v1', {
+      status: 'running',
+      activity: 'idle',
+    }))
+
+    await useTeamStore.getState().fetchWorkbench('team-workbench')
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+    useChatStore.setState((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sessionId]: {
+          ...state.sessions[sessionId]!,
+          chatState: 'thinking',
+          messages: [
+            ...state.sessions[sessionId]!.messages,
+            userMessage('client-direct-1', 'status?', startedAt, true),
+          ],
+        },
+      },
+    }))
+
+    await useTeamStore.getState().sendMessageToMember(sessionId, 'status?')
+
+    expect(sendMemberMessageMock).toHaveBeenCalledWith(
+      'team-workbench',
+      WORKER_ID,
+      'status?',
+      { incarnationId: 'incarnation-send', memberSessionId: `${WORKER_ID}-session` },
+      { messageId: 'client-direct-1' },
+    )
+    const session = useChatStore.getState().sessions[sessionId]!
+    expect(session.chatState).toBe('idle')
+    expect(session.messages.filter((message) => (
+      message.type === 'user_text' && message.pending === true
+    ))).toEqual([])
+    expect(session.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'batched-echo', teammateFrom: 'task-list' }),
+      expect.objectContaining({ transcriptMessageId: 'batched-reply' }),
+    ]))
+  })
+
+  it('keeps two identical direct sends apart in the mailbox envelope ids', async () => {
+    const startedAt = Date.parse('2026-10-24T00:00:00.000Z')
+    getMemberTranscriptMock
+      .mockResolvedValueOnce({ messages: [] })
+      .mockResolvedValueOnce({ messages: [] })
+      .mockResolvedValueOnce({ messages: [] })
+      // The member took both instructions as one batch, well past the legacy
+      // content window, so only the envelope ids can settle each bubble.
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'same-text-batch',
+          type: 'user',
+          content:
+            '<teammate-message teammate_id="user" id="client-same-1">same text</teammate-message>\n\n' +
+            '<teammate-message teammate_id="user" id="client-same-2">same text</teammate-message>',
+          timestamp: new Date(startedAt + 20 * 60_000).toISOString(),
+        }, {
+          id: 'same-text-reply',
+          type: 'assistant',
+          content: [{ type: 'text', text: 'Both handled.' }],
+          timestamp: new Date(startedAt + 20 * 60_000 + 1_000).toISOString(),
+        }],
+      })
+    getWorkbenchMock.mockResolvedValue(workbenchWithWorker('v1', {
+      status: 'running',
+      activity: 'idle',
+    }))
+
+    await useTeamStore.getState().fetchWorkbench('team-workbench')
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+    useChatStore.setState((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sessionId]: {
+          ...state.sessions[sessionId]!,
+          chatState: 'thinking',
+          messages: [
+            ...state.sessions[sessionId]!.messages,
+            userMessage('client-same-1', 'same text', startedAt, true),
+            userMessage('client-same-2', 'same text', startedAt + 1, true),
+          ],
+        },
+      },
+    }))
+
+    await useTeamStore.getState().sendMessageToMember(sessionId, 'same text')
+    await useTeamStore.getState().sendMessageToMember(sessionId, 'same text')
+
+    // Reusing one id would let the mailbox treat the second instruction as a
+    // retry of the first, and one bubble would wait forever.
+    const sentIds = sendMemberMessageMock.mock.calls.map((call) => call[4]?.messageId)
+    expect(new Set(sentIds)).toEqual(new Set(['client-same-1', 'client-same-2']))
+
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+
+    const session = useChatStore.getState().sessions[sessionId]!
+    expect(session.messages.filter((message) => (
+      message.type === 'user_text' && message.pending === true
+    ))).toEqual([])
+    expect(session.chatState).toBe('idle')
+    expect(session.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'same-text-batch',
+        teammateMessageIds: ['client-same-1', 'client-same-2'],
+      }),
+    ]))
+  })
+
+  it('keeps waiting through a failed refresh and settles after the reconnect echo', async () => {
+    getMemberTranscriptMock
+      .mockResolvedValueOnce({ messages: [] })
+      .mockRejectedValueOnce(new Error('sidecar restarting'))
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'reconnected-echo',
+          type: 'user',
+          content: '<teammate-message teammate_id="user" id="client-reconnect">status?</teammate-message>',
+          timestamp: '2026-10-24T00:20:00.000Z',
+        }, {
+          id: 'reconnected-reply',
+          type: 'assistant',
+          content: [{ type: 'text', text: 'Done.' }],
+          timestamp: '2026-10-24T00:20:01.000Z',
+        }],
+      })
+    getWorkbenchMock.mockResolvedValue(workbenchWithWorker('v1', {
+      status: 'running',
+      activity: 'idle',
+    }))
+
+    await useTeamStore.getState().fetchWorkbench('team-workbench')
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+    useChatStore.setState((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sessionId]: {
+          ...state.sessions[sessionId]!,
+          chatState: 'thinking',
+          messages: [
+            ...state.sessions[sessionId]!.messages,
+            userMessage('client-reconnect', 'status?', Date.parse('2026-10-24T00:00:00.000Z'), true),
+          ],
+        },
+      },
+    }))
+
+    await useTeamStore.getState().sendMessageToMember(sessionId, 'status?')
+    expect(sendMemberMessageMock).toHaveBeenCalledWith(
+      'team-workbench',
+      WORKER_ID,
+      'status?',
+      { incarnationId: 'incarnation-send', memberSessionId: `${WORKER_ID}-session` },
+      { messageId: 'client-reconnect' },
+    )
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('thinking')
+
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+
+    expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('idle')
+  })
+
+  it('cancels the wait when the delivery request fails', async () => {
+    sendMemberMessageMock.mockRejectedValueOnce(new Error('network down'))
+    getMemberTranscriptMock.mockResolvedValue({ messages: [] })
+    getWorkbenchMock.mockResolvedValue(workbenchWithWorker('v1', {
+      status: 'running',
+      activity: 'idle',
+    }))
+
+    await useTeamStore.getState().fetchWorkbench('team-workbench')
+    const sessionId = memberSessionId(WORKER_ID, 'incarnation-send')
+    await useTeamStore.getState().refreshMemberSession(sessionId)
+    useChatStore.setState((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sessionId]: {
+          ...state.sessions[sessionId]!,
+          chatState: 'thinking',
+          messages: [
+            ...state.sessions[sessionId]!.messages,
+            userMessage('client-failed', 'status?', Date.now(), true),
+          ],
+        },
+      },
+    }))
+
+    await expect(
+      useTeamStore.getState().sendMessageToMember(sessionId, 'status?'),
+    ).rejects.toThrow('network down')
+
+    // The waiter is gone, so the next sync no longer holds the conversation
+    // open even though the member's activity is still active.
+    await useTeamStore.getState().refreshMemberSession(sessionId)
     expect(useChatStore.getState().sessions[sessionId]?.chatState).toBe('idle')
   })
 })

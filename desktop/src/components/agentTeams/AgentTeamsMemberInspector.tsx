@@ -9,10 +9,13 @@ import {
   getMemberWorkState,
   getWorkbenchTaskState,
   inferTaskOwner,
+  memberMatchesIdentity,
   parseWorkbenchMessageBody,
   resolveMemberModel,
   resolveTeamMemberIdentity,
   stalledTaskOwnerState,
+  standbyMember,
+  standbyReason,
   taskOwnedByMember,
   type MemberWorkState,
   type StalledTaskOwnerState,
@@ -69,25 +72,6 @@ function timestampMs(value: string | undefined): number | null {
   const numeric = /^\d+$/.test(value) ? Number(value) : Number.NaN
   const parsed = Number.isFinite(numeric) ? numeric : Date.parse(value)
   return Number.isFinite(parsed) ? parsed : null
-}
-
-function identityAliases(value: string | undefined): string[] {
-  const normalized = value?.trim().toLowerCase()
-  if (!normalized) return []
-  const short = normalized.split('@')[0] ?? normalized
-  return normalized === short ? [normalized] : [normalized, short]
-}
-
-function memberAliases(member: TeamMember): string[] {
-  return [
-    ...identityAliases(member.agentId),
-    ...identityAliases(member.name),
-  ]
-}
-
-function memberMatchesIdentity(member: TeamMember, identity: string | undefined): boolean {
-  const aliases = identityAliases(identity)
-  return aliases.some(alias => memberAliases(member).includes(alias))
 }
 
 function memberName(member: TeamMember): string {
@@ -232,6 +216,12 @@ function memberTone(state: MemberWorkState): Tone {
   if (state === 'error') return 'danger'
   if (state === 'retrying') return 'warning'
   if (state === 'exited' || state === 'stopped') return 'neutral'
+  // `unknown` is the absence of a turn marker. It must not borrow the `info`
+  // tone that means "running" everywhere else in the app.
+  if (state === 'unknown') return 'neutral'
+  // Standby waits on the user's next assignment, not on a turn: the `info`
+  // tone would read as "running" for a member that has no process at all.
+  if (state === 'standby') return 'neutral'
   return 'info'
 }
 
@@ -351,9 +341,11 @@ export function AgentTeamsMemberInspector({
   )))
   const avatarKey = getMemberAvatarKey(member, isLead)
   const accent = memberAccentColor(member.color, memberIndex)
-  const workState = snapshot.deletedAt
+  const workState: MemberWorkState = snapshot.deletedAt
     ? 'exited'
-    : getMemberWorkState(member, { isLead, leadIsStreaming })
+    : standbyMember(member, snapshot, { isLead })
+      ? 'standby'
+      : getMemberWorkState(member, { isLead, leadIsStreaming })
   const leadMember = snapshot.team.members.find(candidate => candidate.agentId === snapshot.team.leadAgentId)
   const model = resolveMemberModel(member, isLead ? undefined : leadMember?.model)
   const taskHistory = useMemo(
@@ -372,17 +364,25 @@ export function AgentTeamsMemberInspector({
   ))
   const currentStatusLabel = isLead
     ? leadStatusLabel(snapshot, t)
-    : workState === 'working' && runningTask
-      ? t('agentTeams.member.executingTask', { task: runningTask.id })
-      : workState === 'idle' && taskHistory.length > 0 && completedTasks === taskHistory.length
-        ? t('agentTeams.member.waitingForClose')
-        : workState === 'idle' && waitingDependency
-          ? t('agentTeams.member.waitingForDependency', { task: waitingDependency })
-          : workState === 'idle'
-            ? t('agentTeams.member.waitingForTask')
-            : (workState === 'stopped' || workState === 'error' || workState === 'retrying') && runningTask
-              ? t('agentTeams.member.stalledOnTask', { state: memberStateLabel(workState, member, t), task: runningTask.id })
-              : memberStateLabel(workState, member, t)
+    // Standby is the first assignment, not a finished turn: say so instead of
+    // the `idle` wording, and name the dependency it is actually waiting on.
+    : workState === 'standby'
+      ? waitingDependency
+        ? t('agentTeams.member.standbyWaitingForDependency', { task: waitingDependency })
+        : standbyReason(member) === 'pendingStart'
+          ? t('agentTeams.member.notStarted')
+          : t('agentTeams.member.standbyWaiting')
+      : workState === 'working' && runningTask
+        ? t('agentTeams.member.executingTask', { task: runningTask.id })
+        : workState === 'idle' && taskHistory.length > 0 && completedTasks === taskHistory.length
+          ? t('agentTeams.member.waitingForClose')
+          : workState === 'idle' && waitingDependency
+            ? t('agentTeams.member.waitingForDependency', { task: waitingDependency })
+            : workState === 'idle'
+              ? t('agentTeams.member.waitingForTask')
+              : (workState === 'stopped' || workState === 'error' || workState === 'retrying') && runningTask
+                ? t('agentTeams.member.stalledOnTask', { state: memberStateLabel(workState, member, t), task: runningTask.id })
+                : memberStateLabel(workState, member, t)
   // Stopped, retrying and failed members all come back on their own or through
   // a message; say why they paused and what brings them back.
   const awaitsRecovery = !isLead && (
@@ -398,6 +398,11 @@ export function AgentTeamsMemberInspector({
         : member.autoRetry && now !== undefined
           ? retryCountdown(member.autoRetry, now, t)
           : undefined
+  // Standby has no failure to explain, but it does owe the reader what turns it
+  // into a running member: the next assignment or message.
+  const standbyHint = workState === 'standby'
+    ? t('agentTeams.member.standbyHint')
+    : undefined
 
   return (
     <section
@@ -455,8 +460,8 @@ export function AgentTeamsMemberInspector({
             <dt className="text-[11px] font-semibold text-[var(--color-text-tertiary)]">
               {t('agentTeams.inspector.current')}
             </dt>
-            <dd className="mt-0.5 flex min-w-0 items-center gap-1.5 font-semibold">
-              <StatusDot tone={memberTone(workState)} pulse={workState === 'working'} />
+            <dd className="mt-0.5 flex min-w-0 items-center gap-1.5 font-semibold" data-testid="agent-teams-member-state">
+              <StatusDot tone={memberTone(workState)} pulse={workState === 'working'} data-testid="agent-teams-member-state-dot" />
               <span className="truncate">{currentStatusLabel}</span>
             </dd>
           </div>
@@ -498,7 +503,7 @@ export function AgentTeamsMemberInspector({
           </div>}
         </dl>
 
-        {failureReason || recoveryHint ? (
+        {failureReason || recoveryHint || standbyHint ? (
           <div
             data-testid="agent-teams-member-recovery"
             data-member-state={workState}
@@ -519,6 +524,11 @@ export function AgentTeamsMemberInspector({
             {recoveryHint ? (
               <p data-testid="agent-teams-member-recovery-hint" className={failureReason ? 'mt-0.5' : undefined}>
                 {recoveryHint}
+              </p>
+            ) : null}
+            {standbyHint ? (
+              <p data-testid="agent-teams-member-standby-hint">
+                {standbyHint}
               </p>
             ) : null}
           </div>

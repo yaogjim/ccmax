@@ -90,6 +90,24 @@ describe('AgentTeamsPlanCard', () => {
     expect(draft.members.map(member => member.runtime.modelId)).toEqual(['small', 'large'])
   })
 
+  it('keeps an approved role with no task on standby without blocking approval', async () => {
+    // Approval authorizes roles, not a task each. The Reviewer owns no task in
+    // this plan: it must read as standby and start on demand, while the launch
+    // itself stays allowed because every task still names a member.
+    await open()
+
+    const reviewer = screen.getByRole('button', { name: 'Configure Reviewer' })
+    expect(reviewer.textContent).toContain('No task yet · starts on demand')
+    expect(screen.getByTestId('team-plan-standby-hint').textContent).toContain('on standby without a process')
+    expect(screen.getByRole('button', { name: 'Approve and launch' })).toBeEnabled()
+
+    fireEvent.click(reviewer)
+    expect(screen.getByText('Starts on demand')).toBeInTheDocument()
+    // The Builder owns the only task, so it is not marked standby.
+    expect(screen.getByRole('button', { name: 'Configure Builder' }).textContent)
+      .not.toContain('No task yet')
+  })
+
   it.each([undefined, 'removed-member'])('shows an unassigned task accurately and blocks approval until assigned (%s)', async ownerId => {
     const plan = fixture()
     plan.tasks[0]!.ownerId = ownerId

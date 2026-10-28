@@ -169,7 +169,7 @@ export type ServerMessage =
   | { type: 'background_task_stop_failed'; taskId: string; message: string }
   | { type: 'system_notification'; subtype: string; message?: string; data?: unknown }
   | { type: 'pong' }
-  | { type: 'team_update'; teamName: string; members: TeamMemberStatus[]; incarnationId?: string; leadSessionId?: string; createdAt?: number }
+  | { type: 'team_update'; teamName: string; members: TeamMemberStatus[]; incarnationId?: string; leadSessionId?: string; createdAt?: number; stopEpoch?: number }
   | { type: 'team_plan_updated'; teamName: string; sessionId: string; planId: string; revision: number; state: string; incarnationId: string }
   | { type: 'team_created'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'team_workbench_updated'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
@@ -232,6 +232,16 @@ export type TeamMemberStatus = {
    * keeps whatever the last full team read established.
    */
   activity?: TeamMemberActivity
+  /**
+   * Approved, waiting for its first ready task. The live roster always sends a
+   * boolean; an older watcher omits it and leaves the last full read in place.
+   */
+  awaitingDependencies?: boolean
+  /**
+   * Approved but never started. Always sent by the live roster because a
+   * cleared wait must be distinguishable from a field the server predates.
+   */
+  initialStartPending?: boolean
   currentTask?: string
   /** Why the last turn failed; `null` says the member has recovered. */
   lastError?: string | null
@@ -360,9 +370,16 @@ export type UIMessage =
    * `teammateFrom` marks a turn that arrived from another agent rather than
    * from the person at the keyboard. Without it a teammate's instruction and
    * the user's own prompt render identically, which is what flattened the
-   * member transcript.
+   * member transcript. A direct message the operator sends from the member
+   * view comes back as their own turn: it carries no `teammateFrom` (an older
+   * transcript may still say `'user'`), and its envelope id is listed in
+   * `teammateMessageIds` so the optimistic bubble can settle by identity.
+   *
+   * `teammateMessageIds` carries the stable mailbox envelope ids of every
+   * block in this transcript row. One row can hold a batch, so matching a
+   * pending send by id must not rely on the collapsed sender or on content.
    */
-  | { id: string; type: 'user_text'; content: string; sessionReferences?: Array<{ sessionId: string }>; collaboration?: { sourceSessionId: string; messageId?: string }; modelContent?: string; transcriptMessageId?: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean; optimisticQueued?: boolean; awaitingReplay?: boolean; teammateFrom?: string }
+  | { id: string; type: 'user_text'; content: string; sessionReferences?: Array<{ sessionId: string }>; collaboration?: { sourceSessionId: string; messageId?: string }; modelContent?: string; transcriptMessageId?: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean; optimisticQueued?: boolean; awaitingReplay?: boolean; teammateFrom?: string; teammateMessageIds?: string[]; teammateUserMessageIds?: string[] }
   | { id: string; type: 'assistant_text'; content: string; transcriptMessageId?: string; timestamp: number; model?: string }
   | { id: string; type: 'thinking'; content: string; timestamp: number }
   | {

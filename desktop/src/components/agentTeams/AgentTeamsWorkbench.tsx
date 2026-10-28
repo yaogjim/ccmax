@@ -14,6 +14,7 @@ import type {
 import { AgentTeamsCanvas } from './AgentTeamsCanvas'
 import { AgentTeamsCommunicationFeed } from './AgentTeamsCommunicationFeed'
 import { AgentTeamsMemberInspector } from './AgentTeamsMemberInspector'
+import { AgentTeamsTaskDelivery } from './AgentTeamsTaskDelivery'
 import {
   getMemberWorkState,
   getWorkbenchPhase,
@@ -21,6 +22,7 @@ import {
   inferTaskOwner,
   resolveTeamMemberIdentity,
   snapshotWithHistoricalMembers,
+  standbyMember,
   type WorkbenchPhase,
   type WorkbenchTaskState,
 } from './agentTeamsModel'
@@ -231,11 +233,23 @@ export function AgentTeamsWorkbench({ sessionId }: { sessionId: string }) {
   const workingCount = workerMembers.filter((member) => (
     getMemberWorkState(member) === 'working'
   )).length
+  const hasUnknownActivity = workerMembers.some((member) => (
+    getMemberWorkState(member) === 'unknown'
+  ))
+  // Standby roles were approved but never started, so the header must not
+  // report the team as waiting for someone to claim work or as unknown.
+  const standbyCount = workerMembers.filter((member) => (
+    standbyMember(member, snapshot)
+  )).length
   const liveHint = phase === 'forming'
     ? t('agentTeams.live.formingHint')
     : workingCount > 0
       ? t('agentTeams.live.runningHint', { count: workingCount })
-      : t('agentTeams.live.waitingHint')
+      : standbyCount > 0
+        ? t('agentTeams.live.standbyHint', { count: standbyCount })
+        : hasUnknownActivity
+          ? t('agentTeams.member.unknown')
+          : t('agentTeams.live.waitingHint')
   const selectedMember = selectedMemberId
     ? snapshot.team.members.find((member) => member.agentId === selectedMemberId)
     : undefined
@@ -639,6 +653,11 @@ function TaskDetailPanel({
         <span>{t('agentTeams.task.dependsOn')}: {task.blockedBy.map((id) => `#${id}`).join(', ') || '—'}</span>
         <span>{t('agentTeams.task.unblocks')}: {task.blocks.map((id) => `#${id}`).join(', ') || '—'}</span>
       </div>
+      <AgentTeamsTaskDelivery
+        task={task}
+        snapshot={snapshot}
+        onReviewed={() => useTeamStore.getState().fetchWorkbench(snapshot.team.name)}
+      />
     </aside>
   )
 }

@@ -18,6 +18,8 @@ import {
   resolveMemberModel,
   resolveTeamMemberIdentity,
   stalledTaskOwnerState,
+  standbyMember,
+  standbyReason,
   taskOwnedByMember,
   type MemberWorkState,
   type PositionedWorkbenchTask,
@@ -304,6 +306,7 @@ function workState(
   leadIsStreaming: boolean,
 ): MemberWorkState {
   if (snapshot.deletedAt) return 'exited'
+  if (standbyMember(member, snapshot, { isLead })) return 'standby'
   return getMemberWorkState(member, { isLead, leadIsStreaming })
 }
 
@@ -512,22 +515,31 @@ function MemberNode({
   const top = isLead ? LEAD_TOP : MEMBER_TOP
   const avatarSize = isLead ? 96 : 84
   const identityWidth = isLead ? 28 : 24
+  const standby = standbyReason(member)
   const stateLabel = isLead && leadStatus
     ? leadStatus
-    : state === 'working' && position.currentTask
-      ? t('agentTeams.member.executingTask', { task: position.currentTask.id })
-      : state === 'idle' && !isLead
-        ? position.total > 0 && position.completed === position.total
-          ? t('agentTeams.member.waitingForClose')
-          : waitingDependency
-            ? t('agentTeams.member.waitingForDependency', { task: waitingDependency })
-            : t('agentTeams.member.waitingForTask')
-        : isStalledState(state) && position.currentTask
-          ? t('agentTeams.member.stalledOnTask', { state: memberStateLabel(state, member, t), task: position.currentTask.id })
-          : memberStateLabel(state, member, t)
+    : state === 'standby' && !isLead
+      // Waiting for a first assignment, not for a turn to end. Name the
+      // dependency it actually waits on when it already owns blocked tasks.
+      ? waitingDependency
+        ? t('agentTeams.member.standbyWaitingForDependency', { task: waitingDependency })
+        : standby === 'pendingStart'
+          ? t('agentTeams.member.notStarted')
+          : t('agentTeams.member.standbyWaiting')
+      : state === 'working' && position.currentTask
+        ? t('agentTeams.member.executingTask', { task: position.currentTask.id })
+        : state === 'idle' && !isLead
+          ? position.total > 0 && position.completed === position.total
+            ? t('agentTeams.member.waitingForClose')
+            : waitingDependency
+              ? t('agentTeams.member.waitingForDependency', { task: waitingDependency })
+              : t('agentTeams.member.waitingForTask')
+          : isStalledState(state) && position.currentTask
+            ? t('agentTeams.member.stalledOnTask', { state: memberStateLabel(state, member, t), task: position.currentTask.id })
+            : memberStateLabel(state, member, t)
   const characterClass = state === 'working'
     ? 'agent-teams-character-working'
-    : state === 'idle' || state === 'retrying'
+    : state === 'idle' || state === 'retrying' || state === 'standby'
       ? 'agent-teams-character-idle'
       : state === 'exited'
         ? 'agent-teams-character-archived'

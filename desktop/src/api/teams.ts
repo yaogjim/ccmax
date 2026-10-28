@@ -4,8 +4,13 @@ import type {
   TeamDetail,
   TeamWorkbenchSnapshot,
   TeamWorkbenchSessionTimeline,
+  TeamWorkbenchTask,
 } from '../types/team'
 import type { AgentTaskNotification } from '../types/chat'
+import type { TaskDeliveryAction } from '../../../src/shared/taskDelivery'
+
+/** The desktop reviews artifacts; it never submits its own work. */
+export type TaskDeliveryReviewAction = Extract<TaskDeliveryAction, { action: 'accept' | 'return' }>
 
 type TeamsResponse = { teams: TeamSummary[] }
 
@@ -101,10 +106,45 @@ export const teamsApi = {
     )
   },
 
-  sendMemberMessage(teamName: string, agentId: string, content: string) {
-    return api.post<{ ok: true }>(
+  sendMemberMessage(
+    teamName: string,
+    agentId: string,
+    content: string,
+    identity: { incarnationId: string; memberSessionId: string },
+    options?: { messageId?: string },
+  ) {
+    return api.post<{ ok: true; stopEpoch?: number }>(
       `/api/teams/${encodeURIComponent(teamName)}/members/${encodeURIComponent(agentId)}/messages`,
-      { content },
+      {
+        content,
+        // The team generation and member instance this message belongs to. The
+        // server refuses a message without them rather than guessing that the
+        // team now answering to this name is the one the user meant.
+        incarnationId: identity.incarnationId,
+        memberSessionId: identity.memberSessionId,
+        ...(options?.messageId ? { messageId: options.messageId } : {}),
+      },
+    )
+  },
+
+  /**
+   * Accept or return one artifact version as the user. The team's incarnation
+   * is part of the body because the server refuses a review from a snapshot
+   * that outlived the team it was taken from.
+   */
+  reviewTaskDelivery(
+    teamName: string,
+    taskId: string,
+    identity: { leadSessionId: string; incarnationId: string },
+    action: TaskDeliveryReviewAction,
+  ) {
+    return api.post<{ task: TeamWorkbenchTask; updated: boolean }>(
+      `/api/teams/${encodeURIComponent(teamName)}/tasks/${encodeURIComponent(taskId)}/delivery`,
+      {
+        leadSessionId: identity.leadSessionId,
+        incarnationId: identity.incarnationId,
+        deliveryAction: action,
+      },
     )
   },
 

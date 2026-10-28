@@ -32,6 +32,44 @@ const MEMBER_POLL_INTERVAL_MS = 1500
 const MEMBER_TRANSCRIPT_MATCH_WINDOW_MS = 120_000
 const WORKBENCH_HISTORY_LIMIT = 200
 const TEAM_DISCOVERY_TTL_MS = 5_000
+/** Sender an older member transcript recorded for a message typed by the user. */
+const USER_TEAMMATE_SENDER = 'user'
+
+/**
+ * A prompt the person at the keyboard wrote. Teammate instructions are
+ * deliberately excluded: only the user's own echo may settle an optimistic
+ * bubble or end the wait for an answer. Current transcripts leave
+ * `teammateFrom` off the operator's own turn; `'user'` is still accepted so a
+ * row written before that convention settles too.
+ */
+function isUserAuthoredPrompt(
+  message: UIMessage,
+): message is Extract<UIMessage, { type: 'user_text' }> {
+  return message.type === 'user_text' && (
+    !message.teammateFrom ||
+    message.teammateFrom === USER_TEAMMATE_SENDER ||
+    (message.teammateUserMessageIds?.length ?? 0) > 0
+  )
+}
+
+function echoMessageIds(
+  message: Extract<UIMessage, { type: 'user_text' }>,
+): string[] {
+  return message.teammateMessageIds ?? []
+}
+
+function createClientMessageId(): string {
+  const random = globalThis.crypto?.randomUUID?.()
+  return random ? `client-${random}` : `client-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+/**
+ * Pending bubbles whose send already chose an envelope id. Two direct sends
+ * with identical text are still two instructions: the second must not reuse
+ * the first bubble's id, or the mailbox would treat it as a retry and the
+ * first bubble would wait forever.
+ */
+const claimedMemberSendIds = new Map<string, Set<string>>()
 
 /** Generate a synthetic sessionId for team member tabs */
 export const memberSessionId = teamMemberSessionId
@@ -62,6 +100,8 @@ const workbenchRefreshGenerations = new Map<string, number>()
 type AwaitingMemberReply = {
   content: string
   sentAt: number
+  /** Stable mailbox envelope id for the send, when this client chose one. */
+  messageId?: string
   baselineMessageKeys: Set<string>
   /**
    * The failure on record when the message went to a failed member (`null`
@@ -70,6 +110,12 @@ type AwaitingMemberReply = {
    * ends the wait.
    */
   failureAtSend?: string | null
+  /**
+   * The Stop count the server had committed when this send was accepted. A
+   * later, larger count means the user stopped the team after this message
+   * went out, which ends the wait without inventing an answer.
+   */
+  stopEpochAtSend?: number
 }
 const awaitingMemberReplies = new Map<string, AwaitingMemberReply[]>()
 const teamLifecycleGenerations = new Map<string, number>()
@@ -165,6 +211,11 @@ function toTeamMember(raw: Record<string, unknown>): TeamMember {
       '',
     status: normalizeMemberStatus(raw.status as string | undefined),
     activity: normalizeMemberActivity(raw.activity),
+    // The runtime sends both as booleans on the live roster; a payload that
+    // omits them predates the fields, which is not evidence of a standby
+    // member. `initialStartPending` is the only "never ran" marker.
+    awaitingDependencies: raw.awaitingDependencies === true,
+    initialStartPending: raw.initialStartPending === true,
     // The roster omits both once they clear, so a fresh read always replaces them.
     lastError: normalizeMemberLastError(raw.lastError),
     autoRetry: normalizeMemberAutoRetry(raw.autoRetry),
@@ -270,6 +321,15 @@ function mergeTeamMemberStatuses(
       // The watcher omits whatever it could not determine from the roster
       // alone, so an absent field must not erase what a full team read knew.
       activity: normalizeMemberActivity(member.activity) ?? existing.activity,
+      // The runtime always sends both standby markers, so an explicit `false`
+      // clears a wait. A server that predates them leaves them out, and an
+      // absent field must not erase what a full team read knew.
+      awaitingDependencies: member.awaitingDependencies === undefined
+        ? existing.awaitingDependencies
+        : member.awaitingDependencies === true,
+      initialStartPending: member.initialStartPending === undefined
+        ? existing.initialStartPending
+        : member.initialStartPending === true,
       // The failure fields are always sent, as `null` once they clear; only a
       // server that predates them leaves them out.
       lastError: member.lastError === undefined
@@ -420,18 +480,31 @@ function pendingMessagesWithoutTranscriptEcho(
   pendingMessages: Array<Extract<UIMessage, { type: 'user_text' }> & { pending: true }>,
   transcriptMessages: UIMessage[],
 ): UIMessage[] {
-  const availableEchoes = transcriptMessages.filter((message): message is Extract<UIMessage, { type: 'user_text' }> => (
+  const allEchoes = transcriptMessages.filter((message): message is Extract<UIMessage, { type: 'user_text' }> => (
     message.type === 'user_text' &&
-    message.pending !== true &&
-    !message.teammateFrom
+    message.pending !== true
+  ))
+  // A transcript row can hold a whole delivered batch. Its ids settle exactly
+  // the sends they belong to, while the collapsed row content and sender
+  // cannot: one row may contain the user's message and a system notice.
+  const availableIds = new Set<string>()
+  for (const echo of allEchoes) {
+    for (const id of echoMessageIds(echo)) availableIds.add(id)
+  }
+  // Only echoes written before envelope ids existed may settle by content and
+  // time, one-to-one. A new echo with an id belongs to a different send even
+  // when the text is identical, so it must not swallow this pending message.
+  const legacyEchoes = allEchoes.filter((message) => (
+    isUserAuthoredPrompt(message) && echoMessageIds(message).length === 0
   ))
   return pendingMessages.filter((pendingMessage) => {
-    const matchIndex = availableEchoes.findIndex((message) => (
+    if (availableIds.delete(pendingMessage.id)) return false
+    const matchIndex = legacyEchoes.findIndex((message) => (
       message.content === pendingMessage.content &&
       Math.abs(message.timestamp - pendingMessage.timestamp) <= MEMBER_TRANSCRIPT_MATCH_WINDOW_MS
     ))
     if (matchIndex < 0) return true
-    availableEchoes.splice(matchIndex, 1)
+    legacyEchoes.splice(matchIndex, 1)
     return false
   })
 }
@@ -554,14 +627,28 @@ function isMemberTurnMessage(message: UIMessage): boolean {
 function memberReplySettlement(
   messages: UIMessage[],
   awaiting: AwaitingMemberReply,
-): { settled: boolean; promptKey?: string } {
+): { settled: boolean; promptKey?: string; promptMessageIds?: string[] } {
   let promptIndex = -1
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index]!
+    if (message.type !== 'user_text' || message.pending === true) continue
+    if (awaiting.messageId) {
+      const ids = echoMessageIds(message)
+      // A batched row's collapsed sender cannot identify the prompt, but the
+      // envelope id can. It also survives a delivery later than the legacy
+      // content window, which is what a long member turn produces.
+      if (ids.length > 0) {
+        if (ids.includes(awaiting.messageId)) {
+          promptIndex = index
+          break
+        }
+        continue
+      }
+      // A legacy transcript has no id; fall through to the restricted
+      // content and time fallback below.
+    }
     if (
-      message.type === 'user_text' &&
-      message.pending !== true &&
-      !message.teammateFrom &&
+      isUserAuthoredPrompt(message) &&
       !awaiting.baselineMessageKeys.has(memberMessageKey(message)) &&
       message.content === awaiting.content &&
       Math.abs(message.timestamp - awaiting.sentAt) <= MEMBER_TRANSCRIPT_MATCH_WINDOW_MS
@@ -572,10 +659,11 @@ function memberReplySettlement(
   }
   if (promptIndex < 0) return { settled: false }
 
+  const prompt = messages[promptIndex]!
   let turnEnd = messages.length
   const nextPromptOffset = messages.slice(promptIndex + 1).findIndex((message) => (
-    message.type === 'user_text' &&
-    !message.teammateFrom
+    isUserAuthoredPrompt(message) &&
+    message.pending !== true
   ))
   if (nextPromptOffset >= 0) {
     turnEnd = promptIndex + 1 + nextPromptOffset
@@ -586,7 +674,10 @@ function memberReplySettlement(
   const lastMessage = turnMessages.at(-1)
   return {
     settled: lastMessage?.type === 'assistant_text' || lastMessage?.type === 'error',
-    promptKey: memberMessageKey(messages[promptIndex]!),
+    promptKey: memberMessageKey(prompt),
+    ...(echoMessageIds(prompt as Extract<UIMessage, { type: 'user_text' }>).length
+      ? { promptMessageIds: echoMessageIds(prompt as Extract<UIMessage, { type: 'user_text' }>) }
+      : {}),
   }
 }
 
@@ -818,6 +909,7 @@ function syncMemberSessionMessages(
   requestedMutationEpoch?: number,
   requestedTaskUpdatedAt?: Map<string, number>,
   requestedStreamRevision?: number,
+  teamStopEpoch?: number,
 ) {
   const isTerminal = member.status === 'completed' || Boolean(snapshot?.deletedAt)
   const failure = member.status === 'error' ? member.lastError ?? null : undefined
@@ -827,14 +919,26 @@ function syncMemberSessionMessages(
     awaitingReplies.forEach((reply, index) => {
       const settlement = memberReplySettlement(messages, reply)
       if (settlement.promptKey) {
+        const promptIds = new Set(settlement.promptMessageIds ?? [])
         for (let laterIndex = index + 1; laterIndex < awaitingReplies.length; laterIndex += 1) {
-          awaitingReplies[laterIndex]!.baselineMessageKeys.add(settlement.promptKey)
+          const later = awaitingReplies[laterIndex]!
+          // One batched prompt row can carry several direct sends; each id
+          // settles its own wait instead of being masked as already used.
+          if (later.messageId && promptIds.has(later.messageId)) continue
+          later.baselineMessageKeys.add(settlement.promptKey)
         }
       }
       // A failure recorded after the message went out ends the wait: the turn
       // that would have answered it is over.
       const failedSince = failure !== undefined && failure !== reply.failureAtSend
-      if (!settlement.settled && !failedSince) unsettledReplies.push(reply)
+      // A Stop the server recorded after this send ended the turn that would
+      // have answered it. Only a strictly newer count qualifies, so a late
+      // snapshot cannot clear a message sent while the team was already
+      // stopped -- that message is the user asking it to run again.
+      const stoppedSince = teamStopEpoch !== undefined &&
+        reply.stopEpochAtSend !== undefined &&
+        teamStopEpoch > reply.stopEpochAtSend
+      if (!settlement.settled && !failedSince && !stoppedSince) unsettledReplies.push(reply)
     })
   }
   if (unsettledReplies.length === 0) {
@@ -940,7 +1044,17 @@ function syncTeamMemberSessions(
     const sessionId = memberSessionIdForTeam(team, member)
     const session = sessions[sessionId]
     if (!session) continue
-    syncMemberSessionMessages(sessionId, member, snapshot, session.messages)
+    syncMemberSessionMessages(
+      sessionId,
+      member,
+      snapshot,
+      session.messages,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      team.stopEpoch,
+    )
   }
 }
 
@@ -958,6 +1072,7 @@ function clearMemberSessionState(sessionIds: Iterable<string>): void {
     )
     initialMemberSessionLoads.delete(sessionId)
     awaitingMemberReplies.delete(sessionId)
+    claimedMemberSendIds.delete(sessionId)
   }
   useChatStore.getState().applyBoundedUpdate((state) => {
     const sessions = { ...state.sessions }
@@ -1038,6 +1153,7 @@ type TeamStore = {
     teamName: string,
     members: TeamMemberStatus[],
     identity?: TeamLifecycleIdentity,
+    stopEpoch?: number,
   ) => void
   handleTeamWorkbenchUpdated: (
     teamName: string,
@@ -1484,6 +1600,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
           requestedMutationEpoch,
           requestedTaskUpdatedAt,
           requestedStreamRevision,
+          currentTeam.stopEpoch,
         )
       } catch {
         const currentTeam = get().getTeamByMemberSessionId(sessionId)
@@ -1510,6 +1627,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
           undefined,
           undefined,
           requestedStreamRevision,
+          currentTeam.stopEpoch,
         )
       }
     })()
@@ -1638,15 +1756,35 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
     if (!team || !member) {
       throw new Error('Team member session is no longer available')
     }
+    // Sending requires the server's actual snapshot identity. Legacy display
+    // keys and lead sessions are not authority to address a member instance.
+    const incarnationId = team.incarnationId
+    const memberSessionId = member.sessionId
+    if (!incarnationId?.trim() || !memberSessionId?.trim()) {
+      throw new Error('Team member message identity is unavailable; message was not sent')
+    }
     const incarnationKey = memberIncarnationKey(team, member)
 
     const messages = useChatStore.getState().sessions[sessionId]?.messages ?? []
-    const optimisticMessage = [...messages].reverse().find((message) => (
-      isPendingMemberMessage(message) && message.content === content
+    const pendingMessages = messages.filter(isPendingMemberMessage)
+    const claimedIds = claimedMemberSendIds.get(sessionId) ?? new Set<string>()
+    claimedMemberSendIds.set(sessionId, claimedIds)
+    // Drop ids of bubbles that are no longer waiting (settled or discarded).
+    for (const id of [...claimedIds]) {
+      if (!pendingMessages.some((message) => message.id === id)) claimedIds.delete(id)
+    }
+    const optimisticMessage = [...pendingMessages].reverse().find((message) => (
+      message.content === content && !claimedIds.has(message.id)
     ))
+    // The optimistic bubble's id is this client's own UUID, never a transcript
+    // entry id. Sending it as the mailbox envelope id lets the durable echo
+    // settle exactly this bubble, even in a batch or after a long turn.
+    const messageId = optimisticMessage?.id ?? createClientMessageId()
+    claimedIds.add(messageId)
     const awaitingReply: AwaitingMemberReply = {
       content,
       sentAt: optimisticMessage?.timestamp ?? Date.now(),
+      messageId,
       baselineMessageKeys: new Set(
         messages
           .filter((message) => message.id !== optimisticMessage?.id)
@@ -1660,7 +1798,14 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
     ])
 
     try {
-      await teamsApi.sendMemberMessage(team.name, member.agentId, content)
+      const accepted = await teamsApi.sendMemberMessage(
+        team.name,
+        member.agentId,
+        content,
+        { incarnationId, memberSessionId },
+        { messageId },
+      )
+      if (accepted.stopEpoch !== undefined) awaitingReply.stopEpochAtSend = accepted.stopEpoch
       const currentTeam = get().getTeamByMemberSessionId(sessionId)
       const currentMember = get().getMemberBySessionId(sessionId)
       const snapshot = currentTeam
@@ -1731,6 +1876,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
     initialMemberSessionLoads.clear()
     workbenchRefreshGenerations.clear()
     awaitingMemberReplies.clear()
+    claimedMemberSendIds.clear()
     teamLifecycleGenerations.clear()
     teamDiscoveryGenerations.clear()
     teamDiscoveryCompletedAt.clear()
@@ -1856,8 +2002,15 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
     }, delay)))
   },
 
-  handleTeamUpdate: (teamName, members, identity) => {
+  handleTeamUpdate: (teamName, members, identity, stopEpoch) => {
     if (members.length === 0) return
+    // A count only ever grows; ignoring a smaller one keeps a late snapshot
+    // from rewriting what the newest one said.
+    const withStopEpoch = (team: TeamDetail): TeamDetail => (
+      stopEpoch === undefined || (team.stopEpoch !== undefined && team.stopEpoch >= stopEpoch)
+        ? team
+        : { ...team, stopEpoch }
+    )
     const state = get()
     const knownTeams = [
       state.activeTeam,
@@ -1889,7 +2042,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
         current.activeTeam.leadSessionId,
         identity,
       )
-        ? mergeTeamMemberStatuses(current.activeTeam, members)
+        ? withStopEpoch(mergeTeamMemberStatuses(current.activeTeam, members))
         : current.activeTeam
       const memberTeamBySession = Object.fromEntries(
         Object.entries(current.memberTeamBySession).map(([sessionId, memberTeam]) => [
@@ -1900,7 +2053,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
             memberTeam.leadSessionId,
             identity,
           )
-            ? mergeTeamMemberStatuses(memberTeam, members)
+            ? withStopEpoch(mergeTeamMemberStatuses(memberTeam, members))
             : memberTeam,
         ]),
       )
@@ -1918,7 +2071,7 @@ export const useTeamStore = create<TeamStore>((set, get) => ({
           const latest = snapshots[snapshots.length - 1]!
           snapshots[snapshots.length - 1] = {
             ...latest,
-            team: mergeTeamMemberStatuses(latest.team, members),
+            team: withStopEpoch(mergeTeamMemberStatuses(latest.team, members)),
           }
           return [sessionId, { ...timeline, snapshots }]
         }),

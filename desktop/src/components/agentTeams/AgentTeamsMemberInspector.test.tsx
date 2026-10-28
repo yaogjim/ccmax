@@ -180,6 +180,164 @@ describe('AgentTeamsMemberInspector', () => {
     expect(screen.getByText('1/4', { selector: 'dd' })).toBeTruthy()
   })
 
+  it('shows a standby role as awaiting assignment instead of idle or exited', () => {
+    // Approved with no ready task: a reserved address, no process, no work.
+    const writer: TeamMember = {
+      agentId: 'writer@team-a',
+      name: 'writer',
+      role: 'docs writer',
+      status: 'idle',
+      activity: 'idle',
+      sessionId: 'reserved-writer',
+      awaitingDependencies: true,
+    }
+    const frame: TeamWorkbenchSnapshot = {
+      version: 'v1',
+      generatedAt: '2026-10-25T00:00:00.000Z',
+      team: { name: 'team-a', leadAgentId: 'lead@team-a', leadSessionId: 'lead-session', members: [writer] },
+      tasks: [],
+      messages: [],
+    }
+    render(
+      <AgentTeamsMemberInspector
+        snapshots={[frame]}
+        selectedIndex={0}
+        snapshot={frame}
+        member={writer}
+        isLead={false}
+        leadIsStreaming={false}
+        onBack={vi.fn()}
+        onClose={vi.fn()}
+        onOpenExecution={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByTestId('agent-teams-member-state').textContent).toBe(
+      'Standby · waiting for a ready task',
+    )
+    expect(screen.getByTestId('agent-teams-member-standby-hint').textContent).toBe(
+      'Assign a ready task or send a message and it starts',
+    )
+    expect(screen.getByTestId('agent-teams-member-recovery').getAttribute('data-member-state')).toBe('standby')
+    // A standby member holds no process, so the dot must not pulse like a turn.
+    expect(screen.getByTestId('agent-teams-member-state-dot').className).not.toContain('animate-pulse-dot')
+    expect(screen.queryByText('Idle')).toBeNull()
+    expect(screen.queryByText('Exited')).toBeNull()
+  })
+
+  it('names the dependency a standby role actually waits for', () => {
+    const writer: TeamMember = {
+      agentId: 'writer@team-a',
+      name: 'writer',
+      role: 'docs writer',
+      status: 'idle',
+      activity: 'idle',
+      sessionId: 'reserved-writer',
+      awaitingDependencies: true,
+    }
+    const blocked: TeamWorkbenchTask = {
+      id: '5', subject: 'Publish the guide', description: '', owner: 'writer',
+      status: 'pending', blocks: [], blockedBy: ['2'], taskListId: 'team-a',
+    }
+    const dependency: TeamWorkbenchTask = {
+      id: '2', subject: 'Write the guide', description: '', owner: 'builder',
+      status: 'in_progress', blocks: ['5'], blockedBy: [], taskListId: 'team-a',
+    }
+    const frame: TeamWorkbenchSnapshot = {
+      version: 'v1',
+      generatedAt: '2026-10-25T00:00:00.000Z',
+      team: { name: 'team-a', leadAgentId: 'lead@team-a', leadSessionId: 'lead-session', members: [writer] },
+      tasks: [dependency, blocked],
+      messages: [],
+    }
+    render(
+      <AgentTeamsMemberInspector
+        snapshots={[frame]}
+        selectedIndex={0}
+        snapshot={frame}
+        member={writer}
+        isLead={false}
+        leadIsStreaming={false}
+        onBack={vi.fn()}
+        onClose={vi.fn()}
+        onOpenExecution={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByTestId('agent-teams-member-state').textContent).toBe('Standby · waiting for #2')
+  })
+
+  it('says a never-started member has not run, not that it waits on an old dependency', () => {
+    const writer: TeamMember = {
+      agentId: 'writer@team-a',
+      name: 'writer',
+      role: 'docs writer',
+      status: 'idle',
+      activity: 'idle',
+      sessionId: 'reserved-writer',
+      awaitingDependencies: true,
+      initialStartPending: true,
+    }
+    const frame: TeamWorkbenchSnapshot = {
+      version: 'v1',
+      generatedAt: '2026-10-25T00:00:00.000Z',
+      team: { name: 'team-a', leadAgentId: 'lead@team-a', leadSessionId: 'lead-session', members: [writer] },
+      tasks: [],
+      messages: [],
+    }
+    render(
+      <AgentTeamsMemberInspector
+        snapshots={[frame]}
+        selectedIndex={0}
+        snapshot={frame}
+        member={writer}
+        isLead={false}
+        leadIsStreaming={false}
+        onBack={vi.fn()}
+        onClose={vi.fn()}
+        onOpenExecution={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByTestId('agent-teams-member-state').textContent).toBe('Not started · starts on demand')
+    expect(screen.getByTestId('agent-teams-member-standby-hint')).toBeTruthy()
+  })
+
+  it('does not turn an idle member with no task into a never-started one', () => {
+    // `unknown` and `idle` are evidence-free and known-idle states, not
+    // synonyms for standby. Only the runtime markers may claim a first start.
+    const writer: TeamMember = {
+      agentId: 'writer@team-a',
+      name: 'writer',
+      role: 'docs writer',
+      status: 'idle',
+      activity: 'idle',
+      sessionId: 'reserved-writer',
+    }
+    const frame: TeamWorkbenchSnapshot = {
+      version: 'v1',
+      generatedAt: '2026-10-25T00:00:00.000Z',
+      team: { name: 'team-a', leadAgentId: 'lead@team-a', leadSessionId: 'lead-session', members: [writer] },
+      tasks: [],
+      messages: [],
+    }
+    render(
+      <AgentTeamsMemberInspector
+        snapshots={[frame]}
+        selectedIndex={0}
+        snapshot={frame}
+        member={writer}
+        isLead={false}
+        leadIsStreaming={false}
+        onBack={vi.fn()}
+        onClose={vi.fn()}
+        onOpenExecution={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByTestId('agent-teams-member-state').textContent).toBe('Idle · waiting for work')
+  })
+
   it('shows message direction, renders human Markdown, and narrates protocol payloads', () => {
     const messages = [
       message({
@@ -315,6 +473,26 @@ describe('AgentTeamsMemberInspector', () => {
         />,
       )
     }
+
+    it('says the state is unknown when no turn marker was ever recorded', () => {
+      const view = renderMember({ ...builder, status: 'running', activity: 'unknown' })
+
+      // The task list still says `in_progress`, but that is a claim about the
+      // task, not about the member. The member's own line must say unknown.
+      expect(screen.getByTestId('agent-teams-member-state').textContent).toBe('Unknown')
+      expect(screen.queryByText(/Executing #/)).toBeNull()
+      expect(screen.queryByText(/waiting for work/)).toBeNull()
+      expect(screen.queryByText(/waiting for shutdown/)).toBeNull()
+      expect(screen.queryByText(/waiting for #/)).toBeNull()
+
+      // Neutral and still: no work pulse, no recovery offer, no exit claim.
+      const dot = view.container.querySelector('[data-testid="agent-teams-member-state-dot"]')
+      expect(dot).not.toBeNull()
+      expect(dot!.className).not.toContain('animate-pulse-dot')
+      expect(dot!.className).toContain('bg-[var(--color-text-tertiary)]')
+      expect(screen.queryByTestId('agent-teams-member-recovery')).toBeNull()
+      expect(screen.queryByText('Exited')).toBeNull()
+    })
 
     it('says a stopped member resumes from its saved conversation when messaged', () => {
       const onOpenExecution = vi.fn()

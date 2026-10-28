@@ -16,6 +16,8 @@ import {
   shortModelLabel,
   snapshotWithHistoricalMembers,
   stalledTaskOwnerState,
+  standbyMember,
+  standbyReason,
   taskOwnedByMember,
   WORKBENCH_TASK_WIDTH,
 } from './agentTeamsModel'
@@ -664,5 +666,216 @@ describe('getMemberWorkState', () => {
     const lead = member({ agentId: 'lead@team-a', activity: 'stopped', autoRetry: retry })
     expect(getMemberWorkState(lead, { isLead: true, leadIsStreaming: true })).toBe('working')
     expect(getMemberWorkState(lead, { isLead: true, leadIsStreaming: false })).toBe('idle')
+  })
+
+  it('reports a missing turn marker as unknown rather than as known work or idleness', () => {
+    // The watcher has no value that means "not known": it reports a member it
+    // only found through an inbox file, or a config row written without
+    // `isActive`, as `running` and marks the activity `unknown`. Both halves are
+    // guesses -- the status is a compatibility default, the activity is the
+    // absence of evidence -- so neither a running claim nor a known-idle claim
+    // is honest. The inbox-discovery test in `team-watcher.test.ts` pins the
+    // input this consumes.
+    expect(getMemberWorkState(member({ status: 'running', activity: 'unknown' }))).toBe('unknown')
+    expect(getMemberWorkState(member({
+      status: 'running',
+      activity: 'unknown',
+      currentTask: 'Rewrite the watcher',
+    }))).toBe('unknown')
+    expect(getMemberWorkState(member({ status: 'idle', activity: 'unknown' }))).toBe('unknown')
+  })
+
+  it('keeps recorded failure, retry, stop and exit ahead of an unknown activity', () => {
+    expect(getMemberWorkState(member({
+      status: 'error',
+      activity: 'unknown',
+      lastError: 'Credit balance is too low',
+    }))).toBe('error')
+    expect(getMemberWorkState(member({
+      status: 'running',
+      activity: 'unknown',
+      autoRetry: retry,
+    }))).toBe('retrying')
+    // A gone process is recorded evidence too, not something to re-guess.
+    expect(getMemberWorkState(member({
+      status: 'idle',
+      activity: 'stopped',
+      autoRetry: retry,
+    }))).toBe('stopped')
+    expect(getMemberWorkState(member({ status: 'completed', activity: 'unknown' }))).toBe('exited')
+  })
+
+  it('reads the lead from its own session even when its activity is unknown', () => {
+    const lead = member({ agentId: 'lead@team-a', activity: 'unknown' })
+    expect(getMemberWorkState(lead, { isLead: true, leadIsStreaming: true })).toBe('working')
+    expect(getMemberWorkState(lead, { isLead: true, leadIsStreaming: false })).toBe('idle')
+  })
+
+  it('does not mark an unknown owner as stalled, so no recovery is offered', () => {
+    // `stalledTaskOwnerState` drives the "stopped / failed" task callouts, and
+    // inferring a gone process from missing evidence would offer a restart.
+    const owner: TeamMember = {
+      agentId: 'unproven@team-a',
+      name: 'unproven',
+      role: 'unproven',
+      status: 'running',
+      activity: 'unknown',
+    }
+    const base = snapshot([task('1', 'in_progress', [], 'unproven')])
+    const frame: TeamWorkbenchSnapshot = { ...base, team: { ...base.team, members: [owner] } }
+
+    expect(stalledTaskOwnerState(frame.tasks[0]!, frame)).toBeUndefined()
+  })
+
+  it('replays an unknown member as unknown and reserves exited for one that left the roster', () => {
+    const replay = (generatedAt: string, members: TeamMember[]): TeamWorkbenchSnapshot => ({
+      version: generatedAt,
+      generatedAt,
+      team: {
+        name: 'team-a',
+        leadAgentId: 'lead@team-a',
+        leadSessionId: 'session-a',
+        members,
+      },
+      tasks: [],
+      messages: [],
+    })
+    const unknown = member({ status: 'running', activity: 'unknown' })
+    const earlier = replay('2026-08-08T07:00:00.000Z', [unknown])
+    const later = replay('2026-08-08T07:05:00.000Z', [{ ...unknown, activity: 'idle' }])
+    const closed = replay('2026-08-08T07:10:00.000Z', [])
+
+    // An unknown activity is missing evidence, not an ended run and not a turn.
+    expect(getMemberWorkState(
+      snapshotWithHistoricalMembers([earlier, later], 0)!.team.members[0]!,
+    )).toBe('unknown')
+    expect(getMemberWorkState(
+      snapshotWithHistoricalMembers([earlier, later], 1)!.team.members[0]!,
+    )).toBe('idle')
+    // Leaving the roster is the only thing that ends it.
+    expect(getMemberWorkState(
+      snapshotWithHistoricalMembers([earlier, closed], 1)!.team.members[0]!,
+    )).toBe('exited')
+  })
+
+  it('reports an approved member with no ready task as standby, not idle or terminated', () => {
+    expect(getMemberWorkState(member({
+      status: 'idle',
+      activity: 'idle',
+      awaitingDependencies: true,
+    }))).toBe('standby')
+    // A live turn still proves the member is running.
+    expect(getMemberWorkState(member({
+      status: 'idle',
+      activity: 'active',
+      awaitingDependencies: true,
+    }))).toBe('working')
+    // A first start that failed keeps the marker but must surface its failure.
+    expect(getMemberWorkState(member({
+      status: 'error',
+      activity: 'idle',
+      awaitingDependencies: true,
+      lastError: 'Start failed: spawn ENOENT',
+    }))).toBe('error')
+    // Nothing about standby is final.
+    expect(getMemberWorkState(member({
+      status: 'completed',
+      activity: 'exited',
+      awaitingDependencies: true,
+    }))).toBe('exited')
+    // The explicit never-ran marker is the newer form of the same wait.
+    expect(getMemberWorkState(member({
+      status: 'idle',
+      activity: 'idle',
+      initialStartPending: true,
+    }))).toBe('standby')
+  })
+})
+
+describe('standbyMember', () => {
+  const reserved = '11111111-1111-4111-8111-111111111111'
+
+  function standby(overrides: Partial<TeamMember>): TeamMember {
+    return {
+      agentId: 'writer@team-a',
+      name: 'writer',
+      role: 'Writer',
+      status: 'idle',
+      activity: 'idle',
+      sessionId: reserved,
+      ...overrides,
+    }
+  }
+
+  function frame(options: {
+    members: TeamMember[]
+    tasks?: TeamWorkbenchTask[]
+    messages?: TeamWorkbenchSnapshot['messages']
+    deletedAt?: string
+  }): TeamWorkbenchSnapshot {
+    return {
+      version: 'v1',
+      generatedAt: '2026-10-25T00:00:00.000Z',
+      ...(options.deletedAt ? { deletedAt: options.deletedAt } : {}),
+      team: {
+        name: 'team-a',
+        leadAgentId: 'lead@team-a',
+        leadSessionId: 'session-a',
+        members: options.members,
+      },
+      tasks: options.tasks ?? [],
+      messages: options.messages ?? [],
+    }
+  }
+
+  it('trusts the runtime marker even when the member already owns blocked tasks', () => {
+    const writer = standby({ awaitingDependencies: true, initialStartPending: true })
+    expect(standbyMember(writer, frame({
+      members: [writer],
+      tasks: [task('1', 'pending', ['2'], 'writer')],
+    }))).toBe(true)
+  })
+
+  it('does not infer a never-started member from missing tasks or messages', () => {
+    // A reserved address, no task and no mailbox traffic used to be read as
+    // "approved but never started". That is a guess: the same shape describes
+    // a member that finished a turn, and an unknown activity means exactly
+    // that the turn marker is missing.
+    const writer = standby({})
+    expect(standbyMember(writer, frame({ members: [writer] }))).toBe(false)
+    expect(getMemberWorkState(writer)).toBe('idle')
+
+    const unknown = standby({ status: 'running', activity: 'unknown' })
+    expect(standbyMember(unknown, frame({ members: [unknown] }))).toBe(false)
+    expect(getMemberWorkState(unknown)).toBe('unknown')
+
+    // Nor does the absence of the reserved address imply anything.
+    expect(standbyMember(standby({ sessionId: undefined }), frame({ members: [writer] }))).toBe(false)
+  })
+
+  it('keeps the newer never-ran marker distinct from the older waiting marker', () => {
+    expect(standbyReason(standby({ initialStartPending: true, awaitingDependencies: true }))).toBe('pendingStart')
+    expect(standbyReason(standby({ awaitingDependencies: true }))).toBe('waitingDependencies')
+    expect(standbyReason(standby({}))).toBeUndefined()
+
+    // An older team file has `awaitingDependencies` but no
+    // `initialStartPending`; it waits for a task without claiming it never ran.
+    const old = standby({ awaitingDependencies: true })
+    expect(standbyMember(old, frame({ members: [old] }))).toBe(true)
+    // The newer marker alone is enough to say the member never started.
+    const fresh = standby({ initialStartPending: true })
+    expect(standbyMember(fresh, frame({ members: [fresh] }))).toBe(true)
+  })
+
+  it('never calls the lead, a working member or an archived run standby', () => {
+    const lead = standby({ agentId: 'lead@team-a', name: 'team-lead' })
+    expect(standbyMember(lead, frame({ members: [lead] }), { isLead: true })).toBe(false)
+    const working = standby({ status: 'running', activity: 'active' })
+    expect(standbyMember(working, frame({ members: [working] }))).toBe(false)
+    const writer = standby({ awaitingDependencies: true })
+    expect(standbyMember(writer, frame({
+      members: [writer],
+      deletedAt: '2026-10-25T01:00:00.000Z',
+    }))).toBe(false)
   })
 })

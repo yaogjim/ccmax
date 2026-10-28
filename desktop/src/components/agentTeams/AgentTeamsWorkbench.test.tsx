@@ -22,6 +22,7 @@ vi.mock('@/api/teams', () => ({
     getWorkbench: getWorkbenchMock,
     getMemberTranscript: vi.fn(),
     sendMemberMessage: vi.fn(),
+    reviewTaskDelivery: vi.fn(),
     delete: vi.fn(),
   },
 }))
@@ -289,6 +290,68 @@ describe('AgentTeamsWorkbench', () => {
     ).toBe('working')
   })
 
+  it('reports an approved role with no task as standby, not as waiting to claim work', async () => {
+    // The runtime approves roles, not a task per member: a member with no ready
+    // task keeps a reserved address, gets no process, and must read as standby
+    // rather than as an idle teammate the header is waiting on.
+    const snapshot = workbench('v1', ['pending', 'pending', 'pending'])
+    snapshot.team.members = snapshot.team.members.map((member) => (
+      member.name === 'builder'
+        ? { ...member, status: 'idle' as const, activity: 'stopped' as const }
+        : member
+    ))
+    snapshot.team.members.push({
+      agentId: 'writer@visual-team',
+      name: 'writer',
+      role: 'Writer',
+      status: 'idle',
+      activity: 'idle',
+      sessionId: 'reserved-writer',
+      awaitingDependencies: true,
+    })
+    getWorkbenchMock.mockResolvedValueOnce(snapshot)
+
+    await act(async () => {
+      await useTeamStore.getState().fetchWorkbench('visual-team')
+    })
+    render(<AgentTeamsWorkbench sessionId="lead-session" />)
+
+    expect(
+      screen.getByTestId('agent-teams-canvas-member-writer@visual-team').getAttribute('data-member-state'),
+    ).toBe('standby')
+    expect(screen.getByTestId('agent-teams-live-controls').textContent).toContain(
+      '1 on standby · waiting for assignment',
+    )
+    expect(screen.getByTestId('agent-teams-live-controls').textContent).not.toContain(
+      'Waiting for teammates to claim the next work',
+    )
+  })
+
+  it('does not count a member with no turn marker as actively working', async () => {
+    // The watcher reports such a member as `running`, which is a compatibility
+    // default rather than evidence. The header counts live turns, so it must
+    // not announce an active teammate it cannot prove.
+    const snapshot = workbench('v1', ['in_progress', 'pending', 'pending'])
+    snapshot.team.members = snapshot.team.members.map((member) => (
+      member.name === 'builder'
+        ? { ...member, status: 'running' as const, activity: 'unknown' as const }
+        : member
+    ))
+    getWorkbenchMock.mockResolvedValueOnce(snapshot)
+
+    await act(async () => {
+      await useTeamStore.getState().fetchWorkbench('visual-team')
+    })
+    render(<AgentTeamsWorkbench sessionId="lead-session" />)
+
+    expect(
+      screen.getByTestId('agent-teams-canvas-member-builder@visual-team').getAttribute('data-member-state'),
+    ).toBe('unknown')
+    expect(screen.getAllByText('Unknown').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/Waiting for teammates to claim the next work/)).toBeNull()
+    expect(screen.queryByText(/Following \d+ active teammates/)).toBeNull()
+  })
+
   it('opens a 400px member inspector before the explicit execution handoff', async () => {
     getWorkbenchMock.mockResolvedValueOnce(workbench('v1', ['completed', 'in_progress', 'pending']))
     await act(async () => {
@@ -380,6 +443,44 @@ describe('AgentTeamsWorkbench', () => {
       target: { value: '0' },
     })
     expect(screen.queryByTestId('agent-teams-task-detail')).toBeNull()
+  })
+
+  it('shows each artifact version with review actions inside the task details', async () => {
+    const snapshot = workbench('v1', ['in_progress', 'pending', 'pending'])
+    snapshot.team = { ...snapshot.team, incarnationId: 'incarnation-visual' }
+    snapshot.tasks[0] = {
+      ...snapshot.tasks[0]!,
+      delivery: {
+        schemaVersion: 1,
+        revision: 1,
+        submissions: [{
+          version: 1,
+          artifact: 'Panel screenshot and the failing case',
+          criteria: 'Every return carries a reason',
+          owner: 'builder',
+          submittedAt: Date.UTC(2026, 9, 25, 10, 0),
+        }],
+        receipts: [],
+        notices: [],
+      },
+    }
+    getWorkbenchMock.mockResolvedValueOnce(snapshot)
+    await act(async () => {
+      await useTeamStore.getState().fetchWorkbench('visual-team')
+    })
+    render(<AgentTeamsWorkbench sessionId="lead-session" />)
+
+    fireEvent.click(screen.getByTestId('agent-teams-canvas-task-1'))
+
+    expect(screen.getByTestId('agent-teams-task-delivery')).toBeTruthy()
+    expect(screen.getByTestId('agent-teams-delivery-version-1').textContent).toContain(
+      'Panel screenshot and the failing case',
+    )
+    expect(screen.getByTestId('agent-teams-delivery-version-1').textContent).toContain(
+      'Every return carries a reason',
+    )
+    expect(screen.getByRole('button', { name: 'Accept' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Return' })).toBeTruthy()
   })
 
   it('draws a teammate once while retaining its owner labels across several tasks', async () => {
