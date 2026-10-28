@@ -54,6 +54,58 @@ function collectTargets(markdown) {
   return [...new Set(targets)]
 }
 
+async function checkInternalFeatureDocuments(records) {
+  const problems = []
+  const featurePath = 'features/upstream-reliability'
+  const documents = ['prd.md', 'roadmap.md', 'design.md', 'plan.md']
+  const bodies = []
+  for (const document of documents) {
+    const source = path.join(paths.docsDir, featurePath, document)
+    const markdown = await fs.readFile(source, 'utf8')
+    // The opening paragraph is also checked in compiled bundles: route/index
+    // checks alone cannot detect an accidentally inlined private document.
+    bodies.push(markdown.split('\n\n').find(paragraph => paragraph.startsWith('本')))
+    for (const target of collectTargets(markdown)) {
+      if (!target || isExternal(target)) continue
+      if (!await exists(path.resolve(path.dirname(source), withoutSuffix(target)))) {
+        problems.push(`${featurePath}/${document}: unresolved internal link ${target}`)
+      }
+    }
+  }
+  for (const record of records) {
+    if (record.sourcePath.startsWith(`docs/${featurePath}/`) ||
+        record.sourcePath.startsWith(`docs/en/${featurePath}/`)) {
+      problems.push(`${record.sourcePath}: internal feature must stay out of the published manifest`)
+    }
+  }
+  const needles = [featurePath, ...bodies.filter(Boolean)]
+  async function inspect(directory) {
+    if (!await exists(directory)) return
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name)
+      if (entry.isDirectory()) await inspect(file)
+      else if (/\.(?:html|js|json|xml|txt|map)$/.test(entry.name)) {
+        const content = await fs.readFile(file, 'utf8')
+        // JSON module generation escapes line breaks, so test both forms.
+        if (needles.some(needle => content.includes(needle) ||
+            content.includes(JSON.stringify(needle).slice(1, -1)))) {
+          problems.push(`${path.relative(paths.repoDir, file)}: internal feature content leaked`)
+        }
+      }
+    }
+  }
+  await inspect(paths.generatedDir)
+  await inspect(path.join(paths.siteDir, 'dist'))
+  // Only this feature is private; existing /features/computer-use legacy
+  // redirects must remain valid.
+  for (const locale of ['', 'en']) {
+    if (await exists(path.join(paths.siteDir, 'dist', locale, featurePath))) {
+      problems.push(`${featurePath}: internal feature static routes must not be emitted`)
+    }
+  }
+  return problems
+}
+
 function isImageTarget(target) {
   return /\.(?:avif|gif|jpe?g|png|svg|webp)$/i.test(withoutSuffix(target))
 }
@@ -432,6 +484,7 @@ async function main() {
     ...records.map((record) => record.path),
   ])
   const problems = [...await checkLocaleRedirect()]
+  problems.push(...await checkInternalFeatureDocuments(records))
   problems.push(...await checkReadmeImages(readmes))
 
   // docs/agents/ 是内部项目材料，不发布。generator 的 excludedDirectoryNames 掉了 agents

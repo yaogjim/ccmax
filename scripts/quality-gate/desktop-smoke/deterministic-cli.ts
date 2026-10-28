@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { executeDeterministicDesktopSmoke } from './deterministic'
 
@@ -16,6 +17,10 @@ const result = await executeDeterministicDesktopSmoke(
   'desktop-ui-smoke',
   'Deterministic desktop UI smoke',
 )
+
+// Keep skipped/failed evidence too: exit zero on a missing browser is not a
+// successful smoke, and callers need a durable machine-readable distinction.
+writeFileSync(join(artifactDir, 'result.json'), JSON.stringify(result, null, 2) + '\n')
 
 if (result.status === 'skipped') {
   console.log(`[desktop-ui-smoke] SKIPPED: ${result.skipReason}`)

@@ -22,6 +22,10 @@ const checks: Check[] = [
     command: ['bun', 'test', './src/utils/swarm/teamPlanStore.test.ts', './src/server/services/teamPlanService.test.ts'],
   },
   {
+    title: 'Agent Teams versioned delivery old task migration and review recovery',
+    command: ['bun', 'test', './src/utils/taskDelivery.test.ts', './src/tools/TaskDelivery.test.ts'],
+  },
+  {
     title: 'Agent Teams legacy mailbox migration to unread inbox plus history',
     command: ['bun', 'test', './src/utils/teammateMailbox.test.ts', '--test-name-pattern', 'legacy inbox files'],
   },
@@ -30,8 +34,23 @@ const checks: Check[] = [
     command: ['bun', 'test', './src/server/services/teamPlanRuntime.supervisor.test.ts', '--test-name-pattern', 'written before deferred instructions'],
   },
   {
+    // Before `initialStartPending`, an approved member with no ready task still
+    // got a process and a transcript. Its absence must resume that transcript,
+    // never first-start over it, and the new flag must persist across a restart.
+    title: 'Agent Teams standby members recorded before initialStartPending resume their transcript',
+    command: ['bun', 'test', './src/server/services/teamPlanRuntime.supervisor.test.ts', '--test-name-pattern', 'initialStartPending'],
+  },
+  {
+    title: 'Agent Teams legacy Stop baseline and durable Stop recovery',
+    command: ['bun', 'test', './src/server/services/teamPlanRuntime.supervisor.test.ts', '--test-name-pattern', 'outlives the runtime|durable stop epoch'],
+  },
+  {
     title: 'Agent Teams teammate resume from agent metadata written before the teammate fields',
     command: ['bun', 'test', './src/utils/swarm/inProcessRunner.resume.test.ts', '--test-name-pattern', 'metadata written before'],
+  },
+  {
+    title: 'Consumer identity legacy transcripts, metadata and trusted restore compatibility',
+    command: ['bun', 'test', './src/utils/sessionStorage.consumerScope.test.ts', './src/utils/sessionRestore.consumerScope.test.ts', './src/hooks/useSwarmInitialization.consumerScope.test.tsx', './src/utils/swarm/inProcessRunner.resume.test.ts'],
   },
   {
     title: 'Session collaboration state migration and recovery',

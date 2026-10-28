@@ -19,8 +19,8 @@ export const paths = {
   siteDir
 }
 
-/** docs/agents/ 是内部项目材料（上游移除记录），不随站点发布。 */
-const excludedDirectoryNames = new Set(['agents', 'superpowers', 'ui-clone', 'public', 'images'])
+/** docs/agents/ 和 docs/features/ 是内部项目材料，不随站点发布。 */
+const excludedDirectoryNames = new Set(['agents', 'features', 'superpowers', 'ui-clone', 'public', 'images'])
 const excludedFiles = new Set(['AGENTS.md'])
 
 /** 分区顺序与标题。新增一个 docs/ 顶层目录时在这里登记，否则会排到最后并显示裸目录名。 */

@@ -37,7 +37,6 @@ import {
  */
 
 const FIXTURE = 'scripts/quality-gate/agent-flow/fixtures/workspace'
-const MOCK_CLI = 'src/server/__tests__/fixtures/mock-sdk-cli.ts'
 const TARGET_FILE = 'ui-smoke-output.txt'
 const TARGET_CONTENT = 'written-through-the-desktop-ui'
 const SMOKE_PROVIDER_ID = 'desktop-ui-smoke-provider'
@@ -272,21 +271,38 @@ export async function executeDeterministicDesktopSmoke(
     label: 'desktop-ui-smoke',
     seedProviders: false,
     envOverrides: {
-      CLAUDE_CLI_PATH: resolve(rootDir, MOCK_CLI),
+      CLAUDE_CLI_PATH: resolve(rootDir, 'scripts/quality-gate/desktop-smoke/fixtures/team-worker.ts'),
+      MOCK_SDK_TEAM_ECHO_GATE: join(workRoot, 'hold-team-echo'),
       CC_HAHA_DISABLE_TERMINAL_SHELL_ENV: '1',
       MOCK_SDK_TEAM_WORKER_AUDIT: join(workRoot, 'team-worker-audit.jsonl'),
     },
   })
   seedDesktopUiSmokeProvider(sandbox.configDir)
 
-  const server = Bun.spawn(['bun', 'run', 'src/server/index.ts', '--host', '127.0.0.1', '--port', String(serverPort)], {
-    cwd: rootDir,
-    stdout: 'pipe',
-    stderr: 'pipe',
-    env: { ...sandbox.env, SERVER_PORT: String(serverPort) },
-  })
-  void pipeToFile(server.stdout, serverLogPath)
-  void pipeToFile(server.stderr, serverLogPath)
+  // The wrapper delegates non-team sessions to src/server/__tests__/fixtures/mock-sdk-cli.ts.
+  const startServer = () => {
+    const process = Bun.spawn(['bun', 'run', 'src/server/index.ts', '--host', '127.0.0.1', '--port', String(serverPort)], {
+      cwd: rootDir,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...sandbox.env, SERVER_PORT: String(serverPort) },
+    })
+    void pipeToFile(process.stdout, serverLogPath)
+    void pipeToFile(process.stderr, serverLogPath)
+    return process
+  }
+  let server = startServer()
+  const restartServer = async () => {
+    const oldPid = server.pid
+    await stopDesktopSmokeProcess(server, 'server restart', serverLogPath)
+    // Do not substitute an in-process rehydrate call for a real process exit.
+    await server.exited
+    server = startServer()
+    await waitForHttp(`${baseUrl}/health`, 30_000)
+    const lifecycle = { oldPid, newPid: server.pid }
+    appendFileSync(serverLogPath, `\n[quality-gate] Service process restarted ${JSON.stringify(lifecycle)}; sandbox config retained\n`)
+    return lifecycle
+  }
 
   const viteExecutable = resolveDesktopViteExecutable(rootDir)
   if (!viteExecutable) {
@@ -433,7 +449,16 @@ export async function executeDeterministicDesktopSmoke(
     }
     await browserStep(['screenshot', join(artifactDir, 'reloaded.png')], { allowFailure: true })
 
-    await runDesktopUiTeamPlanSmoke({ configDir: sandbox.configDir, sessionId: session.sessionId, projectDir, baseUrl, artifactDir, auditPath: join(workRoot, 'team-worker-audit.jsonl'), browserStep })
+    await runDesktopUiTeamPlanSmoke({
+      configDir: sandbox.configDir, sessionId: session.sessionId, projectDir, baseUrl, artifactDir,
+      auditPath: join(workRoot, 'team-worker-audit.jsonl'), echoGatePath: join(workRoot, 'hold-team-echo'), browserStep, restartServer,
+      assignTask: async () => {
+        const result = await runLoggedCommand(['bun', 'run', 'scripts/quality-gate/desktop-smoke/fixtures/assign-task.ts', 'desktop-ui-review-team', 'builder'], {
+          cwd: rootDir, env: sandbox.env, logPath: serverLogPath, timeoutMs: 30_000,
+        })
+        return JSON.parse(result.stdout.trim()).taskId as string
+      },
+    })
 
     return applyUserStateGuard({
       id: resultId,
