@@ -38,8 +38,9 @@ const { QueryEngine } = await import('./QueryEngine.js')
 const { getDefaultAppState } = await import('./state/AppStateStore.js')
 const { createSessionMessageInbox, sessionMessageUuid } = await import('./utils/sessionMessageInbox.js')
 
+let teamContext: any
 function engine() {
-  let state = getDefaultAppState()
+  let state = { ...getDefaultAppState(), teamContext }
   return new QueryEngine({ cwd: home, tools: [], commands: [], mcpClients: [], agents: [], readFileCache: new Map() as any,
     customSystemPrompt: 'fixture', userSpecifiedModel: 'claude-sonnet-4-5', thinkingConfig: { type: 'disabled' },
     canUseTool: async () => ({ behavior: 'allow', updatedInput: {} }),
@@ -50,7 +51,7 @@ async function untilFlush() {
   for (let i = 0; i < 100 && !flushStarted; i++) await Bun.sleep(1)
   expect(flushStarted).toBe(true)
 }
-beforeEach(() => { inputOptions = undefined; attachment = undefined; releaseFlush = undefined; flushStarted = false; writes = [] })
+beforeEach(() => { teamContext = undefined; inputOptions = undefined; attachment = undefined; releaseFlush = undefined; flushStarted = false; writes = [] })
 afterAll(() => {
   mock.module('./query.js', () => originals.query)
   mock.module('./utils/processUserInput/processUserInput.js', () => originals.input)
@@ -78,6 +79,22 @@ test('idle peer input disables interpretation and acknowledges only after transc
     await next
     expect(receipts).toMatchObject([{ message_id: 'idle', status: 'consumed' }])
   } finally { await iterator.return(); inbox.dispose() }
+})
+
+test('input captures its admitted consumer binding before the asynchronous transcript flush', async () => {
+  const binding = { version: 1, teamName: 'fixture', generation: 1, createdAt: 10, leadSessionId: 'owner', ownerSessionId: 'owner', recipient: { kind: 'lead' } }
+  teamContext = { teamName: 'fixture', teamFilePath: 'fixture', leadAgentId: 'lead', isLeader: true, teammates: {}, consumerScope: binding }
+  const inbox = createSessionMessageInbox(() => {}, () => {})
+  inbox.accept({ subtype: 'enqueue_session_message', message_id: 'scope', sender_session_id: 'peer', text: 'fixture' })
+  const iterator = engine().submitMessage('fixture', { uuid: sessionMessageUuid('scope'), isMeta: true })
+  try {
+    const next = iterator.next()
+    await untilFlush()
+    binding.generation = 2
+    expect(writes[0].consumerScope).toEqual({ ...binding, generation: 1 })
+    releaseFlush!()
+    await next
+  } finally { releaseFlush?.(); await iterator.return(); inbox.dispose() }
 })
 
 test('busy peer attachments persist their stable ID before consumption acknowledgement', async () => {

@@ -51,6 +51,11 @@ import {
   REPEATED_529_ERROR_MESSAGE,
 } from './errors.js'
 import { extractConnectionErrorDetails } from './errorUtils.js'
+import {
+  consumeRequestAttempt,
+  RequestBudgetExhaustedError,
+  type RequestBudget,
+} from './requestBudget.js'
 import { StreamEndedEarlyError } from './streamFallback.js'
 import { StreamWatchdogTimeoutError } from './streamWatchdog.js'
 import { isOpenAIPolicyError } from '../openaiAuth/policyError.js'
@@ -147,6 +152,11 @@ interface RetryOptions {
    * regardless of which request mode hit the overload.
    */
   initialConsecutive529Errors?: number
+  /**
+   * Optional shared budget for real provider attempts. Charged once per
+   * dispatched request, so inner retries cannot outrun the caller's cap.
+   */
+  requestBudget?: RequestBudget
 }
 
 export class CannotRetryError extends Error {
@@ -462,8 +472,19 @@ export async function* withRetry<T>(
         client = await getClient()
       }
 
+      // Charge the shared attempt budget immediately before dispatch, then
+      // re-check the signal so a cancel cannot spend budget or issue a request.
+      if (options.signal?.aborted) {
+        throw new APIUserAbortError()
+      }
+      consumeRequestAttempt(options.requestBudget)
       return await operation(client, attempt, retryContext)
     } catch (error) {
+      // A spent budget is terminal. Retrying cannot help, and walking the
+      // backoff schedule would only delay the caller's own fallback.
+      if (error instanceof RequestBudgetExhaustedError) {
+        throw new CannotRetryError(error, retryContext)
+      }
       // Policy rejection is final even when a gateway labels it 401/429/5xx.
       // Stop before auth refresh, fast-mode changes or persistent/model fallback.
       if (isOpenAIPolicyError(error)) {

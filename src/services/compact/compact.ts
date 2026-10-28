@@ -9,7 +9,7 @@ const sessionTranscriptModule = feature('KAIROS')
 
 import { APIUserAbortError } from '@anthropic-ai/sdk'
 import { markPostCompaction } from 'src/bootstrap/state.js'
-import { getInvokedSkillsForAgent } from '../../bootstrap/state.js'
+import { getInvokedSkillsForAgent, getSdkBetas } from '../../bootstrap/state.js'
 import type { QuerySource } from '../../constants/querySource.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import type { Tool, ToolUseContext } from '../../Tool.js'
@@ -39,7 +39,7 @@ import {
   getMcpInstructionsDeltaAttachment,
 } from '../../utils/attachments.js'
 import { getMemoryPath } from '../../utils/config.js'
-import { COMPACT_MAX_OUTPUT_TOKENS } from '../../utils/context.js'
+import { COMPACT_MAX_OUTPUT_TOKENS, getContextWindowForModel } from '../../utils/context.js'
 import {
   analyzeContext,
   tokenStatsToStatsigMetrics,
@@ -49,6 +49,8 @@ import { hasExactErrorMessage } from '../../utils/errors.js'
 import { cacheToObject } from '../../utils/fileStateCache.js'
 import {
   type CacheSafeParams,
+  type ResultTextOutcome,
+  extractResultTextOutcome,
   runForkedAgent,
 } from '../../utils/forkedAgent.js'
 import {
@@ -83,6 +85,7 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 /* eslint-enable @typescript-eslint/no-require-imports */
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { getTaskOutputPath } from '../../utils/task/diskOutput.js'
+import type { ThinkingConfig } from '../../utils/thinking.js'
 import {
   getTokenUsage,
   tokenCountFromLastAPIResponse,
@@ -108,6 +111,11 @@ import {
   startsWithApiErrorPrefix,
 } from '../api/errors.js'
 import { notifyCompaction } from '../api/promptCacheBreakDetection.js'
+import {
+  createRequestBudget,
+  isRequestBudgetExhausted,
+  type RequestBudget,
+} from '../api/requestBudget.js'
 import { getRetryDelay } from '../api/withRetry.js'
 import { logPermissionContextForAnts } from '../internalLogging.js'
 import {
@@ -176,7 +184,186 @@ export function stripReinjectedAttachments(messages: Message[]): Message[] {
 export const ERROR_MESSAGE_NOT_ENOUGH_MESSAGES =
   'Not enough messages to compact.'
 const MAX_PTL_RETRIES = 3
+/**
+ * One logical compaction gets at most this many real provider attempts.
+ *
+ * This is a deliberate tightening, not the previous worst case. The paths
+ * around it — one cache-sharing fork, up to MAX_COMPACT_STREAMING_RETRIES
+ * streaming attempts and up to MAX_PTL_RETRIES truncate-and-retry rounds — each
+ * carried its own full retry allowance, so their product could exceed this by a
+ * wide margin. Every dispatch now charges this one budget, which bounds the
+ * whole logical operation no matter which inner path (withRetry, model
+ * fallback, non-streaming fallback, mid-stream re-send) does the retrying.
+ */
+const MAX_COMPACT_REQUEST_ATTEMPTS = 6
+/** Headroom reserved for the summarization prompt and estimation drift. */
+const COMPACT_OUTPUT_SAFETY_TOKENS = 4_000
+/**
+ * Smallest explicit cap we will send. Claude requires a manual thinking budget
+ * of at least 1024 tokens and keeps `budget_tokens < max_tokens`, so 1025 is
+ * the smallest value that cannot clamp the budget below that floor.
+ */
+const COMPACT_MIN_OUTPUT_TOKENS = 1_025
 const PTL_RETRY_MARKER = '[earlier conversation truncated for compaction retry]'
+
+function throwIfCompactionAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw new APIUserAbortError()
+  }
+}
+
+/**
+ * Returns the terminal message of the final API response with that whole
+ * response's text attached.
+ *
+ * The streaming API commits one assistant message per content block and every
+ * block of one response shares `message.id`, so a response's last message can
+ * carry no text while an earlier message of the same response holds the whole
+ * summary. Returning the last message alone would drop that summary and make
+ * the caller spend another request on a duplicate. The last message keeps its
+ * own metadata — uuid, timestamp, usage, errorDetails — because it is the
+ * response's terminal state; only the text is widened to the full response.
+ */
+function withFinalResponseText(
+  last: AssistantMessage,
+  text: string,
+): AssistantMessage {
+  if (getAssistantMessageText(last) === text.trim()) {
+    return last
+  }
+  return {
+    ...last,
+    message: {
+      ...last.message,
+      // Only text blocks are rewritten: the merged text already carries every
+      // text block of the response, while non-text blocks (e.g. thinking) are
+      // not part of the summary text and stay untouched.
+      content: [
+        ...last.message.content.filter(block => block.type !== 'text'),
+        { type: 'text', text },
+      ],
+    },
+  }
+}
+
+/**
+ * Turns a terminal non-`ok` outcome from `extractResultTextOutcome` into the
+ * error a caller must see.
+ *
+ * The decision is made from the structured outcome, not from the error text:
+ * a synthetic API error message does not always start with "API Error"
+ * (`NO_RESPONSE_REQUESTED` from a silent 429 fallback, the Opus off-switch
+ * notice), so a string guard alone would accept it as a summary. The provider's
+ * own words are still preserved on the thrown error.
+ */
+function compactionTerminalFailure(
+  outcome: ResultTextOutcome,
+  response: AssistantMessage,
+): Error {
+  if (outcome.status === 'cancelled') {
+    return new APIUserAbortError()
+  }
+  // An unfinished tool turn never produced a result; the streaming path keeps
+  // the generic incomplete-response message so the user gets the same guidance
+  // as a lost stream terminal.
+  if (outcome.status === 'incomplete_tool_use') {
+    return new Error(ERROR_MESSAGE_INCOMPLETE_RESPONSE)
+  }
+  const text = outcome.text || getAssistantMessageText(response) || ''
+  return new Error(text || ERROR_MESSAGE_INCOMPLETE_RESPONSE)
+}
+
+/**
+ * True when an `api_error` outcome is a prompt-too-long rejection, which the
+ * caller's truncate-and-retry loop owns rather than a failure to report.
+ */
+function isPromptTooLongOutcome(outcome: ResultTextOutcome): boolean {
+  return outcome.text.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)
+}
+
+/**
+ * How the cache-sharing compact fork may set `max_tokens`.
+ *
+ * - `keep-cache-key`: the window fits the default output, so send the fork with
+ *   the parent's exact cache-key params (no `max_tokens` override, no thinking
+ *   clamp) and keep the prompt cache hit.
+ * - `capped`: the window cannot fit the default output. An explicit, legal
+ *   `max_tokens` is still possible, so trade the cache hit for a request the
+ *   provider can accept.
+ * - `declined`: no explicit cap can make the request legal. Skip the fork and
+ *   use the streaming path, which owns prompt-too-long truncation, instead of
+ *   sending a request that claims a legality we cannot prove.
+ */
+export type CompactForkOutputCap =
+  | { kind: 'keep-cache-key' }
+  | { kind: 'capped'; maxOutputTokens: number }
+  | { kind: 'declined'; reason: 'unmeasured-input' | 'no-room' }
+
+/**
+ * Picks an explicit `max_tokens` for the cache-sharing compact fork only when
+ * the model window cannot also fit the output the request would otherwise ask
+ * for.
+ *
+ * `estimatedInputTokenCount` is `tokenCountWithEstimation(...)` over the fork's
+ * real request input (context prefix + summarization prompt). Whenever the last
+ * response reported usage it anchors on that usage, so the estimate already
+ * includes the system prompt, tool schemas and cache tokens; the 4K reserve only
+ * has to cover the appended summarization request plus estimation drift. Without
+ * a reported anchor the estimate covers messages only, and the unseen
+ * system/tool overhead can dwarf that reserve — capping on that guess would
+ * assert a legality we cannot prove, hence `unmeasured-input`.
+ */
+export function getCompactForkOutputCap({
+  model,
+  estimatedInputTokenCount,
+  measuredInputTokenCount,
+  thinkingConfig,
+}: {
+  model: string
+  /** tokenCountWithEstimation(...) over the fork request input. */
+  estimatedInputTokenCount: number
+  /** tokenCountFromLastAPIResponse(...); 0 when no usage was reported. */
+  measuredInputTokenCount: number
+  /** The fork's thinking config; an explicit budget must not be clamped down. */
+  thinkingConfig: ThinkingConfig
+}): CompactForkOutputCap {
+  const contextWindow = getContextWindowForModel(model, getSdkBetas())
+  const defaultMaxOutputTokens = getMaxOutputTokensForModel(model)
+  const availableForOutput =
+    contextWindow - estimatedInputTokenCount - COMPACT_OUTPUT_SAFETY_TOKENS
+  if (availableForOutput >= defaultMaxOutputTokens) {
+    return { kind: 'keep-cache-key' }
+  }
+  if (measuredInputTokenCount <= 0) {
+    return { kind: 'declined', reason: 'unmeasured-input' }
+  }
+  // An explicit user max-output setting is already baked into
+  // `defaultMaxOutputTokens`; never raise it, and keep the thinking floor only
+  // while the user's own setting is compatible with it. An explicitly enabled
+  // thinking budget must survive the clamp in claude.ts
+  // (`budget_tokens = min(max_tokens - 1, budget)`), so it raises the floor.
+  const requestedThinkingTokens =
+    thinkingConfig.type === 'enabled' ? thinkingConfig.budgetTokens + 1 : 0
+  const minLegalOutputTokens = Math.min(
+    defaultMaxOutputTokens,
+    Math.max(COMPACT_MIN_OUTPUT_TOKENS, requestedThinkingTokens),
+  )
+  // Validate the cap this fork would actually send, not just the room the
+  // window leaves: `COMPACT_MAX_OUTPUT_TOKENS` can undercut a floor the window
+  // still satisfies, and that cap would clamp an explicit thinking budget down.
+  const cappedOutputTokens = Math.min(
+    defaultMaxOutputTokens,
+    COMPACT_MAX_OUTPUT_TOKENS,
+    availableForOutput,
+  )
+  if (cappedOutputTokens < minLegalOutputTokens) {
+    return { kind: 'declined', reason: 'no-room' }
+  }
+  return {
+    kind: 'capped',
+    maxOutputTokens: cappedOutputTokens,
+  }
+}
 
 /**
  * Drops the oldest API-round groups to fit the provider's reported budget.
@@ -395,6 +582,7 @@ export async function compactConversation(
     }
 
     const preCompactTokenCount = tokenCountWithEstimation(messages)
+    const requestBudget = createRequestBudget(MAX_COMPACT_REQUEST_ATTEMPTS)
 
     const appState = context.getAppState()
     void logPermissionContextForAnts(appState.toolPermissionContext, 'summary')
@@ -444,6 +632,7 @@ export async function compactConversation(
     let summary: string | null
     let ptlAttempts = 0
     for (;;) {
+      throwIfCompactionAborted(context.abortController.signal)
       summaryResponse = await streamCompactSummary({
         messages: messagesToSummarize,
         summaryRequest,
@@ -451,6 +640,7 @@ export async function compactConversation(
         context,
         preCompactTokenCount,
         cacheSafeParams: retryCacheSafeParams,
+        requestBudget,
       })
       summary = getAssistantMessageText(summaryResponse)
       if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
@@ -485,6 +675,10 @@ export async function compactConversation(
         forkContextMessages: truncated,
       }
     }
+
+    // A cancel between the summary response and the boundary write must not
+    // be reported as a successful compaction.
+    throwIfCompactionAborted(context.abortController.signal)
 
     if (!summary) {
       logForDebugging(
@@ -697,6 +891,9 @@ export async function compactConversation(
         context.agentId,
       )
     }
+    // A cancel during post-summary hooks/attachments still must not land a
+    // compaction boundary that the user aborted.
+    throwIfCompactionAborted(context.abortController.signal)
     markPostCompaction()
 
     // Re-append session metadata (custom title, tag) so it stays within
@@ -731,6 +928,9 @@ export async function compactConversation(
       .filter(Boolean)
       .join('\n')
 
+    // Last line of defense: an abort during post-compact hooks must not
+    // return a boundary/result that the caller would persist.
+    throwIfCompactionAborted(context.abortController.signal)
     return {
       boundaryMarker,
       summaryMessages,
@@ -804,6 +1004,7 @@ export async function partialCompactConversation(
     }
 
     const preCompactTokenCount = tokenCountWithEstimation(allMessages)
+    const requestBudget = createRequestBudget(MAX_COMPACT_REQUEST_ATTEMPTS)
 
     context.onCompactProgress?.({
       type: 'hooks_start',
@@ -856,6 +1057,7 @@ export async function partialCompactConversation(
     let summary: string | null
     let ptlAttempts = 0
     for (;;) {
+      throwIfCompactionAborted(context.abortController.signal)
       summaryResponse = await streamCompactSummary({
         messages: apiMessages,
         summaryRequest,
@@ -863,6 +1065,7 @@ export async function partialCompactConversation(
         context,
         preCompactTokenCount,
         cacheSafeParams: retryCacheSafeParams,
+        requestBudget,
       })
       summary = getAssistantMessageText(summaryResponse)
       if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
@@ -893,6 +1096,9 @@ export async function partialCompactConversation(
         forkContextMessages: truncated,
       }
     }
+    // A cancel between the summary response and the boundary write must not
+    // be reported as a successful compaction.
+    throwIfCompactionAborted(context.abortController.signal)
     if (!summary) {
       logEvent('tengu_partial_compact_failed', {
         reason:
@@ -1046,6 +1252,9 @@ export async function partialCompactConversation(
         context.agentId,
       )
     }
+    // A cancel during post-summary hooks/attachments still must not land a
+    // compaction boundary that the user aborted.
+    throwIfCompactionAborted(context.abortController.signal)
     markPostCompaction()
 
     // Re-append session metadata (custom title, tag) so it stays within
@@ -1075,6 +1284,9 @@ export async function partialCompactConversation(
       direction === 'up_to'
         ? (summaryMessages.at(-1)?.uuid ?? boundaryMarker.uuid)
         : boundaryMarker.uuid
+    // Last line of defense: an abort during post-compact hooks must not
+    // return a boundary/result that the caller would persist.
+    throwIfCompactionAborted(context.abortController.signal)
     return {
       boundaryMarker: annotateBoundaryWithPreservedSegment(
         boundaryMarker,
@@ -1129,13 +1341,25 @@ export function createCompactCanUseTool(): CanUseToolFn {
   })
 }
 
-async function streamCompactSummary({
+export type CompactRequestExecutors = {
+  runFork: typeof runForkedAgent
+  queryStreaming: typeof queryModelWithStreaming
+}
+
+const defaultCompactRequestExecutors: CompactRequestExecutors = {
+  runFork: runForkedAgent,
+  queryStreaming: queryModelWithStreaming,
+}
+
+export async function streamCompactSummary({
   messages,
   summaryRequest,
   appState,
   context,
   preCompactTokenCount,
   cacheSafeParams,
+  requestBudget,
+  executors = defaultCompactRequestExecutors,
 }: {
   messages: Message[]
   summaryRequest: UserMessage
@@ -1143,6 +1367,9 @@ async function streamCompactSummary({
   context: ToolUseContext
   preCompactTokenCount: number
   cacheSafeParams: CacheSafeParams
+  requestBudget: RequestBudget
+  /** Injectable request executors; production always uses the defaults. */
+  executors?: CompactRequestExecutors
 }): Promise<AssistantMessage> {
   // When prompt cache sharing is enabled, use forked agent to reuse the
   // main conversation's cached prefix (system prompt, tools, context messages).
@@ -1172,41 +1399,84 @@ async function streamCompactSummary({
     : undefined
 
   try {
-    if (promptCacheSharingEnabled) {
+    throwIfCompactionAborted(context.abortController.signal)
+    // Estimate the fork's real input: the shared context prefix plus the
+    // summarization prompt. `messages` can be a partial slice (partial
+    // compaction), while the fork always sends the full prefix.
+    const forkRequestMessages = [
+      ...cacheSafeParams.forkContextMessages,
+      summaryRequest,
+    ]
+    const forkOutputCap = getCompactForkOutputCap({
+      model: context.options.mainLoopModel,
+      estimatedInputTokenCount: tokenCountWithEstimation(forkRequestMessages),
+      measuredInputTokenCount:
+        tokenCountFromLastAPIResponse(forkRequestMessages),
+      thinkingConfig: context.options.thinkingConfig,
+    })
+    if (promptCacheSharingEnabled && forkOutputCap.kind === 'declined') {
+      // The window is already too small for any legal fork request. Spending
+      // an attempt on it would only earn a prompt-too-long rejection; use the
+      // streaming path, which owns the truncate-and-retry recovery.
+      logForDebugging(
+        `Compact cache sharing skipped: no legal fork output (${forkOutputCap.reason}).`,
+        { level: 'warn' },
+      )
+    }
+    if (promptCacheSharingEnabled && forkOutputCap.kind !== 'declined') {
       try {
-        // DO NOT set maxOutputTokens here. The fork piggybacks on the main thread's
-        // prompt cache by sending identical cache-key params (system, tools, model,
-        // messages prefix, thinking config). Setting maxOutputTokens would clamp
-        // budget_tokens via Math.min(budget, maxOutputTokens-1) in claude.ts,
-        // creating a thinking config mismatch that invalidates the cache.
-        // The streaming fallback path (below) can safely set maxOutputTokensOverride
-        // since it doesn't share cache with the main thread.
-        const result = await runForkedAgent({
+        // The fork normally omits maxOutputTokens so its cache-key params
+        // (system, tools, model, message prefix, thinking config) match the
+        // main thread's. Setting maxOutputTokens would clamp budget_tokens via
+        // Math.min(budget, maxOutputTokens-1) in claude.ts and invalidate the
+        // cache. Only a window that cannot fit the default output asks for an
+        // explicit cap; a roomy window keeps the cache key.
+        throwIfCompactionAborted(context.abortController.signal)
+        const result = await executors.runFork({
           promptMessages: [summaryRequest],
           cacheSafeParams,
           canUseTool: createCompactCanUseTool(),
           querySource: 'compact',
           forkLabel: 'compact',
+          ...(forkOutputCap.kind === 'capped' && {
+            maxOutputTokens: forkOutputCap.maxOutputTokens,
+          }),
           maxTurns: 1,
           skipCacheWrite: true,
+          requestBudget,
           // Pass the compact context's abortController so user Esc aborts the
           // fork — same signal the streaming fallback uses at
           // `signal: context.abortController.signal` below.
           overrides: { abortController: context.abortController },
         })
-        const assistantMsg = getLastAssistantMessage(result.messages)
-        const assistantText = assistantMsg
-          ? getAssistantMessageText(assistantMsg)
-          : null
-        // Guard isApiErrorMessage: query() catches API errors (including
-        // APIUserAbortError on ESC) and yields them as synthetic assistant
-        // messages. Without this check, an aborted compact "succeeds" with
-        // "Request was aborted." as the summary — the text doesn't start with
-        // "API Error" so the caller's startsWithApiErrorPrefix guard misses it.
-        if (assistantMsg && assistantText && !assistantMsg.isApiErrorMessage) {
+        throwIfCompactionAborted(context.abortController.signal)
+        // The fork yields one assistant message per content block and every
+        // block of one response shares `message.id`, so the last message can be
+        // a text-less tail of a response whose earlier block holds the summary.
+        // `extractResultTextOutcome` merges the final response's text while
+        // refusing to summarise an API error, a cancel, an unfinished tool turn
+        // or an earlier response's text.
+        const outcome = extractResultTextOutcome(result.messages)
+        if (outcome.status === 'cancelled') {
+          // query() reports an interrupted turn as an explicit marker after the
+          // last assistant message. That is a cancel, not a summary, and it
+          // must never be turned into another request.
+          throw new APIUserAbortError()
+        }
+        const assistantMsg =
+          outcome.status === 'ok'
+            ? getLastAssistantMessage(result.messages)
+            : undefined
+        // Guard isApiErrorMessage through the outcome's api_error status:
+        // query() catches API errors (including APIUserAbortError on ESC) and
+        // yields them as synthetic assistant messages. Without that check, an
+        // aborted compact "succeeds" with "Request was aborted." as the
+        // summary — the text doesn't start with "API Error" so the caller's
+        // startsWithApiErrorPrefix guard misses it.
+        if (assistantMsg) {
           // Skip success logging for PTL error text — it's returned so the
           // caller's retry loop catches it, but it's not a successful summary.
-          if (!assistantText.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) {
+          if (!outcome.text.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) {
             logEvent('tengu_compact_cache_sharing_success', {
               preCompactTokenCount,
               outputTokens: result.totalUsage.output_tokens,
@@ -1222,10 +1492,10 @@ async function streamCompactSummary({
                   : 0,
             })
           }
-          return assistantMsg
+          return withFinalResponseText(assistantMsg, outcome.text)
         }
         logForDebugging(
-          `Compact cache sharing: no text in response, falling back. Response: ${jsonStringify(assistantMsg)}`,
+          `Compact cache sharing: no summary text (${outcome.status}), falling back. Response: ${jsonStringify(result.messages.at(-1))}`,
           { level: 'warn' },
         )
         logEvent('tengu_compact_cache_sharing_fallback', {
@@ -1234,6 +1504,21 @@ async function streamCompactSummary({
           preCompactTokenCount,
         })
       } catch (error) {
+        // A spent request budget is terminal: no fallback can issue a request,
+        // and query() may already have wrapped the refusal on its way out.
+        if (isRequestBudgetExhausted(error)) {
+          throw error
+        }
+        // A cancel is not a fallback condition: never start another request
+        // after the user aborted.
+        if (
+          error instanceof APIUserAbortError ||
+          context.abortController.signal.aborted
+        ) {
+          throw error instanceof APIUserAbortError
+            ? error
+            : new APIUserAbortError()
+        }
         logError(error)
         logEvent('tengu_compact_cache_sharing_fallback', {
           reason:
@@ -1251,9 +1536,13 @@ async function streamCompactSummary({
     const maxAttempts = retryEnabled ? MAX_COMPACT_STREAMING_RETRIES : 1
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      throwIfCompactionAborted(context.abortController.signal)
       // Reset state for retry
       let hasStartedStreaming = false
-      let response: AssistantMessage | undefined
+      // Every assistant block the stream commits for this attempt, in order.
+      // One response can span several messages that share `message.id`, and
+      // its last message can be text-less, so the whole response is kept.
+      const responseMessages: Message[] = []
       context.setResponseLength?.(() => 0)
 
       // Check if tool search is enabled using the main loop's tools list.
@@ -1285,7 +1574,7 @@ async function streamCompactSummary({
           )
         : [FileReadTool]
 
-      const streamingGen = queryModelWithStreaming({
+      const streamingGen = executors.queryStreaming({
         messages: normalizeMessagesForAPI(
           stripImagesFromMessages(
             stripReinjectedAttachments([
@@ -1315,6 +1604,7 @@ async function streamCompactSummary({
             getMaxOutputTokensForModel(context.options.mainLoopModel),
           ),
           querySource: 'compact',
+          requestBudget,
           agents: context.options.agentDefinitions.activeAgents,
           mcpTools: [],
           effortValue: appState.effortValue,
@@ -1346,14 +1636,43 @@ async function streamCompactSummary({
         }
 
         if (event.type === 'assistant') {
-          response = event
+          responseMessages.push(event)
         }
 
         next = await streamIter.next()
       }
 
-      if (response) {
-        return response
+      // An abort that lands after the final stream event still must not be
+      // reported as a successful compact summary.
+      throwIfCompactionAborted(context.abortController.signal)
+      const completedResponse = getLastAssistantMessage(responseMessages)
+      if (completedResponse) {
+        // A text-less final block of the same response must not hide the
+        // summary an earlier block streamed: the streamed path keeps the
+        // terminal message and widens its text to the whole response.
+        const outcome = extractResultTextOutcome(responseMessages)
+        if (outcome.status === 'ok') {
+          return withFinalResponseText(completedResponse, outcome.text)
+        }
+        // A valid response with no text is still reported by the caller as a
+        // failed compaction (`no_summary`); returning it keeps that path and
+        // its message unchanged.
+        if (outcome.status === 'empty') {
+          return completedResponse
+        }
+        // Prompt-too-long is a real provider answer that the caller's
+        // truncate-and-retry loop owns, so it is returned instead of thrown:
+        // the loop classifies it from the text and parses errorDetails for the
+        // token gap. The terminal message's own flags are kept.
+        if (outcome.status === 'api_error' && isPromptTooLongOutcome(outcome)) {
+          return withFinalResponseText(completedResponse, outcome.text)
+        }
+        // Every other terminal state — an API error, a cancel, or an
+        // unfinished tool turn — is not a summary. Failing here, from the
+        // structured outcome, is what stops a synthetic error whose text has
+        // no "API Error" prefix (NO_RESPONSE_REQUESTED, the off-switch notice)
+        // from being accepted as the compaction summary.
+        throw compactionTerminalFailure(outcome, completedResponse)
       }
 
       if (attempt < maxAttempts) {

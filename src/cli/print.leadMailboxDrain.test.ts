@@ -16,6 +16,8 @@ Object.assign(
   ),
 )
 
+const { createLeadMailboxFixture } = await import('./__tests__/leadMailboxFixture.js')
+
 const TEAM = 'drain-team'
 const LEAD_ID = `team-lead@${TEAM}`
 const WORKER_ID = `worker@${TEAM}`
@@ -63,10 +65,12 @@ afterAll(() => {
 
 test('delivers mail the last teammate left behind, with its summary, before the lead stops polling', async () => {
   clearCommandQueue()
+  const consumerScope = await createLeadMailboxFixture(TEAM)
   expect(
     await mailbox.writeToMailbox(
       'team-lead',
       {
+        id: 'client-drain-1',
         from: 'worker',
         text: 'All 42 tests pass',
         summary: 'tests "green"',
@@ -81,6 +85,7 @@ test('delivers mail the last teammate left behind, with its summary, before the 
     ...defaults,
     teamContext: {
       teamName: TEAM,
+      consumerScope,
       teamFilePath: join(home, 'teams', TEAM, 'config.json'),
       leadAgentId: LEAD_ID,
       teammates: {
@@ -133,7 +138,7 @@ test('delivers mail the last teammate left behind, with its summary, before the 
 
     expect(prompts).toHaveLength(2)
     expect(prompts[1]).toBe(
-      '<teammate-message teammate_id="worker" summary="tests &quot;green&quot;">\n' +
+      '<teammate-message teammate_id="worker" summary="tests &quot;green&quot;" id="client-drain-1">\n' +
         'All 42 tests pass\n' +
         '</teammate-message>',
     )

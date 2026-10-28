@@ -1,4 +1,5 @@
 import type { TaskStateBase } from '../../Task.js'
+import type { ConsumerScope } from '../../utils/swarm/consumerScope.js'
 import type { AgentToolResult } from '../../tools/AgentTool/agentToolUtils.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Message } from '../../types/message.js'
@@ -14,6 +15,7 @@ export type TeammateIdentity = {
   agentId: string // e.g., "researcher@my-team"
   agentName: string // e.g., "researcher"
   teamName: string
+  consumerScope?: ConsumerScope
   color?: string
   planModeRequired: boolean
   parentSessionId: string // Leader's session ID

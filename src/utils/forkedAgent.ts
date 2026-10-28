@@ -19,11 +19,12 @@ import {
   logEvent,
 } from '../services/analytics/index.js'
 import { accumulateUsage, updateUsage } from '../services/api/claude.js'
+import type { RequestBudget } from '../services/api/requestBudget.js'
 import { EMPTY_USAGE, type NonNullableUsage } from '../services/api/logging.js'
 import type { ToolUseContext } from '../Tool.js'
 import type { AgentDefinition } from '../tools/AgentTool/loadAgentsDir.js'
 import type { AgentId } from '../types/ids.js'
-import type { Message } from '../types/message.js'
+import type { AssistantMessage, Message } from '../types/message.js'
 import { createChildAbortController } from './abortController.js'
 import { logForDebugging } from './debug.js'
 import { cloneFileStateCache } from './fileStateCache.js'
@@ -31,7 +32,8 @@ import type { REPLHookContext } from './hooks/postSamplingHooks.js'
 import {
   createUserMessage,
   extractTextContent,
-  getLastAssistantMessage,
+  INTERRUPT_MESSAGE,
+  INTERRUPT_MESSAGE_FOR_TOOL_USE,
 } from './messages.js'
 import { createDenialTrackingState } from './permissions/denialTracking.js'
 import { parseToolListFromCLI } from './permissions/permissionSetup.js'
@@ -110,6 +112,11 @@ export type ForkedAgentParams = {
   /** Skip writing new prompt cache entries on the last message. For
    *  fire-and-forget forks where no future request will read from this prefix. */
   skipCacheWrite?: boolean
+  /**
+   * Optional shared budget for real provider attempts. Threaded into the
+   * forked query so every request the fork issues charges the same budget.
+   */
+  requestBudget?: RequestBudget
 }
 
 export type ForkedAgentResult = {
@@ -247,21 +254,165 @@ export async function prepareForkedCommandContext(
 }
 
 /**
+ * Why the final assistant response did or did not yield result text.
+ *
+ * - ok: the final response produced text.
+ * - no_assistant: the loop produced no assistant message at all.
+ * - cancelled: the turn was interrupted after the last assistant message.
+ * - api_error: the final response is a synthetic API error.
+ * - incomplete_tool_use: the final response contains a tool_use with no
+ *   matching tool_result, so the turn never reached a result.
+ * - empty: the final response is valid but has no text.
+ */
+export type ResultTextStatus =
+  | 'ok'
+  | 'no_assistant'
+  | 'cancelled'
+  | 'api_error'
+  | 'incomplete_tool_use'
+  | 'empty'
+
+export type ResultTextOutcome = {
+  /** Text from the final response only. Empty when nothing is safe to show. */
+  text: string
+  status: ResultTextStatus
+}
+
+/**
+ * Returns the assistant messages that belong to the final API response.
+ *
+ * The streaming API yields one assistant message per content block, and every
+ * segment of the same response shares `message.id`. A different id is a
+ * different request: its text may describe an earlier, failed, or unrelated
+ * turn and must not be used as the result of this one.
+ */
+export function getFinalResponseAssistantMessages(
+  agentMessages: Message[],
+): AssistantMessage[] {
+  const lastIndex = agentMessages.findLastIndex(
+    message => message.type === 'assistant',
+  )
+  if (lastIndex === -1) return []
+
+  const lastMessage = agentMessages[lastIndex] as AssistantMessage
+  const responseId = lastMessage.message.id
+  // Without a response id there is no way to tell which segments belong to the
+  // same request. Treat only the last message as the final response rather
+  // than guessing and crossing into an earlier request.
+  if (!responseId) return [lastMessage]
+
+  const response: AssistantMessage[] = []
+  for (let i = lastIndex; i >= 0; i--) {
+    const message = agentMessages[i]!
+    if (message.type !== 'assistant') continue
+    if (message.message.id !== responseId) break
+    response.unshift(message)
+  }
+  return response
+}
+
+function assistantText(message: AssistantMessage): string {
+  return extractTextContent(message.message.content, '\n')
+}
+
+function syntheticUserText(message: Message): string {
+  if (message.type !== 'user') return ''
+  const content = message.message.content
+  return typeof content === 'string'
+    ? content
+    : extractTextContent(content, '\n')
+}
+
+function wasInterruptedAfter(
+  agentMessages: Message[],
+  lastAssistantIndex: number,
+): boolean {
+  for (let i = lastAssistantIndex + 1; i < agentMessages.length; i++) {
+    const text = syntheticUserText(agentMessages[i]!)
+    if (text === INTERRUPT_MESSAGE || text === INTERRUPT_MESSAGE_FOR_TOOL_USE) {
+      return true
+    }
+  }
+  return false
+}
+
+function collectToolResultIds(agentMessages: Message[]): Set<string> {
+  const ids = new Set<string>()
+  for (const message of agentMessages) {
+    if (message.type !== 'user') continue
+    const content = message.message.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (block.type === 'tool_result') {
+        ids.add(block.tool_use_id)
+      }
+    }
+  }
+  return ids
+}
+
+/**
+ * Extracts result text while keeping the final response's terminal state.
+ *
+ * Recovery is bounded to the final API response. An earlier response is never
+ * used, because it may be an older success that must not overwrite a newer
+ * error, cancellation, or unfinished tool turn.
+ */
+export function extractResultTextOutcome(
+  agentMessages: Message[],
+): ResultTextOutcome {
+  const response = getFinalResponseAssistantMessages(agentMessages)
+  if (response.length === 0) {
+    return { text: '', status: 'no_assistant' }
+  }
+
+  const lastAssistantIndex = agentMessages.findLastIndex(
+    message => message.type === 'assistant',
+  )
+  if (wasInterruptedAfter(agentMessages, lastAssistantIndex)) {
+    return { text: '', status: 'cancelled' }
+  }
+
+  // An API error ends the response. Surface its own text when it has one, but
+  // never reach back to an earlier successful response for a result.
+  for (let i = response.length - 1; i >= 0; i--) {
+    const message = response[i]!
+    if (message.isApiErrorMessage === true) {
+      return { text: assistantText(message), status: 'api_error' }
+    }
+  }
+
+  const toolResultIds = collectToolResultIds(agentMessages)
+  const hasUnfinishedToolUse = response.some(message =>
+    message.message.content.some(
+      block => block.type === 'tool_use' && !toolResultIds.has(block.id),
+    ),
+  )
+  if (hasUnfinishedToolUse) {
+    return { text: '', status: 'incomplete_tool_use' }
+  }
+
+  const text = response
+    .map(assistantText)
+    .filter(part => part.length > 0)
+    .join('\n')
+  return text ? { text, status: 'ok' } : { text: '', status: 'empty' }
+}
+
+/**
  * Extracts result text from agent messages.
+ *
+ * `_defaultText` is retained for caller compatibility but is deliberately not
+ * used as a success fallback: when the final response has no recoverable text
+ * the caller gets an empty string instead of "completed", so an empty tail is
+ * never presented as a real result. Callers that need the reason can use
+ * `extractResultTextOutcome`.
  */
 export function extractResultText(
   agentMessages: Message[],
-  defaultText = 'Execution completed',
+  _defaultText = 'Execution completed',
 ): string {
-  const lastAssistantMessage = getLastAssistantMessage(agentMessages)
-  if (!lastAssistantMessage) return defaultText
-
-  const textContent = extractTextContent(
-    lastAssistantMessage.message.content,
-    '\n',
-  )
-
-  return textContent || defaultText
+  return extractResultTextOutcome(agentMessages).text
 }
 
 /**
@@ -513,6 +664,7 @@ export async function runForkedAgent({
   onMessage,
   skipTranscript,
   skipCacheWrite,
+  requestBudget,
 }: ForkedAgentParams): Promise<ForkedAgentResult> {
   const startTime = Date.now()
   const outputMessages: Message[] = []
@@ -568,6 +720,7 @@ export async function runForkedAgent({
       maxOutputTokensOverride: maxOutputTokens,
       maxTurns,
       skipCacheWrite,
+      requestBudget,
     })) {
       // Extract real usage from message_delta stream events (final usage per API call)
       if (message.type === 'stream_event') {

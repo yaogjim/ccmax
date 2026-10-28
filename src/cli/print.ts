@@ -357,8 +357,6 @@ import {
 import { TEAM_LEAD_NAME } from '../utils/swarm/constants.js'
 import { SHUTDOWN_TEAM_PROMPT } from '../utils/swarm/teamShutdownPrompt.js'
 import {
-  readUnreadMessages,
-  claimMailboxMessages,
   formatTeammateMessages,
   isShutdownApproved,
   type TeammateMessage,
@@ -367,9 +365,11 @@ import {
   partitionLeadMailboxMessages,
   resolveTeammatePermissionRequests,
 } from '../utils/swarm/printLeaderPermissionBridge.js'
-import { removeTeammateFromTeamFile, readTeamFile, getTeamFilePath } from '../utils/swarm/teamHelpers.js'
+import { removeTeammateFromTeamFile, getTeamFilePath } from '../utils/swarm/teamHelpers.js'
 import { setLeaderTeamName } from '../utils/tasks.js'
-import { buildTeamRuntimeSnapshot } from '../utils/swarm/teamRuntimeSnapshot.js'
+import { buildTeamRuntimeSnapshot, installProcessConsumerScope } from '../utils/swarm/teamRuntimeSnapshot.js'
+import { parseConsumerScope, readScopedMailbox, claimScopedMailbox, withConsumerScope, type ConsumerScope } from '../utils/swarm/consumerScope.js'
+import { getCanonicalTeamTaskListId, withTaskListLifecycleLock } from '../utils/tasks.js'
 import { unassignTeammateTasks } from '../utils/tasks.js'
 import { getRunningTasks } from '../utils/task/framework.js'
 import { isBackgroundTask } from '../tasks/types.js'
@@ -463,6 +463,8 @@ export type LeadMailboxPollState = {
    * for the user's next message instead of starting lead turns nobody asked for.
    */
   held: boolean
+  scope?: ConsumerScope
+  identityRejected?: string
 }
 
 export function createLeadMailboxPollState(): LeadMailboxPollState {
@@ -474,7 +476,7 @@ export type LeadMailboxPollStep =
   | { kind: 'held' }
   | { kind: 'idle' }
   | { kind: 'retry' }
-  | { kind: 'batch'; messages: TeammateMessage[] }
+  | { kind: 'batch'; messages: TeammateMessage[]; scope: ConsumerScope }
 
 /**
  * One poll of the team lead's inbox. The batch is claimed (acknowledged by
@@ -485,11 +487,23 @@ export type LeadMailboxPollStep =
  */
 export async function takeLeadMailboxBatch(
   state: LeadMailboxPollState,
-  options: { teamName: string | undefined; hasActiveTeammates: boolean },
+  options: { teamName: string | undefined; hasActiveTeammates: boolean; consumerScope?: unknown },
 ): Promise<LeadMailboxPollStep> {
   const { teamName, hasActiveTeammates } = options
+  if (state.identityRejected) return { kind: 'stop' }
+  const parsed = parseConsumerScope(state.scope ?? options.consumerScope)
+  const reject = (reason: string): LeadMailboxPollStep => {
+    state.identityRejected = reason
+    logForDebugging(`[print.ts] Consumer identity ${reason}; automatic receiving stopped; history remains available`, { level: 'warn' })
+    return { kind: 'stop' }
+  }
+  if (parsed.status !== 'bound') return reject(parsed.status)
+  if (parsed.scope.teamName !== teamName || parsed.scope.recipient.kind !== 'lead') return reject('stale')
+  const scope = state.scope ??= parsed.scope
   if (state.held) return { kind: 'held' }
-  const unread = await readUnreadMessages(TEAM_LEAD_NAME, teamName)
+  const read = await readScopedMailbox(scope)
+  if (read.status !== 'current') return read.status === 'retryable_io' ? { kind: 'retry' } : reject(read.status)
+  const unread = read.value
 
   if (!hasActiveTeammates) {
     if (
@@ -512,14 +526,16 @@ export async function takeLeadMailboxBatch(
     return { kind: 'idle' }
   }
 
-  const claimed = await claimMailboxMessages(TEAM_LEAD_NAME, teamName, unread)
+  const claim = await claimScopedMailbox(scope, unread)
+  if (claim.status !== 'claimed' && claim.status !== 'retryable_io' && claim.status !== 'commit_uncertain') return reject(claim.status)
+  const claimed = claim.status === 'claimed' ? claim.messages : undefined
   if (claimed) {
     state.consecutiveAckFailures = 0
     if (claimed.length === 0) {
       // Another consumer (a mid-turn attachment) took the whole batch.
       return hasActiveTeammates ? { kind: 'idle' } : { kind: 'stop' }
     }
-    return { kind: 'batch', messages: claimed }
+    return { kind: 'batch', messages: claimed, scope }
   }
 
   state.consecutiveAckFailures += 1
@@ -537,7 +553,9 @@ export async function takeLeadMailboxBatch(
     `[print.ts] Could not mark ${unread.length} inbox message(s) read for ${state.consecutiveAckFailures} polls; processing the batch unmarked`,
     { level: 'warn' },
   )
-  return { kind: 'batch', messages: unread }
+  const current = await withConsumerScope(scope, () => true)
+  if (current.status !== 'current') return current.status === 'retryable_io' ? { kind: 'retry' } : reject(current.status)
+  return { kind: 'batch', messages: unread, scope }
 }
 
 // Track message UUIDs received during the current session runtime
@@ -562,6 +580,20 @@ function trackReceivedMessageUuid(uuid: UUID): boolean {
     }
   }
   return true // new UUID
+}
+
+type ScopedQueuedCommand = QueuedCommand & { consumerScope?: ConsumerScope }
+
+/** The synchronous prompt-list acceptance point, after queue waits. */
+export async function acceptLeadMailboxPrompt(
+  command: ScopedQueuedCommand,
+  held: boolean,
+  accept: (command: QueuedCommand) => void,
+): Promise<'accepted' | 'held' | 'stale' | 'unbound' | 'unsupported' | 'retryable_io'> {
+  if (!command.consumerScope) { accept(command); return 'accepted' }
+  if (held) return 'held'
+  const result = await withConsumerScope(command.consumerScope, () => { accept(command) })
+  return result.status === 'current' ? 'accepted' : result.status
 }
 
 type PromptValue = string | ContentBlockParam[]
@@ -597,6 +629,8 @@ export function canBatchWith(
   return (
     next !== undefined &&
     next.mode === 'prompt' &&
+    !(head as ScopedQueuedCommand).consumerScope &&
+    !(next as ScopedQueuedCommand).consumerScope &&
     !isPendingSessionMessage(head.uuid) &&
     !isPendingSessionMessage(next.uuid) &&
     next.workload === head.workload &&
@@ -643,6 +677,8 @@ export async function runHeadless(
     setSDKStatus?: (status: SDKStatus) => void
   },
 ): Promise<void> {
+  const rawWorkerScope = process.env.CC_HAHA_TEAM_CONSUMER_SCOPE
+  delete process.env.CC_HAHA_TEAM_CONSUMER_SCOPE
   if (
     process.env.USER_TYPE === 'ant' &&
     isEnvTruthy(process.env.CLAUDE_CODE_EXIT_AFTER_FIRST_RENDER)
@@ -845,6 +881,15 @@ export async function runHeadless(
     sessionStartHooksPromise: options.sessionStartHooksPromise,
     restoredWorkerState: structuredIO.restoredWorkerState,
   })
+
+  // The host is the trusted issuer, but the carrier is not proof: restore may
+  // have switched sessions, and the roster may have changed during startup.
+  if (rawWorkerScope !== undefined) {
+    const installed = await installProcessConsumerScope(rawWorkerScope, getSessionId(), teamContext => {
+      setAppState(prev => ({ ...prev, teamContext }))
+    })
+    if (installed.status !== 'current' || !installed.value) throw new Error(`Team worker consumer identity ${installed.status}; automatic receiving stopped; history remains available`)
+  }
 
   // SessionStart hooks can emit initialUserMessage — the first user turn for
   // headless orchestrator sessions where stdin is empty and additionalContext
@@ -1234,6 +1279,7 @@ function runHeadlessStreaming(
   // to finish exiting after the closing lead was asked to stand it down.
   const LEAD_POLL_INTERVAL_MS = 500
   const leadMailboxPoll = createLeadMailboxPollState()
+  const heldMailboxCommands: ScopedQueuedCommand[] = []
   let heldBackResult: StdoutMessage | null = null
   const deferredAgentNotifications = new TaskNotificationFollowUpBatch()
   let abortController: AbortController | undefined
@@ -2190,7 +2236,21 @@ function runHeadlessStreaming(
       // ask() call so messages that queued up during a long turn coalesce
       // into a single follow-up turn instead of N separate turns.
       const drainCommandQueue = async () => {
+        if (!leadMailboxPoll.held) {
+          for (const pending of heldMailboxCommands.splice(0)) enqueue(pending)
+        }
         while ((command = dequeue(isMainThread))) {
+          const scopedCommand = command as ScopedQueuedCommand
+          const accepted: QueuedCommand[] = []
+          const acceptance = await acceptLeadMailboxPrompt(scopedCommand, leadMailboxPoll.held, item => { accepted.push(item) })
+          if (acceptance !== 'accepted') {
+            if (acceptance === 'held' || acceptance === 'retryable_io') heldMailboxCommands.push(scopedCommand)
+            else leadMailboxPoll.identityRejected = acceptance
+            continue
+          }
+          // The scoped prompt was synchronously accepted into this run's list
+          // under its final fence; no lock crosses ask() or a generator yield.
+          command = accepted[0]!
           if (
             command.mode !== 'prompt' &&
             command.mode !== 'orphaned-permission' &&
@@ -2712,6 +2772,7 @@ function runHeadlessStreaming(
           // drains leftover mail once after the last teammate is gone.
           const step = await takeLeadMailboxBatch(leadMailboxPoll, {
             teamName,
+            consumerScope: refreshedState.teamContext?.consumerScope,
             hasActiveTeammates: hasTeammatesRequiringShutdown(refreshedState),
           })
 
@@ -2749,18 +2810,23 @@ function runHeadlessStreaming(
               logForDebugging(
                 `[print.ts] Routing ${partitioned.permissionRequests.length} teammate permission request(s) and ${partitioned.sandboxPermissionRequests.length} sandbox request(s) to the host`,
               )
-              void resolveTeammatePermissionRequests({
+              await withConsumerScope(step.scope, () => {
+                void resolveTeammatePermissionRequests({
                 host: structuredIO,
                 canPromptHost: options.hostPermissionPromptAvailable === true,
                 teamName,
                 permissionRequests: partitioned.permissionRequests,
                 sandboxPermissionRequests:
                   partitioned.sandboxPermissionRequests,
+                })
               })
             }
 
             // Process shutdown_approved messages - remove teammates from team file
             // This mirrors what useInboxPoller does in interactive mode (lines 546-606)
+            await withTaskListLifecycleLock(getCanonicalTeamTaskListId(step.scope.teamName), async () => {
+              const current = await withConsumerScope(step.scope, () => true)
+              if (current.status !== 'current') return
             for (const m of partitioned.remaining) {
               const shutdownApproval = isShutdownApproved(m.text)
               if (shutdownApproval && teamName) {
@@ -2812,6 +2878,8 @@ function runHeadlessStreaming(
               }
             }
 
+            })
+
             if (partitioned.remaining.length === 0) {
               continue
             }
@@ -2825,7 +2893,8 @@ function runHeadlessStreaming(
               mode: 'prompt',
               value: formatted,
               uuid: randomUUID(),
-            })
+              consumerScope: step.scope,
+            } as ScopedQueuedCommand)
             void run()
             return // run() will come back here after processing
           }
@@ -3074,9 +3143,14 @@ function runHeadlessStreaming(
           }
         } else if (message.request.subtype === 'team_runtime_snapshot') {
           try {
-            const teamContext = buildTeamRuntimeSnapshot(readTeamFile(message.request.team_name), message.request.created_at, getSessionId(), getTeamFilePath(message.request.team_name))
-            setLeaderTeamName(teamContext.teamName)
-            setAppState(prev => ({ ...prev, teamContext }))
+            const request = message.request
+            const installed = await withConsumerScope(request.consumer_scope, (scope, team) => {
+              const teamContext = buildTeamRuntimeSnapshot(team, request.created_at, getSessionId(), getTeamFilePath(request.team_name), scope)
+              if (teamContext.teamName !== request.team_name) throw new Error('Foreign team runtime snapshot')
+              setLeaderTeamName(teamContext.teamName)
+              setAppState(prev => ({ ...prev, teamContext }))
+            })
+            if (installed.status !== 'current') throw new Error(`Team runtime snapshot consumer identity ${installed.status}`)
             sendControlResponseSuccess(message)
           } catch (error) {
             sendControlResponseError(message, error instanceof Error ? error.message : String(error))
@@ -5383,7 +5457,7 @@ async function loadInitialMessages(
             }
           }
         }
-        restoreSessionStateFromLog(result, setAppState)
+        await restoreSessionStateFromLog(result, setAppState, { forkSession: options.forkSession })
 
         // Restore session metadata so it's re-appended on exit via reAppendSessionMetadata
         restoreSessionMetadata(
@@ -5583,7 +5657,7 @@ async function loadInitialMessages(
           await resetSessionFilePointer()
         }
       }
-      restoreSessionStateFromLog(result, setAppState)
+      await restoreSessionStateFromLog(result, setAppState, { forkSession: options.forkSession })
 
       // Restore session metadata so it's re-appended on exit via reAppendSessionMetadata
       restoreSessionMetadata(

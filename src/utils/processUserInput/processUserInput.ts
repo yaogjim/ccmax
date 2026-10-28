@@ -32,12 +32,12 @@ import {
 } from '../../types/textInputTypes.js'
 import {
   type AgentMentionAttachment,
+  collectAcceptedAttachments,
   createAttachmentMessage,
   getAttachmentMessages,
 } from '../attachments.js'
 import type { PastedContent } from '../config.js'
 import type { EffortValue } from '../effort.js'
-import { toArray } from '../generators.js'
 import {
   executeUserPromptSubmitHooks,
   getUserPromptSubmitHookBlockingMessage,
@@ -500,7 +500,7 @@ async function processUserInputBase(
 
   queryCheckpoint('query_attachment_loading_start')
   const attachmentMessages = shouldExtractAttachments
-    ? await toArray(
+    ? await collectAcceptedAttachments(
         getAttachmentMessages(
           inputString,
           context,

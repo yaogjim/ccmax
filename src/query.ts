@@ -8,6 +8,10 @@ import type {
 import type { CanUseToolFn } from './hooks/useCanUseTool.js'
 import { FallbackTriggeredError } from './services/api/withRetry.js'
 import {
+  isRequestBudgetExhausted,
+  type RequestBudget,
+} from './services/api/requestBudget.js'
+import {
   calculateTokenWarningState,
   isAutoCompactEnabled,
   type AutoCompactTrackingState,
@@ -62,6 +66,7 @@ import { generateToolUseSummary } from './services/toolUseSummary/toolUseSummary
 import { prependUserContext, appendSystemContext } from './utils/api.js'
 import { recordUserContextSnapshot } from './services/api/promptSnapshot.js'
 import {
+  acceptAttachmentMessage,
   createAttachmentMessage,
   filterDuplicateMemoryAttachments,
   getAttachmentMessages,
@@ -197,6 +202,12 @@ export type QueryParams = {
   maxOutputTokensOverride?: number
   maxTurns?: number
   skipCacheWrite?: boolean
+  /**
+   * Optional shared budget for real provider attempts across this whole
+   * query. Undefined for ordinary conversations, which keeps prior
+   * retry behavior unchanged.
+   */
+  requestBudget?: RequestBudget
   // API task_budget (output_config.task_budget, beta task-budgets-2026-03-13).
   // Distinct from the tokenBudget +500k auto-continue feature. `total` is the
   // budget for the whole agentic turn; `remaining` is computed per iteration
@@ -704,6 +715,7 @@ async function* queryLoop(
               hasAppendSystemPrompt:
                 !!toolUseContext.options.appendSystemPrompt,
               maxOutputTokensOverride,
+              requestBudget: params.requestBudget,
               fetchOverride: dumpPromptsFetch,
               mcpTools: appState.mcp.tools,
               hasPendingMcpServers: appState.mcp.clients.some(
@@ -987,6 +999,14 @@ async function* queryLoop(
         queryChainId: queryChainIdForAnalytics,
         queryDepth: queryTracking.depth,
       })
+
+      // A spent request budget is terminal for the logical operation that
+      // owns it (compaction). Yielding it as a synthetic API error would let
+      // the caller treat it as a retryable failure and start yet another
+      // request, defeating the cap.
+      if (isRequestBudgetExhausted(error)) {
+        throw error
+      }
 
       // Handle image size/resize errors with user-friendly messages
       if (
@@ -1618,8 +1638,9 @@ async function* queryLoop(
       if (attachment.type === 'attachment' && attachment.attachment.type === 'queued_command' &&
         attachment.attachment.origin?.kind === 'channel' && attachment.attachment.origin.server === 'session-collaboration' &&
         !isPendingSessionMessage(attachment.attachment.source_uuid)) continue
-      yield attachment
-      toolResults.push(attachment)
+      if (await acceptAttachmentMessage(attachment, accepted => { toolResults.push(accepted) })) {
+        yield attachment
+      }
     }
 
     // Memory prefetch consume: only if settled and not already consumed on

@@ -4,13 +4,19 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import * as mailbox from '../utils/teammateMailbox.js'
 import {
+  acceptLeadMailboxPrompt,
   createLeadMailboxPollState,
   type LeadMailboxPollStep,
   MAX_LEAD_MAILBOX_ACK_FAILURES,
   takeLeadMailboxBatch,
 } from './print.js'
 
+import { createLeadMailboxFixture } from './__tests__/leadMailboxFixture.js'
+import type { ConsumerScope } from '../utils/swarm/consumerScope.js'
+import * as scopes from '../utils/swarm/consumerScope.js'
+
 const TEAM = 'print-lead-team'
+let consumerScope: ConsumerScope
 
 let configDir: string
 let originalConfigDir: string | undefined
@@ -19,6 +25,7 @@ beforeEach(async () => {
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
   configDir = await mkdtemp(join(tmpdir(), 'cc-haha-print-lead-mailbox-'))
   process.env.CLAUDE_CONFIG_DIR = configDir
+  consumerScope = await createLeadMailboxFixture(TEAM)
 })
 
 afterEach(async () => {
@@ -43,6 +50,53 @@ function texts(step: LeadMailboxPollStep): string[] | undefined {
 }
 
 describe('print-mode team lead mailbox poll', () => {
+  test('an unbound lead stops without reading or acknowledging mail', async () => {
+    await send('worker', 'still unread', 1)
+    const state = createLeadMailboxPollState()
+    expect(await takeLeadMailboxBatch(state, {
+      teamName: TEAM,
+      hasActiveTeammates: true,
+    })).toEqual({ kind: 'stop' })
+    expect(state.identityRejected).toBe('unbound')
+    expect(await unreadTexts()).toEqual(['still unread'])
+  })
+
+  test('a queued batch cannot enter the prompt list after the team is recreated', async () => {
+    await send('worker', 'old batch', 1)
+    const step = await takeLeadMailboxBatch(createLeadMailboxPollState(), {
+      teamName: TEAM, consumerScope, hasActiveTeammates: true,
+    })
+    expect(step.kind).toBe('batch')
+    if (step.kind !== 'batch') throw new Error('Expected a claimed batch')
+    await createLeadMailboxFixture(TEAM)
+    await send('worker', 'new inbox', 2)
+    const accepted: unknown[] = []
+    expect(await acceptLeadMailboxPrompt({
+      value: 'old batch', mode: 'prompt', consumerScope: step.scope,
+    }, false, command => accepted.push(command))).toBe('stale')
+    expect(accepted).toEqual([])
+    expect(await unreadTexts()).toEqual(['new inbox'])
+  })
+
+  test('identity replacement never enters the acknowledgement failure fallback', async () => {
+    await send('worker', 'old candidate', 1)
+    const claim = spyOn(scopes, 'claimScopedMailbox').mockImplementation(async () => {
+      await createLeadMailboxFixture(TEAM)
+      return { status: 'stale' }
+    })
+    const state = createLeadMailboxPollState()
+    state.consecutiveAckFailures = MAX_LEAD_MAILBOX_ACK_FAILURES - 1
+    try {
+      expect(await takeLeadMailboxBatch(state, {
+        teamName: TEAM, consumerScope, hasActiveTeammates: true,
+      })).toEqual({ kind: 'stop' })
+      expect(state.identityRejected).toBe('stale')
+      expect(await unreadTexts()).toEqual(['old candidate'])
+    } finally {
+      claim.mockRestore()
+    }
+  })
+
   test('acknowledges only the batch it read', async () => {
     await send('alice', 'report', 1)
     const readUnread = mailbox.readUnreadMessages
@@ -57,7 +111,7 @@ describe('print-mode team lead mailbox poll', () => {
 
     try {
       const step = await takeLeadMailboxBatch(createLeadMailboxPollState(), {
-        teamName: TEAM,
+        teamName: TEAM, consumerScope,
         hasActiveTeammates: true,
       })
       expect(texts(step)).toEqual(['report'])
@@ -71,7 +125,7 @@ describe('print-mode team lead mailbox poll', () => {
   test('keeps polling quietly while teammates work and nothing is unread', async () => {
     expect(
       await takeLeadMailboxBatch(createLeadMailboxPollState(), {
-        teamName: TEAM,
+        teamName: TEAM, consumerScope,
         hasActiveTeammates: true,
       }),
     ).toEqual({ kind: 'idle' })
@@ -80,7 +134,7 @@ describe('print-mode team lead mailbox poll', () => {
   test('drains mail left behind by the last teammate before stopping', async () => {
     await send('worker', 'final report', 1)
     const state = createLeadMailboxPollState()
-    const departed = { teamName: TEAM, hasActiveTeammates: false }
+    const departed = { teamName: TEAM, consumerScope, hasActiveTeammates: false }
 
     expect(texts(await takeLeadMailboxBatch(state, departed))).toEqual([
       'final report',
@@ -92,7 +146,7 @@ describe('print-mode team lead mailbox poll', () => {
   test('drains only once per departure, then waits for an active teammate', async () => {
     await send('worker', 'final report', 1)
     const state = createLeadMailboxPollState()
-    const departed = { teamName: TEAM, hasActiveTeammates: false }
+    const departed = { teamName: TEAM, consumerScope, hasActiveTeammates: false }
 
     expect(texts(await takeLeadMailboxBatch(state, departed))).toEqual([
       'final report',
@@ -104,7 +158,7 @@ describe('print-mode team lead mailbox poll', () => {
     expect(
       texts(
         await takeLeadMailboxBatch(state, {
-          teamName: TEAM,
+          teamName: TEAM, consumerScope,
           hasActiveTeammates: true,
         }),
       ),
@@ -117,7 +171,7 @@ describe('print-mode team lead mailbox poll', () => {
       undefined,
     )
     const state = createLeadMailboxPollState()
-    const active = { teamName: TEAM, hasActiveTeammates: true }
+    const active = { teamName: TEAM, consumerScope, hasActiveTeammates: true }
 
     try {
       for (let poll = 1; poll < MAX_LEAD_MAILBOX_ACK_FAILURES; poll++) {

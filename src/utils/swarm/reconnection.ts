@@ -6,10 +6,12 @@
  * - Resumed sessions: Initialize from teamName/agentName stored in the transcript
  */
 
+import { getSessionId } from '../../bootstrap/state.js'
 import type { AppState } from '../../state/AppState.js'
 import { logForDebugging } from '../debug.js'
 import { logError } from '../log.js'
-import { getDynamicTeamContext } from '../teammate.js'
+import { getDynamicTeamContext, setDynamicTeamContext } from '../teammate.js'
+import { parseConsumerScope, withConsumerScope, type ScopeCheck } from './consumerScope.js'
 import { getTeamFilePath, readTeamFile } from './teamHelpers.js'
 
 /**
@@ -62,7 +64,56 @@ export function computeInitialTeamContext():
     selfAgentName: agentName,
     isLeader,
     teammates: {},
+    consumerScope: context.consumerScope,
   }
+}
+
+/** Last explicit carrier wins, including null, malformed and future versions. */
+export function latestTranscriptConsumerScope(messages: readonly unknown[]): unknown {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (typeof message === 'object' && message !== null && Object.hasOwn(message, 'consumerScope')) {
+      return (message as { consumerScope: unknown }).consumerScope
+    }
+  }
+  return undefined
+}
+
+/** Restore only the original instance under the normal consumption fences. */
+export async function restoreTranscriptConsumerScope(
+  messages: readonly unknown[],
+  ownerSessionId: string,
+  install: (context: NonNullable<AppState['teamContext']>) => void,
+): Promise<ScopeCheck<boolean>> {
+  const parsed = parseConsumerScope(latestTranscriptConsumerScope(messages))
+  if (parsed.status !== 'bound') return parsed
+  const { scope } = parsed
+  // A root transcript may not acquire the identity of an in-process child.
+  // Those recover through their metadata + transcript ID in the runner.
+  if (scope.recipient.kind === 'member' && scope.recipient.backend === 'in-process') return { status: 'stale' }
+  return withConsumerScope(scope, (current, team) => {
+    // The owner may have switched during lock acquisition (/resume). Do not
+    // install a binding validated for a process that no longer owns this turn.
+    if (getSessionId() !== ownerSessionId) return false
+    const member = current.recipient.kind === 'member'
+      ? team.members.find(candidate => candidate.consumerInstanceId === (current.recipient.kind === 'member' ? current.recipient.memberInstanceId : undefined))
+      : undefined
+    if (current.recipient.kind === 'member' && !member) return false
+    if (member) {
+      setDynamicTeamContext({
+        teamName: team.name, agentId: member.agentId, agentName: member.name,
+        planModeRequired: member.planModeRequired ?? false,
+        color: member.color, parentSessionId: current.leadSessionId, consumerScope: current,
+      })
+    }
+    install({
+      teamName: team.name, teamFilePath: getTeamFilePath(team.name),
+      leadAgentId: team.leadAgentId, selfAgentId: member?.agentId,
+      selfAgentName: member?.name, isLeader: current.recipient.kind === 'lead',
+      teammates: {}, consumerScope: current,
+    })
+    return true
+  }, { expectedOwnerSessionId: ownerSessionId })
 }
 
 /**
@@ -72,48 +123,18 @@ export function computeInitialTeamContext():
  * in the transcript. It sets up teamContext in AppState so that heartbeat
  * and other swarm features work correctly.
  */
-export function initializeTeammateContextFromSession(
+export async function initializeTeammateContextFromSession(
   setAppState: (updater: (prev: AppState) => AppState) => void,
   teamName: string,
   agentName: string,
-): void {
-  // Read team file to get lead agent ID
-  const teamFile = readTeamFile(teamName)
-  if (!teamFile) {
-    logError(
-      new Error(
-        `[initializeTeammateContextFromSession] Could not read team file for ${teamName} (agent: ${agentName})`,
-      ),
-    )
-    return
-  }
-
-  // Find the member in the team file to get their agentId
-  const member = teamFile.members.find(m => m.name === agentName)
-  if (!member) {
-    logForDebugging(
-      `[Reconnection] Member ${agentName} not found in team ${teamName} - may have been removed`,
-    )
-  }
-  const agentId = member?.agentId
-
-  const teamFilePath = getTeamFilePath(teamName)
-
-  // Set teamContext in AppState
-  setAppState(prev => ({
-    ...prev,
-    teamContext: {
-      teamName,
-      teamFilePath,
-      leadAgentId: teamFile.leadAgentId,
-      selfAgentId: agentId,
-      selfAgentName: agentName,
-      isLeader: false,
-      teammates: {},
-    },
-  }))
-
-  logForDebugging(
-    `[Reconnection] Initialized agent context from session for ${agentName} in team ${teamName}`,
-  )
+  consumerScope?: unknown,
+  ownerSessionId?: string,
+): Promise<void> {
+  // Names are display/address metadata, never a registration authority.
+  const parsed = parseConsumerScope(consumerScope)
+  if (parsed.status !== 'bound' || !ownerSessionId || parsed.scope.teamName !== teamName ||
+    parsed.scope.recipient.kind !== 'member' || parsed.scope.recipient.agentName !== agentName) return
+  await restoreTranscriptConsumerScope([{ consumerScope }], ownerSessionId, context => {
+    setAppState(prev => ({ ...prev, teamContext: context }))
+  })
 }

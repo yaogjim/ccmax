@@ -81,9 +81,11 @@ import {
 import { fetchSystemPromptParts } from './utils/queryContext.js'
 import { setCwd } from './utils/Shell.js'
 import {
+  captureTranscriptBinding,
   flushSessionStorage,
   recordTranscript,
 } from './utils/sessionStorage.js'
+import { getConsumerScope } from './utils/teammate.js'
 import { asSystemPrompt } from './utils/systemPromptType.js'
 import { resolveThemeSetting } from './utils/systemTheme.js'
 import {
@@ -379,7 +381,10 @@ export class QueryEngine {
       // slash-command processing) keeps the no-op — nothing else calls
       // setMessages past that point.
       setMessages: fn => {
-        this.mutableMessages = fn(this.mutableMessages)
+        const previous = new Set(this.mutableMessages.map(message => message.uuid))
+        const updated = fn(this.mutableMessages)
+        captureTranscriptBinding(updated.filter(message => !previous.has(message.uuid)), getConsumerScope(getAppState().teamContext))
+        this.mutableMessages = updated
       },
       onChangeAPIKey: () => {},
       handleElicitation: this.config.handleElicitation,
@@ -433,7 +438,9 @@ export class QueryEngine {
 
     if (workerAgent && workerPreset && !workerPreset.activated) {
       const { activateTeamWorkerPreset } = await import('./utils/swarm/teamWorkerPreset.js')
-      this.mutableMessages.push(...await activateTeamWorkerPreset(workerAgent, processUserInputContext))
+      const presetMessages = await activateTeamWorkerPreset(workerAgent, processUserInputContext)
+      captureTranscriptBinding(presetMessages, getConsumerScope(getAppState().teamContext))
+      this.mutableMessages.push(...presetMessages)
       workerPreset.activated = true
     }
 
@@ -481,7 +488,9 @@ export class QueryEngine {
       }
     }
 
-    // Push new messages, including user input and any attachments
+    // Push new messages, including user input and any attachments. Capture now,
+    // not when the asynchronous transcript writer eventually runs.
+    captureTranscriptBinding(messagesFromUserInput, getConsumerScope(getAppState().teamContext))
     this.mutableMessages.push(...messagesFromUserInput)
 
     // Update params to reflect updates from processing /slash commands
@@ -770,6 +779,7 @@ export class QueryEngine {
       maxTurns,
       taskBudget,
     }), completeCheckpoint)) {
+      if ('uuid' in message) captureTranscriptBinding([message as Message], getConsumerScope(getAppState().teamContext))
       // Record assistant, user, and compact boundary messages
       if (
         message.type === 'assistant' ||

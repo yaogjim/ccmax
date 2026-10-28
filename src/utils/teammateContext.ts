@@ -14,6 +14,7 @@
  */
 
 import { AsyncLocalStorage } from 'async_hooks'
+import type { ConsumerScope } from './swarm/consumerScope.js'
 
 /**
  * Runtime context for in-process teammates.
@@ -26,6 +27,7 @@ export type TeammateContext = {
   agentName: string
   /** Team name this teammate belongs to */
   teamName: string
+  consumerScope?: ConsumerScope
   /** UI color assigned to this teammate */
   color?: string
   /** Whether teammate must enter plan mode before implementing */
@@ -98,6 +100,7 @@ export function createTeammateContext(config: {
   agentId: string
   agentName: string
   teamName: string
+  consumerScope?: ConsumerScope
   color?: string
   planModeRequired: boolean
   parentSessionId: string

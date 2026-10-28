@@ -32,7 +32,12 @@ import {
   writeToMailbox,
 } from '../teammateMailbox.js'
 import { runInProcessTeammate } from './inProcessRunner.js'
-import { writeTeamFileAsync } from './teamHelpers.js'
+import { registerLeaderToolUseConfirmQueue, unregisterLeaderToolUseConfirmQueue } from './leaderPermissionBridge.js'
+import { mutateTeamFileAsync, readTeamFile, writeTeamFileAsync } from './teamHelpers.js'
+import { memberConsumerScope, type ConsumerScope } from './consumerScope.js'
+import { beginTaskListLifecycle, createTask, getCanonicalTeamTaskListId, listTasks, withTaskListLifecycleLock } from '../tasks.js'
+
+let consumerScope: ConsumerScope
 
 const TEAM = 'runtime-team'
 const NAME = 'worker'
@@ -66,13 +71,24 @@ beforeEach(async () => {
         cwd: configDir,
         subscriptions: [],
         backendType: 'in-process',
+        consumerInstanceId: TRANSCRIPT_ID,
       },
     ],
+  })
+  const team = readTeamFile(TEAM)!
+  const listId = getCanonicalTeamTaskListId(TEAM)
+  const lifecycle = await withTaskListLifecycleLock(listId, () => beginTaskListLifecycle(listId, {
+    teamName: TEAM, createdAt: team.createdAt, leadSessionId: team.leadSessionId!,
+  }))
+  consumerScope = memberConsumerScope({
+    team, generation: lifecycle.generation, ownerSessionId: 'leader-session',
+    backend: 'in-process', agentName: NAME, memberInstanceId: TRANSCRIPT_ID,
   })
 })
 
 afterEach(async () => {
   mock.restore()
+  unregisterLeaderToolUseConfirmQueue()
   drainSdkEvents()
   resetStateForTests()
   if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
@@ -123,6 +139,7 @@ function createFixture(turns: Turn[], options: { leaderAbort?: AbortController }
     planModeRequired: false,
     parentSessionId: 'leader-session',
     resumableAgentId: TRANSCRIPT_ID,
+    consumerScope,
   }
   const task: InProcessTeammateTaskState = {
     id: TASK_ID,
@@ -148,9 +165,11 @@ function createFixture(turns: Turn[], options: { leaderAbort?: AbortController }
   }
   let state = { tasks: { [TASK_ID]: task } } as unknown as AppState
   const idleTransitions: boolean[] = []
+  const observedMessages: Message[] = []
   const setAppState = (updater: (prev: AppState) => AppState) => {
     const before = (state.tasks[TASK_ID] as InProcessTeammateTaskState | undefined)?.isIdle
     state = updater(state)
+    observedMessages.push(...((state.tasks[TASK_ID] as InProcessTeammateTaskState | undefined)?.messages ?? []))
     const after = (state.tasks[TASK_ID] as InProcessTeammateTaskState | undefined)?.isIdle
     if (after !== undefined && after !== before) idleTransitions.push(after)
   }
@@ -180,6 +199,7 @@ function createFixture(turns: Turn[], options: { leaderAbort?: AbortController }
     identity,
     calls,
     idleTransitions,
+    observedMessages,
     getState: () => state,
     /** Input typed into the teammate's view: picked up at its next idle poll */
     queueInput(value: string) {
@@ -218,6 +238,154 @@ function createFixture(turns: Turn[], options: { leaderAbort?: AbortController }
     },
   }
 }
+
+test('a claimed batch is not appended after its consumer is replaced before handoff', async () => {
+  const consumers = await import('./consumerScope.js')
+  const claim = consumers.claimScopedMailbox
+  spyOn(consumers, 'claimScopedMailbox').mockImplementation(async (...args) => {
+    const result = await claim(...args)
+    if (result.status === 'claimed' && result.messages.length > 0) {
+      await mutateTeamFileAsync(TEAM, team => {
+        team.members[0]!.consumerInstanceId = 'replacement'
+      })
+    }
+    return result
+  })
+  const fixture = createFixture([async () => {
+    await writeToMailbox(NAME, { from: 'team-lead', text: 'do-not-append-old-batch', timestamp: 'fixture' }, TEAM)
+    return [text('First turn complete')]
+  }])
+  await fixture.run()
+  expect(fixture.calls).toHaveLength(1)
+  expect(JSON.stringify(fixture.observedMessages)).not.toContain('do-not-append-old-batch')
+  expect(readTeamFile(TEAM)!.members[0]!.consumerInstanceId).toBe('replacement')
+})
+
+test('a late UI permission approval cannot authorize a replaced consumer', async () => {
+  let queue: Array<{ onAllow: (input: Record<string, unknown>, updates: never[]) => Promise<void> }> = []
+  registerLeaderToolUseConfirmQueue(update => { queue = update(queue as never) as never })
+  const fixture = createFixture([async input => {
+    const pending = input.canUseTool(
+      { name: 'fixture_tool', description: async () => 'Fixture permission' } as never,
+      {}, input.toolUseContext, createAssistantMessage({ content: 'Ask permission' }), 'late-ui-permission',
+      { behavior: 'ask', message: 'Confirm fixture' },
+    )
+    while (queue.length === 0) await new Promise(resolve => setTimeout(resolve, 1))
+    const dialog = queue[0]!
+    await mutateTeamFileAsync(TEAM, team => { team.members[0]!.consumerInstanceId = 'replacement' })
+    await dialog.onAllow({}, [])
+    const decision = await pending
+    expect(decision.behavior).not.toBe('allow')
+    return [text('Should not continue')]
+  }])
+  const result = await fixture.run()
+  expect(result.success).toBe(false)
+  expect(result.error).toContain('消费实例')
+  expect(queue).toEqual([])
+})
+
+test('an invalidated UI permission waiter removes only its own dialog and stops', async () => {
+  let queue: unknown[] = []
+  registerLeaderToolUseConfirmQueue(update => { queue = update(queue as never) })
+  const fixture = createFixture([async input => {
+    const pending = input.canUseTool(
+      { name: 'fixture_tool', description: async () => 'Fixture permission' } as never,
+      {}, input.toolUseContext, createAssistantMessage({ content: 'Ask permission' }), 'ui-permission-fixture',
+      { behavior: 'ask', message: 'Confirm fixture' },
+    )
+    while (queue.length === 0) await new Promise(resolve => setTimeout(resolve, 1))
+    await mutateTeamFileAsync(TEAM, team => { team.members[0]!.consumerInstanceId = 'replacement' })
+    await pending
+    return [text('Should not continue')]
+  }])
+  const result = await fixture.run()
+  expect(fixture.abortController.signal.aborted).toBe(false)
+  expect(result.success).toBe(false)
+  expect(result.error).toContain('消费实例')
+  expect(queue).toEqual([])
+})
+
+test('an invalidated permission waiter terminates without waiting for runner abort', async () => {
+  const fixture = createFixture([async input => {
+    const pending = input.canUseTool(
+      { name: 'fixture_tool', description: async () => 'Fixture permission' } as never,
+      {}, input.toolUseContext, createAssistantMessage({ content: 'Ask permission' }), 'permission-fixture',
+      { behavior: 'ask', message: 'Confirm fixture' },
+    )
+    await mutateTeamFileAsync(TEAM, team => {
+      team.members[0]!.consumerInstanceId = 'replacement'
+    })
+    await pending
+    return [text('Should not continue')]
+  }])
+  const result = await fixture.run()
+  expect(fixture.abortController.signal.aborted).toBe(false)
+  expect(result.success).toBe(false)
+  expect(result.error).toContain('消费实例')
+  expect(fixture.calls).toHaveLength(1)
+  expect(readTeamFile(TEAM)!.members[0]!.consumerInstanceId).toBe('replacement')
+})
+
+test('a replaced runner stops before retrying and does not notify the replacement team', async () => {
+  const fixture = createFixture([async () => {
+    await mutateTeamFileAsync(TEAM, team => ({
+      ...team,
+      members: team.members.map(member => ({ ...member, consumerInstanceId: 'replacement', isActive: true })),
+    }))
+    return [apiError('API Error: 529 Overloaded')]
+  }])
+  const result = await fixture.run()
+  expect(fixture.calls).toHaveLength(1)
+  expect(result.success).toBe(false)
+  expect(result.error).toContain('消费实例')
+  expect(await leadNotifications()).toEqual([])
+  expect(readTeamFile(TEAM)!.members[0]).toMatchObject({
+    consumerInstanceId: 'replacement', isActive: true,
+  })
+})
+
+test('a current idle consumer claims follow-up work under the scoped task fence', async () => {
+  const listId = getCanonicalTeamTaskListId(TEAM)
+  await createTask(listId, { subject: 'Prior ownership', description: '', status: 'completed', owner: NAME, blocks: [], blockedBy: [] })
+  const pending = await createTask(listId, { subject: 'Follow-up work', description: '', status: 'pending', blocks: [], blockedBy: [] })
+  const fixture = createFixture([
+    () => [text('Finished')],
+    input => {
+      expect(promptOf(input)).toContain('Follow-up work')
+      fixture.abortController.abort()
+      return [text('Claimed')]
+    },
+  ])
+  expect((await fixture.run()).success).toBe(true)
+  expect(fixture.calls).toHaveLength(2)
+  expect((await listTasks(listId)).find(task => task.id === pending)).toMatchObject({
+    owner: NAME, status: 'in_progress',
+  })
+})
+
+test('an idle consumer invalidated at mailbox read never claims replacement work', async () => {
+  const listId = getCanonicalTeamTaskListId(TEAM)
+  await createTask(listId, { subject: 'Prior ownership', description: '', status: 'completed', owner: NAME, blocks: [], blockedBy: [] })
+  const pending = await createTask(listId, { subject: 'Replacement work', description: '', status: 'pending', blocks: [], blockedBy: [] })
+  const read = spyOn(await import('./consumerScope.js'), 'readScopedMailbox')
+    .mockImplementation(async () => {
+      await mutateTeamFileAsync(TEAM, team => ({
+        ...team,
+        members: team.members.map(member => ({ ...member, consumerInstanceId: 'replacement', isActive: true })),
+      }))
+      return { status: 'stale' }
+    })
+  const fixture = createFixture([() => [text('Finished')]])
+  try {
+    const result = await fixture.run()
+    expect(result.success).toBe(false)
+    expect(fixture.calls).toHaveLength(1)
+    expect((await listTasks(listId)).find(task => task.id === pending)).toMatchObject({ status: 'pending' })
+    expect((await listTasks(listId)).find(task => task.id === pending)?.owner).toBeUndefined()
+  } finally {
+    read.mockRestore()
+  }
+})
 
 describe('in-process teammate compaction', () => {
   function fakeCompaction() {
@@ -575,6 +743,8 @@ describe('in-process teammate transcript', () => {
     expect(first!.recordedUuids).toBeInstanceOf(Set)
     expect(second!.recordedUuids).toBe(first!.recordedUuids)
     expect(first!.extraMetadata).toEqual({
+      consumerScope,
+      parentSessionId: 'leader-session',
       taskKind: 'in_process_teammate',
       teamName: TEAM,
       name: NAME,

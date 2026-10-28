@@ -1,4 +1,5 @@
 ﻿import { getConfiguredProviderOutputBudget, getOutputBudgetHeaders, markOutputBudgetSource } from './outputBudget.js'
+import { consumeRequestAttempt, isRequestBudgetExhausted, type RequestBudget } from './requestBudget.js'
 import { OpenAICodexTurnState } from '../openaiAuth/turnState.js';
 import type {
   BetaContentBlock,
@@ -795,6 +796,9 @@ export type Options = {
   // so the model can pace itself. `remaining` is computed by the caller
   // (query.ts decrements across the agentic loop).
   taskBudget?: { total: number; remaining?: number };
+  // Optional shared attempt budget for one logical operation (compaction).
+  // Charged once per real provider request, including retries and fallbacks.
+  requestBudget?: RequestBudget;
 };
 
 export async function queryModelWithoutStreaming({
@@ -938,6 +942,7 @@ export async function* executeNonStreamingRequest(
     signal: AbortSignal;
     initialConsecutive529Errors?: number;
     querySource?: QuerySource;
+    requestBudget?: RequestBudget;
   },
   paramsFromContext: (context: RetryContext) => BetaMessageStreamParams,
   onAttempt: (attempt: number, start: number, maxOutputTokens: number) => void,
@@ -1014,6 +1019,7 @@ export async function* executeNonStreamingRequest(
       signal: retryOptions.signal,
       initialConsecutive529Errors: retryOptions.initialConsecutive529Errors,
       querySource: retryOptions.querySource,
+      requestBudget: retryOptions.requestBudget,
     },
   );
 
@@ -1139,6 +1145,8 @@ async function* queryModel(
 > {
   if (getAPIProvider() === "azureOpenAI") {
     try {
+      if (signal.aborted) throw new APIUserAbortError();
+      consumeRequestAttempt(options.requestBudget);
       const systemText = systemPrompt.join("\n");
       const maxOutputTokens =
         options.maxOutputTokensOverride ??
@@ -1179,6 +1187,13 @@ async function* queryModel(
 
       yield assistantMessage;
     } catch (error) {
+      // Same contract as the main path below: a spent request budget is
+      // terminal for the logical operation that owns it. Yielding a synthetic
+      // API-error message here would let compact/query read the refusal as a
+      // model response and dispatch again.
+      if (isRequestBudgetExhausted(error)) {
+        throw error;
+      }
       yield getAssistantMessageFromError(error, options.model, { messages });
     }
     return;
@@ -2103,6 +2118,7 @@ async function* queryModel(
         ...(isFastModeEnabled() ? { fastMode: isFastMode } : false),
         signal,
         querySource: options.querySource,
+        requestBudget: options.requestBudget,
       },
     );
 
@@ -3170,6 +3186,7 @@ async function* queryModel(
           signal,
           initialConsecutive529Errors: is529Error(streamingError) ? 1 : 0,
           querySource: options.querySource,
+          requestBudget: options.requestBudget,
         },
         paramsFromContext,
         (attempt, _startTime, tokens) => {
@@ -3209,6 +3226,13 @@ async function* queryModel(
       clearStreamIdleTimers();
     }
   } catch (errorFromRetry) {
+    // A spent request budget is terminal for the logical operation that owns
+    // it. Yielding a synthetic API-error message would make compact/query treat
+    // the refusal as a model response and issue yet another request.
+    if (isRequestBudgetExhausted(errorFromRetry)) {
+      throw errorFromRetry
+    }
+
     // FallbackTriggeredError must propagate to query.ts, which performs the
     // actual model switch. Swallowing it here would turn the fallback into a
     // no-op — the user would just see "Model fallback triggered: X -> Y" as
@@ -3278,6 +3302,7 @@ async function* queryModel(
             thinkingConfig,
             ...(isFastModeEnabled() && { fastMode: isFastMode }),
             signal,
+            requestBudget: options.requestBudget,
           },
           paramsFromContext,
           (attempt, _startTime, tokens) => {
@@ -3314,6 +3339,11 @@ async function* queryModel(
       } catch (fallbackError) {
         // Propagate model-fallback signal to query.ts (see comment above).
         if (fallbackError instanceof FallbackTriggeredError) {
+          throw fallbackError;
+        }
+
+        // Budget refusals are owned by the caller, never rewritten as text.
+        if (isRequestBudgetExhausted(fallbackError)) {
           throw fallbackError;
         }
 

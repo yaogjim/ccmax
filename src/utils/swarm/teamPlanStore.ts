@@ -48,8 +48,11 @@ export function validateTeamPlanGraph(plan: Pick<TeamPlanRecord, 'members' | 'ta
   const names = new Set(plan.members.map(member => member.name))
   const tasks = new Map(plan.tasks.map(task => [task.id, task]))
   if (memberIds.size !== plan.members.length || names.size !== plan.members.length || tasks.size !== plan.tasks.length) throw new TeamPlanError('Member names and IDs and task IDs must be unique', 400)
-  if (runnable && (plan.members.length === 0 || plan.tasks.length === 0)) throw new TeamPlanError('Plan needs members and assigned tasks', 400)
-  if (runnable && plan.members.some(member => !plan.tasks.some(task => task.ownerId === member.id))) throw new TeamPlanError('Every member needs an assigned task', 400)
+  // The approval authorizes roles and scope, not a task per member: an
+  // approved member may stand by with no task and be started later by a ready
+  // task or an explicit instruction. Tasks that do exist must still name a
+  // member of this plan, and an empty roster still cannot be approved.
+  if (runnable && plan.members.length === 0) throw new TeamPlanError('Plan needs members', 400)
   const visiting = new Set<string>(), visited = new Set<string>()
   const visit = (id: string) => {
     if (visited.has(id)) return

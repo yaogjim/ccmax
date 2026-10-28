@@ -1,17 +1,25 @@
 import { spawn, type ChildProcess, type SpawnOptions } from 'child_process'
-import type { Duplex } from 'stream'
 
-// Keep the guardian outside the target shell's job table: a command's bare
-// `wait` must not wait for our lifetime watcher. Arguments reach the original
-// shell unchanged, including login flags and sandbox command wrappers.
+// The watcher is a job of this supervisor, never of the target shell: a
+// command's bare `wait` must not wait for its lifetime watcher. Observe PIDs
+// rather than an extra stdio pipe, which Bun can close during file-fd reuse.
 const PARENT_PROCESS_GUARD = `
+runtime_pid=$1
+shift
+supervisor_pid=$$
 (
-  if ! IFS= read -r lifetime <&3; then
-    kill -KILL "-$$"
-  fi
+  poller=
+  trap 'if [ -n "$poller" ]; then kill "$poller" 2>/dev/null || :; wait "$poller" 2>/dev/null || :; fi; exit 0' TERM INT HUP
+  while kill -0 "$runtime_pid" 2>/dev/null && kill -0 "$supervisor_pid" 2>/dev/null; do
+    sleep 0.1 &
+    poller=$!
+    wait "$poller" 2>/dev/null || :
+    poller=
+  done
+  kill -KILL "-$supervisor_pid" 2>/dev/null || :
 ) </dev/null >/dev/null 2>&1 &
 lifetime_guard=$!
-"$@" 3<&-
+"$@"
 lifetime_status=$?
 kill "$lifetime_guard" 2>/dev/null || :
 wait "$lifetime_guard" 2>/dev/null || :
@@ -27,25 +35,12 @@ export function spawnWithParentProcessGuard(
   // behavior; callers must not infer that a runtime crash killed its children.
   if (process.platform === 'win32') return spawn(command, args, options)
 
-  const stdio = Array.isArray(options.stdio)
-    ? [...options.stdio]
-    : Array(3).fill(options.stdio ?? 'pipe')
-  stdio[3] = 'pipe'
-  const child = spawn('/bin/sh', [
-    '-c', PARENT_PROCESS_GUARD, 'cc-haha-shell-lifetime', command, ...args,
+  return spawn('/bin/sh', [
+    '-c', PARENT_PROCESS_GUARD, 'ccmax-shell-lifetime', String(process.pid), command, ...args,
   ], {
     ...options,
+    // The supervisor must lead a private process group so watcher and caller
+    // cancellation can reap this command without touching the runtime group.
     detached: true,
-    stdio,
   })
-
-  // The CLI owns the pipe's write end. Even SIGKILL closes it in the kernel,
-  // so EOF reaps this command's group without depending on SDK task_started,
-  // a model loop, or graceful cleanup. Normal completion kills and waits for
-  // the guardian in the supervisor before returning the original exit code.
-  const lifetimePipe = child.stdio[3] as Duplex | null
-  const release = () => lifetimePipe?.destroy()
-  child.once('exit', release)
-  child.once('error', release)
-  return child
 }

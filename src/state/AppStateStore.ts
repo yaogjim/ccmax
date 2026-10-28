@@ -30,6 +30,7 @@ import type { EffortValue } from '../utils/effort.js'
 import type { FileHistoryState } from '../utils/fileHistory.js'
 import type { REPLHookContext } from '../utils/hooks/postSamplingHooks.js'
 import type { SessionHooksState } from '../utils/hooks/sessionHooks.js'
+import type { ConsumerScope } from '../utils/swarm/consumerScope.js'
 import type { ModelSetting } from '../utils/model/model.js'
 import type { DenialTrackingState } from '../utils/permissions/denialTracking.js'
 import type { PermissionMode } from '../utils/permissions/PermissionMode.js'
@@ -324,6 +325,13 @@ export type AppState = DeepImmutable<{
     teamName: string
     teamFilePath: string
     leadAgentId: string
+    /**
+     * The team/member instance this session was bound to when it was created,
+     * registered or verifiably restored. Mailbox consumers check it; they never
+     * derive it from the current team file, which may describe a same-named
+     * replacement. Absent means this session may not consume automatically.
+     */
+    consumerScope?: ConsumerScope
     // Self-identity for swarm members (separate processes in tmux panes)
     // Note: This is different from toolUseContext.agentId which is for in-process subagents
     selfAgentId?: string // Swarm member's own ID (same as leadAgentId for leaders)
@@ -355,6 +363,7 @@ export type AppState = DeepImmutable<{
       text: string
       timestamp: string
       status: 'pending' | 'processing' | 'processed'
+      consumerScope?: ConsumerScope
       color?: string
       summary?: string
     }>

@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -308,6 +308,24 @@ const ENV_KEYS = [
   'CLAUDE_STREAM_TOOL_INPUT_MAX_DURATION_MS',
 ] as const
 
+type ActiveQueryRequest = {
+  abort: () => void
+  restore: () => Promise<void>
+}
+
+// Bun abandons a test's awaited work once it exceeds its timeout, so the async
+// `finally` below may never run. This hook restores the process-wide environment
+// and cancels the in-flight loopback request from outside the timed-out test.
+let activeQueryRequest: ActiveQueryRequest | undefined
+
+afterEach(() => {
+  const active = activeQueryRequest
+  activeQueryRequest = undefined
+  if (!active) return
+  active.abort()
+  void active.restore()
+})
+
 async function captureQueryRequest({
   model,
   pinnedModel,
@@ -368,6 +386,30 @@ async function captureQueryRequest({
   const globals = globalThis as typeof globalThis & { MACRO?: { BUILD_TIME: string } }
   const originalMacro = globals.MACRO
   const originalIsInteractive = getIsInteractive()
+  const controller = new AbortController()
+  let restored = false
+  const restore = async () => {
+    // Also runs from the abandoned test's `finally` after `afterEach` already
+    // restored, which must not overwrite the next test's environment.
+    if (restored) return
+    restored = true
+    for (const key of envKeys) {
+      const value = originalEnv[key]
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    if (originalMacro === undefined) delete globals.MACRO
+    else globals.MACRO = originalMacro
+    setIsInteractive(originalIsInteractive)
+    server.stop(true)
+    clearCapabilityCache()
+    await rm(configDir, { recursive: true, force: true }).catch(() => {})
+  }
+  const active: ActiveQueryRequest = {
+    abort: () => controller.abort(),
+    restore,
+  }
+  activeQueryRequest = active
 
   try {
     globals.MACRO = { BUILD_TIME: '' }
@@ -375,12 +417,6 @@ async function captureQueryRequest({
     process.env.NODE_ENV = 'production'
     process.env.HOME = configDir
     process.env.CLAUDE_CONFIG_DIR = configDir
-    if (globalThinkingEnabled !== undefined) {
-      await writeFile(
-        join(configDir, 'settings.json'),
-        JSON.stringify({ alwaysThinkingEnabled: globalThinkingEnabled }),
-      )
-    }
     delete process.env.CLAUDE_CODE_USE_BEDROCK
     delete process.env.CLAUDE_CODE_USE_VERTEX
     delete process.env.CLAUDE_CODE_USE_FOUNDRY
@@ -408,6 +444,14 @@ async function captureQueryRequest({
       if (value === undefined) delete process.env[key]
       else process.env[key] = value
     }
+    // Keep this the last await before the query: a timed-out test must not
+    // resume and write environment variables after `afterEach` restored them.
+    if (globalThinkingEnabled !== undefined) {
+      await writeFile(
+        join(configDir, 'settings.json'),
+        JSON.stringify({ alwaysThinkingEnabled: globalThinkingEnabled }),
+      )
+    }
     clearCapabilityCache()
     enableConfigs()
 
@@ -433,7 +477,7 @@ async function captureQueryRequest({
             ? { type: 'disabled' }
             : { type: 'enabled', budgetTokens: thinkingBudget },
           tools: [],
-          signal: new AbortController().signal,
+          signal: controller.signal,
           options: {
             ...options,
             enablePromptCaching: false,
@@ -448,7 +492,7 @@ async function captureQueryRequest({
     } else {
       result = await queryWithModel({
         userPrompt: 'Reply exactly OK',
-        signal: new AbortController().signal,
+        signal: controller.signal,
         options,
       })
     }
@@ -462,17 +506,8 @@ async function captureQueryRequest({
       requestHeaders,
     }
   } finally {
-    for (const key of envKeys) {
-      const value = originalEnv[key]
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
-    if (originalMacro === undefined) delete globals.MACRO
-    else globals.MACRO = originalMacro
-    setIsInteractive(originalIsInteractive)
-    server.stop(true)
-    clearCapabilityCache()
-    await rm(configDir, { recursive: true, force: true })
+    if (activeQueryRequest === active) activeQueryRequest = undefined
+    await restore()
   }
 }
 

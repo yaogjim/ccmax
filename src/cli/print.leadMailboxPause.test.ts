@@ -67,6 +67,7 @@ const { setIsInteractive, getIsInteractive } = await import(
   '../bootstrap/state.js'
 )
 const mailbox = await import('../utils/teammateMailbox.js')
+const { createLeadMailboxFixture } = await import('./__tests__/leadMailboxFixture.js')
 const { SHUTDOWN_TEAM_PROMPT } = await import(
   '../utils/swarm/teamShutdownPrompt.js'
 )
@@ -91,7 +92,8 @@ beforeEach(() => {
   clearCommandQueue()
 })
 
-function startLead(team: string, options: { inProcessTeammate?: boolean } = {}) {
+async function startLead(team: string, options: { inProcessTeammate?: boolean } = {}) {
+  const consumerScope = await createLeadMailboxFixture(team)
   const defaults = getDefaultAppState()
   const inProcessTeammate = options.inProcessTeammate === true
   let state = {
@@ -100,6 +102,7 @@ function startLead(team: string, options: { inProcessTeammate?: boolean } = {}) 
       ? undefined
       : {
           teamName: team,
+          consumerScope,
           teamFilePath: join(home, 'teams', team, 'config.json'),
           leadAgentId: LEAD_ID,
           teammates: {
@@ -193,29 +196,29 @@ async function until(done: () => boolean, ms = 10_000): Promise<void> {
   expect(done()).toBe(true)
 }
 
-async function report(team: string, text: string): Promise<void> {
+async function report(team: string, text: string, id: string): Promise<void> {
   expect(
     await mailbox.writeToMailbox(
       'team-lead',
-      { from: 'worker', text, timestamp: new Date().toISOString() },
+      { id, from: 'worker', text, timestamp: new Date().toISOString() },
       team,
     ),
   ).toBe(true)
 }
 
-const delivered = (text: string) =>
-  `<teammate-message teammate_id="worker">\n${text}\n</teammate-message>`
+const delivered = (text: string, id: string) =>
+  `<teammate-message teammate_id="worker" id="${id}">\n${text}\n</teammate-message>`
 
 test('a team pause keeps teammate mail from starting lead turns until the user speaks again', async () => {
   const team = 'pause-team'
-  const lead = startLead(team)
+  const lead = await startLead(team)
   try {
     lead.say('start')
     await until(() => prompts.length === 1)
     await lead.control('team_plan_pause')
 
     // A report a member wrote before the Stop killed it.
-    await report(team, 'halfway done')
+    await report(team, 'halfway done', 'client-pause-halfway')
     // Several poll intervals: the lead must not act on its own.
     await Bun.sleep(1_500)
     expect(prompts).toEqual(['start'])
@@ -223,7 +226,11 @@ test('a team pause keeps teammate mail from starting lead turns until the user s
 
     lead.say('continue')
     await until(() => prompts.length === 3)
-    expect(prompts).toEqual(['start', 'continue', delivered('halfway done')])
+    expect(prompts).toEqual([
+      'start',
+      'continue',
+      delivered('halfway done', 'client-pause-halfway'),
+    ])
   } finally {
     await lead.close()
   }
@@ -231,15 +238,18 @@ test('a team pause keeps teammate mail from starting lead turns until the user s
 
 test('a plain interrupt keeps delivering teammate mail between turns', async () => {
   const team = 'interrupt-team'
-  const lead = startLead(team)
+  const lead = await startLead(team)
   try {
     lead.say('start')
     await until(() => prompts.length === 1)
     await lead.control('interrupt')
 
-    await report(team, 'done')
+    await report(team, 'done', 'client-interrupt-done')
     await until(() => prompts.length === 2)
-    expect(prompts).toEqual(['start', delivered('done')])
+    expect(prompts).toEqual([
+      'start',
+      delivered('done', 'client-interrupt-done'),
+    ])
   } finally {
     await lead.close()
   }
@@ -247,7 +257,7 @@ test('a plain interrupt keeps delivering teammate mail between turns', async () 
 
 test('a closing lead asks a lingering team to shut down once, then closes when it exits', async () => {
   const team = 'shutdown-once-team'
-  const lead = startLead(team, { inProcessTeammate: true })
+  const lead = await startLead(team, { inProcessTeammate: true })
   onShutdownGuard = () => lead.finishInProcessTeammate()
   try {
     lead.holdFirstTurn()
@@ -276,7 +286,7 @@ test('a closing lead asks a lingering team to shut down once, then closes when i
 
 test('a closing lead asks a host-paused team to shut down once, then closes when it exits', async () => {
   const team = 'shutdown-once-held-team'
-  const lead = startLead(team)
+  const lead = await startLead(team)
   onShutdownGuard = () => lead.finishTeam()
   try {
     lead.holdFirstTurn()

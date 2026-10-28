@@ -42,6 +42,16 @@ import {
   withInProcessTeammateActivity,
 } from './inProcessRunner.js'
 import * as teamHelpers from './teamHelpers.js'
+import { memberConsumerScope } from './consumerScope.js'
+import { beginTaskListLifecycle, getCanonicalTeamTaskListId, withTaskListLifecycleLock } from '../tasks.js'
+
+function activityScope(teamName: string) {
+  return memberConsumerScope({
+    team: { name: teamName, createdAt: 10, leadSessionId: 'leader-session' },
+    generation: 1, ownerSessionId: 'leader-session', backend: 'in-process',
+    agentName: 'worker', memberInstanceId: 'activity-instance',
+  })
+}
 import {
   readTeamFile,
   type TeamFile,
@@ -859,7 +869,7 @@ describe('in-process teammate activity synchronization', () => {
   test('synchronizes active and idle turn transitions to the team roster', async () => {
     await withTempConfig(async () => {
       const teamName = 'activity-team'
-      const member = createMember('worker', teamName)
+      const member = { ...createMember('worker', teamName), consumerInstanceId: 'activity-instance' }
       await writeTeamFileAsync(teamName, {
         name: teamName,
         createdAt: Date.now(),
@@ -868,7 +878,7 @@ describe('in-process teammate activity synchronization', () => {
       })
 
       await expect(withInProcessTeammateActivity(
-        { agentName: member.name, teamName },
+        { agentName: member.name, teamName, consumerScope: activityScope(teamName) },
         async () => {
           expect(readTeamFile(teamName)?.members[0]?.isActive).toBe(true)
           throw new Error('turn failed')
@@ -888,7 +898,7 @@ describe('in-process teammate activity synchronization', () => {
 
     try {
       await expect(withInProcessTeammateActivity(
-        { agentName: 'worker', teamName: 'activity-team' },
+        { agentName: 'worker', teamName: 'activity-team', consumerScope: activityScope('activity-team') },
         async () => 'turn completed',
       )).resolves.toBe('turn completed')
       expect(setMemberActive).toHaveBeenCalledTimes(2)
@@ -914,7 +924,7 @@ describe('in-process teammate activity synchronization', () => {
         planModeRequired: false,
         parentSessionId: 'leader-session',
       }
-      const member = createMember(agentName, teamName)
+      const member = { ...createMember(agentName, teamName), consumerInstanceId: 'first-turn-instance' }
       const teamFile: TeamFile = {
         name: teamName,
         createdAt: Date.now(),
@@ -923,6 +933,14 @@ describe('in-process teammate activity synchronization', () => {
         members: [member],
       }
       await writeTeamFileAsync(teamName, teamFile)
+      const listId = getCanonicalTeamTaskListId(teamName)
+      const lifecycle = await withTaskListLifecycleLock(listId, () => beginTaskListLifecycle(listId, {
+        teamName, createdAt: teamFile.createdAt, leadSessionId: identity.parentSessionId,
+      }))
+      identity.consumerScope = memberConsumerScope({
+        team: teamFile, generation: lifecycle.generation, ownerSessionId: identity.parentSessionId,
+        backend: 'in-process', agentName, memberInstanceId: member.consumerInstanceId,
+      })
       await createTask(teamName, {
         subject: 'Earlier explicit assignment',
         description: 'Makes an accidental first-turn claim observable',

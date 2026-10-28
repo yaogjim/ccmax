@@ -232,21 +232,24 @@ import { memoryAge, memoryFreshnessText } from '../memdir/memoryAge.js'
 import { getAutoMemPath, isAutoMemoryEnabled } from '../memdir/paths.js'
 import { getAgentMemoryDir } from '../tools/AgentTool/agentMemory.js'
 import {
-  readUnreadMessages,
-  claimMailboxMessages,
-  isShutdownApproved,
   isStructuredProtocolMessage,
   isIdleNotification,
 } from './teammateMailbox.js'
 import {
+  claimScopedMailbox,
+  consumerInboxName,
+  readScopedMailbox,
+  sameConsumerScope,
+  withConsumerScope,
+  type ConsumerScope,
+} from './swarm/consumerScope.js'
+import {
+  getConsumerScope,
   getAgentName,
   getAgentId,
   getTeamName,
-  isTeamLead,
 } from './teammate.js'
 import { isInProcessTeammate } from './teammateContext.js'
-import { removeTeammateFromTeamFile } from './swarm/teamHelpers.js'
-import { unassignTeammateTasks } from './tasks.js'
 import { getCompanionIntroAttachment } from '../buddy/prompt.js'
 
 export const TODO_REMINDER_CONFIG = {
@@ -729,9 +732,38 @@ export type Attachment =
       sample: string
     }
 
+// 在调用者的输入列表同步接纳；generator yield 必须发生在锁释放之后。
+export async function acceptAttachmentMessage(
+  message: AttachmentMessage,
+  accept: (message: AttachmentMessage) => void,
+): Promise<boolean> {
+  if (message.attachment.type !== 'teammate_mailbox') {
+    accept(message)
+    return true
+  }
+  const result = await withConsumerScope(message.attachment.consumerScope, () => {
+    accept(message)
+    return true
+  })
+  return result.status === 'current' && result.value
+}
+
+export async function collectAcceptedAttachments(
+  source: AsyncIterable<AttachmentMessage>,
+): Promise<AttachmentMessage[]> {
+  const messages: AttachmentMessage[] = []
+  for await (const message of source) {
+    await acceptAttachmentMessage(message, accepted => { messages.push(accepted) })
+  }
+  return messages
+}
+
 export type TeammateMailboxAttachment = {
   type: 'teammate_mailbox'
+  consumerScope?: ConsumerScope
   messages: Array<{
+    /** Stable mailbox envelope id; legacy records may not have one. */
+    id?: string
     from: string
     text: string
     timestamp: string
@@ -3682,31 +3714,14 @@ export async function getTeammateMailboxAttachments(
   // Get AppState early to check for team lead status
   const appState = toolUseContext.getAppState()
 
-  // Use agent name from helper (checks AsyncLocalStorage, then dynamicTeamContext)
-  const envAgentName = getAgentName()
-
-  // Get team name (checks AsyncLocalStorage, dynamicTeamContext, then AppState)
-  const teamName = getTeamName(appState.teamContext)
-
-  // Check if we're the team lead (uses shared logic from swarm utils)
-  const teamLeadStatus = isTeamLead(appState.teamContext)
-
-  // Check if viewing a teammate's transcript (for in-process teammates)
   const viewedTeammate = getViewedTeammateTask(appState)
-
-  // Resolve agent name based on who we're VIEWING:
-  // - If viewing a teammate, use THEIR name (to read from their mailbox)
-  // - Otherwise use env var if set, or leader's name if we're the team lead
-  let agentName = viewedTeammate?.identity.agentName ?? envAgentName
-  if (!agentName && teamLeadStatus && appState.teamContext) {
-    const leadAgentId = appState.teamContext.leadAgentId
-    // Look up the lead's name from agents map (not the UUID)
-    agentName = appState.teamContext.teammates[leadAgentId]?.name || 'team-lead'
-  }
-
-  logForDebugging(
-    `[SwarmMailbox] getTeammateMailboxAttachments called: envAgentName=${envAgentName}, isTeamLead=${teamLeadStatus}, resolved agentName=${agentName}, teamName=${teamName}`,
-  )
+  // 地址与身份必须来自同一个载体，不能混用 viewed name 和 lead team。
+  const scope = viewedTeammate
+    ? viewedTeammate.identity.consumerScope
+    : getConsumerScope(appState.teamContext)
+  if (!scope) return []
+  const agentName = consumerInboxName(scope)
+  const teamName = scope.teamName
 
   // Only check inbox if running as an agent in a swarm or team lead
   if (!agentName) {
@@ -3727,7 +3742,9 @@ export async function getTeammateMailboxAttachments(
   // attachment generation races with InboxPoller: whichever reads first marks all
   // messages as read, and if attachments wins, protocol messages get bundled as raw
   // LLM context text instead of being routed to their UI handlers.
-  const allUnreadMessages = await readUnreadMessages(agentName, teamName)
+  const read = await readScopedMailbox(scope)
+  if (read.status !== 'current') return []
+  const allUnreadMessages = read.value
   const unreadCandidates = allUnreadMessages.filter(
     m => !isStructuredProtocolMessage(m.text),
   )
@@ -3736,11 +3753,9 @@ export async function getTeammateMailboxAttachments(
   // can never deliver one of them a second time, and mail that arrives after
   // the read stays unread. A failed claim attaches nothing; the messages
   // remain unread for the next pass.
-  const unreadMessages =
-    unreadCandidates.length > 0
-      ? ((await claimMailboxMessages(agentName, teamName, unreadCandidates)) ??
-        [])
-      : []
+  const claimed = await claimScopedMailbox(scope, unreadCandidates)
+  if (claimed.status !== 'claimed') return []
+  const unreadMessages = claimed.messages
   logForDebugging(
     `[MailboxBridge] Found ${allUnreadMessages.length} unread message(s) for "${agentName}" (${allUnreadMessages.length - unreadCandidates.length} structured protocol messages filtered out, ${unreadMessages.length} claimed)`,
   )
@@ -3757,7 +3772,9 @@ export async function getTeammateMailboxAttachments(
   const pendingInboxMessages =
     viewedTeammate || isInProcessTeammate()
       ? [] // Viewing teammate or running as in-process teammate - don't show leader's inbox
-      : appState.inbox.messages.filter(m => m.status === 'pending')
+      : appState.inbox.messages.filter(m =>
+          m.status === 'pending' && !isStructuredProtocolMessage(m.text) &&
+          sameConsumerScope(m.consumerScope, scope))
   logForDebugging(
     `[SwarmMailbox] Found ${pendingInboxMessages.length} pending message(s) in AppState.inbox`,
   )
@@ -3767,9 +3784,11 @@ export async function getTeammateMailboxAttachments(
   // 1. getTeammateMailboxAttachments reads file -> finds message M
   // 2. InboxPoller reads same file -> queues M in AppState.inbox
   // 3. getTeammateMailboxAttachments reads AppState -> finds M again
-  // We deduplicate using from+timestamp+text prefix as the key
+  // Envelope identity is authoritative; only legacy messages without an id
+  // fall back to sender, timestamp and text. Separate sends can be identical.
   const seen = new Set<string>()
   let allMessages: Array<{
+    id?: string
     from: string
     text: string
     timestamp: string
@@ -3778,10 +3797,17 @@ export async function getTeammateMailboxAttachments(
   }> = []
 
   for (const m of [...unreadMessages, ...pendingInboxMessages]) {
-    const key = `${m.from}|${m.timestamp}|${m.text.slice(0, 100)}`
+    const key = m.id
+      ? `id:${m.id}`
+      : `legacy:${m.from}|${m.timestamp}|${m.text.slice(0, 100)}`
     if (!seen.has(key)) {
       seen.add(key)
       allMessages.push({
+        // The envelope id is what lets the desktop correlate the injected
+        // transcript echo with the send that produced it; `messages.ts`
+        // formats it as the `id` attribute. Legacy records have none, so the
+        // key is omitted rather than rendered as an empty attribute.
+        ...(m.id ? { id: m.id } : {}),
         from: m.from,
         text: m.text,
         timestamp: m.timestamp,
@@ -3830,65 +3856,12 @@ export async function getTeammateMailboxAttachments(
   const attachment: Attachment[] = [
     {
       type: 'teammate_mailbox',
+      consumerScope: scope,
       messages: allMessages,
     },
   ]
 
-  // Process shutdown_approved messages - remove teammates from team file
-  // This mirrors what useInboxPoller does in interactive mode (lines 546-606)
-  // In -p mode, useInboxPoller doesn't run, so we must handle this here
-  if (teamLeadStatus && teamName) {
-    for (const m of allMessages) {
-      const shutdownApproval = isShutdownApproved(m.text)
-      if (shutdownApproval) {
-        const teammateToRemove = shutdownApproval.from
-        logForDebugging(
-          `[SwarmMailbox] Processing shutdown_approved from ${teammateToRemove}`,
-        )
-
-        // Find the teammate ID by name
-        const teammateId = appState.teamContext?.teammates
-          ? Object.entries(appState.teamContext.teammates).find(
-              ([, t]) => t.name === teammateToRemove,
-            )?.[0]
-          : undefined
-
-        if (teammateId) {
-          // Remove from team file
-          await removeTeammateFromTeamFile(teamName, {
-            agentId: teammateId,
-            name: teammateToRemove,
-          })
-          logForDebugging(
-            `[SwarmMailbox] Removed ${teammateToRemove} from team file`,
-          )
-
-          // Unassign tasks owned by this teammate
-          await unassignTeammateTasks(
-            teamName,
-            teammateId,
-            teammateToRemove,
-            'shutdown',
-          )
-
-          // Remove from teamContext in AppState
-          toolUseContext.setAppState(prev => {
-            if (!prev.teamContext?.teammates) return prev
-            if (!(teammateId in prev.teamContext.teammates)) return prev
-            const { [teammateId]: _, ...remainingTeammates } =
-              prev.teamContext.teammates
-            return {
-              ...prev,
-              teamContext: {
-                ...prev.teamContext,
-                teammates: remainingTeammates,
-              },
-            }
-          })
-        }
-      }
-    }
-  }
+  // 协议消息由所属 poller 处理，附件路径不执行 shutdown 等控制副作用。
 
   // Mark AppState inbox messages as processed LAST, after attachment is built
   // This ensures messages aren't lost if earlier operations fail

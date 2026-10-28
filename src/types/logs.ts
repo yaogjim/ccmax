@@ -219,6 +219,7 @@ export type AttributionSnapshotMessage = {
 }
 
 export type TranscriptMessage = SerializedMessage & {
+  consumerScope?: unknown
   parentUuid: UUID | null
   logicalParentUuid?: UUID | null // Preserves logical parent when parentUuid is nullified for session breaks
   isSidechain: boolean

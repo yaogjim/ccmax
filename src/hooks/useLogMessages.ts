@@ -72,8 +72,11 @@ export function useLogMessages(messages: Message[], ignore: boolean = false) {
         ? {
             teamName: teamContext?.teamName,
             agentName: teamContext?.selfAgentName,
+            // New messages carry the scope captured at admission. Never stamp
+            // the render's current binding onto uncaptured historical messages.
+            consumerScope: null,
           }
-        : {},
+        : { consumerScope: null },
       parentHint,
       messages,
     ).then(lastRecordedUuid => {

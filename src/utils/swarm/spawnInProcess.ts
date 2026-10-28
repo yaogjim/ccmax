@@ -43,7 +43,9 @@ import {
   unregisterAgent as unregisterPerfettoAgent,
 } from '../telemetry/perfettoTracing.js'
 import { createAgentId } from '../uuid.js'
-import { removeMemberByAgentId } from './teamHelpers.js'
+import { removeScopedMember, withConsumerScope, type ConsumerScope } from './consumerScope.js'
+import { writeAgentMetadata } from '../sessionStorage.js'
+import { asAgentId } from '../../types/ids.js'
 import { isTeamReviewRequired } from './teamPlanPolicy.js'
 import { readTeamPlan } from './teamPlanStore.js'
 
@@ -74,9 +76,14 @@ export type InProcessSpawnConfig = {
   planModeRequired: boolean
   /** Optional model override for this teammate */
   model?: string
+  /** The consumer identity the roster entry for this spawn was registered
+   * with. Absent when the caller could not bind one, in which case the runner
+   * reads no mail rather than falling back to the name. */
+  consumerScope?: ConsumerScope
   /** Set when resuming a teammate: the agent id of its existing transcript.
    * A fresh spawn gets a new one and starts with an empty inbox. */
   resumableAgentId?: string
+  isResume?: boolean
   /** Permission mode to resume with; defaults from planModeRequired. */
   permissionMode?: PermissionMode
 }
@@ -118,6 +125,7 @@ export async function spawnInProcessTeammate(
   context: SpawnContext,
 ): Promise<InProcessSpawnOutput> {
   const { name, teamName, prompt, color, planModeRequired, model } = config
+  const consumerScope = config.consumerScope
   const { setAppState } = context
   if (isTeamReviewRequired() || await readTeamPlan(teamName)) {
     return { success: false, agentId: formatAgentId(name, teamName), error: 'Reviewed teams must start from the approved server snapshot, never the in-process backend.' }
@@ -132,10 +140,23 @@ export async function spawnInProcessTeammate(
   )
 
   try {
-    // A new teammate must not read mail left for an earlier one with this
-    // name; a resumed teammate keeps whatever arrived while it was stopped.
-    if (config.resumableAgentId === undefined) {
-      await clearMailbox(name, teamName)
+    const resumableAgentId = config.resumableAgentId ?? createAgentId()
+    const prepared = await withConsumerScope(consumerScope, async scope => {
+      if (scope.recipient.kind !== 'member' || scope.recipient.backend !== 'in-process' ||
+        scope.recipient.memberInstanceId !== resumableAgentId) return false
+      // 新建清除保留邮箱必须和实例校验共用锁，晚到启动不得清新实例邮件。
+      if (!(config.isResume ?? config.resumableAgentId !== undefined)) {
+        await clearMailbox(name, teamName)
+      }
+      await writeAgentMetadata(asAgentId(resumableAgentId), {
+        agentType: 'teammate', taskKind: 'in_process_teammate', teamName, name,
+        parentSessionId: scope.ownerSessionId, consumerScope: scope,
+        color, planModeRequired, permissionMode: config.permissionMode,
+      })
+      return true
+    })
+    if (prepared.status !== 'current' || !prepared.value) {
+      throw new Error(`消费实例 ${prepared.status}，启动已停止；历史仍可查看`)
     }
 
     // Create independent AbortController for this teammate
@@ -153,7 +174,8 @@ export async function spawnInProcessTeammate(
       color,
       planModeRequired,
       parentSessionId,
-      resumableAgentId: config.resumableAgentId ?? createAgentId(),
+      resumableAgentId,
+      ...(consumerScope ? { consumerScope } : {}),
     }
 
     // Create teammate context for AsyncLocalStorage
@@ -166,6 +188,7 @@ export async function spawnInProcessTeammate(
       planModeRequired,
       parentSessionId,
       abortController,
+      ...(consumerScope ? { consumerScope } : {}),
     })
 
     // Register agent in Perfetto trace for hierarchy visualization
@@ -253,7 +276,7 @@ export async function killInProcessTeammate(
   setAppState: SetAppStateFn,
 ): Promise<boolean> {
   let killed = false
-  let teamName: string | null = null
+  let consumerScope: ConsumerScope | undefined
   let agentId: string | null = null
   let toolUseId: string | undefined
   let description: string | undefined
@@ -271,7 +294,7 @@ export async function killInProcessTeammate(
     }
 
     // Capture identity for cleanup after state update
-    teamName = teammateTask.identity.teamName
+    consumerScope = teammateTask.identity.consumerScope
     agentId = teammateTask.identity.agentId
     toolUseId = teammateTask.toolUseId
     description = teammateTask.description
@@ -324,8 +347,11 @@ export async function killInProcessTeammate(
 
   try {
     // Remove from team file (outside state updater to avoid file I/O in callback)
-    if (teamName && agentId) {
-      await removeMemberByAgentId(teamName, agentId)
+    if (agentId) {
+      const removed = await removeScopedMember(consumerScope, agentId)
+      if (removed.status === 'retryable_io') {
+        throw new Error('成员退出清理未完成：配置写入失败')
+      }
     }
   } finally {
     // The task is already stopped. Persistence failures must not suppress its

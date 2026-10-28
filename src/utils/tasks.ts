@@ -14,6 +14,7 @@ import { createSignal } from './signal.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
 import { getTeamName } from './teammate.js'
 import { getTeammateContext } from './teammateContext.js'
+import { emptyTaskDelivery, isTaskAwaitingReview, isTaskDeliveryUnsupported, migrateTaskDeliveryRecord, taskDeliverySchema, TASK_DELIVERY_UNSUPPORTED_ERROR } from '../shared/taskDelivery.js'
 
 // Listeners for task list updates (used for immediate UI refresh in same process)
 const tasksUpdated = createSignal()
@@ -96,7 +97,13 @@ export const TaskSchema = lazySchema(() =>
     blocks: z.array(z.string()), // task IDs this task blocks
     blockedBy: z.array(z.string()), // task IDs that block this task
     metadata: z.record(z.string(), z.unknown()).optional(), // arbitrary metadata
-  }),
+    delivery: taskDeliverySchema.optional(),
+    // Derived on read when the on-disk delivery is from a newer version or is
+    // damaged: the raw record is kept here in memory, the task is read-only,
+    // and no write ever persists these two fields over the user's JSON.
+    deliveryError: z.string().optional(),
+    deliveryUnsupported: z.unknown().optional(),
+  }).passthrough(),
 )
 export type Task = z.infer<ReturnType<typeof TaskSchema>>
 
@@ -416,7 +423,7 @@ export async function createTaskWithCommit(
     // Read highest ID from disk while holding the lock
     const highestId = await findHighestTaskId(taskListId)
     const id = String(highestId + 1)
-    const task: Task = { id, ...taskData }
+    const task: Task = { id, ...taskData, delivery: taskData.delivery ?? emptyTaskDelivery() }
     const path = getTaskPath(taskListId, id)
     const revision = await bumpTaskListRevisionLocked(taskListId)
     await writeFile(path, jsonStringify(task, null, 2))
@@ -459,7 +466,7 @@ export async function getTask(
         data.status = 'in_progress'
       }
     }
-    const parsed = TaskSchema().safeParse(data)
+    const parsed = TaskSchema().safeParse(migrateTaskDeliveryRecord(data))
     if (!parsed.success) {
       logForDebugging(
         `[Tasks] Task ${taskId} failed schema validation: ${parsed.error.message}`,
@@ -488,6 +495,9 @@ async function updateTaskUnsafe(
   const existing = await getTask(taskListId, taskId)
   if (!existing) {
     return null
+  }
+  if (isTaskDeliveryUnsupported(existing)) {
+    throw new Error(TASK_DELIVERY_UNSUPPORTED_ERROR)
   }
   const updated: Task = { ...existing, ...updates, id: taskId }
   const path = getTaskPath(taskListId, taskId)
@@ -524,11 +534,61 @@ export type AtomicTaskUpdateResult = {
   updated: boolean
   committedAt: string
   revision: number
+  /**
+   * Set only when an internal option refused the write inside the transaction.
+   * Nothing was written; `task` is the unchanged current record. Callers that
+   * did not opt into the refusal never see this field.
+   */
+  refused?: { error: string }
+}
+
+/**
+ * A status on a task with artifact history moves only through
+ * submit/accept/return. Generic edits must not complete it, and an accepted
+ * artifact must never be reopened by a status edit either.
+ */
+export const TASK_DELIVERY_STATUS_UPDATE_ERROR = 'A task with artifact history cannot change status outside the independent delivery review protocol; use deliveryAction to submit, accept, or return the artifact'
+
+/**
+ * Only an artifact that was returned may change hands. A version still under
+ * review keeps its owner so the reviewer judges the version it was sent, and
+ * an accepted (completed) task is never reassigned.
+ */
+export const TASK_DELIVERY_REASSIGN_ERROR = 'A task can be reassigned only after its latest artifact was returned and before it is completed; a version awaiting review keeps its owner'
+
+/** Artifact history is durable review evidence, so the task is never deleted. */
+export const TASK_DELIVERY_DELETE_ERROR = 'A task with artifact delivery history cannot be deleted; review or return the artifact instead'
+
+/**
+ * One deny rule shared by every delete entry. It covers both a delivery task
+ * and a task whose delivery schema this build cannot read: deleting either
+ * would erase acceptance evidence, and a read-only task must not be rewritten
+ * just to drop its dependency edges.
+ */
+export function assertTaskDeletionAllowed(task: Task): void {
+  if (isTaskDeliveryUnsupported(task)) throw new Error(TASK_DELIVERY_UNSUPPORTED_ERROR)
+  if ((task.delivery?.submissions.length ?? 0) > 0) throw new Error(TASK_DELIVERY_DELETE_ERROR)
 }
 
 export type AtomicTaskUpdateOptions = {
   addBlocks?: string[]
   addBlockedBy?: string[]
+  /**
+   * Internal TaskUpdate ordering gate; never exposed as a generic tool input.
+   * When a status advances to `in_progress` or `completed`, every dependency in
+   * the transaction's merged `blockedBy` set must exist and be completed. The
+   * caller's precheck runs before the completion hooks and before this lock
+   * wait, so only a recheck here can see a dependency reopened in between.
+   */
+  requireCompletedDependencies?: boolean
+  /** Internal delivery protocol only; never exposed as a generic tool input. */
+  deliveryTransition?: boolean
+  /**
+   * Internal teammate-shutdown cleanup only; never exposed as a tool input.
+   * It may release an owner (never take one) and leave artifact history and a
+   * pending review untouched.
+   */
+  internalUnassign?: boolean
 }
 
 /**
@@ -560,6 +620,11 @@ export async function updateTaskAtomically(
     releaseTask = await lockfile.lock(taskPath, LOCK_OPTIONS)
     const current = await getTask(taskListId, taskId)
     if (!current) return null
+    // An unreadable delivery history cannot be rewritten: the task stays
+    // visible, but every mutation is refused so the raw record is preserved.
+    if (isTaskDeliveryUnsupported(current)) {
+      throw new Error(TASK_DELIVERY_UNSUPPORTED_ERROR)
+    }
     const previous: Task = {
       ...current,
       blocks: [...current.blocks],
@@ -567,6 +632,42 @@ export async function updateTaskAtomically(
       ...(current.metadata ? { metadata: { ...current.metadata } } : {}),
     }
     const updates = { ...(resolveUpdates(previous) ?? {}) }
+    if (!options.deliveryTransition) {
+      // Presence, not value: `{ delivery: undefined }` erases history and
+      // `{ status: undefined }` erases a required field. Both are changes.
+      if ('delivery' in updates) throw new Error('Use the independent delivery review protocol')
+      if ('status' in updates && updates.status === undefined) throw new Error('Task status cannot be removed')
+      const latest = previous.delivery?.submissions.at(-1)
+      if (latest) {
+        const statusChanging = 'status' in updates && updates.status !== previous.status
+        const ownerChanging = 'owner' in updates && updates.owner !== previous.owner
+        if (options.internalUnassign) {
+          // Shutdown cleanup releases an owner; it never takes one and never
+          // rewrites the artifact history. A version still under review keeps
+          // `in_progress`: the review belongs to that version, so handing the
+          // task back to the pending pool would invite a new owner to redo it.
+          if ('owner' in updates && updates.owner !== undefined) {
+            throw new Error(TASK_DELIVERY_REASSIGN_ERROR)
+          }
+          if (statusChanging && (
+            isTaskAwaitingReview(previous) ||
+            previous.status === 'completed' ||
+            updates.status !== 'pending'
+          )) {
+            throw new Error(TASK_DELIVERY_STATUS_UPDATE_ERROR)
+          }
+        } else if (statusChanging) {
+          // Completion, reopening, and every other transition belong to the
+          // delivery protocol; a generic edit must not carry one across it.
+          throw new Error(TASK_DELIVERY_STATUS_UPDATE_ERROR)
+        } else if (ownerChanging && (
+          latest.review?.decision !== 'return' ||
+          previous.status === 'completed'
+        )) {
+          throw new Error(TASK_DELIVERY_REASSIGN_ERROR)
+        }
+      }
+    }
     const nextBlocks = [...previous.blocks]
     const nextBlockedBy = [...previous.blockedBy]
     const relatedUpdates = new Map<
@@ -613,6 +714,33 @@ export async function updateTaskAtomically(
     }
     if (JSON.stringify(nextBlockedBy) !== JSON.stringify(previous.blockedBy)) {
       updates.blockedBy = nextBlockedBy
+    }
+
+    if (options.requireCompletedDependencies) {
+      // The caller checked before the completion hooks and before this lock
+      // wait, so a dependency reopened in either window would slip through.
+      // Re-derive the merged dependency set here, inside the transaction, from
+      // the same lock's task files; listTasks only reads, so no second lock is
+      // taken. A refusal returns without writing or bumping the revision.
+      if (updates.status === 'in_progress' || updates.status === 'completed') {
+        const tasksById = new Map(
+          (await listTasks(taskListId)).map(item => [item.id, item]),
+        )
+        const unsatisfied = findUnsatisfiedBlockers(
+          { blockedBy: nextBlockedBy },
+          tasksById,
+        )
+        if (unsatisfied.length > 0) {
+          return {
+            previous,
+            task: current,
+            updated: false,
+            committedAt: new Date().toISOString(),
+            revision: await readTaskListRevisionLocked(taskListId),
+            refused: { error: formatTaskDependencyBlockedError(taskId, unsatisfied) },
+          }
+        }
+      }
     }
 
     for (const key of Object.keys(updates) as Array<keyof Omit<Task, 'id'>>) {
@@ -694,7 +822,12 @@ export async function deleteTaskWithCommit(
 
   try {
     releaseList = await lockfile.lock(lockPath, LOCK_OPTIONS)
-    if (!await getTask(taskListId, taskId)) return { deleted: false }
+    const existing = await getTask(taskListId, taskId)
+    if (!existing) return { deleted: false }
+    // Deleting a delivery task would erase the acceptance evidence its
+    // dependencies rely on, so the deny rule runs before the high water mark,
+    // the unlink, and any reciprocal edge rewrite.
+    assertTaskDeletionAllowed(existing)
     const revision = await bumpTaskListRevisionLocked(taskListId)
     // Update high water mark before deleting to prevent ID reuse
     const numericId = parseInt(taskId, 10)
@@ -711,6 +844,9 @@ export async function deleteTaskWithCommit(
     // Remove references to this task from other tasks
     const allTasks = await listTasks(taskListId)
     for (const task of allTasks) {
+      // Read-only tasks are never rewritten; their dangling edge keeps them
+      // fail-closed instead of blocking the deletion of another task.
+      if (isTaskDeliveryUnsupported(task)) continue
       const newBlocks = task.blocks.filter(id => id !== taskId)
       const newBlockedBy = task.blockedBy.filter(id => id !== taskId)
       if (
@@ -863,6 +999,10 @@ export async function blockTask(
 
 export type ClaimTaskResult = {
   success: boolean
+  /**
+   * `blocked` covers both an unfinished dependency (`blockedByTasks`) and a
+   * submission awaiting independent review, which has no blocker to list.
+   */
   reason?:
     | 'task_not_found'
     | 'already_claimed'
@@ -872,6 +1012,46 @@ export type ClaimTaskResult = {
   task?: Task
   busyWithTasks?: string[] // task IDs the agent is busy with (when reason is 'agent_busy')
   blockedByTasks?: string[] // task IDs blocking this task (when reason is 'blocked')
+}
+
+/**
+ * A blocker counts as satisfied only when a task with that ID is present and
+ * completed. A dependency whose task file vanished is not evidence of finished
+ * work, so a dangling edge keeps the task claimable-looking but refused.
+ */
+export function findUnsatisfiedBlockers(
+  task: { blockedBy: readonly string[] },
+  tasksById: ReadonlyMap<string, Task>,
+): string[] {
+  return task.blockedBy.filter(id => tasksById.get(id)?.status !== 'completed')
+}
+
+/**
+ * One refusal message for every dependency gate: the precheck in TaskUpdate
+ * and the recheck inside the atomic transaction must read the same, or the
+ * caller cannot tell which of the two refused.
+ */
+export function formatTaskDependencyBlockedError(
+  taskId: string,
+  blockedIds: readonly string[],
+): string {
+  return `Task #${taskId} waits on ${blockedIds.map(id => `#${id}`).join(', ')}, not completed yet. Do not work on it or change its status until then; TaskList shows which of your tasks are ready.`
+}
+
+/**
+ * An owner write is refused while the artifact state cannot be judged. A
+ * submitted artifact belongs to the owner whose work is being judged until a
+ * reviewer accepts or returns it; anyone else would receive it before the
+ * review concluded, which is the mutation the TaskUpdate reassignment guard
+ * refuses. A record this build cannot interpret has no known review state, so
+ * it is refused the same way instead of surfacing as a missing task. A returned
+ * version is ordinary rework: it stays claimable and keeps its history.
+ */
+function claimMutationBlocked(task: Task, needsClaimMutation: boolean): boolean {
+  return (
+    needsClaimMutation &&
+    (isTaskAwaitingReview(task) || isTaskDeliveryUnsupported(task))
+  )
 }
 
 /**
@@ -1212,18 +1392,6 @@ export async function claimTask(
       return { success: false, reason: 'already_resolved', task }
     }
 
-    // Check for unresolved blockers (open or in_progress tasks block)
-    const allTasks = await listTasks(taskListId)
-    const unresolvedTaskIds = new Set(
-      allTasks.filter(t => t.status !== 'completed').map(t => t.id),
-    )
-    const blockedByTasks = task.blockedBy.filter(id =>
-      unresolvedTaskIds.has(id),
-    )
-    if (blockedByTasks.length > 0) {
-      return { success: false, reason: 'blocked', task, blockedByTasks }
-    }
-
     // Claim the task (already holding taskPath lock — use unsafe variant)
     const claimUpdates: Partial<Omit<Task, 'id'>> = {
       owner: claimantAgentId,
@@ -1231,6 +1399,21 @@ export async function claimTask(
     }
     const needsClaimMutation = task.owner !== claimantAgentId ||
       (options.markInProgress && task.status !== 'in_progress')
+    if (claimMutationBlocked(task, needsClaimMutation)) {
+      return { success: false, reason: 'blocked', task }
+    }
+
+    // Check for unresolved blockers: open or in_progress tasks, and a
+    // dependency whose task file is gone, all block the claim.
+    const allTasks = await listTasks(taskListId)
+    const blockedByTasks = findUnsatisfiedBlockers(
+      task,
+      new Map(allTasks.map(item => [item.id, item])),
+    )
+    if (blockedByTasks.length > 0) {
+      return { success: false, reason: 'blocked', task, blockedByTasks }
+    }
+
     if (needsClaimMutation) await bumpTaskListRevisionLocked(taskListId)
     const updated = needsClaimMutation
       ? await updateTaskUnsafe(taskListId, taskId, claimUpdates)
@@ -1284,12 +1467,22 @@ async function claimTaskWithBusyCheck(
       return { success: false, reason: 'already_resolved', task }
     }
 
-    // Check for unresolved blockers (open or in_progress tasks block)
-    const unresolvedTaskIds = new Set(
-      allTasks.filter(t => t.status !== 'completed').map(t => t.id),
-    )
-    const blockedByTasks = task.blockedBy.filter(id =>
-      unresolvedTaskIds.has(id),
+    // Claim the task inside the same list transaction used for the busy check.
+    const claimUpdates: Partial<Omit<Task, 'id'>> = {
+      owner: claimantAgentId,
+      ...(options.markInProgress ? { status: 'in_progress' as const } : {}),
+    }
+    const needsClaimMutation = task.owner !== claimantAgentId ||
+      (options.markInProgress && task.status !== 'in_progress')
+    if (claimMutationBlocked(task, needsClaimMutation)) {
+      return { success: false, reason: 'blocked', task }
+    }
+
+    // Check for unresolved blockers: open or in_progress tasks, and a
+    // dependency whose task file is gone, all block the claim.
+    const blockedByTasks = findUnsatisfiedBlockers(
+      task,
+      new Map(allTasks.map(item => [item.id, item])),
     )
     if (blockedByTasks.length > 0) {
       return { success: false, reason: 'blocked', task, blockedByTasks }
@@ -1311,13 +1504,6 @@ async function claimTaskWithBusyCheck(
       }
     }
 
-    // Claim the task inside the same list transaction used for the busy check.
-    const claimUpdates: Partial<Omit<Task, 'id'>> = {
-      owner: claimantAgentId,
-      ...(options.markInProgress ? { status: 'in_progress' as const } : {}),
-    }
-    const needsClaimMutation = task.owner !== claimantAgentId ||
-      (options.markInProgress && task.status !== 'in_progress')
     if (needsClaimMutation) await bumpTaskListRevisionLocked(taskListId)
     const updated = needsClaimMutation
       ? await updateTaskWhileTaskListLocked(taskListId, taskId, claimUpdates)
@@ -1478,16 +1664,32 @@ export async function unassignTeammateTasks(
   // Re-check ownership inside the task-list transaction so shutdown cleanup
   // cannot erase a reassignment that another actor committed after this scan.
   const unassignedTasks: Array<{ id: string; subject: string }> = []
+  const awaitingReviewIds: string[] = []
   for (const task of unresolvedAssignedTasks) {
-    const result = await updateTaskAtomically(teamName, task.id, (current) => {
-      if (
-        current.status === 'completed' ||
-        (current.owner !== teammateId && current.owner !== teammateName)
-      ) return undefined
-      return { owner: undefined, status: 'pending' }
-    })
-    if (result?.updated) {
-      unassignedTasks.push({ id: result.task.id, subject: result.task.subject })
+    // A task whose delivery history cannot be read is read-only.
+    if (isTaskDeliveryUnsupported(task)) continue
+    try {
+      const result = await updateTaskAtomically(teamName, task.id, (current) => {
+        if (
+          current.status === 'completed' ||
+          (current.owner !== teammateId && current.owner !== teammateName)
+        ) return undefined
+        // A version still awaiting independent review keeps its in_progress
+        // status: the review belongs to that version, so only the owner is
+        // released and rework is scheduled after the reviewer returns it.
+        const status = isTaskAwaitingReview(current) ? current.status : 'pending'
+        return { owner: undefined, status }
+      }, { internalUnassign: true })
+      if (result?.updated) {
+        unassignedTasks.push({ id: result.task.id, subject: result.task.subject })
+        if (isTaskAwaitingReview(result.task)) awaitingReviewIds.push(result.task.id)
+      }
+    } catch (error) {
+      // Shutdown cleanup is best-effort: one task that cannot be released must
+      // not leave every later task owned by a member that no longer exists.
+      logForDebugging(
+        `[Tasks] Failed to unassign task ${task.id} from ${teammateName}: ${errorMessage(error)}`,
+      )
     }
   }
 
@@ -1506,6 +1708,9 @@ export async function unassignTeammateTasks(
       .map(t => `#${t.id} "${t.subject}"`)
       .join(', ')
     notificationMessage += ` ${unassignedTasks.length} task(s) were unassigned: ${taskList}. Use TaskList to check availability and TaskUpdate with owner to reassign them to idle teammates.`
+    if (awaitingReviewIds.length > 0) {
+      notificationMessage += ` Task(s) ${awaitingReviewIds.map(id => `#${id}`).join(', ')} stay in progress until an independent reviewer accepts or returns the artifact; reassign them only after a return.`
+    }
   }
 
   return {

@@ -95,6 +95,8 @@ import { jsonParse, jsonStringify } from './slowOperations.js'
 import type { ContentReplacementRecord } from './toolResultStorage.js'
 import { validateUuid } from './uuid.js'
 
+import { parseConsumerScope, sameConsumerScope } from './swarm/consumerScope.js'
+
 // Cache MACRO.VERSION at module level to work around bun --define bug in async contexts
 // See: https://github.com/oven-sh/bun/issues/26168
 const VERSION = typeof MACRO !== 'undefined' ? MACRO.VERSION : 'unknown'
@@ -337,6 +339,10 @@ export type AgentMetadata = {
   customAgentType?: string
   /** Permission mode of the teammate's latest turn. */
   permissionMode?: PermissionMode
+  /** Fixed registration identity, never reconstructed from the current roster. */
+  consumerScope?: import('./swarm/consumerScope.js').ConsumerScope
+  /** Parent transcript owner for in-process recovery. */
+  parentSessionId?: string
 }
 
 /**
@@ -353,8 +359,20 @@ export async function writeAgentMetadata(
   metadata: AgentMetadata,
 ): Promise<void> {
   const path = getAgentMetadataPath(agentId)
+  const previous = await readAgentMetadata(agentId)
+  // Omitted fields are not deletions. In particular a later turn must retain
+  // the registration scope and data written by newer versions.
+  const updates = Object.fromEntries(Object.entries(metadata).filter(([, value]) => value !== undefined))
+  const oldScope = parseConsumerScope(previous?.consumerScope)
+  const newScope = parseConsumerScope(metadata.consumerScope)
+  if (oldScope.status === 'bound' && newScope.status === 'bound' && sameConsumerScope(oldScope.scope, newScope.scope)) {
+    updates.consumerScope = {
+      ...oldScope.scope, ...newScope.scope,
+      recipient: { ...oldScope.scope.recipient, ...newScope.scope.recipient },
+    }
+  }
   await mkdir(dirname(path), { recursive: true })
-  await writeFile(path, JSON.stringify(metadata))
+  await writeFile(path, JSON.stringify({ ...previous, ...updates }))
 }
 
 export async function readAgentMetadata(
@@ -1217,7 +1235,7 @@ class Project {
     isSidechain: boolean = false,
     agentId?: string,
     startingParentUuid?: UUID | null,
-    teamInfo?: { teamName?: string; agentName?: string },
+    teamInfo?: TeamInfo,
   ) {
     // Capture the policy before any async work: a later settings change must
     // not make the history submitted while disabled eligible for persistence.
@@ -1281,6 +1299,11 @@ class Project {
             message.type === 'user' ? (getPromptId() ?? undefined) : undefined,
           agentId,
           ...message,
+          ...(Object.hasOwn(message, 'consumerScope')
+            ? { consumerScope: (message as Message & { consumerScope?: unknown }).consumerScope ?? null }
+            : teamInfo && Object.hasOwn(teamInfo, 'consumerScope')
+              ? { consumerScope: teamInfo.consumerScope ?? null }
+              : {}),
           // Session-stamp fields MUST come after the spread. On --fork-session
           // and --resume, messages arrive as SerializedMessage (carries source
           // sessionId/cwd/etc. because removeExtraFields only strips parentUuid
@@ -1624,6 +1647,20 @@ class Project {
 export type TeamInfo = {
   teamName?: string
   agentName?: string
+  /** null is an explicit unbound marker; unknown versions survive round trips. */
+  consumerScope?: unknown
+}
+
+/** Capture at synchronous admission, before logging awaits or binding changes. */
+export function captureTranscriptBinding(
+  messages: readonly Message[],
+  consumerScope: unknown,
+): void {
+  for (const message of messages) {
+    if (!Object.hasOwn(message, 'consumerScope')) {
+      Object.assign(message, { consumerScope: structuredClone(consumerScope ?? null) })
+    }
+  }
 }
 
 // Filter out already-recorded messages before passing to insertMessageChain.
@@ -1649,6 +1686,8 @@ export async function recordTranscript(
   startingParentUuidHint?: UUID,
   allMessages?: readonly Message[],
 ): Promise<UUID | null> {
+  // Clone synchronously: callers may change bindings while the queued write waits.
+  teamInfo = teamInfo ? structuredClone(teamInfo) : undefined
   const project = getProject()
   const cleanedMessages = project.filterPersistableMessages(
     cleanMessagesForLogging(messages, allMessages),

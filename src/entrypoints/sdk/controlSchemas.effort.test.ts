@@ -65,6 +65,11 @@ describe('SDK team runtime controls', () => {
     expect(SDKControlRequestSchema().safeParse({ type: 'control_request', request_id: 'snapshot', request: { subtype: 'team_runtime_snapshot', team_name: 'reviewed', created_at: 123 } }).success).toBe(true)
     expect(SDKControlRequestSchema().safeParse({ type: 'control_request', request_id: 'snapshot', request: { subtype: 'team_runtime_snapshot', team_name: 'reviewed' } }).success).toBe(false)
   })
+  test('retains the raw snapshot scope for fail-closed runtime validation', () => {
+    const raw = { version: 999, futureField: 'preserve' }
+    const parsed = SDKControlRequestSchema().parse({ type: 'control_request', request_id: 'snapshot-scope', request: { subtype: 'team_runtime_snapshot', team_name: 'reviewed', created_at: 123, consumer_scope: raw } })
+    expect(parsed.request).toMatchObject({ consumer_scope: raw })
+  })
   test('accepts planning pause without ending the SDK session', () => {
     expect(SDKControlRequestSchema().safeParse({ type: 'control_request', request_id: 'pause', request: { subtype: 'team_plan_pause' } }).success).toBe(true)
   })

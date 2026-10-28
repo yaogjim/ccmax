@@ -1,7 +1,7 @@
 import { z } from 'zod/v4'
 
 export function isValidTeamMemberName(name: string): boolean {
-  return /^[\p{L}\p{N}_-]+$/u.test(name) && name !== 'team-lead'
+  return /^[\p{L}\p{N}_-]+$/u.test(name) && name !== 'team-lead' && name !== 'user'
 }
 
 export const teamPlanRuntimeSchema = z.object({

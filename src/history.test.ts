@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import * as fsPromises from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -71,103 +71,94 @@ describe('prompt history persistence', () => {
       await Promise.resolve()
     }
 
-    mock.module('./utils/sleep.js', () => ({
-      ...sleepUtils,
-      sleep: async (
-        ms: number,
-        signal?: AbortSignal,
-        opts?: Parameters<typeof sleepUtils.sleep>[2],
-      ) => {
-        if (ms === 500) {
-          retryDelayEntered.resolve()
-          await retryDelayRelease.promise
-          retryDelayFinished.resolve()
-          return
-        }
-        return realSleep(ms, signal, opts)
-      },
-    }))
-    mock.module('./utils/lockfile.js', () => ({
-      ...lockfile,
-      lock: async (
-        ...args: Parameters<typeof lockfile.lock>
-      ): ReturnType<typeof lockfile.lock> => {
-        const release = await realLock(...args)
-        return async () => {
-          try {
-            await release()
-          } finally {
-            latchAt(flushReleased, flushReleases).resolve()
-            flushReleases += 1
-          }
-        }
-      },
-    }))
-    mock.module('fs/promises', () => ({
-      ...fsPromises,
-      appendFile: async (...args: Parameters<typeof fsPromises.appendFile>) => {
-        appendCalls += 1
-        behaviorCalls += 1
-        const invocation = appendCalls - 1
-        latchAt(appendEntered, invocation).resolve()
+    spyOn(sleepUtils, 'sleep').mockImplementation(async (
+      ms: number,
+      signal?: AbortSignal,
+      opts?: Parameters<typeof sleepUtils.sleep>[2],
+    ) => {
+      if (ms === 500) {
+        retryDelayEntered.resolve()
+        await retryDelayRelease.promise
+        retryDelayFinished.resolve()
+        return
+      }
+      return realSleep(ms, signal, opts)
+    })
+    spyOn(lockfile, 'lock').mockImplementation(async (
+      ...args: Parameters<typeof lockfile.lock>
+    ): ReturnType<typeof lockfile.lock> => {
+      const release = await realLock(...args)
+      return async () => {
         try {
-          if (behavior === 'partial-then-success' && behaviorCalls === 1) {
-            const payload = Buffer.from(String(args[1]))
-            await realAppendFile(
-              args[0],
-              payload.subarray(0, Math.floor(payload.length / 2)),
-              { mode: 0o600 },
-            )
-            throw new Error('injected partial append failure')
-          }
-          if (behavior === 'full-then-error' && behaviorCalls === 1) {
-            await realAppendFile(...args)
-            throw new Error('injected post-commit append failure')
-          }
-          if (behavior === 'rollback-fails' && behaviorCalls === 1) {
-            const payload = Buffer.from(String(args[1]))
-            await realAppendFile(
-              args[0],
-              payload.subarray(0, Math.floor(payload.length / 2)),
-              { mode: 0o600 },
-            )
-            throw new Error('injected partial append failure')
-          }
-          if (behavior === 'read-fails' && behaviorCalls === 1) {
-            throw new Error('injected append failure before reconciliation read')
-          }
-          if (behavior === 'unexpected-tail' && behaviorCalls === 1) {
-            await realAppendFile(args[0], 'not-a-payload-prefix', {
-              mode: 0o600,
-            })
-            throw new Error('injected append with unexpected tail')
-          }
-          return await realAppendFile(...args)
+          await release()
         } finally {
-          latchAt(appendSettled, invocation).resolve()
+          latchAt(flushReleased, flushReleases).resolve()
+          flushReleases += 1
         }
-      },
-      readFile: async (...args: Parameters<typeof fsPromises.readFile>) => {
-        try {
-          if (behavior === 'read-fails' && behaviorCalls === 1) {
-            throw new Error('injected reconciliation read failure')
-          }
-          return await realReadFile(...args)
-        } finally {
-          reconcileReadSettled.resolve()
+      }
+    })
+    spyOn(fsPromises, 'appendFile').mockImplementation(async (...args: Parameters<typeof fsPromises.appendFile>) => {
+      appendCalls += 1
+      behaviorCalls += 1
+      const invocation = appendCalls - 1
+      latchAt(appendEntered, invocation).resolve()
+      try {
+        if (behavior === 'partial-then-success' && behaviorCalls === 1) {
+          const payload = Buffer.from(String(args[1]))
+          await realAppendFile(
+            args[0],
+            payload.subarray(0, Math.floor(payload.length / 2)),
+            { mode: 0o600 },
+          )
+          throw new Error('injected partial append failure')
         }
-      },
-      truncate: async (...args: Parameters<typeof fsPromises.truncate>) => {
-        try {
-          if (behavior === 'rollback-fails') {
-            throw new Error('injected rollback failure')
-          }
-          return await realTruncate(...args)
-        } finally {
-          truncateSettled.resolve()
+        if (behavior === 'full-then-error' && behaviorCalls === 1) {
+          await realAppendFile(...args)
+          throw new Error('injected post-commit append failure')
         }
-      },
-    }))
+        if (behavior === 'rollback-fails' && behaviorCalls === 1) {
+          const payload = Buffer.from(String(args[1]))
+          await realAppendFile(
+            args[0],
+            payload.subarray(0, Math.floor(payload.length / 2)),
+            { mode: 0o600 },
+          )
+          throw new Error('injected partial append failure')
+        }
+        if (behavior === 'read-fails' && behaviorCalls === 1) {
+          throw new Error('injected append failure before reconciliation read')
+        }
+        if (behavior === 'unexpected-tail' && behaviorCalls === 1) {
+          await realAppendFile(args[0], 'not-a-payload-prefix', {
+            mode: 0o600,
+          })
+          throw new Error('injected append with unexpected tail')
+        }
+        return await realAppendFile(...args)
+      } finally {
+        latchAt(appendSettled, invocation).resolve()
+      }
+    })
+    spyOn(fsPromises, 'readFile').mockImplementation(async (...args: Parameters<typeof fsPromises.readFile>) => {
+      try {
+        if (behavior === 'read-fails' && behaviorCalls === 1) {
+          throw new Error('injected reconciliation read failure')
+        }
+        return await realReadFile(...args)
+      } finally {
+        reconcileReadSettled.resolve()
+      }
+    })
+    spyOn(fsPromises, 'truncate').mockImplementation(async (...args: Parameters<typeof fsPromises.truncate>) => {
+      try {
+        if (behavior === 'rollback-fails') {
+          throw new Error('injected rollback failure')
+        }
+        return await realTruncate(...args)
+      } finally {
+        truncateSettled.resolve()
+      }
+    })
 
     const history = await import('./history.js')
     history.clearPendingHistoryEntries()

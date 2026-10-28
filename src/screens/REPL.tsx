@@ -39,7 +39,7 @@ import { consumeEarlyInput } from '../utils/earlyInput.js';
 import { setMemberActive } from '../utils/swarm/teamHelpers.js';
 import { isSwarmWorker, generateSandboxRequestId, sendSandboxPermissionRequestViaMailbox, sendSandboxPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js';
 import { registerSandboxPermissionCallback } from '../hooks/useSwarmPermissionPoller.js';
-import { getTeamName, getAgentName } from '../utils/teammate.js';
+import { getTeamName, getAgentName, getConsumerScope } from '../utils/teammate.js';
 import { WorkerPendingPermission } from '../components/permissions/WorkerPendingPermission.js';
 import { injectUserMessageToTeammate, getAllInProcessTeammateTasks } from '../tasks/InProcessTeammateTask/InProcessTeammateTask.js';
 import { isLocalAgentTask, queuePendingMessage, appendMessageToLocalAgent, type LocalAgentTaskState } from '../tasks/LocalAgentTask/LocalAgentTask.js';
@@ -183,12 +183,13 @@ import type { LogOption } from '../types/logs.js';
 import type { AgentColorName } from '../tools/AgentTool/agentColorManager.js';
 import { fileHistoryCompleteSnapshot, fileHistoryMakeSnapshot, type FileHistoryState, fileHistoryRewind, type FileHistorySnapshot, copyFileHistoryForResume, fileHistoryEnabled, fileHistoryHasAnyChanges } from '../utils/fileHistory.js';
 import { type AttributionState, incrementPromptCount } from '../utils/commitAttribution.js';
-import { recordAttributionSnapshot } from '../utils/sessionStorage.js';
+import { recordAttributionSnapshot, captureTranscriptBinding } from '../utils/sessionStorage.js';
 import { computeStandaloneAgentContext, restoreAgentFromSession, restoreSessionStateFromLog, restoreWorktreeForResume, exitRestoredWorktree } from '../utils/sessionRestore.js';
 import { isBgSession, updateSessionName, updateSessionActivity } from '../utils/concurrentSessions.js';
 import { isInProcessTeammateTask, type InProcessTeammateTaskState } from '../tasks/InProcessTeammateTask/types.js';
 import { restoreRemoteAgentTasks } from '../tasks/RemoteAgentTask/RemoteAgentTask.js';
 import { useInboxPoller } from '../hooks/useInboxPoller.js';
+import { captureNewTranscriptMessages, rememberHydratedMessages } from './replTranscriptBinding.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
 const proactiveModule = feature('PROACTIVE') || feature('KAIROS') ? require('../proactive/index.js') : null;
@@ -1185,6 +1186,12 @@ export function REPL({
   }, [setToolUseConfirmQueue]);
   const [messages, rawSetMessages] = useState<MessageType[]>(initialMessages ?? []);
   const messagesRef = useRef(messages);
+  // Objects already admitted to the transcript. Lets a synchronous append be
+  // told apart from a wholesale restore/fork load without re-scanning bindings.
+  const knownMessagesRef = useRef<WeakSet<object> | null>(null);
+  if (knownMessagesRef.current === null) {
+    knownMessagesRef.current = new WeakSet<object>(initialMessages ?? []);
+  }
   // Stores the willowMode variant that was shown (or false if no hint shown).
   // Captured at hint_shown time so hint_converted telemetry reports the same
   // variant — the GrowthBook value shouldn't change mid-session, but reading
@@ -1199,9 +1206,22 @@ export function REPL({
   // truth, React state is the render projection.  Without this, paths
   // that queue functional updaters then synchronously read the ref
   // (e.g. handleSpeculationAccept → onQuery) see stale data.
-  const setMessages = useCallback((action: React.SetStateAction<MessageType[]>) => {
+  const setMessages = useCallback((action: React.SetStateAction<MessageType[]>, options?: {
+    captureBinding?: boolean;
+  }) => {
     const prev = messagesRef.current;
     const next = typeof action === 'function' ? action(messagesRef.current) : action;
+    if (next !== prev && knownMessagesRef.current) {
+      if (options?.captureBinding === false) {
+        // Restore/fork hydration: keep each message's existing binding (or its
+        // absence) and never retro-attach identity to history.
+        rememberHydratedMessages(knownMessagesRef.current, next);
+      } else {
+        // Capture at the synchronous append point so a later async render or
+        // log pass cannot stamp the then-current identity onto older messages.
+        captureNewTranscriptMessages(knownMessagesRef.current, next, getConsumerScope(store.getState().teamContext));
+      }
+    }
     messagesRef.current = next;
     if (next.length < userInputBaselineRef.current) {
       // Shrank (compact/rewind/clear) — clamp so placeholderText's length
@@ -1223,7 +1243,7 @@ export function REPL({
       }
     }
     rawSetMessages(next);
-  }, []);
+  }, [store]);
   // Capture the baseline message count alongside the placeholder text so
   // the render can hide it once displayedMessages grows past the baseline.
   const setUserInputOnProcessing = useCallback((input: string | undefined) => {
@@ -1739,7 +1759,7 @@ export function REPL({
     try {
       // Deserialize messages to properly clean up the conversation
       // This filters unresolved tool uses and adds a synthetic assistant message if needed
-      const messages = deserializeMessages(log.messages);
+      let messages = deserializeMessages(log.messages);
 
       // Match coordinator/normal mode to the resumed session
       if (feature('COORDINATOR_MODE')) {
@@ -1798,8 +1818,18 @@ export function REPL({
         void copyPlanForResume(log, asSessionId(sessionId));
       }
 
-      // Restore file history and attribution state from the resumed conversation
-      restoreSessionStateFromLog(log, setAppState);
+      // Restore file history and attribution state from the resumed conversation.
+      // The restore validates the consumer binding under both locks; forks must
+      // not inherit the source session's consumption qualification.
+      await restoreSessionStateFromLog(log, setAppState, {
+        forkSession: entrypoint === 'fork'
+      });
+      // Restore may replace log.messages (forks explicitly clear bindings).
+      // Preserve only the warning/hook messages created by this resume path;
+      // the historical prefix must be read again after restore completes.
+      const resumeAdditions = messages.slice(log.messages.length);
+      messages = [...deserializeMessages(log.messages), ...resumeAdditions];
+      captureTranscriptBinding(resumeAdditions, getConsumerScope(store.getState().teamContext));
       if (log.fileHistorySnapshots) {
         void copyFileHistoryForResume(log);
       }
@@ -1926,9 +1956,10 @@ export function REPL({
         contentReplacementStateRef.current = reconstructContentReplacementState(messages, log.contentReplacements ?? []);
       }
 
-      // Reset messages to the provided initial messages
-      // Use a callback to ensure we're not dependent on stale state
-      setMessages(() => messages);
+      // Reset messages to the provided initial messages.
+      // Hydration keeps each restored message's own binding (or its absence);
+      // capture happens only for messages appended after this point.
+      setMessages(() => messages, { captureBinding: false });
 
       // Clear any active tool JSX
       setToolJSX(null);
@@ -4024,6 +4055,9 @@ export function REPL({
       content,
       isMeta: options?.isMeta ? true : undefined
     });
+    // Capture the consumer binding at synchronous admission, before the async
+    // render/log path can see a different current identity.
+    captureTranscriptBinding([userMessage], getConsumerScope(store.getState().teamContext));
     void onQuery([userMessage], newAbortController, true, [], mainLoopModel);
     return true;
   }, [onQuery, mainLoopModel, store]);

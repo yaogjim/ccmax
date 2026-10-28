@@ -9,6 +9,11 @@
  * rewrite the live file under the lock, so it has to stay small, while the
  * desktop feed still needs the whole conversation (readMailboxHistory).
  *
+ * A write that carries an envelope id appends at most once ever: the id is
+ * looked for in the live inbox and in the whole retained history, both read
+ * under the same lock, so a retried HTTP delivery cannot duplicate an entry a
+ * consumer has already archived.
+ *
  * Note: Inboxes are keyed by agent name within a team.
  */
 
@@ -95,8 +100,37 @@ export type TeammateMessage = {
   summary?: string // 5-10 word summary shown as preview in the UI
 }
 
+/**
+ * Sender recorded when the person at the keyboard writes into a teammate's
+ * inbox from the desktop member view. The member transcript echoes it as an
+ * ordinary user turn, so the UI must not treat it as inter-agent traffic.
+ */
+export const USER_MESSAGE_SENDER = 'user'
+
 export function createMailboxMessageId(): string {
   return `mailbox-${randomUUID()}`
+}
+
+/** Envelope ids this module mints itself; callers may not claim them. */
+const SYSTEM_MESSAGE_ID_PREFIX = 'mailbox-'
+
+/**
+ * Envelope ids travel inside `id="..."` and are read back by a plain
+ * `id="([^"]*)"` scan, so a caller-chosen id must survive XML escaping
+ * unchanged: no quotes, angle brackets, ampersands, whitespace or control
+ * characters. Escaping would otherwise turn `a"b` into `a&quot;b`, which the
+ * reader hands back verbatim -- the echo would then name an id no sender ever
+ * sent. The reserved `mailbox-` prefix keeps a client from colliding with an
+ * envelope this module generated.
+ */
+const MAILBOX_MESSAGE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/
+
+export function isValidMailboxMessageId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    MAILBOX_MESSAGE_ID_PATTERN.test(value) &&
+    !value.startsWith(SYSTEM_MESSAGE_ID_PREFIX)
+  )
 }
 
 export function createMailboxMessage(
@@ -278,6 +312,32 @@ export async function readUnreadMessages(
 }
 
 /**
+ * Every envelope id in a recipient's archived history.
+ *
+ * Call only while holding the inbox lock: a locked mutation appends history
+ * before it republishes the live inbox, so under the lock an id is in at
+ * least one of the two files. Reading before the lock is not safe -- a
+ * consumer can archive the entry in between, and the retry then finds neither
+ * copy and appends a duplicate.
+ *
+ * The whole retained history is scanned on purpose. A byte window cannot bound
+ * an id: one large message can push every earlier entry out of it, and an id
+ * that falls outside would be appended a second time. The cost is one
+ * sequential read of the history file per write that carries an id.
+ *
+ * The guarantee is bounded by what can be read back: history that is retained
+ * and readable. `readInboxHistory` reports an unreadable file as empty, so a
+ * write in that state can still append twice rather than lose the message.
+ */
+async function inboxHistoryIds(historyPath: string): Promise<Set<string>> {
+  const ids = new Set<string>()
+  for (const message of await readInboxHistory(historyPath)) {
+    if (message.id) ids.add(message.id)
+  }
+  return ids
+}
+
+/**
  * Every message a recipient has received -- archived history plus the live
  * inbox -- in chronological order, each with its read flag. Lock-free and
  * read-only; this is what the desktop communication feed shows.
@@ -410,10 +470,19 @@ async function replaceInboxFile(
  * as read -- newly acknowledged ones and legacy read entries alike -- move to
  * the history file; only unread entries are republished, as compact JSON.
  * Throws when the lock or the file cannot be used (ENOENT: no inbox).
+ *
+ * `options.readHistoryIds` hands `update` the archived envelope ids. It is
+ * opt-in because it costs a full history read, and it is read while the lock
+ * is held so the live inbox and the archive describe one moment: a consumer
+ * cannot archive an entry between the two reads.
  */
 async function updateInbox(
   inboxPath: string,
-  update: (messages: TeammateMessage[]) => TeammateMessage[],
+  update: (
+    messages: TeammateMessage[],
+    historyIds: ReadonlySet<string>,
+  ) => TeammateMessage[],
+  options: { readHistoryIds?: boolean } = {},
 ): Promise<void> {
   const release = await lockfile.lock(inboxPath, {
     lockfilePath: `${inboxPath}.lock`,
@@ -421,7 +490,10 @@ async function updateInbox(
   })
   try {
     const current = await readInboxForUpdate(inboxPath)
-    const next = update(current.messages)
+    const historyIds = options.readHistoryIds
+      ? await inboxHistoryIds(getInboxHistoryPath(inboxPath))
+      : new Set<string>()
+    const next = update(current.messages, historyIds)
     // History first: a crash between the two steps can repeat an entry,
     // which readers deduplicate, but can never lose one.
     await appendInboxHistory(
@@ -447,9 +519,11 @@ async function updateInbox(
  * @param recipientName - The recipient's agent name (not UUID)
  * @param message - The message to write
  * @param teamName - Optional team name
- * @returns true once the message is persisted; false when it was not (for
- *   example the inbox stayed locked past the retry budget). Never throws, so
- *   callers must check the result before reporting a message as sent.
+ * @returns true once the message is in the inbox (a retry whose envelope id
+ *   was already delivered counts: it is there exactly once). False when it was
+ *   not persisted (for example the inbox stayed locked past the retry budget).
+ *   Never throws, so callers must check the result before reporting a message
+ *   as sent.
  */
 export async function writeToMailbox(
   recipientName: string,
@@ -476,7 +550,31 @@ export async function writeToMailbox(
     }
 
     const newMessage = createMailboxMessage(message)
-    await updateInbox(inboxPath, messages => [...messages, newMessage])
+    // A retried delivery (the caller kept its envelope id because the first
+    // request failed after the write landed) must not append a second copy.
+    // Delivered entries move from the live inbox into history, so both files
+    // are consulted -- and both are read under the lock, so a consumer
+    // archiving between the two reads cannot hide the id from this write.
+    let appended = false
+    // Newly minted ids cannot occur in retained history. Only a caller-supplied
+    // id can be a retry, so ordinary member traffic avoids a full history scan.
+    await updateInbox(inboxPath, (messages, historyIds) => {
+      if (
+        newMessage.id &&
+        (historyIds.has(newMessage.id) ||
+          messages.some(existing => existing.id === newMessage.id))
+      ) {
+        return messages
+      }
+      appended = true
+      return [...messages, newMessage]
+    }, { readHistoryIds: Boolean(message.id) })
+    if (!appended) {
+      logForDebugging(
+        `[TeammateMailbox] writeToMailbox: ${newMessage.id} was already delivered to ${recipientName}`,
+      )
+      return true
+    }
     logForDebugging(
       `[TeammateMailbox] Wrote message to ${recipientName}'s inbox from ${message.from}`,
     )
@@ -587,6 +685,8 @@ export async function clearMailbox(
 }
 
 type TeammateMessageEnvelope = {
+  /** Stable mailbox envelope id, echoed so a sender can correlate the turn. */
+  id?: string
   from: string
   text: string
   color?: string
@@ -597,7 +697,8 @@ type TeammateMessageEnvelope = {
  * Formats one teammate message as the `<teammate-message>` block that models
  * and transcript renderers parse. Attribute values are escaped so a sender
  * name, color or summary can neither end its attribute nor forge another
- * envelope.
+ * envelope. The envelope id is appended last, so renderers that only know the
+ * historical attributes still match the tag.
  */
 export function formatTeammateMessage(
   message: TeammateMessageEnvelope,
@@ -608,7 +709,10 @@ export function formatTeammateMessage(
   const summaryAttr = message.summary
     ? ` summary="${escapeXmlAttr(message.summary)}"`
     : ''
-  return `<${TEAMMATE_MESSAGE_TAG} teammate_id="${escapeXmlAttr(message.from)}"${colorAttr}${summaryAttr}>\n${message.text}\n</${TEAMMATE_MESSAGE_TAG}>`
+  const idAttr = message.id
+    ? ` id="${escapeXmlAttr(message.id)}"`
+    : ''
+  return `<${TEAMMATE_MESSAGE_TAG} teammate_id="${escapeXmlAttr(message.from)}"${colorAttr}${summaryAttr}${idAttr}>\n${message.text}\n</${TEAMMATE_MESSAGE_TAG}>`
 }
 
 /**

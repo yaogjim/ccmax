@@ -57,6 +57,8 @@ import { isTodoV2Enabled } from './tasks.js'
 import type { TodoList } from './todo/types.js'
 import { TodoListSchema } from './todo/types.js'
 import type { ContentReplacementRecord } from './toolResultStorage.js'
+import { clearDynamicTeamContext } from './teammate.js'
+import { latestTranscriptConsumerScope, restoreTranscriptConsumerScope } from './swarm/reconnection.js'
 import {
   getCurrentWorktreeSession,
   restoreWorktreeSession,
@@ -93,14 +95,44 @@ function extractTodosFromTranscript(messages: Message[]): TodoList {
   return []
 }
 
+function hasTranscriptTeamBinding(messages: readonly Message[]): boolean {
+  return latestTranscriptConsumerScope(messages) != null || messages.some(message => 'teamName' in message && !!message.teamName)
+}
+
+function warnConsumerRestore(result: ResumeResult, status: string): void {
+  const detail = status === 'stale'
+    ? 'the team or member instance has changed'
+    : status === 'fork'
+      ? 'forks do not inherit consumer identity'
+      : `consumer identity ${status}`
+  const warning = createSystemMessage(`Automatic team reception stopped: ${detail}; history remains readable.`, 'warning')
+  Object.assign(warning, { consumerScope: structuredClone(latestTranscriptConsumerScope(result.messages ?? []) ?? null) })
+  result.messages = [...(result.messages ?? []), warning]
+}
+
 /**
  * Restore session state (file history, attribution, todos) from log on resume.
  * Used by both SDK (print.ts) and interactive (REPL.tsx, main.tsx) resume paths.
  */
-export function restoreSessionStateFromLog(
+export async function restoreSessionStateFromLog(
   result: ResumeResult,
   setAppState: (f: (prev: AppState) => AppState) => void,
-): void {
+  opts: { forkSession?: boolean } = {},
+): Promise<void> {
+  const hadTeamBinding = hasTranscriptTeamBinding(result.messages ?? [])
+  clearDynamicTeamContext()
+  setAppState(prev => ({ ...prev, teamContext: undefined }))
+  if (opts.forkSession && result.messages) {
+    result.messages = result.messages.map(message => ({ ...message, consumerScope: null }))
+  }
+  if (!opts.forkSession) {
+    const restored = await restoreTranscriptConsumerScope(result.messages ?? [], getSessionId(), teamContext => {
+      setAppState(prev => ({ ...prev, teamContext }))
+    })
+    if (restored.status !== 'current' && hadTeamBinding) warnConsumerRestore(result, restored.status)
+  } else if (hadTeamBinding) {
+    warnConsumerRestore(result, 'fork')
+  }
   // Restore file history state
   if (result.fileHistorySnapshots && result.fileHistorySnapshots.length > 0) {
     fileHistoryRestoreStateFromLog(result.fileHistorySnapshots, newState => {
@@ -441,6 +473,12 @@ export async function processResumedConversation(
     hasExplicitCliEffort: boolean
   },
 ): Promise<ProcessedResume> {
+  const hadTeamBinding = hasTranscriptTeamBinding(result.messages)
+  clearDynamicTeamContext()
+  context.initialState = { ...context.initialState, teamContext: undefined }
+  if (opts.forkSession) {
+    result = { ...result, messages: result.messages.map(message => ({ ...message, consumerScope: null })) }
+  }
   // Match coordinator/normal mode to the resumed session
   let modeWarning: string | undefined
   if (feature('COORDINATOR_MODE')) {
@@ -478,6 +516,15 @@ export async function processResumedConversation(
     // overage). insertContentReplacement stamps sessionId = getSessionId() =
     // the fresh ID, so loadTranscriptFile's keyed lookup will match.
     await recordContentReplacement(result.contentReplacements)
+  }
+
+  if (!opts.forkSession) {
+    const restored = await restoreTranscriptConsumerScope(result.messages, getSessionId(), teamContext => {
+      context.initialState = { ...context.initialState, teamContext }
+    })
+    if (restored.status !== 'current' && hadTeamBinding) warnConsumerRestore(result, restored.status)
+  } else if (hadTeamBinding) {
+    warnConsumerRestore(result, 'fork')
   }
 
   // Restore session metadata so /status shows the saved name and metadata

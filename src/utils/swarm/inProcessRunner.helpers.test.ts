@@ -13,6 +13,16 @@ import {
 import { jsonStringify } from '../slowOperations.js'
 import { readMailbox, writeToMailbox } from '../teammateMailbox.js'
 import {
+  beginTaskListLifecycle,
+  getCanonicalTeamTaskListId,
+  withTaskListLifecycleLock,
+} from '../tasks.js'
+import {
+  memberConsumerScope,
+  type ConsumerScope,
+} from './consumerScope.js'
+import { mutateTeamFileAsync, writeTeamFileAsync } from './teamHelpers.js'
+import {
   classifyTeammateTurnFailure,
   getTeammateTurnResult,
   takeTeammateMailbox,
@@ -126,11 +136,44 @@ describe('teammate mailbox drain', () => {
   const TEAM = 'drain-team'
   let configDir: string
   let originalConfigDir: string | undefined
+  let scope: ConsumerScope
 
   beforeEach(async () => {
     originalConfigDir = process.env.CLAUDE_CONFIG_DIR
     configDir = await mkdtemp(join(tmpdir(), 'cc-haha-runner-drain-'))
     process.env.CLAUDE_CONFIG_DIR = configDir
+    const team = {
+      name: TEAM,
+      createdAt: 10,
+      leadSessionId: 'lead-session',
+      leadAgentId: `team-lead@${TEAM}`,
+      members: [{
+        agentId: `worker@${TEAM}`,
+        name: 'worker',
+        consumerInstanceId: 'worker-instance',
+        backendType: 'in-process' as const,
+        joinedAt: 10,
+        cwd: configDir,
+        tmuxPaneId: '',
+        subscriptions: [],
+      }],
+    }
+    await writeTeamFileAsync(TEAM, team)
+    const listId = getCanonicalTeamTaskListId(TEAM)
+    const lifecycle = await withTaskListLifecycleLock(listId, () =>
+      beginTaskListLifecycle(listId, {
+        teamName: TEAM,
+        createdAt: 10,
+        leadSessionId: 'lead-session',
+      }))
+    scope = memberConsumerScope({
+      team,
+      generation: lifecycle.generation,
+      ownerSessionId: 'lead-session',
+      backend: 'in-process',
+      agentName: 'worker',
+      memberInstanceId: 'worker-instance',
+    })
   })
 
   afterEach(async () => {
@@ -143,6 +186,41 @@ describe('teammate mailbox drain', () => {
     expect(await writeToMailbox('worker', { from, text, timestamp: new Date().toISOString() }, TEAM)).toBe(true)
   }
 
+  async function drain() {
+    return takeTeammateMailbox({ agentName: 'worker', teamName: TEAM, consumerScope: scope })
+  }
+
+  test('a replaced member instance drains nothing and keeps the new inbox intact', async () => {
+    await mail('team-lead', 'for the old instance')
+    await mutateTeamFileAsync(TEAM, team => ({
+      ...team,
+      members: team.members.map(member => ({
+        ...member,
+        consumerInstanceId: 'replacement-instance',
+      })),
+    }))
+
+    await expect(drain()).rejects.toThrow('消费实例 stale')
+    expect(
+      (await readMailbox('worker', TEAM)).filter(message => !message.read),
+    ).toHaveLength(1)
+
+    // The replacement's own registration may collect it.
+    const replacement = { ...scope, recipient: { ...scope.recipient, memberInstanceId: 'replacement-instance' } } as ConsumerScope
+    expect(
+      await takeTeammateMailbox({ agentName: 'worker', teamName: TEAM, consumerScope: replacement }),
+    ).toMatchObject({ type: 'new_messages' })
+  })
+
+  test('a runner without a bound instance reads nothing', async () => {
+    await mail('team-lead', 'unbound')
+
+    await expect(takeTeammateMailbox({ agentName: 'worker', teamName: TEAM })).rejects.toThrow('消费实例 unbound')
+    expect(
+      (await readMailbox('worker', TEAM)).filter(message => !message.read),
+    ).toHaveLength(1)
+  })
+
   test('hands over a shutdown request alone and first', async () => {
     await mail('reviewer', 'Peer chatter')
     await mail('team-lead', jsonStringify({
@@ -152,23 +230,23 @@ describe('teammate mailbox drain', () => {
       timestamp: new Date().toISOString(),
     }))
 
-    const first = await takeTeammateMailbox({ agentName: 'worker', teamName: TEAM })
+    const first = await drain()
     expect(first).toMatchObject({ type: 'shutdown_request', from: 'team-lead' })
     // The rest waits for the model's decision
-    const second = await takeTeammateMailbox({ agentName: 'worker', teamName: TEAM })
+    const second = await drain()
     expect(second).toEqual({
       type: 'new_messages',
       messages: [expect.objectContaining({ from: 'reviewer', text: 'Peer chatter' })],
     })
-    expect(await takeTeammateMailbox({ agentName: 'worker', teamName: TEAM })).toBeNull()
+    expect(await drain()).toBeNull()
   })
 
   test('delivers nothing twice and leaves an empty inbox empty', async () => {
-    expect(await takeTeammateMailbox({ agentName: 'worker', teamName: TEAM })).toBeNull()
+    expect(await drain()).toBeNull()
     await mail('team-lead', 'One')
     await mail('reviewer', 'Two')
 
-    const delivery = await takeTeammateMailbox({ agentName: 'worker', teamName: TEAM })
+    const delivery = await drain()
     expect(delivery).toEqual({
       type: 'new_messages',
       messages: [
@@ -176,7 +254,7 @@ describe('teammate mailbox drain', () => {
         expect.objectContaining({ text: 'Two' }),
       ],
     })
-    expect(await takeTeammateMailbox({ agentName: 'worker', teamName: TEAM })).toBeNull()
+    expect(await drain()).toBeNull()
     expect((await readMailbox('worker', TEAM)).filter(message => !message.read)).toEqual([])
   })
 })

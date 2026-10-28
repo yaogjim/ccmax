@@ -643,7 +643,7 @@ export const SDKControlElicitationResponseSchema = lazySchema(() =>
 
 export const SDKControlRequestInnerSchema = lazySchema(() =>
   z.union([
-    z.object({ subtype: z.literal('team_runtime_snapshot'), team_name: z.string().min(1), created_at: z.number() }),
+    z.object({ subtype: z.literal('team_runtime_snapshot'), team_name: z.string().min(1), created_at: z.number(), consumer_scope: z.unknown().optional() }),
     z.object({ subtype: z.literal('team_plan_pause') }),
     sessionMessageInputSchema,
     SDKControlInterruptRequestSchema(),

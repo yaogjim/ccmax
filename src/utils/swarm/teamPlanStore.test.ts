@@ -76,12 +76,29 @@ test('unrelated corrupt plan is isolated from session lookup', async () => {
   await writeFile(join(getTeamDir('broken'), 'plan.json'), '{broken')
   expect((await findTeamPlanForSession('session'))?.planId).toBe(plan.planId)
 })
-test('submission requires assigned work for every member', async () => {
+test('an approved plan may keep a member with no task, with its pending configuration frozen', async () => {
   const plan = await draft()
-  const empty = await replaceTeamPlan('review', identity(plan), { tasks: [] })
-  await expect(submitTeamPlan('review', identity(empty))).rejects.toThrow('assigned tasks')
-  const unassigned = await replaceTeamPlan('review', identity(empty), { tasks: [{ id: 't', subject: 'unassigned', dependencies: [] }] })
-  await expect(submitTeamPlan('review', identity(unassigned))).rejects.toThrow('Every member')
+  const standby = await stageMember('review', { id: 'standby', name: 'Standby', agentType: 'general-purpose', prompt: 'Wait for a ready task', runtime })
+  const submitted = await submitTeamPlan('review', identity(standby))
+  expect(submitted.state).toBe('review_pending')
+  const approved = (await approveTeamPlan('review', identity(submitted), 'standby', submitted)).plan
+  expect(approved.state).toBe('launching')
+  expect(approved.approvedSnapshot?.members.map(member => member.id)).toEqual(['worker', 'standby'])
+  // The frozen snapshot is what a later first start reads, not a re-approval.
+  expect(approved.approvedSnapshot?.members.find(member => member.id === 'standby')?.prompt).toBe('Wait for a ready task')
+  expect(approved.approvedSnapshot?.tasks).toHaveLength(1)
+})
+
+test('a plan with no tasks can be approved, while an unowned task still cannot', async () => {
+  const plan = await draft()
+  const unassigned = await replaceTeamPlan('review', identity(plan), { tasks: [{ id: 't', subject: 'unassigned', dependencies: [] }] })
+  await expect(submitTeamPlan('review', identity(unassigned))).rejects.toThrow('Every task needs an assigned member')
+  const empty = await replaceTeamPlan('review', identity(unassigned), { tasks: [] })
+  const submitted = await submitTeamPlan('review', identity(empty))
+  expect(submitted.state).toBe('review_pending')
+  const approved = (await approveTeamPlan('review', identity(submitted), 'no-tasks', submitted)).plan
+  expect(approved.approvedSnapshot?.tasks).toEqual([])
+  expect(approved.approvedSnapshot?.members).toHaveLength(1)
 })
 test('multiple incremental rosters retain all existing members and reject duplicate starts', async () => {
   const { mutateTeamPlan, isTeamExecutionApproved } = await import('./teamPlanStore.js')

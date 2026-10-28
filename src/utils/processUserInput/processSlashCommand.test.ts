@@ -4,13 +4,24 @@ import teamCommand from '../../commands/team.js'
 import type { Command } from '../../commands.js'
 import type { ToolUseContext } from '../../Tool.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
-import { createAssistantMessage } from '../messages.js'
+import type { Message } from '../../types/message.js'
+import {
+  createAssistantAPIErrorMessage,
+  createAssistantMessage,
+  createUserInterruptionMessage,
+} from '../messages.js'
 
 process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY ?? 'test-key'
 
+const defaultAgentMessages = (): Message[] => [
+  createAssistantMessage({ content: 'debugger result' }) as unknown as Message,
+]
+
+let forkedAgentMessages: Message[] = defaultAgentMessages()
+
 const runAgentMock = mock(() =>
   (async function* () {
-    yield createAssistantMessage({ content: 'debugger result' })
+    for (const message of forkedAgentMessages) yield message
   })(),
 )
 
@@ -165,5 +176,116 @@ describe('/team slash command processing', () => {
       'Agent',
       'SendMessage',
     ]))
+  })
+})
+
+const forkedCommand = {
+  type: 'prompt',
+  name: 'forked-report',
+  description: 'fake forked command',
+  progressMessage: 'running',
+  contentLength: 0,
+  source: 'builtin',
+  context: 'fork',
+  getPromptForCommand: async () => [{ type: 'text', text: 'build the report' }],
+} as unknown as Command
+
+function inResponse(responseId: string, message: Message): Message {
+  if (message.type === 'assistant') {
+    message.message.id = responseId
+  }
+  return message
+}
+
+function textAssistant(responseId: string, text: string): Message {
+  return inResponse(
+    responseId,
+    createAssistantMessage({ content: text }) as unknown as Message,
+  )
+}
+
+function commandOutput(result: Awaited<ReturnType<typeof processSlashCommand>>): string {
+  return (
+    result.messages
+      .filter(message => message.type === 'user')
+      .map(message => message.message.content)
+      .filter((content): content is string => typeof content === 'string')
+      .find(
+        content =>
+          content.includes('<local-command-stdout>') ||
+          content.includes('<local-command-stderr>'),
+      ) ?? ''
+  )
+}
+
+describe('/forked prompt slash command outcome', () => {
+  beforeEach(() => {
+    runAgentMock.mockClear()
+    forkedAgentMessages = defaultAgentMessages()
+  })
+
+  test('keeps stdout and the result text for a successful fork', async () => {
+    forkedAgentMessages = [textAssistant('msg_ok', 'Command output')]
+
+    const result = await processSlashCommand(
+      '/forked-report',
+      [],
+      [],
+      [],
+      makeContext([makeAgent('general-purpose')], [forkedCommand]),
+      () => {},
+    )
+
+    expect(result.shouldQuery).toBe(false)
+    expect(commandOutput(result)).toContain('<local-command-stdout>')
+    expect(commandOutput(result)).toContain('Command output')
+    expect(result.resultText).toBe('Command output')
+  })
+
+  test('reports an API error on stderr instead of a successful stdout', async () => {
+    forkedAgentMessages = [
+      inResponse(
+        'msg_api_error',
+        createAssistantAPIErrorMessage({ content: 'API Error: 500' }) as unknown as Message,
+      ),
+    ]
+
+    const result = await processSlashCommand(
+      '/forked-report',
+      [],
+      [],
+      [],
+      makeContext([makeAgent('general-purpose')], [forkedCommand]),
+      () => {},
+    )
+
+    const output = commandOutput(result)
+    expect(output).toContain('<local-command-stderr>')
+    expect(output).not.toContain('<local-command-stdout>')
+    expect(output).toContain('api_error')
+    expect(output).toContain('API Error: 500')
+    expect(result.resultText).toContain('did not complete (api_error)')
+  })
+
+  test('reports a cancelled fork on stderr', async () => {
+    forkedAgentMessages = [
+      textAssistant('msg_partial', 'Partial output'),
+      createUserInterruptionMessage({ toolUse: false }) as unknown as Message,
+    ]
+
+    const result = await processSlashCommand(
+      '/forked-report',
+      [],
+      [],
+      [],
+      makeContext([makeAgent('general-purpose')], [forkedCommand]),
+      () => {},
+    )
+
+    const output = commandOutput(result)
+    expect(output).toContain('<local-command-stderr>')
+    expect(output).not.toContain('<local-command-stdout>')
+    expect(output).toContain('cancelled')
+    expect(result.resultText).toContain('cancelled')
   })
 })

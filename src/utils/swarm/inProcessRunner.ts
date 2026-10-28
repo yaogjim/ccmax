@@ -11,7 +11,8 @@
 
 import { feature } from 'bun:bundle'
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
-import type { UUID } from 'crypto'
+import { type UUID } from 'crypto'
+import { getSessionId } from '../../bootstrap/state.js'
 import { getSystemPrompt } from '../../constants/prompts.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import {
@@ -119,12 +120,14 @@ import {
   type Task,
 } from '../tasks.js'
 import type { TeammateContext } from '../teammateContext.js'
+import { getConsumerScope } from '../teammate.js'
+import { claimScopedMailbox, consumerScopeKey, memberConsumerScope, mutateScopedTeam, parseConsumerScope, readScopedMailbox, removeScopedMember, sameConsumerScope, withConsumerScope, type ConsumerScope } from './consumerScope.js'
+
 import {
   createTeamStreamScopeId,
   runWithTeammateContext,
 } from '../teammateContext.js'
 import {
-  claimMailboxMessages,
   createIdleNotification,
   formatTeammateMessage,
   formatTeammateMessages,
@@ -134,8 +137,6 @@ import {
   isPlanApprovalResponse,
   isShutdownRequest,
   isStructuredProtocolMessage,
-  markMessagesAsReadByIdentity,
-  readMailbox,
   type TeammateMessage,
   writeToMailbox,
 } from '../teammateMailbox.js'
@@ -157,10 +158,10 @@ import {
 } from './permissionSync.js'
 import { spawnInProcessTeammate } from './spawnInProcess.js'
 import {
-  mutateTeamFileAsync,
   readTeamFile,
   readTeamFileAsync,
   setMemberActive,
+  type TeamFile,
 } from './teamHelpers.js'
 import { TEAMMATE_SYSTEM_PROMPT_ADDENDUM } from './teammatePromptAddendum.js'
 import {
@@ -169,6 +170,19 @@ import {
   summarizeTurnFailure,
   TEAMMATE_AUTO_CONTINUE_DELAYS_MS,
 } from './turnFailure.js'
+
+class ConsumerIdentityError extends Error {
+  constructor(readonly reason: string) {
+    super(`消费实例 ${reason}，自动接收已停止；历史仍可查看`)
+  }
+}
+
+async function requireCurrentConsumer(identity: Pick<TeammateIdentity, 'consumerScope'>): Promise<void> {
+  const checked = await withConsumerScope(identity.consumerScope, () => true)
+  if (checked.status === 'stale' || checked.status === 'unbound' || checked.status === 'unsupported') {
+    throw new ConsumerIdentityError(checked.status)
+  }
+}
 
 type SetAppStateFn = (updater: (prev: AppState) => AppState) => void
 
@@ -236,6 +250,7 @@ function createInProcessCanUseTool(
       }
     }
 
+    await requireCurrentConsumer(identity)
     // Check if aborted before showing UI
     if (abortController.signal.aborted) {
       return { behavior: 'ask', message: SUBAGENT_REJECT_MESSAGE }
@@ -257,9 +272,23 @@ function createInProcessCanUseTool(
 
     // Standard path: use ToolUseConfirm dialog with worker badge
     if (setToolUseConfirmQueue) {
-      return new Promise<PermissionDecision>(resolve => {
+      return new Promise<PermissionDecision>((resolve, reject) => {
         let decisionMade = false
         const permissionStartMs = Date.now()
+        const instancePoll = setInterval(async () => {
+          if (decisionMade) return
+          const checked = await withConsumerScope(identity.consumerScope, () => true)
+          if (decisionMade || checked.status === 'current' || checked.status === 'retryable_io') return
+          decisionMade = true
+          cleanupWaiter()
+          reportPermissionWait()
+          setToolUseConfirmQueue(queue => queue.filter(item => item.toolUseID !== toolUseID))
+          reject(new ConsumerIdentityError(checked.status))
+        }, PERMISSION_POLL_INTERVAL_MS)
+        function cleanupWaiter() {
+          clearInterval(instancePoll)
+          abortController.signal.removeEventListener('abort', onAbortListener)
+        }
 
         // Report permission wait time to the caller so it can be
         // subtracted from the displayed elapsed time.
@@ -270,6 +299,7 @@ function createInProcessCanUseTool(
         const onAbortListener = () => {
           if (decisionMade) return
           decisionMade = true
+          cleanupWaiter()
           reportPermissionWait()
           resolve({ behavior: 'ask', message: SUBAGENT_REJECT_MESSAGE })
           setToolUseConfirmQueue(queue =>
@@ -301,10 +331,7 @@ function createInProcessCanUseTool(
             onAbort() {
               if (decisionMade) return
               decisionMade = true
-              abortController.signal.removeEventListener(
-                'abort',
-                onAbortListener,
-              )
+              cleanupWaiter()
               reportPermissionWait()
               resolve({ behavior: 'ask', message: SUBAGENT_REJECT_MESSAGE })
             },
@@ -315,11 +342,10 @@ function createInProcessCanUseTool(
               contentBlocks?: ContentBlockParam[],
             ) {
               if (decisionMade) return
+              const accepted = await withConsumerScope(identity.consumerScope, () => {
+              if (decisionMade) return
               decisionMade = true
-              abortController.signal.removeEventListener(
-                'abort',
-                onAbortListener,
-              )
+              cleanupWaiter()
               reportPermissionWait()
               persistPermissionUpdates(permissionUpdates)
               // Write back permission updates to the leader's shared context
@@ -349,14 +375,19 @@ function createInProcessCanUseTool(
                 ...(contentBlocks &&
                   contentBlocks.length > 0 && { contentBlocks }),
               })
+              })
+              if (accepted.status !== 'current' && !decisionMade) {
+                decisionMade = true
+                cleanupWaiter()
+                reportPermissionWait()
+                setToolUseConfirmQueue(queue => queue.filter(item => item.toolUseID !== toolUseID))
+                reject(new ConsumerIdentityError(accepted.status))
+              }
             },
             onReject(feedback?: string, contentBlocks?: ContentBlockParam[]) {
               if (decisionMade) return
               decisionMade = true
-              abortController.signal.removeEventListener(
-                'abort',
-                onAbortListener,
-              )
+              cleanupWaiter()
               reportPermissionWait()
               const message = feedback
                 ? `${SUBAGENT_REJECT_MESSAGE_WITH_REASON_PREFIX}${feedback}`
@@ -373,20 +404,21 @@ function createInProcessCanUseTool(
                 toolUseID,
               )
               if (freshResult.behavior === 'allow') {
-                decisionMade = true
-                abortController.signal.removeEventListener(
-                  'abort',
-                  onAbortListener,
-                )
-                reportPermissionWait()
-                setToolUseConfirmQueue(queue =>
-                  queue.filter(item => item.toolUseID !== toolUseID),
-                )
-                resolve({
-                  ...freshResult,
-                  updatedInput: input,
-                  userModified: false,
+                const accepted = await withConsumerScope(identity.consumerScope, () => {
+                  if (decisionMade) return
+                  decisionMade = true
+                  cleanupWaiter()
+                  reportPermissionWait()
+                  setToolUseConfirmQueue(queue => queue.filter(item => item.toolUseID !== toolUseID))
+                  resolve({ ...freshResult, updatedInput: input, userModified: false })
                 })
+                if (accepted.status !== 'current' && !decisionMade) {
+                  decisionMade = true
+                  cleanupWaiter()
+                  reportPermissionWait()
+                  setToolUseConfirmQueue(queue => queue.filter(item => item.toolUseID !== toolUseID))
+                  reject(new ConsumerIdentityError(accepted.status))
+                }
               }
             },
           },
@@ -395,7 +427,7 @@ function createInProcessCanUseTool(
     }
 
     // Fallback: use mailbox system when leader UI queue is unavailable
-    return new Promise<PermissionDecision>(resolve => {
+    return new Promise<PermissionDecision>((resolve, reject) => {
       const request = createPermissionRequest({
         toolName: (tool as Tool).name,
         toolUseId: toolUseID,
@@ -452,33 +484,55 @@ function createInProcessCanUseTool(
             return
           }
 
-          const allMessages = await readMailbox(
-            identity.agentName,
-            identity.teamName,
-          )
+          const scope = identity.consumerScope
+          if (!scope) {
+            cleanup()
+            reject(new ConsumerIdentityError('unbound'))
+            return
+          }
+          const read = await readScopedMailbox(scope)
+          if (read.status !== 'current') {
+            if (read.status !== 'retryable_io') {
+              cleanup()
+              reject(new ConsumerIdentityError(read.status))
+            }
+            return
+          }
+          const allMessages = read.value
           for (let i = 0; i < allMessages.length; i++) {
             const msg = allMessages[i]
             if (msg && !msg.read) {
               const parsed = isPermissionResponse(msg.text)
               if (parsed && parsed.request_id === request.id) {
-                await markMessagesAsReadByIdentity(
-                  identity.agentName,
-                  identity.teamName,
-                  [msg],
-                )
-                if (parsed.subtype === 'success') {
-                  processMailboxPermissionResponse({
-                    requestId: parsed.request_id,
-                    decision: 'approved',
-                    updatedInput: parsed.response?.updated_input,
-                    permissionUpdates: parsed.response?.permission_updates,
-                  })
-                } else {
-                  processMailboxPermissionResponse({
-                    requestId: parsed.request_id,
-                    decision: 'rejected',
-                    feedback: parsed.error,
-                  })
+                // The waiter resolves only on a claim that this instance won;
+                // a refused claim leaves the response for a poll under the
+                // then-current instance instead of acting on it here.
+                const claimed = await claimScopedMailbox(scope, [msg])
+                if (claimed.status !== 'claimed') {
+                  if (claimed.status === 'stale' || claimed.status === 'unbound' || claimed.status === 'unsupported') {
+                    cleanup()
+                    reject(new ConsumerIdentityError(claimed.status))
+                    return
+                  }
+                  continue
+                }
+                if (claimed.messages.length === 0) continue
+                const processed = await withConsumerScope(scope, () => {
+                  if (parsed.subtype === 'success') {
+                    processMailboxPermissionResponse({
+                      requestId: parsed.request_id, decision: 'approved',
+                      updatedInput: parsed.response?.updated_input,
+                      permissionUpdates: parsed.response?.permission_updates,
+                    })
+                  } else {
+                    processMailboxPermissionResponse({
+                      requestId: parsed.request_id, decision: 'rejected', feedback: parsed.error,
+                    })
+                  }
+                })
+                if (processed.status !== 'current' && processed.status !== 'retryable_io') {
+                  cleanup()
+                  reject(new ConsumerIdentityError(processed.status))
                 }
                 return // Callback already resolves the promise
               }
@@ -617,11 +671,13 @@ export function buildInProcessTeammateAgentDefinition(
 }
 
 async function setInProcessTeammateActivity(
-  identity: Pick<TeammateIdentity, 'agentName' | 'teamName'>,
+  identity: Pick<TeammateIdentity, 'agentName' | 'teamName' | 'consumerScope'>,
   isActive: boolean,
 ): Promise<void> {
   try {
-    await setMemberActive(identity.teamName, identity.agentName, isActive)
+    const recipient = identity.consumerScope?.recipient
+    if (recipient?.kind !== 'member') return
+    await setMemberActive(identity.teamName, identity.agentName, isActive, recipient.memberInstanceId)
   } catch (error) {
     logForDebugging(
       `[inProcessRunner] Failed to sync ${identity.agentName} activity: ${error}`,
@@ -631,7 +687,7 @@ async function setInProcessTeammateActivity(
 
 /** Keep the persisted roster active only while an in-process turn is running. */
 export async function withInProcessTeammateActivity<T>(
-  identity: Pick<TeammateIdentity, 'agentName' | 'teamName'>,
+  identity: Pick<TeammateIdentity, 'agentName' | 'teamName' | 'consumerScope'>,
   runTurn: () => Promise<T>,
 ): Promise<T> {
   await setInProcessTeammateActivity(identity, true)
@@ -711,15 +767,17 @@ async function sendIdleNotification(
     failureReason?: string
     result?: string
   },
+  consumerScope?: ConsumerScope,
 ): Promise<boolean> {
   const notification = createIdleNotification(agentName, options)
 
-  return sendMessageToLeader(
+  const sent = await withConsumerScope(consumerScope, () => sendMessageToLeader(
     agentName,
     jsonStringify(notification),
     agentColor,
     teamName,
-  )
+  ))
+  return sent.status === 'current' && sent.value
 }
 
 /** Why a teammate's turn ended on an API error, and whether a retry can fix it. */
@@ -977,23 +1035,36 @@ export type TeammateMailboxDelivery = Extract<
  * so a failed mark delivers nothing and the next poll tries again.
  */
 export async function takeTeammateMailbox(
-  identity: Pick<TeammateIdentity, 'agentName' | 'teamName'>,
+  identity: Pick<TeammateIdentity, 'agentName' | 'teamName' | 'consumerScope'>,
 ): Promise<TeammateMailboxDelivery | null> {
-  const { agentName, teamName } = identity
-  const unread = (await readMailbox(agentName, teamName)).filter(
-    message => !message.read,
-  )
+  const { agentName, teamName, consumerScope } = identity
+  // An in-process runner without a bound instance must not fall back to its
+  // name: after a same-name replacement that address belongs to the new
+  // teammate, and its inbox is not this runner's to drain.
+  if (!consumerScope) {
+    logForDebugging(
+      `[inProcessRunner] ${agentName} has no consumer scope; automatic inbox reads stopped`,
+    )
+    throw new ConsumerIdentityError('unbound')
+  }
+  const read = await readScopedMailbox(consumerScope)
+  if (read.status !== 'current') {
+    if (read.status !== 'retryable_io') throw new ConsumerIdentityError(read.status)
+    return null
+  }
+  const unread = read.value.filter(message => !message.read)
   if (unread.length === 0) return null
 
   const shutdownMessage = unread.find(message =>
     isShutdownRequest(message.text),
   )
   if (shutdownMessage) {
-    const claimed = await claimMailboxMessages(agentName, teamName, [
-      shutdownMessage,
-    ])
-    if (claimed === undefined) return null
-    if (claimed.length > 0) {
+    const claimed = await claimScopedMailbox(consumerScope, [shutdownMessage])
+    if (claimed.status !== 'claimed') {
+      if (claimed.status === 'stale' || claimed.status === 'unbound' || claimed.status === 'unsupported') throw new ConsumerIdentityError(claimed.status)
+      return null
+    }
+    if (claimed.messages.length > 0) {
       const request = isShutdownRequest(shutdownMessage.text)
       logForDebugging(
         `[inProcessRunner] ${agentName} received shutdown request from ${request?.from} (prioritized over ${unread.length - 1} unread messages)`,
@@ -1025,16 +1096,20 @@ export async function takeTeammateMailbox(
       `[inProcessRunner] ${agentName} dropping ${protocolFrames.length} protocol frame(s) from ${[...new Set(protocolFrames.map(message => message.from))].join(', ')}`,
       { level: 'warn' },
     )
-    await claimMailboxMessages(agentName, teamName, protocolFrames)
+    await claimScopedMailbox(consumerScope, protocolFrames)
   }
 
   if (deliverable.length === 0) return null
-  const claimed = await claimMailboxMessages(agentName, teamName, deliverable)
-  if (!claimed || claimed.length === 0) return null
+  const claimed = await claimScopedMailbox(consumerScope, deliverable)
+  if (claimed.status !== 'claimed') {
+    if (claimed.status === 'stale' || claimed.status === 'unbound' || claimed.status === 'unsupported') throw new ConsumerIdentityError(claimed.status)
+    return null
+  }
+  if (claimed.messages.length === 0) return null
   logForDebugging(
-    `[inProcessRunner] ${agentName} draining ${claimed.length} message(s) from ${[...new Set(claimed.map(message => message.from))].join(', ')}`,
+    `[inProcessRunner] ${agentName} draining ${claimed.messages.length} message(s) from ${[...new Set(claimed.messages.map(message => message.from))].join(', ')}`,
   )
-  return { type: 'new_messages', messages: claimed }
+  return { type: 'new_messages', messages: claimed.messages }
 }
 
 /**
@@ -1072,6 +1147,7 @@ async function waitForNextPromptOrShutdown(
 
   let pollCount = 0
   while (!abortController.signal.aborted) {
+    await requireCurrentConsumer(identity)
     if (cancelSignal?.aborted) return { type: 'cancelled' }
 
     // Check for in-memory pending messages on every iteration (from transcript viewing)
@@ -1145,7 +1221,11 @@ async function waitForNextPromptOrShutdown(
 
     // Check the team's task list for unclaimed tasks
     if (claimTasks) {
-      const taskPrompt = await claimNextInProcessTask(identity)
+      const claim = await withConsumerScope(identity.consumerScope, () => claimNextInProcessTask(identity))
+      if (claim.status !== 'current' && claim.status !== 'retryable_io') {
+        throw new ConsumerIdentityError(claim.status)
+      }
+      const taskPrompt = claim.status === 'current' ? claim.value : undefined
       if (taskPrompt) {
         return {
           type: 'new_message',
@@ -1314,6 +1394,8 @@ export async function runInProcessTeammate(
   const recordedUuids = new Set<UUID>(allMessages.map(message => message.uuid))
   const transcriptMetadata: Partial<AgentMetadata> = {
     taskKind: 'in_process_teammate',
+    consumerScope: identity.consumerScope,
+    parentSessionId: identity.parentSessionId,
     teamName: identity.teamName,
     name: identity.agentName,
     planModeRequired: identity.planModeRequired,
@@ -1336,7 +1418,12 @@ export async function runInProcessTeammate(
     : undefined
 
   // Makes what the teammate was handed while waiting its next prompt
-  const takeNextPrompt = (next: WaitResult): void => {
+  const takeNextPrompt = async (next: WaitResult): Promise<void> => {
+    const accepted = await withConsumerScope(identity.consumerScope, () => acceptNextPrompt(next))
+    if (accepted.status !== 'current') throw new ConsumerIdentityError(accepted.status)
+  }
+
+  const acceptNextPrompt = (next: WaitResult): void => {
     // A new instruction starts a fresh retry budget: someone has seen the
     // teammate's state and wants it to go on.
     autoContinueAttempts = 0
@@ -1454,6 +1541,7 @@ export async function runInProcessTeammate(
 
     // Main teammate loop - runs until abort or shutdown approved
     while (!abortController.signal.aborted && !shouldExit) {
+      await requireCurrentConsumer(identity)
       logForDebugging(
         `[inProcessRunner] ${identity.agentId} processing prompt: ${currentPrompt.substring(0, 50)}...`,
       )
@@ -1828,7 +1916,7 @@ export async function runInProcessTeammate(
           continue
         }
         if (next.type !== 'cancelled') {
-          takeNextPrompt(next)
+          await takeNextPrompt(next)
           continue
         }
         retryCancelled = true
@@ -1878,10 +1966,11 @@ export async function runInProcessTeammate(
                 summary,
                 result,
               },
+              identity.consumerScope,
             )
             if (sent && result !== undefined) lastDeliveredResult = result
           }
-          takeNextPrompt(delivery)
+          await takeNextPrompt(delivery)
           continue
         }
       }
@@ -1919,6 +2008,7 @@ export async function runInProcessTeammate(
             failureReason,
             result,
           },
+          identity.consumerScope,
         )
         if (sent && result !== undefined) lastDeliveredResult = result
       } else {
@@ -1932,7 +2022,7 @@ export async function runInProcessTeammate(
       )
 
       // Wait for next message or shutdown
-      takeNextPrompt(
+      await takeNextPrompt(
         await waitForNextPromptOrShutdown(
           identity,
           abortController,
@@ -2055,6 +2145,7 @@ export async function runInProcessTeammate(
         result:
           partialResult !== lastDeliveredResult ? partialResult : undefined,
       },
+      identity.consumerScope,
     )
 
     unregisterPerfettoAgent(identity.agentId)
@@ -2163,42 +2254,203 @@ export type InProcessTeammateResume =
       taskId: string
       /** Messages of the earlier conversation the teammate continues from */
       resumedMessageCount: number
+      /**
+       * `original` continues the instance that was already registered;
+       * `rejoined` registered a new instance after the old one left the team.
+       */
+      restoredAs: 'original' | 'rejoined'
+      /**
+       * The exact member instance this outcome is about. Callers that write
+       * to the teammate afterwards must validate against this scope rather
+       * than re-deriving an identity from the current name.
+       */
+      consumerScope: ConsumerScope
     }
   | {
       /** Another caller restarted it first; it is running now */
       kind: 'already_running'
+      /**
+       * The exact member instance that is running. A follow-up message must
+       * be written against this scope; the current name is not proof.
+       */
+      consumerScope: ConsumerScope
     }
+
+/** An in-process member scope carried by a template or a metadata file. */
+function memberScopeFromCarrier(
+  raw: unknown,
+  teamName: string,
+  agentName: string,
+  instanceId: string,
+): ConsumerScope | undefined {
+  const parsed = parseConsumerScope(raw)
+  if (parsed.status !== 'bound') return undefined
+  const scope = parsed.scope
+  if (scope.teamName !== teamName) return undefined
+  if (scope.recipient.kind !== 'member') return undefined
+  if (scope.recipient.backend !== 'in-process') return undefined
+  if (scope.recipient.agentName !== agentName) return undefined
+  if (scope.recipient.memberInstanceId !== instanceId) return undefined
+  return scope
+}
+
+/**
+ * The instance this process remembers for a name. The template is runtime
+ * state, so this stays synchronous and can key the in-flight map before any
+ * filesystem read.
+ */
+function templateInstanceId(
+  template: TeammateRespawnTemplate | undefined,
+  agentName: string,
+  teamName: string,
+): string | undefined {
+  const parsed = parseConsumerScope(template?.identity.consumerScope)
+  if (parsed.status === 'bound') {
+    const { scope } = parsed
+    if (
+      scope.teamName === teamName &&
+      scope.recipient.kind === 'member' &&
+      scope.recipient.backend === 'in-process' &&
+      scope.recipient.agentName === agentName
+    ) {
+      return scope.recipient.memberInstanceId
+    }
+  }
+  return template?.identity.resumableAgentId
+}
+
+/**
+ * A scope read from a sidecar is only usable when the sidecar still names the
+ * same team, agent and transcript instance, and its recorded parent session is
+ * the scope owner. Unknown or older versions stay unbound.
+ */
+function memberScopeFromMetadata(
+  metadata: AgentMetadata | null,
+  teamName: string,
+  agentName: string,
+  instanceId: string,
+): ConsumerScope | undefined {
+  if (metadata?.taskKind !== 'in_process_teammate') return undefined
+  if (metadata.teamName !== teamName || metadata.name !== agentName) return undefined
+  if (metadata.parentSessionId === undefined) return undefined
+  const scope = memberScopeFromCarrier(
+    metadata.consumerScope,
+    teamName,
+    agentName,
+    instanceId,
+  )
+  if (!scope) return undefined
+  // The sidecar must bind the same parent session the scope was issued under.
+  return metadata.parentSessionId === scope.ownerSessionId ? scope : undefined
+}
+
+function scopeMatchesTeam(
+  scope: ConsumerScope,
+  team: { name: string; createdAt: number; leadSessionId?: string },
+  generation: number,
+): boolean {
+  return (
+    scope.teamName === team.name &&
+    scope.createdAt === team.createdAt &&
+    scope.leadSessionId === (team.leadSessionId ?? '') &&
+    scope.generation === generation
+  )
+}
+
+/**
+ * The caller is fixed when the resume starts: a later read of the current team
+ * context must not be able to substitute another identity while the resume
+ * awaits the disk.
+ */
+function captureResumeCaller(params: ResumeInProcessTeammateParams): ConsumerScope {
+  const parsed = parseConsumerScope(
+    getConsumerScope(params.context.getAppState().teamContext),
+  )
+  if (parsed.status !== 'bound') {
+    throw new Error(`Cannot resume teammate: caller identity is ${parsed.status}`)
+  }
+  if (parsed.scope.teamName !== params.teamName) {
+    throw new Error('Cannot resume teammate: caller belongs to another team')
+  }
+  return parsed.scope
+}
+
+/** Re-check after waiting for another resume that this caller may still act. */
+async function requireCallerStillCurrent(
+  callerScope: ConsumerScope,
+  params: ResumeInProcessTeammateParams,
+): Promise<void> {
+  const checked = await withConsumerScope(callerScope, () => true)
+  if (checked.status !== 'current') {
+    throw new Error(`Cannot resume teammate: caller identity is ${checked.status}`)
+  }
+  const teamFile = await readTeamFileAsync(params.teamName)
+  const member = teamFile?.members.find(entry => entry.name === params.agentName)
+  const template = respawnTemplates.get(
+    formatAgentId(params.agentName, params.teamName),
+  )
+  const known = isCurrentTemplate(template, teamFile?.createdAt)
+    ? templateInstanceId(template, params.agentName, params.teamName)
+    : undefined
+  if (known && member?.consumerInstanceId && member.consumerInstanceId !== known) {
+    throw new Error(`"${params.agentName}" was replaced while it was resuming`)
+  }
+}
 
 /**
  * Restarts an in-process teammate that is not running -- its runner failed,
  * finished, was stopped or evicted -- from its own transcript, with `prompt`
- * as its next turn. It keeps its name@team address, color, model and agent
- * definition, gets a new task and abort controller, and rejoins the team file
- * if it had left it. Mail that arrived while it was stopped stays in its
- * inbox. A teammate this process never ran (the lead restarted since)
- * restarts from its team-file record without earlier conversation.
+ * as its next turn.
+ *
+ * A teammate still on the roster continues its original instance: its
+ * instance id, scope and transcript are the ones it was registered with, and
+ * both the caller and that instance must still be current. A teammate that
+ * left the roster is only restarted from this explicit call by registering a
+ * new instance (new id, scope and transcript) whose context is the old
+ * conversation; the old sidecar is never rewritten. A name now held by a
+ * different instance is a conflict, never a redirect to that instance.
  */
 export async function resumeInProcessTeammate(
   params: ResumeInProcessTeammateParams,
 ): Promise<InProcessTeammateResume> {
-  const agentId = formatAgentId(params.agentName, params.teamName)
-  const pending = resumesInFlight.get(agentId)
-  if (pending) {
-    const resumed = await pending.then(
-      () => true,
-      () => false,
+  // The caller is fixed once, before any disk read or wait.
+  const callerScope = captureResumeCaller(params)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const target = await resolveResumeTarget(params)
+    // The target's full creation tuple and member instance, not a name or a
+    // partial key: a replacement must never coalesce with its predecessor.
+    const inFlightKey = consumerScopeKey(target.consumerScope)
+    const pending = resumesInFlight.get(inFlightKey)
+    if (!pending) {
+      const resume = resumeStoppedTeammate(params, callerScope, target)
+      resumesInFlight.set(inFlightKey, resume)
+      try {
+        return await resume
+      } finally {
+        resumesInFlight.delete(inFlightKey)
+      }
+    }
+    const settled = await pending.then(
+      outcome => outcome,
+      () => null,
     )
-    return resumed
-      ? { kind: 'already_running' }
-      : resumeInProcessTeammate(params)
+    if (!settled) {
+      // The other resume failed; re-resolve the target and try once more.
+      continue
+    }
+    // Re-verify after the wait: both the caller and the instance that is now
+    // running must still be current. The outcome carries that exact scope so
+    // the caller's follow-up write cannot fall back to the current name.
+    await requireCallerStillCurrent(callerScope, params)
+    const checked = await withConsumerScope(settled.consumerScope, () => true)
+    if (checked.status !== 'current') {
+      throw new Error(
+        `Cannot resume teammate: "${params.agentName}" is ${checked.status}`,
+      )
+    }
+    return { kind: 'already_running', consumerScope: settled.consumerScope }
   }
-  const resume = resumeStoppedTeammate(params)
-  resumesInFlight.set(agentId, resume)
-  try {
-    return await resume
-  } finally {
-    resumesInFlight.delete(agentId)
-  }
+  throw new Error('Cannot resume teammate: retryable_io')
 }
 
 type ResumeInProcessTeammateParams = {
@@ -2241,14 +2493,34 @@ function findTeammateAgentDefinition(
     : undefined
 }
 
-async function resumeStoppedTeammate({
+type ResumeRegistration =
+  | { status: 'original'; scope: ConsumerScope }
+  | { status: 'rejoined'; scope: ConsumerScope }
+  | { status: 'name_taken' }
+  | { status: 'stale_target' }
+
+type ResolvedResumeTarget = {
+  member: TeamFile['members'][number] | undefined
+  template: TeammateRespawnTemplate | undefined
+  rejoin: boolean
+  targetInstanceId: string
+  rejoinInstanceId?: string
+  /** The target's full creation tuple and member instance. */
+  consumerScope: ConsumerScope
+  transcript: Awaited<ReturnType<typeof getAgentTranscript>>
+  metadata: AgentMetadata | null
+  resumeMessages: Message[]
+}
+
+/**
+ * Everything a resume learns before it takes a lock: which branch applies,
+ * the old conversation, and (for a rejoin) a new instance id. The resulting
+ * scope is the target's full identity and keys the in-flight map.
+ */
+async function resolveResumeTarget({
   agentName,
   teamName,
-  prompt,
-  from,
-  summary,
-  context,
-}: ResumeInProcessTeammateParams): Promise<InProcessTeammateResume> {
+}: ResumeInProcessTeammateParams): Promise<ResolvedResumeTarget> {
   const agentId = formatAgentId(agentName, teamName)
   const teamFile = await readTeamFileAsync(teamName)
   if (!teamFile?.members) {
@@ -2259,19 +2531,38 @@ async function resumeStoppedTeammate({
   const template = isCurrentTemplate(storedTemplate, teamFile.createdAt)
     ? storedTemplate
     : undefined
-  if (!template && member?.backendType !== 'in-process') {
+  const knownInstance = templateInstanceId(template, agentName, teamName)
+
+  if (member && member.backendType !== 'in-process') {
+    throw new Error(
+      `"${agentName}" is not an in-process teammate of team "${teamName}"`,
+    )
+  }
+  // A name now held by another instance is a conflict. Never bind the
+  // replacement just because the name matches.
+  if (member && knownInstance && member.consumerInstanceId !== knownInstance) {
+    throw new Error(
+      `"${agentName}" was replaced by a different instance; refusing to resume it`,
+    )
+  }
+
+  const rejoin = member === undefined
+  const targetInstanceId = rejoin
+    ? knownInstance
+    : member.consumerInstanceId
+  if (!targetInstanceId) {
     throw new Error(
       `"${agentName}" is not an in-process teammate of team "${teamName}"`,
     )
   }
 
-  const transcriptAgentId = template?.identity.resumableAgentId
-  const [transcript, metadata] = transcriptAgentId
-    ? await Promise.all([
-        getAgentTranscript(asAgentId(transcriptAgentId)),
-        readAgentMetadata(asAgentId(transcriptAgentId)).catch(() => null),
-      ])
-    : [null, null]
+  // Everything the lock cannot await is prepared here: the old conversation
+  // and, for a rejoin, the new instance id.
+  const rejoinInstanceId = rejoin ? createAgentId() : undefined
+  const [transcript, metadata] = await Promise.all([
+    getAgentTranscript(asAgentId(targetInstanceId)),
+    readAgentMetadata(asAgentId(targetInstanceId)).catch(() => null),
+  ])
   const resumeMessages = transcript
     ? filterWhitespaceOnlyAssistantMessages(
         filterOrphanedThinkingOnlyMessages(
@@ -2280,6 +2571,70 @@ async function resumeStoppedTeammate({
       )
     : []
 
+  const templateScope = memberScopeFromCarrier(
+    template?.identity.consumerScope,
+    teamName,
+    agentName,
+    targetInstanceId,
+  )
+  const metadataScope = memberScopeFromMetadata(
+    metadata,
+    teamName,
+    agentName,
+    targetInstanceId,
+  )
+  if (
+    templateScope &&
+    metadataScope &&
+    !sameConsumerScope(templateScope, metadataScope)
+  ) {
+    throw new Error(
+      `"${agentName}" has conflicting persisted identities; refusing to resume it`,
+    )
+  }
+  const consumerScope = templateScope ?? metadataScope
+  if (!consumerScope) {
+    throw new Error(
+      `"${agentName}" is not an in-process teammate of team "${teamName}"`,
+    )
+  }
+
+  return {
+    member,
+    template,
+    rejoin,
+    targetInstanceId,
+    ...(rejoinInstanceId ? { rejoinInstanceId } : {}),
+    consumerScope,
+    transcript,
+    metadata,
+    resumeMessages,
+  }
+}
+
+async function resumeStoppedTeammate(
+  {
+    agentName,
+    teamName,
+    prompt,
+    from,
+    summary,
+    context,
+  }: ResumeInProcessTeammateParams,
+  callerScope: ConsumerScope,
+  {
+    member,
+    template,
+    rejoin,
+    targetInstanceId,
+    rejoinInstanceId,
+    consumerScope: existingScope,
+    transcript,
+    metadata,
+    resumeMessages,
+  }: ResolvedResumeTarget,
+): Promise<InProcessTeammateResume> {
+  const agentId = formatAgentId(agentName, teamName)
   const runnerContext: ToolUseContext = template?.toolUseContext ?? {
     ...context,
     messages: [],
@@ -2295,6 +2650,68 @@ async function resumeStoppedTeammate({
     : (member?.planModeRequired ?? false)
   const model = template ? template.model : member?.model
 
+  // Validate the fixed caller and the target's original scope, then reserve
+  // the roster entry, under one lifecycle -> config lock. A rejoin only gets
+  // the name while it is still vacant; a conflict is reported, not redirected.
+  const registration = await mutateScopedTeam<ResumeRegistration>(
+    callerScope,
+    (team, caller) => {
+      if (!scopeMatchesTeam(existingScope, team, caller.generation)) {
+        return { status: 'stale_target' }
+      }
+      if (rejoin) {
+        if (team.members.some(entry => entry.name === agentName)) {
+          return { status: 'name_taken' }
+        }
+        const scope = memberConsumerScope({
+          team,
+          generation: caller.generation,
+          ownerSessionId: getSessionId(),
+          backend: 'in-process',
+          agentName,
+          memberInstanceId: rejoinInstanceId!,
+        })
+        team.members.push({
+          agentId,
+          name: agentName,
+          consumerInstanceId: rejoinInstanceId!,
+          agentType: agentDefinition?.agentType ?? member?.agentType,
+          model,
+          color,
+          planModeRequired,
+          joinedAt: Date.now(),
+          tmuxPaneId: 'in-process',
+          cwd: getCwd(),
+          subscriptions: [],
+          backendType: 'in-process',
+        })
+        return { status: 'rejoined', scope }
+      }
+      const entry = team.members.find(candidate => candidate.agentId === agentId)
+      if (!entry || entry.consumerInstanceId !== targetInstanceId) {
+        return { status: 'stale_target' }
+      }
+      entry.joinedAt = Date.now()
+      return { status: 'original', scope: existingScope }
+    },
+    { expectedOwnerSessionId: getSessionId() },
+  )
+  if (registration.status !== 'current') {
+    throw new Error(`Cannot resume teammate: ${registration.status}`)
+  }
+  if (registration.value.status === 'name_taken') {
+    throw new Error(
+      `Cannot rejoin "${agentName}": the name is now held by a different member`,
+    )
+  }
+  if (registration.value.status === 'stale_target') {
+    throw new Error(
+      `Cannot resume "${agentName}": its team or member instance changed`,
+    )
+  }
+  const consumerScope = registration.value.scope
+  const resumableAgentId = rejoin ? rejoinInstanceId! : targetInstanceId
+
   const spawned = await spawnInProcessTeammate(
     {
       name: agentName,
@@ -2303,9 +2720,11 @@ async function resumeStoppedTeammate({
       color,
       planModeRequired,
       model,
-      // Without a transcript the teammate starts a new one, but it still
-      // keeps the mail that was left for it
-      resumableAgentId: transcriptAgentId ?? createAgentId(),
+      consumerScope,
+      // A rejoin is a new registration with a new transcript; the old
+      // conversation is only context. An original instance keeps its own.
+      resumableAgentId,
+      isResume: !rejoin,
       permissionMode: resumablePermissionMode(metadata),
     },
     { setAppState: runnerContext.setAppState, toolUseId: context.toolUseId },
@@ -2317,36 +2736,19 @@ async function resumeStoppedTeammate({
     !spawned.teammateContext ||
     !spawned.abortController
   ) {
+    // Roll back only the instance this resume registered, never a member that
+    // now occupies the name.
+    if (rejoin) {
+      const rolledBack = await removeScopedMember(consumerScope, agentId)
+      if (rolledBack.status !== 'current') {
+        logForDebugging(
+          `[inProcessRunner] could not roll back ${agentId}: ${rolledBack.status}`,
+        )
+      }
+    }
     throw new Error(spawned.error ?? 'Failed to respawn in-process teammate')
   }
 
-  // Rejoin the roster before the runner starts
-  try {
-    await mutateTeamFileAsync(teamName, file => {
-      const entry = file.members.find(candidate => candidate.agentId === agentId)
-      if (entry) {
-        entry.joinedAt = Date.now()
-        return
-      }
-      file.members.push({
-        agentId,
-        name: agentName,
-        agentType: agentDefinition?.agentType ?? member?.agentType,
-        model,
-        color,
-        planModeRequired,
-        joinedAt: Date.now(),
-        tmuxPaneId: 'in-process',
-        cwd: getCwd(),
-        subscriptions: [],
-        backendType: 'in-process',
-      })
-    })
-  } catch (error) {
-    logForDebugging(
-      `[inProcessRunner] could not re-add ${agentId} to the team file: ${error}`,
-    )
-  }
   runnerContext.setAppState(prev =>
     prev.teamContext
       ? {
@@ -2401,5 +2803,7 @@ async function resumeStoppedTeammate({
     kind: 'resumed',
     taskId: spawned.taskId,
     resumedMessageCount: resumeMessages.length,
+    restoredAs: rejoin ? 'rejoined' : 'original',
+    consumerScope,
   }
 }

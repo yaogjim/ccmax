@@ -140,6 +140,48 @@ test.skipIf(process.platform === 'win32')('preserves an existing sandbox wrapper
   expect(stdout).toBe('literal $arg `command` "quoted"\n')
 })
 
+test.skipIf(process.platform === 'win32')('repeated file-fd commands never mistake a healthy runtime for a closed lifetime pipe', async () => {
+  const directory = fixtureDirectory()
+  const fixture = join(directory, 'fd-reuse.ts')
+  writeFileSync(fixture, `
+    import { closeSync, openSync } from 'fs'
+    import { spawnWithParentProcessGuard } from ${JSON.stringify(import.meta.dir + '/parentProcessGuard.ts')}
+    const failures = []
+    const rejections = []
+    process.on('unhandledRejection', error => rejections.push(String(error)))
+    for (let index = 0; index < 200; index++) {
+      const fd = openSync('/dev/null', 'a')
+      const child = spawnWithParentProcessGuard('/bin/sh', ['-c', 'exit 0'], {
+        stdio: ['pipe', fd, fd],
+      })
+      closeSync(fd)
+      const result = await new Promise(resolve => {
+        child.once('exit', (code, signal) => resolve({ code, signal }))
+        child.once('error', error => resolve({ error: String(error) }))
+      })
+      if (result.code !== 0 || result.signal !== null) failures.push(result)
+    }
+    await new Promise(resolve => setTimeout(resolve, 100))
+    console.log(JSON.stringify({ failures, rejections }))
+  `)
+  const runtime = spawn(process.execPath, ['--no-env-file', fixture], {
+    cwd: directory,
+    env: { PATH: process.env.PATH, HOME: directory, CLAUDE_CONFIG_DIR: join(directory, 'config') },
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  children.push(runtime)
+  let stdout = ''
+  let stderr = ''
+  runtime.stdout!.on('data', data => { stdout += data })
+  runtime.stderr!.on('data', data => { stderr += data })
+  expect(await exited(runtime)).toBe(0)
+  expect(stderr).toBe('')
+  const result = JSON.parse(stdout.trim())
+  expect(result.failures).toEqual([])
+  expect(result.rejections).toEqual([])
+}, 30_000)
+
 for (const action of ['terminate', 'abort'] as const) {
   test.skipIf(process.platform === 'win32')(`reaps the target and guardian when the supervisor is ${action === 'abort' ? 'aborted' : 'terminated'}`, async () => {
     const output = join(fixtureDirectory(), 'ticks')

@@ -83,6 +83,20 @@ export type TeamFile = {
   leadAgentId: string
   leadSessionId?: string // Actual session UUID of the leader (for discovery)
   hiddenPaneIds?: string[] // Pane IDs that are currently hidden from the UI
+  /**
+   * When the user last stopped this team. Durable so the pause outlives the
+   * server process: a restarted runtime reads it back and keeps automatic work
+   * held until a new instruction arrives. Absent on files written before it
+   * existed, which means "never stopped".
+   */
+  pausedAt?: number
+  /**
+   * How many times the user has stopped this team. A count rather than a time:
+   * the desktop settles a pending member wait only when a Stop is newer than
+   * the one the send committed against, and comparing clocks across processes
+   * cannot answer that. Absent means zero.
+   */
+  stopEpoch?: number
   teamAllowedPaths?: TeamAllowedPath[] // Paths all teammates can edit without asking
   members: Array<{
     agentId: string
@@ -102,6 +116,15 @@ export type TeamFile = {
     cwd: string
     worktreePath?: string
     sessionId?: string
+    /**
+     * Identity of this registration, changed whenever the name is registered
+     * again. `agentId` and `name` are addresses that a recreated team or a
+     * replaced member reuses, so mailbox consumers compare this value instead.
+     * Absent on members written before it was recorded: they may still read
+     * their history, but a consumer cannot be bound to them until a trusted
+     * registration writes one.
+     */
+    consumerInstanceId?: string
     subscriptions: string[]
     backendType?: BackendType
     isActive?: boolean // false when idle, undefined/true when active
@@ -114,8 +137,18 @@ export type TeamFile = {
      * The member has not been given its approved instructions yet: every task
      * it owns waited on unfinished work when the team started. Absent on
      * members written before this was recorded, which were all instructed.
+     * This is about instructions, not processes: an older deferred member had
+     * a process and a transcript even while it waited.
      */
     awaitingDependencies?: boolean
+    /**
+     * The member's process has never run, so its first start begins a new
+     * conversation instead of resuming one. Written `true` for an approved
+     * member that has no ready task and cleared when its start succeeds.
+     * Absent on members written before this was recorded: every one of them
+     * already had a process, so it must be resumed, never started afresh.
+     */
+    initialStartPending?: boolean
   }>
 }
 
@@ -227,7 +260,7 @@ export async function readTeamFileAsync(
 
 // Call only while holding the config lock. Readers need no lock: rename
 // exposes either the complete previous config or the complete replacement.
-async function replaceTeamFileAsync(
+export async function replaceTeamFileAsync(
   teamName: string,
   content: string,
 ): Promise<void> {
@@ -258,7 +291,7 @@ async function replaceTeamFileAsync(
   }
 }
 
-async function withTeamFileLock<T>(
+export async function withTeamFileLock<T>(
   teamName: string,
   action: () => Promise<T>,
 ): Promise<T> {
@@ -291,7 +324,7 @@ export async function writeTeamFileAsync(
   )
 }
 
-class TeamFileNotFoundError extends Error {
+export class TeamFileNotFoundError extends Error {
   constructor(teamName: string) {
     super(`Team "${teamName}" does not exist`)
   }
@@ -598,6 +631,7 @@ export async function setMemberActive(
   teamName: string,
   memberName: string,
   isActive: boolean,
+  consumerInstanceId?: string,
 ): Promise<void> {
   const existing = await readTeamFileAsync(teamName)
   if (!existing) {
@@ -610,7 +644,8 @@ export async function setMemberActive(
   let memberFound = false
   let didChange = false
   await mutateTeamFileAsync(teamName, teamFile => {
-    const member = teamFile.members.find(m => m.name === memberName)
+    const member = teamFile.members.find(m => m.name === memberName &&
+      (consumerInstanceId === undefined || m.consumerInstanceId === consumerInstanceId))
     if (!member) return
     memberFound = true
     if (member.isActive === isActive) return

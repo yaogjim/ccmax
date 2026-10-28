@@ -23,6 +23,7 @@ export {
 } from './teammateContext.js'
 
 import type { AppState } from '../state/AppState.js'
+import type { ConsumerScope } from './swarm/consumerScope.js'
 import { isEnvTruthy } from './envUtils.js'
 import { getTeammateContext } from './teammateContext.js'
 
@@ -48,6 +49,7 @@ let dynamicTeamContext: {
   color?: string
   planModeRequired: boolean
   parentSessionId?: string
+  consumerScope?: ConsumerScope
 } | null = null
 
 /**
@@ -61,6 +63,7 @@ export function setDynamicTeamContext(
     color?: string
     planModeRequired: boolean
     parentSessionId?: string
+    consumerScope?: ConsumerScope
   } | null,
 ): void {
   dynamicTeamContext = context
@@ -78,6 +81,16 @@ export function clearDynamicTeamContext(): void {
  */
 export function getDynamicTeamContext(): typeof dynamicTeamContext {
   return dynamicTeamContext
+}
+
+export function getConsumerScope(
+  teamContext?: { consumerScope?: ConsumerScope },
+): ConsumerScope | undefined {
+  const inProcess = getTeammateContext()
+  // 存在成员上下文但缺身份时不得借用父会话或 lead 的身份。
+  if (inProcess) return inProcess.consumerScope
+  if (dynamicTeamContext) return dynamicTeamContext.consumerScope
+  return teamContext?.consumerScope
 }
 
 /**

@@ -35,20 +35,17 @@ import type { PaneBackendType } from '../utils/swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from '../utils/swarm/constants.js'
 import { getLeaderToolUseConfirmQueue } from '../utils/swarm/leaderPermissionBridge.js'
 import { sendPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js'
-import {
-  readTeamFileAsync,
-  removeTeammateFromTeamFile,
-  setMemberMode,
-} from '../utils/swarm/teamHelpers.js'
 import { unassignTeammateTasks } from '../utils/tasks.js'
 import {
   getAgentName,
+  getConsumerScope,
   isPlanModeRequired,
   isTeamLead,
   isTeammate,
 } from '../utils/teammate.js'
 import { isInProcessTeammate } from '../utils/teammateContext.js'
 import {
+  claimMailboxMessages,
   formatTeammateMessages,
   getTrustedShutdownApproval,
   isModeSetRequest,
@@ -62,11 +59,18 @@ import {
   isShutdownRequest,
   isTeamPermissionUpdate,
   isTrustedTeamLeaderMessage,
-  markMessagesAsReadByIdentity,
-  readUnreadMessages,
   type TeammateMessage,
   writeToMailbox,
 } from '../utils/teammateMailbox.js'
+import {
+  consumerInboxName,
+  markScopedMailboxRead,
+  mutateScopedTeam,
+  readScopedMailbox,
+  sameConsumerScope,
+  withConsumerScope,
+  type ConsumerScope,
+} from '../utils/swarm/consumerScope.js'
 import {
   hasPermissionCallback,
   hasSandboxPermissionCallback,
@@ -109,6 +113,31 @@ function getAgentNameToPoll(appState: AppState): string | undefined {
 
 const INBOX_POLL_INTERVAL_MS = 1000
 
+/**
+ * Claims one receipt and runs its synchronous handler inside the same
+ * lifecycle→config commit. There is no microtask window between the claim and
+ * the handler: if the instance was replaced, neither the claim nor the handler
+ * runs. The handler must stay synchronous (no network, model turn or yield).
+ */
+async function claimAndHandleReceipt(
+  scope: ConsumerScope,
+  message: TeammateMessage,
+  handle: () => void,
+): Promise<'handled' | 'deferred' | 'retryable_io'> {
+  const result = await withConsumerScope(scope, async (current, team) => {
+    const claimed = await claimMailboxMessages(
+      consumerInboxName(current),
+      team.name,
+      [message],
+    )
+    if (!claimed || claimed.length === 0) return 'deferred' as const
+    handle()
+    return 'handled' as const
+  })
+  if (result.status === 'current') return result.value
+  return result.status === 'retryable_io' ? 'retryable_io' : 'deferred'
+}
+
 type Props = {
   enabled: boolean
   isLoading: boolean
@@ -147,15 +176,52 @@ export function useInboxPoller({
     const currentAppState = store.getState()
     const agentName = getAgentNameToPoll(currentAppState)
     if (!agentName) return
+    // The scope is the instance this session was bound to at creation or a
+    // verified restore. Without one there is nothing trustworthy to consume
+    // for: the current team file would happily describe a same-named
+    // replacement, and its inbox is not this session's to read.
+    const scope = getConsumerScope(currentAppState.teamContext)
+    if (!scope) {
+      logForDebugging('[InboxPoller] No consumer scope bound; skipping automatic inbox reads')
+      return
+    }
 
-    const unread = await readUnreadMessages(
-      agentName,
-      currentAppState.teamContext?.teamName,
-    )
-
+    const read = await readScopedMailbox(scope)
+    if (read.status !== 'current') {
+      if (read.status !== 'stale') {
+        logForDebugging(`[InboxPoller] Mailbox read refused: ${read.status}`)
+      }
+      return
+    }
+    const unread = read.value
     if (unread.length === 0) return
 
+    // C-ORDER for the hook: receive or queue locally first, then mark. Nothing
+    // is claimed ahead of the handlers. Re-check the instance once here so a
+    // replacement that committed during the read neither acts on this batch
+    // nor marks it read; the final acceptance and mark check again.
+    const currentInstance = await withConsumerScope(scope, () => true)
+    if (currentInstance.status !== 'current') {
+      logForDebugging(
+        `[InboxPoller] Mailbox batch no longer current (${currentInstance.status}); leaving it unread`,
+      )
+      return
+    }
+
     logForDebugging(`[InboxPoller] Found ${unread.length} unread message(s)`)
+
+    const deferredProtocolReceipts: TeammateMessage[] = []
+    // Ordinary protocol handlers receive first, then acknowledge. Every final
+    // local effect revalidates under the same short lifecycle/config commit.
+    const receiveProtocol = async (messages: TeammateMessage[], action: () => void | Promise<void>) => {
+      const result = await withConsumerScope(scope, action)
+      if (result.status !== 'current') {
+        deferredProtocolReceipts.push(...messages)
+        logForDebugging(`[InboxPoller] Protocol receive refused: ${result.status}; leaving unread`)
+        return false
+      }
+      return true
+    }
 
     // Check for plan approval responses and transition out of plan mode if approved
     // Security: Only accept approval responses from the team lead
@@ -172,7 +238,7 @@ export function useInboxPoller({
             const targetMode = approvalResponse.permissionMode ?? 'default'
 
             // Transition out of plan mode
-            setAppState(prev => ({
+            const received = await receiveProtocol([msg], () => { setAppState(prev => ({
               ...prev,
               toolPermissionContext: applyPermissionUpdate(
                 prev.toolPermissionContext,
@@ -182,7 +248,9 @@ export function useInboxPoller({
                   destination: 'session',
                 },
               ),
-            }))
+            })) })
+            if (!received) continue
+
             logForDebugging(
               `[InboxPoller] Plan approved by team lead, exited plan mode to ${targetMode}`,
             )
@@ -200,20 +268,27 @@ export function useInboxPoller({
     }
 
     let deferShutdownApprovals = false
+    // Permission/sandbox responses are the contract exception to receive→mark:
+    // they are only acted on after their own scoped claim succeeds. A response
+    // whose claim refused stays unread instead of being archived with the rest
+    // of this batch.
 
     // Helper to mark messages as read in the inbox file.
     // Called after messages are successfully delivered or reliably queued.
     // Acknowledges exactly this poll's batch: anything that arrived after the
     // read stays unread for the next poll.
     const markRead = async () => {
-      const processed = deferShutdownApprovals
-        ? unread.filter(message => !isShutdownApproved(message.text))
-        : unread
-      await markMessagesAsReadByIdentity(
-        agentName,
-        currentAppState.teamContext?.teamName,
-        processed,
-      )
+      const processed = (
+        deferShutdownApprovals
+          ? unread.filter(message => !isShutdownApproved(message.text))
+          : unread
+      ).filter(message => !deferredProtocolReceipts.includes(message))
+      const marked = await markScopedMailboxRead(scope, processed)
+      if (marked.status !== 'current') {
+        // Never acknowledge into a replacement inbox: the batch belongs to the
+        // scope this poll read, and that instance is gone.
+        logForDebugging(`[InboxPoller] Mailbox acknowledgement refused: ${marked.status}`)
+      }
     }
 
     // Separate permission messages from regular teammate messages
@@ -310,18 +385,18 @@ export function useInboxPoller({
               // No-op for tmux workers (no classifier auto-approval)
             },
             onAbort() {
-              void sendPermissionResponseViaMailbox(
+              void receiveProtocol([m], async () => { await sendPermissionResponseViaMailbox(
                 parsed.agent_id,
                 { decision: 'rejected', resolvedBy: 'leader' },
                 parsed.request_id,
                 teamName,
-              )
+              ) })
             },
             onAllow(
               updatedInput: Record<string, unknown>,
               permissionUpdates: PermissionUpdate[],
             ) {
-              void sendPermissionResponseViaMailbox(
+              void receiveProtocol([m], async () => { await sendPermissionResponseViaMailbox(
                 parsed.agent_id,
                 {
                   decision: 'approved',
@@ -331,10 +406,10 @@ export function useInboxPoller({
                 },
                 parsed.request_id,
                 teamName,
-              )
+              ) })
             },
             onReject(feedback?: string) {
-              void sendPermissionResponseViaMailbox(
+              void receiveProtocol([m], async () => { await sendPermissionResponseViaMailbox(
                 parsed.agent_id,
                 {
                   decision: 'rejected',
@@ -343,7 +418,7 @@ export function useInboxPoller({
                 },
                 parsed.request_id,
                 teamName,
-              )
+              ) })
             },
             async recheckPermission() {
               // No-op for tmux workers — permission state is on the worker side
@@ -352,129 +427,145 @@ export function useInboxPoller({
 
           // Deduplicate: if acknowledging failed on a prior poll,
           // the same message will be re-read — skip if already queued.
-          setToolUseConfirmQueue(queue => {
-            if (queue.some(q => q.toolUseID === parsed.tool_use_id)) {
-              return queue
-            }
-            return [...queue, entry]
-          })
-        } else {
-          logForDebugging(
-            `[InboxPoller] ToolUseConfirmQueue unavailable, dropping permission request from ${parsed.agent_id}`,
-          )
+          await receiveProtocol([m], () => {
+              setToolUseConfirmQueue(queue => {
+                if (queue.some(q => q.toolUseID === parsed.tool_use_id)) {
+                  return queue
+                }
+                return [...queue, entry]
+            })
+            })
+          } else {
+            deferredProtocolReceipts.push(m)
+            logForDebugging(
+              `[InboxPoller] ToolUseConfirmQueue unavailable, retaining permission request from ${parsed.agent_id}`,
+            )
+          }
+        }
+
+        // Send desktop notification for the first request
+        const firstParsed = isPermissionRequest(permissionRequests[0]?.text ?? '')
+        if (firstParsed && !isLoading && !focusedInputDialog) {
+          await receiveProtocol(permissionRequests, () => { void sendNotification(
+            {
+              message: `${firstParsed.agent_id} needs permission for ${firstParsed.tool_name}`,
+              notificationType: 'worker_permission_prompt',
+            },
+            terminal,
+          ) })
         }
       }
 
-      // Send desktop notification for the first request
-      const firstParsed = isPermissionRequest(permissionRequests[0]?.text ?? '')
-      if (firstParsed && !isLoading && !focusedInputDialog) {
-        void sendNotification(
-          {
-            message: `${firstParsed.agent_id} needs permission for ${firstParsed.tool_name}`,
-            notificationType: 'worker_permission_prompt',
-          },
-          terminal,
+      // Handle permission responses (worker side) - invoke registered callbacks
+      if (permissionResponses.length > 0 && isTeammate()) {
+        logForDebugging(
+          `[InboxPoller] Found ${permissionResponses.length} permission response(s)`,
         )
-      }
-    }
 
-    // Handle permission responses (worker side) - invoke registered callbacks
-    if (permissionResponses.length > 0 && isTeammate()) {
-      logForDebugging(
-        `[InboxPoller] Found ${permissionResponses.length} permission response(s)`,
-      )
+        for (const m of permissionResponses) {
+          if (!isTrustedTeamLeaderMessage(m)) continue
 
-      for (const m of permissionResponses) {
-        if (!isTrustedTeamLeaderMessage(m)) continue
+          const parsed = isPermissionResponse(m.text)
+          if (!parsed) continue
 
-        const parsed = isPermissionResponse(m.text)
-        if (!parsed) continue
-
-        if (hasPermissionCallback(parsed.request_id)) {
-          logForDebugging(
-            `[InboxPoller] Processing permission response for ${parsed.request_id}: ${parsed.subtype}`,
-          )
-
-          if (parsed.subtype === 'success') {
-            processMailboxPermissionResponse({
-              requestId: parsed.request_id,
-              decision: 'approved',
-              updatedInput: parsed.response?.updated_input,
-              permissionUpdates: parsed.response?.permission_updates,
+          if (hasPermissionCallback(parsed.request_id)) {
+            // Contract exception: a permission response is processed only after
+            // its own scoped claim succeeds, and the handler runs in that same
+            // short commit. Awaiting a claim and then handling afterwards would
+            // leave a microtask window outside the lock.
+            const outcome = await claimAndHandleReceipt(scope, m, () => {
+              logForDebugging(
+                `[InboxPoller] Processing permission response for ${parsed.request_id}: ${parsed.subtype}`,
+              )
+              if (parsed.subtype === 'success') {
+                processMailboxPermissionResponse({
+                  requestId: parsed.request_id,
+                  decision: 'approved',
+                  updatedInput: parsed.response?.updated_input,
+                  permissionUpdates: parsed.response?.permission_updates,
+                })
+              } else {
+                processMailboxPermissionResponse({
+                  requestId: parsed.request_id,
+                  decision: 'rejected',
+                  feedback: parsed.error,
+                })
+              }
             })
-          } else {
-            processMailboxPermissionResponse({
-              requestId: parsed.request_id,
-              decision: 'rejected',
-              feedback: parsed.error,
-            })
+            if (outcome !== 'handled') {
+              deferredProtocolReceipts.push(m)
+              logForDebugging(
+                `[InboxPoller] Permission response left unread: claim ${outcome}`,
+              )
+            }
           }
         }
       }
-    }
 
-    // Handle sandbox permission requests (leader side) - add to workerSandboxPermissions queue
-    if (
-      sandboxPermissionRequests.length > 0 &&
-      isTeamLead(currentAppState.teamContext)
-    ) {
-      logForDebugging(
-        `[InboxPoller] Found ${sandboxPermissionRequests.length} sandbox permission request(s)`,
-      )
+      // Handle sandbox permission requests (leader side) - add to workerSandboxPermissions queue
+      if (
+        sandboxPermissionRequests.length > 0 &&
+        isTeamLead(currentAppState.teamContext)
+      ) {
+        logForDebugging(
+          `[InboxPoller] Found ${sandboxPermissionRequests.length} sandbox permission request(s)`,
+        )
 
-      const newSandboxRequests: Array<{
-        requestId: string
-        workerId: string
-        workerName: string
-        workerColor?: string
-        host: string
-        createdAt: number
-      }> = []
+        const newSandboxRequests: Array<{
+          requestId: string
+          workerId: string
+          workerName: string
+          workerColor?: string
+          host: string
+          createdAt: number
+        }> = []
 
-      for (const m of sandboxPermissionRequests) {
-        const parsed = isSandboxPermissionRequest(m.text)
-        if (!parsed) continue
+        for (const m of sandboxPermissionRequests) {
+          const parsed = isSandboxPermissionRequest(m.text)
+          if (!parsed) continue
 
-        // Validate required nested fields to prevent crashes from malformed messages
-        if (!parsed.hostPattern?.host) {
-          logForDebugging(
-            `[InboxPoller] Invalid sandbox permission request: missing hostPattern.host`,
-          )
-          continue
-        }
+          // Validate required nested fields to prevent crashes from malformed messages
+          if (!parsed.hostPattern?.host) {
+            logForDebugging(
+              `[InboxPoller] Invalid sandbox permission request: missing hostPattern.host`,
+            )
+            continue
+          }
 
-        newSandboxRequests.push({
-          requestId: parsed.requestId,
-          workerId: parsed.workerId,
-          workerName: parsed.workerName,
-          workerColor: parsed.workerColor,
-          host: parsed.hostPattern.host,
-          createdAt: parsed.createdAt,
+          newSandboxRequests.push({
+            requestId: parsed.requestId,
+            workerId: parsed.workerId,
+            workerName: parsed.workerName,
+            workerColor: parsed.workerColor,
+            host: parsed.hostPattern.host,
+            createdAt: parsed.createdAt,
         })
       }
 
       if (newSandboxRequests.length > 0) {
-        setAppState(prev => ({
-          ...prev,
-          workerSandboxPermissions: {
-            ...prev.workerSandboxPermissions,
-            queue: [
-              ...prev.workerSandboxPermissions.queue,
-              ...newSandboxRequests,
-            ],
-          },
+        const received = await receiveProtocol(sandboxPermissionRequests, () => {
+          setAppState(prev => ({
+            ...prev,
+            workerSandboxPermissions: {
+              ...prev.workerSandboxPermissions,
+              queue: [
+                ...prev.workerSandboxPermissions.queue,
+                ...newSandboxRequests,
+              ],
+            },
         }))
+        })
 
         // Send desktop notification for the first new request
         const firstRequest = newSandboxRequests[0]
-        if (firstRequest && !isLoading && !focusedInputDialog) {
-          void sendNotification(
+        if (received && firstRequest && !isLoading && !focusedInputDialog) {
+          await receiveProtocol(sandboxPermissionRequests, () => { void sendNotification(
             {
               message: `${firstRequest.workerName} needs network access to ${firstRequest.host}`,
               notificationType: 'worker_permission_prompt',
             },
             terminal,
-          )
+          ) })
         }
       }
     }
@@ -493,22 +584,32 @@ export function useInboxPoller({
 
         // Check if we have a registered callback for this request
         if (hasSandboxPermissionCallback(parsed.requestId)) {
-          logForDebugging(
-            `[InboxPoller] Processing sandbox permission response for ${parsed.requestId}: allow=${parsed.allow}`,
-          )
+          // Same contract exception as permission responses: claim and run the
+          // synchronous handler in one short commit, otherwise leave unread.
+          const outcome = await claimAndHandleReceipt(scope, m, () => {
+            logForDebugging(
+              `[InboxPoller] Processing sandbox permission response for ${parsed.requestId}: allow=${parsed.allow}`,
+            )
 
-          // Process the response using the exported function
-          processSandboxPermissionResponse({
-            requestId: parsed.requestId,
-            host: parsed.host,
-            allow: parsed.allow,
+            // Process the response using the exported function
+            processSandboxPermissionResponse({
+              requestId: parsed.requestId,
+              host: parsed.host,
+              allow: parsed.allow,
+            })
+
+            // Clear the pending sandbox request indicator
+            setAppState(prev => ({
+              ...prev,
+              pendingSandboxRequest: null,
+            }))
           })
-
-          // Clear the pending sandbox request indicator
-          setAppState(prev => ({
-            ...prev,
-            pendingSandboxRequest: null,
-          }))
+          if (outcome !== 'handled') {
+            deferredProtocolReceipts.push(m)
+            logForDebugging(
+              `[InboxPoller] Sandbox permission response left unread: claim ${outcome}`,
+            )
+          }
         }
       }
     }
@@ -549,20 +650,22 @@ export function useInboxPoller({
           `[InboxPoller] Permission update rules: ${jsonStringify(parsed.permissionUpdate.rules)}`,
         )
 
-        setAppState(prev => {
-          const updated = applyPermissionUpdate(prev.toolPermissionContext, {
-            type: 'addRules',
-            rules: parsed.permissionUpdate.rules,
-            behavior: parsed.permissionUpdate.behavior,
-            destination: 'session',
-          })
-          logForDebugging(
-            `[InboxPoller] Updated session allow rules: ${jsonStringify(updated.alwaysAllowRules.session)}`,
-          )
-          return {
-            ...prev,
-            toolPermissionContext: updated,
-          }
+        await receiveProtocol([m], () => {
+          setAppState(prev => {
+            const updated = applyPermissionUpdate(prev.toolPermissionContext, {
+              type: 'addRules',
+              rules: parsed.permissionUpdate.rules,
+              behavior: parsed.permissionUpdate.behavior,
+              destination: 'session',
+            })
+            logForDebugging(
+              `[InboxPoller] Updated session allow rules: ${jsonStringify(updated.alwaysAllowRules.session)}`,
+            )
+            return {
+              ...prev,
+              toolPermissionContext: updated,
+            }
+        })
         })
       }
     }
@@ -595,25 +698,27 @@ export function useInboxPoller({
           `[InboxPoller] Applying mode change from team-lead: ${targetMode}`,
         )
 
-        // Update local permission context
-        setAppState(prev => ({
-          ...prev,
-          toolPermissionContext: applyPermissionUpdate(
-            prev.toolPermissionContext,
-            {
-              type: 'setMode',
-              mode: toExternalPermissionMode(targetMode),
-              destination: 'session',
-            },
-          ),
-        }))
-
-        // Update config.json so team lead can see the new mode
-        const teamName = currentAppState.teamContext?.teamName
-        const agentName = getAgentName()
-        if (teamName && agentName) {
-          await setMemberMode(teamName, agentName, targetMode)
+        const changed = await mutateScopedTeam(scope, team => {
+          const member = team.members.find(member => member.name === getAgentName())
+          if (member) member.mode = targetMode
+        })
+        if (changed.status !== 'current') {
+          deferredProtocolReceipts.push(m)
+          continue
         }
+        await receiveProtocol([m], () => {
+          setAppState(prev => ({
+            ...prev,
+            toolPermissionContext: applyPermissionUpdate(
+              prev.toolPermissionContext,
+              {
+                type: 'setMode',
+                mode: toExternalPermissionMode(targetMode),
+                destination: 'session',
+              },
+            ),
+        }))
+        })
       }
     }
 
@@ -646,31 +751,35 @@ export function useInboxPoller({
           permissionMode: modeToInherit,
         }
 
-        void writeToMailbox(
-          m.from,
-          {
-            from: TEAM_LEAD_NAME,
-            text: jsonStringify(approvalResponse),
-            timestamp: new Date().toISOString(),
-          },
-          teamName,
-        )
-
-        // Update in-process teammate task state if applicable
-        const taskId = findInProcessTeammateTaskId(m.from, currentAppState)
-        if (taskId) {
-          handlePlanApprovalResponse(
-            taskId,
+        const received = await receiveProtocol([m], async () => {
+          await writeToMailbox(
+            m.from,
             {
-              type: 'plan_approval_response',
-              requestId: parsed.requestId,
-              approved: true,
+              from: TEAM_LEAD_NAME,
+              text: jsonStringify(approvalResponse),
               timestamp: new Date().toISOString(),
-              permissionMode: modeToInherit,
             },
-            setAppState,
+            teamName,
           )
-        }
+
+          // Update in-process teammate task state if applicable
+          const taskId = findInProcessTeammateTaskId(m.from, currentAppState)
+          if (taskId) {
+            handlePlanApprovalResponse(
+              taskId,
+              {
+                type: 'plan_approval_response',
+                requestId: parsed.requestId,
+                approved: true,
+                timestamp: new Date().toISOString(),
+                permissionMode: modeToInherit,
+              },
+              setAppState,
+            )
+          }
+
+        })
+        if (!received) continue
 
         logForDebugging(
           `[InboxPoller] Auto-approved plan from ${m.from} (request ${parsed.requestId})`,
@@ -704,68 +813,40 @@ export function useInboxPoller({
         `[InboxPoller] Found ${shutdownApprovals.length} shutdown approval(s)`,
       )
 
-      const teamName = currentAppState.teamContext?.teamName
-      const trustedTeamFile = teamName ? await readTeamFileAsync(teamName) : null
-      if (!trustedTeamFile) {
-        deferShutdownApprovals = true
-      }
-
+      // Backend discovery is preparation, not authority to act. Resolve it
+      // outside the commit, then re-read the trusted target under both locks.
+      await ensureBackendsRegistered()
+      const insideTmux = await isInsideTmux()
       for (const m of shutdownApprovals) {
-        const parsed = getTrustedShutdownApproval(
-          m,
-          trustedTeamFile?.members ?? [],
-        )
-        if (!parsed) continue
-
-        // Pane selection comes only from leader-owned team state.
-        if (parsed.paneId && parsed.backendType) {
-          void (async () => {
+        const removed = await mutateScopedTeam(scope, async team => {
+          const parsed = getTrustedShutdownApproval(m, team.members)
+          if (!parsed) return undefined
+          if (parsed.paneId && parsed.backendType) {
             try {
-              // Ensure backend classes are imported (no subprocess probes)
-              await ensureBackendsRegistered()
-              const insideTmux = await isInsideTmux()
-              const backend = getBackendByType(
-                parsed.backendType as PaneBackendType,
-              )
-              const success = await backend?.killPane(
-                parsed.paneId!,
-                !insideTmux,
-              )
-              logForDebugging(
-                `[InboxPoller] Killed pane ${parsed.paneId} for ${parsed.name}: ${success}`,
-              )
+              const backend = getBackendByType(parsed.backendType as PaneBackendType)
+              const success = await backend?.killPane(parsed.paneId, !insideTmux)
+              logForDebugging(`[InboxPoller] Killed pane ${parsed.paneId} for ${parsed.name}: ${success}`)
             } catch (error) {
-              logForDebugging(
-                `[InboxPoller] Failed to kill pane for ${parsed.name}: ${error}`,
-              )
+              logForDebugging(`[InboxPoller] Failed to kill pane for ${parsed.name}: ${error}`)
             }
-          })()
+          }
+          // Mutate this already-locked file, never enter the config lock again.
+          team.members = team.members.filter(member => member.agentId !== parsed.agentId)
+          const { notificationMessage } = await unassignTeammateTasks(
+            team.name, parsed.agentId, parsed.name, 'shutdown',
+          )
+          return { parsed, notificationMessage }
+        })
+        if (removed.status !== 'current') {
+          deferShutdownApprovals = true
+          logForDebugging(`[InboxPoller] Shutdown commit refused: ${removed.status}; leaving unread`)
+          break
         }
-
-        // Remove the teammate from teamContext.teammates so the count is accurate
+        if (!removed.value) continue
+        const { parsed, notificationMessage } = removed.value
         const teammateToRemove = parsed.name
-        if (teammateToRemove && currentAppState.teamContext?.teammates) {
-          const teammateId = parsed.agentId
-
-          if (teammateId) {
-            // Remove from team file (leader owns team file mutations)
-            if (teamName) {
-              await removeTeammateFromTeamFile(teamName, {
-                agentId: teammateId,
-                name: teammateToRemove,
-              })
-            }
-
-            // Unassign tasks and build notification message
-            const { notificationMessage } = teamName
-              ? await unassignTeammateTasks(
-                  teamName,
-                  teammateId,
-                  teammateToRemove,
-                  'shutdown',
-                )
-              : { notificationMessage: `${teammateToRemove} has shut down.` }
-
+        const teammateId = parsed.agentId
+        const received = await receiveProtocol([m], () => {
             setAppState(prev => {
               if (!prev.teamContext?.teammates) return prev
               if (!(teammateId in prev.teamContext.teammates)) return prev
@@ -809,16 +890,14 @@ export function useInboxPoller({
                       }),
                       timestamp: new Date().toISOString(),
                       status: 'pending' as const,
+                      consumerScope: scope,
                     },
                   ],
                 },
               }
             })
-            logForDebugging(
-              `[InboxPoller] Removed ${teammateToRemove} (${teammateId}) from teamContext`,
-            )
-          }
-        }
+        })
+        if (!received) continue
 
         // Pass through for UI rendering - the component will render it nicely
         regularMessages.push(m)
@@ -845,11 +924,14 @@ export function useInboxPoller({
           messages: [
             ...prev.inbox.messages,
             ...regularMessages.map(m => ({
-              id: randomUUID(),
+              // Keep the mailbox envelope id so the queued turn carries the
+              // same correlation the live path would have delivered.
+              id: m.id ?? randomUUID(),
               from: m.from,
               text: m.text,
               timestamp: m.timestamp,
               status: 'pending' as const,
+              consumerScope: scope,
               color: m.color,
               summary: m.summary,
             })),
@@ -858,22 +940,17 @@ export function useInboxPoller({
       }))
     }
 
-    if (!isLoading && !focusedInputDialog) {
-      // IDLE: Submit as new turn immediately
-      logForDebugging(`[InboxPoller] Session idle, submitting immediately`)
-      const submitted = onSubmitTeammateMessage(formatted)
-      if (!submitted) {
-        // Submission rejected (query already running), queue for later
-        logForDebugging(
-          `[InboxPoller] Submission rejected, queuing for later delivery`,
-        )
+    const accepted = await withConsumerScope(scope, () => {
+      if (!sameConsumerScope(getConsumerScope(store.getState().teamContext), scope)) return false
+      // 最终交接必须同步完成；格式化与磁盘读取不等同于接纳输入。
+      if (!isLoading && !focusedInputDialog) {
+        if (!onSubmitTeammateMessage(formatted)) queueMessages()
+      } else {
         queueMessages()
       }
-    } else {
-      // BUSY: Add to inbox queue for UI display + later delivery
-      logForDebugging(`[InboxPoller] Session busy, queuing for later delivery`)
-      queueMessages()
-    }
+      return true
+    })
+    if (accepted.status !== 'current' || !accepted.value) return
 
     // Mark messages as read only after they have been successfully delivered
     // or reliably queued in AppState. This prevents permanent message loss
@@ -945,25 +1022,46 @@ export function useInboxPoller({
       `[InboxPoller] Session idle, delivering ${pendingMessages.length} pending message(s)`,
     )
 
-    // Format messages with XML wrapper for Claude (include color if available)
-    const formatted = formatTeammateMessages(pendingMessages)
-
-    // Try to submit - only clear messages if successful
-    const submitted = onSubmitTeammateMessage(formatted)
-    if (submitted) {
-      // Clear the specific messages we just submitted by their IDs
-      const submittedIds = new Set(pendingMessages.map(m => m.id))
-      setAppState(prev => ({
-        ...prev,
-        inbox: {
-          messages: prev.inbox.messages.filter(m => !submittedIds.has(m.id)),
-        },
-      }))
-    } else {
-      logForDebugging(
-        `[InboxPoller] Submission rejected, keeping messages queued`,
-      )
-    }
+    let cancelled = false
+    void (async () => {
+      // 延迟项只使用入队时绑定的身份，禁止继承当前同名团队的身份。
+      const scope = pendingMessages[0]?.consumerScope
+      if (!scope) return
+      const batch = pendingMessages.filter(m => sameConsumerScope(m.consumerScope, scope))
+      const formatted = formatTeammateMessages(batch)
+      const submittedIds = new Set(batch.map(m => m.id))
+      const result = await withConsumerScope(scope, () => {
+        if (cancelled || !sameConsumerScope(getConsumerScope(store.getState().teamContext), scope)) return false
+        if (!onSubmitTeammateMessage(formatted)) return false
+        setAppState(prev => ({
+          ...prev,
+          inbox: {
+            messages: prev.inbox.messages.filter(m => !submittedIds.has(m.id)),
+          },
+        }))
+        return true
+      })
+      if (result.status === 'stale' || result.status === 'unsupported' || result.status === 'unbound') {
+        logForDebugging(
+          `[InboxPoller] Dropping queued batch for a ${result.status} consumer scope`,
+        )
+        setAppState(prev => ({
+          ...prev,
+          inbox: { messages: prev.inbox.messages.filter(m => !batch.includes(m)) },
+        }))
+      } else if (result.status === 'current' && result.value === false) {
+        // Stop/rejection keeps the already-claimed local batch for the same
+        // scope; it is retried after the instance is current again.
+        logForDebugging(
+          '[InboxPoller] Queued batch not accepted; retaining it for the same scope',
+        )
+      } else if (result.status === 'retryable_io') {
+        logForDebugging(
+          '[InboxPoller] Scope recheck failed with retryable I/O; retaining the queued batch',
+        )
+      }
+    })()
+    return () => { cancelled = true }
   }, [
     enabled,
     isLoading,

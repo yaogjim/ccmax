@@ -19,15 +19,18 @@ import { renderToolUseProgressMessage } from '../../tools/AgentTool/UI.js';
 import type { CommandResultDisplay } from '../../types/command.js';
 import { createAbortController } from '../abortController.js';
 import { getAgentContext } from '../agentContext.js';
-import { createAttachmentMessage, getAttachmentMessages } from '../attachments.js';
+import { collectAcceptedAttachments, createAttachmentMessage, getAttachmentMessages } from '../attachments.js';
 import { logForDebugging } from '../debug.js';
 import { isEnvTruthy } from '../envUtils.js';
 import { AbortError, MalformedCommandError } from '../errors.js';
 import { getDisplayPath } from '../file.js';
-import { extractResultText, prepareForkedCommandContext } from '../forkedAgent.js';
+import {
+  extractResultTextOutcome,
+  prepareForkedCommandContext,
+  type ResultTextOutcome
+} from '../forkedAgent.js';
 import { getFsImplementation } from '../fsOperations.js';
 import { isFullscreenEnvEnabled } from '../fullscreen.js';
-import { toArray } from '../generators.js';
 import { registerSkillHooks } from '../hooks/registerSkillHooks.js';
 import { logError } from '../log.js';
 import { enqueuePendingNotification } from '../messageQueueManager.js';
@@ -49,6 +52,17 @@ import type { ProcessUserInputBaseResult, ProcessUserInputContext } from './proc
 type SlashCommandResult = ProcessUserInputBaseResult & {
   command: Command;
 };
+
+/**
+ * Failure marker for a forked command whose final response did not produce a
+ * usable result (API error, cancellation, unfinished tool use, or an empty
+ * tail). Shared by the synchronous and background paths so neither presents
+ * the terminal state as a successful command output.
+ */
+function forkedCommandFailureText(commandName: string, outcome: ResultTextOutcome): string {
+  const detail = outcome.text ? `\n${outcome.text}` : '';
+  return `Forked command /${commandName} did not complete (${outcome.status}).${detail}`;
+}
 
 // Poll interval and deadline for MCP settle before launching a background
 // forked subagent. MCP servers typically connect within 1-3s of startup;
@@ -165,9 +179,10 @@ async function executeForkedSlashCommand(command: CommandBase & PromptCommand, a
       })) {
         agentMessages.push(message);
       }
-      const resultText = extractResultText(agentMessages, 'Command completed');
-      logForDebugging(`Background forked command /${commandName} completed (agent ${agentId})`);
-      enqueueResult(`<scheduled-task-result command="/${commandName}">\n${resultText}\n</scheduled-task-result>`);
+      const outcome = extractResultTextOutcome(agentMessages);
+      const failed = outcome.status !== 'ok';
+      logForDebugging(`Background forked command /${commandName} finished (agent ${agentId}, status: ${outcome.status})`);
+      enqueueResult(`<scheduled-task-result command="/${commandName}"${failed ? ' status="failed"' : ''}>\n${failed ? forkedCommandFailureText(commandName, outcome) : outcome.text}\n</scheduled-task-result>`);
     })().catch(err => {
       logError(err);
       enqueueResult(`<scheduled-task-result command="/${commandName}" status="failed">\n${err instanceof Error ? err.message : String(err)}\n</scheduled-task-result>`);
@@ -271,22 +286,26 @@ async function executeForkedSlashCommand(command: CommandBase & PromptCommand, a
     // Clear the progress display
     setToolJSX(null);
   }
-  let resultText = extractResultText(agentMessages, 'Command completed');
-  logForDebugging(`Forked slash command /${command.name} completed with agent ${agentId}`);
+  const outcome = extractResultTextOutcome(agentMessages);
+  const failed = outcome.status !== 'ok';
+  let resultText = failed ? forkedCommandFailureText(getCommandName(command), outcome) : outcome.text;
+  logForDebugging(`Forked slash command /${command.name} finished with agent ${agentId} (status: ${outcome.status})`);
 
   // Prepend debug log for ant users so it appears inside the command output
   if ("external" === 'ant') {
     resultText = `[ANT-ONLY] API calls: ${getDisplayPath(getDumpPromptsPath(agentId))}\n${resultText}`;
   }
 
-  // Return the result as a user message (simulates the agent's output)
+  // Return the result as a user message (simulates the agent's output).
+  // A failed fork is reported on stderr, not as a successful stdout payload.
+  const outputTag = failed ? 'local-command-stderr' : 'local-command-stdout';
   const messages: UserMessage[] = [createUserMessage({
     content: prepareUserContent({
       inputString: `/${getCommandName(command)} ${args}`.trim(),
       precedingInputBlocks
     })
   }), createUserMessage({
-    content: `<local-command-stdout>\n${resultText}\n</local-command-stdout>`
+    content: `<${outputTag}>\n${resultText}\n</${outputTag}>`
   })];
   return {
     messages,
@@ -909,7 +928,7 @@ async function getMessagesForPromptSlashCommand(command: CommandBase & PromptCom
   // content itself from triggering discovery — it's meta-content, not user
   // intent, and a large SKILL.md (e.g. 110KB) would fire chunked AKI queries
   // adding seconds of latency to every skill invocation.
-  const attachmentMessages = await toArray(getAttachmentMessages(result.filter((block): block is TextBlockParam => block.type === 'text').map(block => block.text).join(' '), context, null, [],
+  const attachmentMessages = await collectAcceptedAttachments(getAttachmentMessages(result.filter((block): block is TextBlockParam => block.type === 'text').map(block => block.text).join(' '), context, null, [],
   // queuedCommands - handled by query.ts for mid-turn attachments
   context.messages, 'repl_main_thread', {
     skipSkillDiscovery: true
