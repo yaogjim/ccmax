@@ -242,6 +242,7 @@ jobs:
 
       - name: Create temporary self-signed cu-helper identity
         if: matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed != 'true'
+        timeout-minutes: 3
         shell: bash
         run: |
           set -euo pipefail
@@ -274,7 +275,7 @@ jobs:
             -s \
             -k "$keychain_password" \
             "$keychain_path"
-          security add-trusted-cert -r trustRoot -p codeSign -k "$keychain_path" "$work_dir/cert.pem"
+          sudo -n security add-trusted-cert -d -r trustRoot -p codeSign -k "$keychain_path" "$work_dir/cert.pem"
           security list-keychains -d user -s "$keychain_path" $(security list-keychains -d user | tr -d '"')
           identity="$(
             security find-identity -v -p codesigning "$keychain_path" \

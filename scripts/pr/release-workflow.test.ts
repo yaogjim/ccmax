@@ -436,7 +436,8 @@ describe('release desktop workflow', () => {
     expect(temporaryIdentity).toContain('cu-helper-dev')
     expect(temporaryIdentity).toContain('CC_HAHA_SIGN_IDENTITY')
     expect(temporaryIdentity).toContain('openssl pkcs12 -export -legacy')
-    expect(temporaryIdentity).toContain('security add-trusted-cert -r trustRoot -p codeSign -k "$keychain_path" "$work_dir/cert.pem"')
+    expect(temporaryIdentity).toContain('sudo -n security add-trusted-cert -d -r trustRoot -p codeSign -k "$keychain_path" "$work_dir/cert.pem"')
+    expect(temporaryIdentity).toContain('timeout-minutes: 3')
     for (const name of ['Sign Windows application executables with SignPath', 'Sign Windows installer with SignPath']) {
       expect(extractStep(readReleaseWorkflow(), name)).toContain("needs.signing-preflight.outputs.windows_signed == 'true'")
     }
