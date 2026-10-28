@@ -15,6 +15,11 @@ on:
         required: false
         default: true
         type: boolean
+      allow_unsigned_macos:
+        description: 'Build an unsigned macOS artifact when signing secrets are absent (manual releases only)'
+        required: false
+        default: false
+        type: boolean
       skip_windows_signing:
         description: 'Build unsigned Windows artifacts while SignPath onboarding is pending'
         required: false
@@ -57,6 +62,7 @@ jobs:
           SIGNPATH_APPLICATION_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_APPLICATION_ARTIFACT_CONFIGURATION_SLUG }}
           SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG }}
           RELEASE_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}
+          ALLOW_UNSIGNED_MACOS: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_unsigned_macos == true }}
           SKIP_WINDOWS_SIGNING: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_windows_signing == true }}
         run: |
           # macOS signing + notarization is preferred: Squirrel.Mac auto-update and
@@ -70,9 +76,14 @@ jobs:
           [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] || missing+=("APPLE_APP_SPECIFIC_PASSWORD")
           [ -n "$APPLE_TEAM_ID" ] || missing+=("APPLE_TEAM_ID")
           if [ "${#missing[@]}" -gt 0 ]; then
-            printf '::error::Missing macOS signing/notarization secrets (%s): refusing to build a macOS release whose Computer Use runtime cannot pass client attestation.\n' "${missing[*]}"
-            echo "macos_signed=false" >> "$GITHUB_OUTPUT"
-            exit 1
+            if [ "$ALLOW_UNSIGNED_MACOS" = "true" ]; then
+              printf '::warning::Missing macOS signing/notarization secrets (%s): building an explicitly unsigned macOS release; Computer Use client attestation will fail.\n' "${missing[*]}"
+              echo "macos_signed=false" >> "$GITHUB_OUTPUT"
+            else
+              printf '::error::Missing macOS signing/notarization secrets (%s): refusing to build a macOS release whose Computer Use runtime cannot pass client attestation.\n' "${missing[*]}"
+              echo "macos_signed=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
           else
             echo "macos_signed=true" >> "$GITHUB_OUTPUT"
           fi

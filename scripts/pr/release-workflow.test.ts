@@ -347,8 +347,15 @@ describe('release desktop workflow', () => {
       default: false,
       type: 'boolean',
     })
+    expect(workflow.on.workflow_dispatch.inputs.allow_unsigned_macos).toEqual({
+      description: 'Build an unsigned macOS artifact when signing secrets are absent (manual releases only)',
+      required: false,
+      default: false,
+      type: 'boolean',
+    })
     const preflight = workflow.jobs['signing-preflight'].steps.find((step: { id?: string }) => step.id === 'validate')
     expect(preflight.env.SKIP_WINDOWS_SIGNING).toBe("${{ github.event_name == 'workflow_dispatch' && inputs.skip_windows_signing == true }}")
+    expect(preflight.env.ALLOW_UNSIGNED_MACOS).toBe("${{ github.event_name == 'workflow_dispatch' && inputs.allow_unsigned_macos == true }}")
 
     const directory = mkdtempSync(join(tmpdir(), 'release-signing-preflight-'))
     const configured = Object.fromEntries(Object.keys(preflight.env).map(key => [key, 'test-value']))
@@ -359,6 +366,8 @@ describe('release desktop workflow', () => {
       { name: 'release missing SignPath without skip', env: { SIGNPATH_API_TOKEN: '' }, code: 1, outputs: 'macos_signed=true\nwindows_signed=false\n' },
       { name: 'draft missing SignPath', env: { RELEASE_DRAFT: 'true', SIGNPATH_API_TOKEN: '' }, code: 0, outputs: 'macos_signed=true\nwindows_signed=false\n' },
       { name: 'explicit skip still requires macOS credentials', env: { SKIP_WINDOWS_SIGNING: 'true', CSC_LINK: '' }, code: 1, outputs: 'macos_signed=false\n' },
+      { name: 'explicit unsigned macOS release', env: { ALLOW_UNSIGNED_MACOS: 'true', CSC_LINK: '' }, code: 0, outputs: 'macos_signed=false\nwindows_signed=true\n' },
+      { name: 'unsigned macOS stays opt-in', env: { ALLOW_UNSIGNED_MACOS: 'false', CSC_LINK: '' }, code: 1, outputs: 'macos_signed=false\n' },
     ]
     try {
       for (const [index, scenario] of cases.entries()) {
