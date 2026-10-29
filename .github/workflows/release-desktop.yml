@@ -971,6 +971,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.value }}
+          # Without this, a missing tag is created on the default branch head,
+          # so the release source no longer matches the assets built here.
+          target_commitish: ${{ github.sha }}
           name: ccmax v${{ steps.version.outputs.value }}
           body: ${{ steps.release_notes.outputs.body }}
           draft: true

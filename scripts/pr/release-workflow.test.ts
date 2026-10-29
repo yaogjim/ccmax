@@ -592,6 +592,9 @@ describe('release desktop workflow', () => {
     expect(publishJob).toContain("if: github.event_name == 'workflow_dispatch' && inputs.draft == true")
     expect(publishJob).toContain('release remains draft')
     expect(publishJob).toContain('fail_on_unmatched_files: true')
+    // The tag must point at the commit these assets were built from; otherwise
+    // GitHub creates it on the default branch head and the source no longer matches.
+    expect(publishJob).toContain('target_commitish: ${{ github.sha }}')
     expect(publishJob).toContain('Load release notes')
     expect(publishJob.indexOf('Publish complete GitHub release')).toBeLessThan(publishJob.indexOf('Publish GitHub release after complete upload'))
     expect(workflow.indexOf('publish-release:')).toBeGreaterThan(workflow.indexOf('build:'))
