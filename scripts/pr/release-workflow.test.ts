@@ -52,6 +52,20 @@ describe('release desktop workflow', () => {
     }
   })
 
+  test('macOS matrix jobs share one concurrency group instead of competing for a runner', () => {
+    const workflow = parse(readReleaseWorkflow())
+    const concurrency = workflow.jobs.build.concurrency
+
+    // Only one macOS runner is granted per run; parallel macOS jobs leave the
+    // other waiting until GitHub cancels it as "not acquired". Serialize them.
+    expect(concurrency['cancel-in-progress']).toBe(false)
+    expect(concurrency.group).toBe(
+      "release-desktop-${{ matrix.smoke_platform == 'macos' && 'macos-serial' || matrix.label }}",
+    )
+    // Non-macOS platforms keep their own group so Linux builds still run in parallel.
+    expect(concurrency.group).toContain('matrix.label')
+  })
+
   test('release packaging does not run the PR-quality gate', () => {
     const workflow = readReleaseWorkflow()
 

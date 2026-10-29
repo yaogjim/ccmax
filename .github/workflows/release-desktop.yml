@@ -138,6 +138,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.signing-preflight.outputs.matrix) }}
+    # Only one macOS runner is granted at a time; letting both macOS jobs queue
+    # makes GitHub cancel the loser as "not acquired by Runner" after 15 minutes.
+    concurrency:
+      group: "release-desktop-${{ matrix.smoke_platform == 'macos' && 'macos-serial' || matrix.label }}"
+      cancel-in-progress: false
 
     runs-on: ${{ matrix.platform }}
     name: Build (${{ matrix.label }})
