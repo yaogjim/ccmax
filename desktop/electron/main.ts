@@ -29,6 +29,8 @@ import { runProfileStartup } from './services/profileStartup'
 import { prepareUserDataProfile } from './services/userDataProfileMigration'
 import { installTray, shouldInstallTray, type TrayController } from './services/tray'
 import { ElectronUpdaterService, updaterSessionProxyConfig } from './services/updater'
+import { createMacReplaceBackend, isAdhocSignedBundle } from './services/macReplaceUpdate'
+import { resolveAppBundlePath } from './services/macUpdate'
 import { createUpdateSmokeUpdaterFromEnv } from './services/updateSmoke'
 import { ElectronTerminalService, type TerminalSpawnInput } from './services/terminal'
 import { ElectronPreviewService, type PreviewBounds } from './services/preview'
@@ -318,8 +320,38 @@ function getUpdaterService() {
     },
   }, {
     updateConfigPath: !smokeUpdater && app.isPackaged ? path.join(process.resourcesPath, 'app-update.yml') : undefined,
+    macUpdateBackend: smokeUpdater ? null : createMacUpdateBackend(),
+    resolveUpdateFiles() {
+      // 使用本次检查的 provider 解析 tag 和相对文件名，避免猜测下载地址。
+      const state = (autoUpdater as unknown as {
+        updateInfoAndProvider: {
+          info: unknown
+          provider: { resolveFiles(info: unknown): Array<{ url: URL, info: { sha512?: string, size?: number } }> }
+        } | null
+      }).updateInfoAndProvider
+      if (!state) throw new Error('No update provider is available')
+      return state.provider.resolveFiles(state.info).map(file => ({
+        url: file.url.href,
+        sha512: file.info.sha512,
+        size: file.info.size,
+      }))
+    },
   })
   return updaterService
+}
+
+// Squirrel.Mac refuses ad-hoc signed builds, which is what an unsigned release
+// produces. Those builds install the downloaded zip with a replacement script.
+function createMacUpdateBackend() {
+  if (process.platform !== 'darwin' || !app.isPackaged) return null
+  const bundlePath = resolveAppBundlePath(process.execPath)
+  if (!bundlePath || !isAdhocSignedBundle(bundlePath)) return null
+  return createMacReplaceBackend({
+    bundlePath,
+    arch: process.arch === 'arm64' ? 'arm64' : 'x64',
+    cacheDir: path.join(app.getPath('userData'), 'updates'),
+    logPath: path.join(app.getPath('logs'), 'update.log'),
+  })
 }
 
 function nodePtyRuntimeCacheDir() {

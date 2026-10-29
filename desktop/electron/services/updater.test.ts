@@ -202,6 +202,71 @@ describe('Electron updater service', () => {
     expect(env).toEqual({ APPDATA: 'C:\\Users\\someone\\AppData\\Roaming' })
   })
 
+  it('installs macOS updates through the replacement backend instead of Squirrel', async () => {
+    const events: Array<{ event: string, data?: unknown }> = []
+    const files = [
+      { url: 'https://example.com/ccmax-1.2.4-mac-x64.zip', sha512: 'x64', size: 10 },
+      { url: 'https://example.com/ccmax-1.2.4-mac-arm64.zip', sha512: 'arm64', size: 10 },
+    ]
+    const backend = {
+      download: vi.fn(async ({ onProgress }: { onProgress: (progress: { transferred: number, total: number | null }) => void }) => {
+        onProgress({ transferred: 4, total: 10 })
+        onProgress({ transferred: 10, total: 10 })
+        return { path: '/tmp/ccmax-update/ccmax-1.2.4-mac-arm64.zip' }
+      }),
+      install: vi.fn(),
+    }
+    const local = fakeUpdater()
+    local.checkForUpdates.mockResolvedValue({ updateInfo: { version: '1.2.4', files } })
+    const service = new ElectronUpdaterService(local, undefined, { macUpdateBackend: backend })
+
+    await service.checkForUpdates()
+    await service.downloadUpdate(event => events.push(event))
+
+    expect(local.downloadUpdate).not.toHaveBeenCalled()
+    expect(backend.download).toHaveBeenCalledWith(expect.objectContaining({ files }))
+    expect(events).toEqual([
+      { event: 'Started', data: { contentLength: 10 } },
+      { event: 'Progress', data: { chunkLength: 4 } },
+      { event: 'Progress', data: { chunkLength: 6 } },
+      { event: 'Finished' },
+    ])
+
+    service.quitAndInstallDownloadedUpdate()
+    expect(backend.install).toHaveBeenCalledWith({ path: '/tmp/ccmax-update/ccmax-1.2.4-mac-arm64.zip' })
+    expect(local.quitAndInstall).not.toHaveBeenCalled()
+  })
+
+  it('resolves provider asset URLs before passing files to the replacement backend', async () => {
+    const local = fakeUpdater()
+    const files = [{ url: 'ccmax-1.2.4-mac-arm64.zip', sha512: 'digest' }]
+    const resolved = [{ ...files[0], url: 'https://example.com/releases/v1.2.4/ccmax-1.2.4-mac-arm64.zip' }]
+    local.checkForUpdates.mockResolvedValue({ updateInfo: { version: '1.2.4', files } })
+    const backend = { download: vi.fn().mockResolvedValue({ path: '/tmp/update.zip' }), install: vi.fn() }
+    const resolveUpdateFiles = vi.fn().mockReturnValue(resolved)
+    const service = new ElectronUpdaterService(local, undefined, { macUpdateBackend: backend, resolveUpdateFiles })
+
+    await service.checkForUpdates()
+    await service.downloadUpdate(() => {})
+
+    expect(resolveUpdateFiles).toHaveBeenCalledWith()
+    expect(backend.download).toHaveBeenCalledWith(expect.objectContaining({ files: resolved }))
+  })
+
+  it('rejects missing replacement payload metadata instead of falling back to Squirrel', async () => {
+    const backend = { download: vi.fn(), install: vi.fn() }
+    const local = fakeUpdater()
+    local.checkForUpdates.mockResolvedValue({ updateInfo: { version: '1.2.5' } })
+    const service = new ElectronUpdaterService(local, undefined, { macUpdateBackend: backend })
+
+    await service.checkForUpdates()
+    await expect(service.downloadUpdate(() => {})).rejects.toThrow('payload')
+
+    expect(backend.download).not.toHaveBeenCalled()
+    expect(local.downloadUpdate).not.toHaveBeenCalled()
+    expect(service.hasDownloadedUpdate()).toBe(false)
+  })
+
   it('leaves an externally supplied CLAUDE_CONFIG_DIR untouched when installing', async () => {
     const service = new ElectronUpdaterService(updater)
     updater.checkForUpdates.mockResolvedValue({ updateInfo: { version: '1.2.4' } })

@@ -1,7 +1,7 @@
 {
   "name": "claude-code-desktop",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Desktop coding agent workbench for ccmax.",
   "homepage": "https://github.com/yaogjim/ccmax",
   "author": {

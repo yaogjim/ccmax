@@ -1,4 +1,5 @@
 import type { DesktopUpdateDownloadEvent } from '../../src/lib/desktopHost/types'
+import type { MacUpdateFileInfo } from './macUpdate'
 import { existsSync } from 'node:fs'
 import { clearAppManagedPortableEnv } from './appMode'
 
@@ -6,6 +7,7 @@ export type ElectronUpdateInfo = {
   version: string
   body?: string | null
   releaseNotes?: string | Array<{ note?: string | null }> | null
+  files?: MacUpdateFileInfo[]
 }
 
 export type ElectronUpdateCheckResult = {
@@ -38,6 +40,19 @@ export type ElectronUpdaterProxyController = {
 
 export type ElectronUpdaterRuntimeOptions = {
   updateConfigPath?: string
+  // Squirrel.Mac refuses ad-hoc signed builds, so those releases install the
+  // downloaded zip with a replacement script instead of the native updater.
+  macUpdateBackend?: MacUpdateBackend | null
+  resolveUpdateFiles?: () => MacUpdateFileInfo[]
+}
+
+export type MacUpdateBackend = {
+  download(input: {
+    files: MacUpdateFileInfo[]
+    proxy?: string | null
+    onProgress: (progress: { transferred: number, total: number | null }) => void
+  }): Promise<{ path: string }>
+  install(input: { path: string }): void
 }
 
 export type UpdaterSessionProxyConfig = {
@@ -92,8 +107,13 @@ export class ElectronUpdaterService {
   private readonly proxyController?: ElectronUpdaterProxyController
   private readonly updateConfigPath?: string
   private pendingUpdate: ElectronUpdateMetadata | null = null
+  private pendingFiles: MacUpdateFileInfo[] = []
+  private downloadedUpdatePath: string | null = null
+  private readonly macUpdateBackend?: MacUpdateBackend | null
+  private readonly resolveUpdateFiles?: () => MacUpdateFileInfo[]
   private downloaded = false
   private proxyKey: string | null = null
+  private currentProxy: string | null = null
 
   constructor(
     updater: ElectronUpdaterLike,
@@ -103,6 +123,8 @@ export class ElectronUpdaterService {
     this.updater = updater
     this.proxyController = proxyController
     this.updateConfigPath = runtimeOptions.updateConfigPath
+    this.macUpdateBackend = runtimeOptions.macUpdateBackend ?? null
+    this.resolveUpdateFiles = runtimeOptions.resolveUpdateFiles
     this.updater.autoDownload = false
     // Differential download issues many small sequential range requests and is
     // RTT-bound against the GitHub CDN, so it downloads far below line speed.
@@ -111,9 +133,10 @@ export class ElectronUpdaterService {
   }
 
   private async applyProxy(options?: ElectronUpdateCheckOptions) {
+    const proxy = options?.proxy?.trim() || null
+    this.currentProxy = proxy
     if (!this.proxyController) return
 
-    const proxy = options?.proxy?.trim() || null
     const nextProxyKey = proxy ? `manual:${proxy}` : 'system'
     if (this.proxyKey === nextProxyKey) return
 
@@ -135,6 +158,8 @@ export class ElectronUpdaterService {
       result = null
     }
     this.pendingUpdate = normalizeUpdateInfo(result?.updateInfo)
+    this.pendingFiles = result?.updateInfo?.files ?? []
+    this.downloadedUpdatePath = null
     this.downloaded = false
     return this.pendingUpdate
   }
@@ -145,6 +170,36 @@ export class ElectronUpdaterService {
     }
     if (this.downloaded) {
       emit({ event: 'Finished' })
+      return
+    }
+
+    if (this.macUpdateBackend) {
+      const files = this.resolveUpdateFiles?.() ?? this.pendingFiles
+      if (files.length === 0) throw new Error('Update metadata has no macOS payload files')
+      const backend = this.macUpdateBackend
+      let stagedTransferred = 0
+      let stagedStarted = false
+      const { path } = await backend.download({
+        files,
+        proxy: this.currentProxy,
+        onProgress: (progress) => {
+          if (!stagedStarted) {
+            stagedStarted = true
+            emit({ event: 'Started', data: { contentLength: progress.total } })
+          }
+          const chunkLength = Math.max(0, progress.transferred - stagedTransferred)
+          stagedTransferred = progress.transferred
+          if (chunkLength > 0) {
+            emit({ event: 'Progress', data: { chunkLength } })
+          }
+        },
+      })
+      if (!stagedStarted) {
+        emit({ event: 'Started', data: { contentLength: null } })
+      }
+      emit({ event: 'Finished' })
+      this.downloadedUpdatePath = path
+      this.downloaded = true
       return
     }
 
@@ -178,6 +233,8 @@ export class ElectronUpdaterService {
 
   cancelInstall() {
     this.pendingUpdate = null
+    this.pendingFiles = []
+    this.downloadedUpdatePath = null
     this.downloaded = false
   }
 
@@ -196,6 +253,10 @@ export class ElectronUpdaterService {
 
   quitAndInstallDownloadedUpdate(env: NodeJS.ProcessEnv = process.env) {
     this.stageDownloadedUpdate()
+    if (this.macUpdateBackend && this.downloadedUpdatePath) {
+      this.macUpdateBackend.install({ path: this.downloadedUpdatePath })
+      return
+    }
     // The NSIS installer spawned here inherits this process's environment.
     // Hand it the same clean environment a manually launched setup gets, so
     // its legacy-data checks read the persisted app-mode.json instead of a
